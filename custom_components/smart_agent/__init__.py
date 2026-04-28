@@ -4126,6 +4126,97 @@ class SmartAgentAiSceneOpsView(HomeAssistantView):
         return self.json({"ok": False, "error": "unsupported action"}, status_code=400)
 
 
+class SmartAgentModeView(HomeAssistantView):
+    """运行模式切换接口（home/showroom）。"""
+
+    url = "/api/v1/mode"
+    name = "api:smart_agent:v1:mode"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        mode = str((body or {}).get("mode", "") or "").strip().lower()
+        if mode not in ("home", "showroom"):
+            return self.json(_json_error_payload("invalid mode", "validation_error", False), status_code=400)
+
+        await coord.async_set_mode(mode)
+        return self.json({"ok": True, "mode": mode})
+
+
+class SmartAgentShowroomSceneView(HomeAssistantView):
+    """展厅场景/自定义提示设置接口。"""
+
+    url = "/api/v1/showroom/scene"
+    name = "api:smart_agent:v1:showroom:scene"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        scene = str((body or {}).get("scene", "") or "").strip()
+        custom_prompt = str((body or {}).get("custom_prompt", "") or "").strip()
+        is_command = bool((body or {}).get("is_command", False))
+
+        await coord.async_set_showroom_scene(
+            scene_key=scene,
+            custom_prompt=custom_prompt,
+            is_command=is_command,
+        )
+        return self.json({"ok": True, "scene": scene, "is_command": is_command})
+
+
+class SmartAgentShowroomSceneConfigView(HomeAssistantView):
+    """展厅预设场景配置更新接口。"""
+
+    url = "/api/v1/showroom/scene-config"
+    name = "api:smart_agent:v1:showroom:scene-config"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        scene_key = str((body or {}).get("scene_key", "") or "").strip()
+        if not scene_key:
+            return self.json(_json_error_payload("scene_key required", "validation_error", False), status_code=400)
+
+        await coord.async_update_showroom_scene_config(
+            scene_key=scene_key,
+            label=(body or {}).get("label"),
+            virtual_time=(body or {}).get("virtual_time"),
+            scene_desc=(body or {}).get("scene_desc"),
+            hint=(body or {}).get("hint"),
+        )
+        return self.json({"ok": True, "scene_key": scene_key})
+
+
 class SmartAgentPatrolTriggerView(HomeAssistantView):
     """巡检触发接口。"""
 
@@ -5205,6 +5296,9 @@ def _register_v1_views(hass: HomeAssistant) -> None:
         SmartAgentBackupsActionView,
         SmartAgentAiSceneOpsView,
         SmartAgentPatrolTriggerView,
+        SmartAgentModeView,
+        SmartAgentShowroomSceneView,
+        SmartAgentShowroomSceneConfigView,
         SmartAgentDevicePairStartView,
         SmartAgentDevicePairConfirmView,
         SmartAgentVoiceSessionView,

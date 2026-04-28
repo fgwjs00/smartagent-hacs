@@ -367,9 +367,11 @@ class IntentVerifier:
         # 预先构建：已占用区域 set 和无人区域 set
         occupied_rooms: set[str] = set()
         empty_rooms: set[str] = set()
+        uncertain_rooms: set[str] = set()
         for room, sensors in self._occ_map.items():
             if any(s in ("unknown", "unavailable") for _, s in sensors):
                 occupied_rooms.add(room)  # fail-closed: 占用不确定按有人处理
+                uncertain_rooms.add(room)
             elif any(s == "on" for _, s in sensors):
                 occupied_rooms.add(room)
             elif all(s == "off" for _, s in sensors):
@@ -433,7 +435,13 @@ class IntentVerifier:
                         f"[意图验证] 用户主动关灯 {eid}，区域 {action_room} 有人在场，已放行（USER_EXPLICIT）"
                     )
                 else:
-                    _reason = f"有人在场关灯拒绝: 区域 {action_room} 有人在场"
+                    if action_room in uncertain_rooms:
+                        _reason = (
+                            f"占用状态不确定关灯拒绝: 区域 {action_room} 存在 unknown/unavailable，"
+                            "按 fail-closed 拒绝"
+                        )
+                    else:
+                        _reason = f"有人在场关灯拒绝: 区域 {action_room} 有人在场"
                     self._log("WARN",
                         f"[意图验证] ⛔{eid}: {_reason}"
                     )

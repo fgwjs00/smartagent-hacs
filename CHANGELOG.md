@@ -1,5 +1,13 @@
 # Changelog
 
+## Beta 0.0.3 - 2026-04-29
+
+Latest beta test release.
+
+- Publishes the latest SmartAgent integration package.
+- Includes CP1-CP6 validation closure from the current engineering line.
+- Aligns the public version with `0.0.3` for Home Assistant update detection.
+
 ## Beta 0.0.2 - 2026-04-29
 
 Compatibility release for Home Assistant update detection.

@@ -569,7 +569,7 @@ class ContextBuilder:
                     break
                 n = str(f.get("name"))
                 # 保留 P1/关键观测段，不做兜底裁剪
-                if n in {"priority_section", "occupancy_section"}:
+                if n in {"priority_section", "occupancy_section", "vision_context", "showroom_tiered_prompt", "device_table"}:
                     continue
                 curr = str(lr_map.get(n, "") or "")
                 if not curr:

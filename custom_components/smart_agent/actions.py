@@ -515,7 +515,6 @@ class ActionsMixin:
             if (
                 domain == "light"
                 and service == "turn_on"
-                and self._mode == MODE_SHOWROOM
                 and not _is_user_explicit
             ):
                 _room = ((self.device_info.get(entity_id) or {}).get("room") or "").strip()
