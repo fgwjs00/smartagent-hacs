@@ -1,5 +1,12 @@
 # Changelog
 
+## Beta 0.0.1 Update 1 - 2026-04-28
+
+UI fix release.
+
+- Updates the published SmartAgent UI package.
+- Keeps the public beta release line aligned with `0.0.1-beta.1`.
+
 ## Beta 0.0.1 - 2026-04-28
 
 Initial external beta release for controlled testing.

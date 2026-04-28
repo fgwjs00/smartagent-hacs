@@ -2016,8 +2016,9 @@ class SmartAgentAiScenesView(HomeAssistantView):
                 proxied = _addon_result_payload_status(scenes if isinstance(scenes, dict) else None)
                 if proxied is not None:
                     payload, status = proxied
-                    if status not in (404, 405):
-                        return self.json(payload, status_code=status)
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("ai_scenes"), status_code=status)
+                    return self.json(payload, status_code=status)
                 if isinstance(scenes, list):
                     return self.json(scenes)
                 if isinstance(scenes, dict):
@@ -2660,9 +2661,8 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
                     else:
                         payload, status = _json_from_addon_result(settings)
                     if status in (404, 405):
-                        pass
-                    else:
-                        return self.json(payload, status_code=status)
+                        return self.json(_addon_endpoint_missing_payload("settings_system_get"), status_code=status)
+                    return self.json(payload, status_code=status)
                 else:
                     return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
             except Exception as exc:
@@ -2896,9 +2896,8 @@ class SmartAgentSystemBrandView(HomeAssistantView):
                     else:
                         payload, status = _json_from_addon_result(brand)
                     if status in (404, 405):
-                        pass
-                    else:
-                        return self.json(payload, status_code=status)
+                        return self.json(_addon_endpoint_missing_payload("system_brand"), status_code=status)
+                    return self.json(payload, status_code=status)
                 else:
                     return self.json(_addon_unreachable_payload("system_brand"), status_code=502)
             except Exception as exc:
@@ -3845,8 +3844,9 @@ class SmartAgentEnergyView(HomeAssistantView):
                 proxied = _addon_result_payload_status(stats if isinstance(stats, dict) else None)
                 if proxied is not None:
                     payload, status = proxied
-                    if status not in (404, 405):
-                        return self.json(payload, status_code=status)
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("energy"), status_code=status)
+                    return self.json(payload, status_code=status)
                 if isinstance(stats, list):
                     return self.json(stats)
                 if isinstance(stats, dict):
@@ -3978,8 +3978,9 @@ class SmartAgentBackupsView(HomeAssistantView):
                 proxied = _addon_result_payload_status(backups if isinstance(backups, dict) else None)
                 if proxied is not None:
                     payload, status = proxied
-                    if status not in (404, 405):
-                        return self.json(payload, status_code=status)
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("backups"), status_code=status)
+                    return self.json(payload, status_code=status)
                 if isinstance(backups, list):
                     return self.json(backups)
                 if isinstance(backups, dict):
