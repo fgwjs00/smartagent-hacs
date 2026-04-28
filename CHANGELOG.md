@@ -1,5 +1,12 @@
 # Changelog
 
+## Beta 0.0.2 - 2026-04-29
+
+Compatibility release for Home Assistant update detection.
+
+- Uses public machine version `0.0.2`.
+- Keeps the UI fix release available through a version format that Home Assistant can detect reliably.
+
 ## Beta 0.0.1 Update 1 - 2026-04-28
 
 UI fix release.

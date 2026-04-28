@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: "0.0.1-beta.1"
-display_version: "Beta 0.0.1 Update 1"
+release_version: "0.0.2"
+display_version: "Beta 0.0.2"
 channel: "beta"
 release_date: "2026-04-28"
 public_release_ready: false
@@ -10,5 +10,5 @@ component:
   source_path: "custom_components/smart_agent"
 
 release_notes:
-  summary: "UI fix release for Beta 0.0.1."
-  customer_visible_version: "Beta 0.0.1 Update 1"
+  summary: "UI fix release with Home Assistant add-on update detection compatibility."
+  customer_visible_version: "Beta 0.0.2"

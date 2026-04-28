@@ -1,6 +1,6 @@
 # SmartAgent for Home Assistant
 
-Current release: `Beta 0.0.1 Update 1`
+Current release: `Beta 0.0.2`
 
 ## 中文说明
 
@@ -50,7 +50,7 @@ SmartAgent 的目标是让智能家居从“被动响应”升级为“主动服
 
 ### 更新
 
-SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.1 Update 1`。
+SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.2`。
 
 ## English
 
@@ -100,4 +100,4 @@ SmartAgent aims to move the smart home experience from passive response to proac
 
 ### Updates
 
-The SmartAgent Home Assistant integration is updated through HACS. The current public release is `Beta 0.0.1 Update 1`.
+The SmartAgent Home Assistant integration is updated through HACS. The current public release is `Beta 0.0.2`.
