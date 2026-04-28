@@ -1,0 +1,172 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "选择 AI 推理引擎",
+        "description": "选择本地部署的 Ollama 或云端 API（通义千问 / DeepSeek / SiliconFlow 等）",
+        "data": {
+          "engine": "AI 引擎"
+        }
+      },
+      "connect_local": {
+        "title": "本地 Ollama 配置",
+        "description": "填写 Ollama 服务的 IP 地址（或域名）和模型名称。\n同机部署填 `http://127.0.0.1:11434`，异机填 `http://<IP>:11434`。",
+        "data": {
+          "ollama_url":   "Ollama 地址（IP / 域名）",
+          "ollama_model": "模型名称"
+        },
+        "data_description": {
+          "ollama_url":   "示例：http://127.0.0.1:11434 或 http://192.168.1.100:11434",
+          "ollama_model": "从下拉选择或手动输入已安装的模型名，如 qwen3-smarthome"
+        }
+      },
+      "connect_online": {
+        "title": "云端 API 配置",
+        "description": "选择供应商后 API 地址自动填入；选择「自定义」时请手动填写 API 地址。",
+        "data": {
+          "online_provider": "API 供应商",
+          "online_api_key":  "API Key",
+          "online_model":    "模型名称",
+          "online_base_url": "API 地址（仅「自定义」时需填）"
+        },
+        "data_description": {
+          "online_provider": "选择后自动设置 API 地址",
+          "online_api_key":  "在对应平台控制台获取",
+          "online_model":    "从下拉选择或手动输入，如 qwen-turbo / deepseek-chat",
+          "online_base_url": "选择「自定义」供应商时填写，如 https://api.example.com/v1"
+        }
+      },
+      "options": {
+        "title": "系统功能配置",
+        "description": "设置 AI 置信度、播报级别、视觉增强及联网工具。",
+        "data": {
+          "confidence_auto":   "自动执行置信度（%）",
+          "confidence_notify": "通知推送置信度（%）",
+          "cooldown_seconds":  "设备冷却时间（秒）",
+          "tts_service":       "TTS 服务（domain.service）",
+          "tts_target":        "TTS 目标媒体播放器",
+          "tts_level":         "TTS 播报级别",
+          "frigate_enabled":   "启用 Frigate NVR 视觉感知",
+          "qweather_api_key":  "和风天气 API Key",
+          "searxng_url":       "SearXNG 地址",
+          "cloud_fallback":    "启用云端降级 (Cloud Fallback)",
+          "vision_enabled":    "启用 LLMVision 视觉增强",
+          "vision_engine":     "视觉分析引擎",
+          "vision_model":      "视觉分析模型",
+          "stt_engine":        "STT 语音识别引擎",
+          "stt_language":      "STT 识别语言",
+          "showroom_biz_start":        "展厅营业开始时间",
+          "showroom_biz_end":           "展厅营业结束时间",
+          "showroom_area_name":         "展厅区域名称（HA Area）",
+          "showroom_excluded_subareas": "展厅排除子区域（逗号分隔）",
+          "license_key":               "License Key（SaaS 授权，可选）"
+        },
+        "data_description": {
+          "confidence_auto":   "置信度 ≥ 此值时自动执行，建议 85~95",
+          "confidence_notify": "置信度 ≥ 此值时推送通知，建议 60~80",
+          "cooldown_seconds":  "同一设备两次操作最短间隔，建议 60",
+          "tts_service":       "如 tts.piper、tts.cloud_say",
+          "tts_target":        "如 media_player.bedroom_speaker",
+          "frigate_enabled":   "开启后 SmartAgent 订阅 Frigate MQTT 事件，实现摄像头联动",
+          "qweather_api_key":  "用于获取实时天气和穿衣建议",
+          "searxng_url":       "用于 AI 互联网搜索，如 http://192.168.1.100:8888",
+          "cloud_fallback":    "本地模型处理复杂问题时自动调用云端大模型",
+          "vision_enabled":    "对摄像头关键事件快照进行多模态 AI 分析",
+          "vision_engine":     "选择本地模型或云端 API 进行视觉分析",
+          "vision_model":      "如 llava:7b (本地) 或 qwen-vl-max (云端)",
+          "stt_engine":        "如 stt.faster_whisper，留空则使用默认",
+          "stt_language":      "语音识别语言，默认 zh-CN",
+          "showroom_biz_start":        "HH:MM 格式，如 08:50 表示 8点50分",
+          "showroom_biz_end":           "HH:MM 格式，如 19:00 表示 19点整",
+          "showroom_area_name":         "填写 HA 区域注册表中展厅对应的区域名称，如「展厅」或「Showroom」；留空则展厅模式无法正确识别展厅设备",
+          "showroom_excluded_subareas": "逗号分隔的子区域名称，如「走廊,门厅」；这些区域的灯不参与展厅 P1 保护",
+          "license_key":               "购买后填入，格式 SA-XXXX-XXXX-XXXX-XXXX，空则使用免费版"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect":   "无法连接，请检查 IP 地址、端口和网络",
+      "invalid_api_key":  "API Key 不可为空",
+      "invalid_base_url": "选择「自定义」供应商时，API 地址不可为空",
+      "biz_time_invalid": "时间格式应为 HH:MM（如 08:50），且开始时间必须早于结束时间"
+    },
+    "abort": {
+      "already_configured": "该集成已配置，请通过「配置」修改设置"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "修改 SmartAgent 设置",
+        "description": "可切换引擎、更换 API Key、修改模型和调整置信度。选择展厅模式后将进入展厅专属配置页。",
+        "data": {
+          "engine":            "AI 引擎",
+          "ollama_url":        "Ollama 地址（IP / 域名）",
+          "ollama_model":      "Ollama 模型名称",
+          "online_provider":   "云端 API 供应商",
+          "online_api_key":    "API Key",
+          "online_model":      "云端模型名称",
+          "online_base_url":   "API 地址（仅「自定义」时需填）",
+          "confidence_auto":   "自动执行置信度（%）",
+          "confidence_notify": "通知推送置信度（%）",
+          "cooldown_seconds":  "设备冷却时间（秒）",
+          "tts_service":       "TTS 服务（domain.service）",
+          "tts_target":        "TTS 目标媒体播放器",
+          "tts_level":         "TTS 播报级别（0=关闭 1=仅回复 2=回复+动作 3=全部）",
+          "frigate_enabled":   "启用 Frigate NVR 视觉感知",
+          "qweather_api_key":  "和风天气 API Key",
+          "searxng_url":       "SearXNG 地址",
+          "cloud_fallback":    "启用云端降级 (Cloud Fallback)",
+          "vision_enabled":    "启用 LLMVision 视觉增强",
+          "vision_engine":     "视觉分析引擎",
+          "vision_model":      "视觉分析模型",
+          "mode":              "运行模式",
+          "addon_auth_token":  "Add-on 内部认证令牌（SA_AUTH_TOKEN）"
+        },
+        "data_description": {
+          "ollama_url":        "本地 Ollama 服务地址，如 http://127.0.0.1:11434",
+          "ollama_model":      "已安装的 Ollama 模型名",
+          "online_provider":   "选择供应商后 API 地址自动更新",
+          "online_api_key":    "云端 API 密钥",
+          "online_model":      "云端模型名称，支持手动输入",
+          "online_base_url":   "仅选「自定义」时需要手动填写",
+          "tts_service":       "如 tts.piper、tts.cloud_say",
+          "tts_target":        "如 media_player.bedroom_speaker",
+          "frigate_enabled":   "开启后 SmartAgent 订阅 Frigate MQTT 事件，实现摄像头联动",
+          "qweather_api_key":  "用于获取实时天气和穿衣建议",
+          "searxng_url":       "用于 AI 互联网搜索，如 http://192.168.1.100:8888",
+          "cloud_fallback":    "本地模型处理复杂问题时自动调用云端大模型",
+          "vision_enabled":    "对摄像头关键事件快照进行多模态 AI 分析",
+          "vision_engine":     "选择本地模型或云端 API 进行视觉分析",
+          "vision_model":      "如 llava:7b (本地) 或 qwen-vl-max (云端)",
+          "mode":              "家庭模式：普通住宅使用；展厅模式：销售展厅专用，需商业版授权，选择后进入展厅专属配置",
+          "addon_auth_token":  "需与 SmartAgent Add-on 的 SA_AUTH_TOKEN 环境变量保持一致，留空则不启用认证"
+        }
+      },
+      "showroom_config": {
+        "title": "展厅专属配置（商业版）",
+        "description": "配置展厅营业时间与三区分治区域角色映射。仅在展厅模式下生效，普通家庭用户无需配置。",
+        "data": {
+          "showroom_biz_start":        "营业开始时间",
+          "showroom_biz_end":          "营业结束时间",
+          "showroom_area_name":        "展示区名称（HA Area Registry）",
+          "showroom_excluded_subareas":"展示区内排除子区域（逗号分隔）",
+          "showroom_zone_map":         "区域角色映射（JSON）"
+        },
+        "data_description": {
+          "showroom_biz_start":        "HH:MM 格式，如 08:50 表示 8点50分",
+          "showroom_biz_end":          "HH:MM 格式，如 19:00 表示 19点整",
+          "showroom_area_name":        "填写 HA 区域注册表中展厅对应的区域名称，如「展厅」；此区域固定为展示区（display）角色",
+          "showroom_excluded_subareas":"展示区内不参与 P1 分层保护的子区域，如「走廊,门厅」",
+          "showroom_zone_map":         "JSON 格式角色映射，角色：display=展示区、experience=体验区（默认）、work=工作区。示例：{\"客厅\": \"experience\", \"餐厅\": \"experience\", \"办公室\": \"work\"}"
+        }
+      }
+    },
+    "error": {
+      "invalid_api_key":   "API Key 不可为空",
+      "invalid_base_url":  "选择「自定义」供应商时，API 地址不可为空",
+      "biz_time_invalid":  "营业时间格式错误或开始时间不早于结束时间，请使用 HH:MM 格式",
+      "invalid_json":      "区域角色映射不是合法的 JSON 格式，请检查语法"
+    }
+  }
+}

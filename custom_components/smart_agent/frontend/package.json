@@ -1,0 +1,22 @@
+{
+  "name": "smart-agent-panel",
+  "version": "2.5.0",
+  "description": "SmartAgent HA custom panel — Material Design 3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:min": "node build.mjs --minify",
+    "deploy": "node patch-mwc.js && node build.mjs --prod",
+    "deploy:min": "node patch-mwc.js && node build.mjs --prod --minify",
+    "watch": "node build.mjs --watch",
+    "dev": "node build.mjs --watch",
+    "postinstall": "node patch-mwc.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.2"
+  },
+  "dependencies": {
+    "@material/web": "^2.4.1"
+  }
+}

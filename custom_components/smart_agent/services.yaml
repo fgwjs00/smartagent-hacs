@@ -1,0 +1,290 @@
+discover_devices:
+  name: 发现设备
+  description: 扫描 HA 中所有设备并自动添加到 SmartAgent
+
+sync_rooms_to_ha:
+  name: 同步房间到 HA
+  description: 将 AI 管家中的房间信息同步到 Home Assistant 的区域注册表中
+
+batch_add_devices:
+  name: 批量添加设备
+  description: 将指定实体批量添加到 SmartAgent 设备列表
+  fields:
+    entities:
+      name: 实体列表
+      description: "逗号分隔的 entity_id 列表"
+      required: true
+      example: "light.living_room,switch.bedroom"
+      selector:
+        text:
+
+add_device:
+  name: 添加设备
+  description: 添加或更新单个设备
+  fields:
+    entity_id:
+      name: 实体 ID
+      required: true
+      selector:
+        entity:
+    description:
+      name: 描述
+      description: "格式：名称|区域|类型|操作"
+      required: true
+      selector:
+        text:
+
+delete_device:
+  name: 删除设备
+  description: 删除指定设备
+  fields:
+    entity_id:
+      name: 实体 ID
+      required: true
+      selector:
+        entity:
+
+update_device:
+  name: 更新设备信息
+  description: 更新设备的名称、区域等字段
+  fields:
+    entity_id:
+      name: 实体 ID
+      required: true
+      selector:
+        entity:
+    name:
+      name: 名称
+      selector:
+        text:
+    room:
+      name: 区域
+      selector:
+        text:
+    type:
+      name: 类型
+      selector:
+        text:
+    ops:
+      name: 操作说明
+      selector:
+        text:
+
+add_habit:
+  name: 添加画像
+  fields:
+    content:
+      name: 画像内容
+      required: true
+      selector:
+        text:
+
+delete_habit:
+  name: 删除画像
+  fields:
+    content:
+      name: 画像内容
+      required: true
+      selector:
+        text:
+
+toggle_habit_lock:
+  name: 锁定/解锁画像
+  fields:
+    content:
+      name: 画像内容
+      required: true
+      selector:
+        text:
+
+add_rule:
+  name: 添加规则
+  fields:
+    content:
+      name: 规则内容
+      required: true
+      selector:
+        text:
+
+delete_rule:
+  name: 删除规则
+  fields:
+    content:
+      name: 规则内容
+      required: true
+      selector:
+        text:
+
+toggle_rule_lock:
+  name: 锁定/解锁规则
+  fields:
+    content:
+      name: 规则内容
+      required: true
+      selector:
+        text:
+
+manual_inference:
+  name: 手动触发推理
+  description: 跳过监听器和冷却期，直接触发一次 AI 推理（用于测试）
+  fields:
+    trigger:
+      name: 触发描述
+      description: "描述本次触发的原因（可选）"
+      required: false
+      default: "手动测试触发"
+      selector:
+        text:
+
+clear_overrides:
+  name: 重置 AI 记忆
+  description: 清除覆盖保护、历史事件等短期记忆，让 AI 以全新状态开始决策（不影响画像/规则/行为学习摘要）
+
+delete_behavior_pattern:
+  name: 删除行为规律
+  description: 删除指定 ID 的行为学习规律（P2 自学习）
+  fields:
+    id:
+      name: 规律 ID
+      description: 要删除的行为规律数据库 ID
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+
+set_mode:
+  name: 设置模式
+  description: 切换家庭模式或展厅模式
+  fields:
+    mode:
+      name: 模式
+      description: "home=家庭模式，showroom=展厅模式"
+      required: true
+      selector:
+        select:
+          options:
+            - value: home
+              label: 家庭模式
+            - value: showroom
+              label: 展厅模式
+
+set_showroom_scene:
+  name: 设置展厅场景
+  description: 设置展厅预设场景或自定义描述（仅展厅模式下生效）
+  fields:
+    scene:
+      name: 预设场景
+      required: false
+      selector:
+        select:
+          options:
+            - value: ""
+              label: 无（使用自定义或通用演示）
+            - value: night_sleep
+              label: 晚间休息
+            - value: morning_wake
+              label: 晨起
+            - value: movie
+              label: 影院
+            - value: welcome_home
+              label: 回家
+            - value: leave_home
+              label: 离家
+    custom_prompt:
+      name: 自定义场景描述
+      description: "语音或文本描述要模拟的场景（与预设二选一）"
+      required: false
+      selector:
+        text:
+    is_command:
+      name: 一次性指令模式
+      description: "true = 执行一次后自动清空，不写入持久配置，不影响巡检背景；false（默认）= 持久模式，每次巡检均生效"
+      required: false
+      default: false
+      selector:
+        boolean:
+
+update_showroom_scene_config:
+  name: 更新展厅场景配置
+  description: 修改指定展厅场景的显示名、虚拟时间、场景描述或 AI 提示词
+  fields:
+    scene_key:
+      name: 场景键名
+      description: 要修改的场景标识（如 night_sleep、morning_wake 等）
+      required: true
+      selector:
+        text:
+    label:
+      name: 显示名称
+      required: false
+      selector:
+        text:
+    virtual_time:
+      name: 虚拟时间
+      description: "格式 HH:MM"
+      required: false
+      selector:
+        text:
+    scene_desc:
+      name: 场景描述
+      required: false
+      selector:
+        text:
+    hint:
+      name: AI 提示词
+      required: false
+      selector:
+        text:
+
+set_device_control_mode:
+  name: 设置设备管辖模式
+  description: 切换设备的 AI 托管、HA 优先或共享模式
+  fields:
+    entity_id:
+      name: 实体 ID
+      required: true
+      selector:
+        entity:
+    mode:
+      name: 模式
+      description: "ai=AI全权, ha=HA优先, shared=共享"
+      required: true
+      selector:
+        select:
+          options:
+            - value: ai
+              label: AI全权
+            - value: ha
+              label: HA优先
+            - value: shared
+              label: 共享模式
+
+batch_set_control_mode:
+  name: 批量设置管辖模式
+  description: 按房间或类型批量修改设备的管辖模式
+  fields:
+    room:
+      name: 房间
+      required: false
+      selector:
+        text:
+    type:
+      name: 类型
+      description: "如 light, switch, climate 等"
+      required: false
+      selector:
+        text:
+    mode:
+      name: 模式
+      description: "ai=AI全权, ha=HA优先, shared=共享"
+      required: true
+      selector:
+        select:
+          options:
+            - value: ai
+              label: AI全权
+            - value: ha
+              label: HA优先
+            - value: shared
+              label: 共享模式

@@ -1,0 +1,22 @@
+{
+  "domain": "smart_agent",
+  "name": "AI SmartAgent",
+  "codeowners": [
+    "@fgwjs00"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "frontend",
+    "panel_custom",
+    "http"
+  ],
+  "documentation": "https://github.com/fgwjs00/smartagent-hacs",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/fgwjs00/smartagent-hacs/issues",
+  "requirements": [
+    "aiohttp>=3.8.0",
+    "cryptography>=41.0.0"
+  ],
+  "version": "0.0.1-beta.0"
+}
