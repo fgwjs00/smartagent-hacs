@@ -117,6 +117,7 @@ class DatabaseMixin:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL,
                     locked INTEGER DEFAULT 0, created TEXT)
             """)
+            _safe_add_column(conn, "rules", "semantic_layer TEXT DEFAULT 'behavior'")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS behavior_patterns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,6 +358,7 @@ class DatabaseMixin:
             for _col_def in (
                 "intent          TEXT DEFAULT ''",
                 "scene_candidate TEXT DEFAULT ''",
+                "memory_layer    TEXT DEFAULT 'reflex'",
             ):
                 _safe_add_column(conn, "decision_cache", _col_def)
 

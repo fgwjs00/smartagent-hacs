@@ -74,6 +74,125 @@ _HA_PANEL_DEGRADED_MODE = _env_flag("SA_HA_PANEL_DEGRADED_MODE", True)
 _HA_PANEL_REGISTER_ENABLED = _env_flag("SA_HA_PANEL_REGISTER_ENABLED", not _HA_PANEL_DEGRADED_MODE)
 _HA_PANEL_STATIC_EXPOSED = _env_flag("SA_HA_PANEL_STATIC_EXPOSED", not _HA_PANEL_DEGRADED_MODE)
 _HA_SCREEN_STATIC_EXPOSED = _env_flag("SA_HA_SCREEN_STATIC_EXPOSED", True)
+_SYSTEM_CPU_SNAPSHOT: tuple[int, int] | None = None
+
+
+def _clamp_percent(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if numeric != numeric or numeric < 0:
+        return 0.0
+    if numeric > 100:
+        return 100.0
+    return round(numeric, 1)
+
+
+def _read_proc_cpu_snapshot() -> tuple[int, int] | None:
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as fp:
+            line = fp.readline()
+    except OSError:
+        return None
+
+    parts = line.split()
+    if not parts or parts[0] != "cpu":
+        return None
+    try:
+        values = [int(item) for item in parts[1:]]
+    except ValueError:
+        return None
+    if len(values) < 4:
+        return None
+
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return sum(values), idle
+
+
+def _cpu_percent_between(before: tuple[int, int], after: tuple[int, int]) -> float | None:
+    total_delta = after[0] - before[0]
+    idle_delta = after[1] - before[1]
+    if total_delta <= 0 or idle_delta < 0:
+        return None
+    busy_delta = max(0, total_delta - idle_delta)
+    return _clamp_percent((busy_delta * 100.0) / total_delta)
+
+
+def _read_proc_cpu_percent() -> float | None:
+    global _SYSTEM_CPU_SNAPSHOT
+
+    current = _read_proc_cpu_snapshot()
+    if current is None:
+        return None
+
+    previous = _SYSTEM_CPU_SNAPSHOT
+    if previous is None:
+        time.sleep(0.05)
+        sampled = _read_proc_cpu_snapshot()
+        _SYSTEM_CPU_SNAPSHOT = sampled or current
+        if sampled is None:
+            return None
+        return _cpu_percent_between(current, sampled)
+
+    _SYSTEM_CPU_SNAPSHOT = current
+    return _cpu_percent_between(previous, current)
+
+
+def _read_proc_memory_percent() -> float | None:
+    fields: dict[str, float] = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fp:
+            for line in fp:
+                if ":" not in line:
+                    continue
+                key, raw_value = line.split(":", 1)
+                parts = raw_value.strip().split()
+                if not parts:
+                    continue
+                try:
+                    fields[key] = float(parts[0])
+                except ValueError:
+                    continue
+    except OSError:
+        return None
+
+    total = fields.get("MemTotal", 0.0)
+    available = fields.get("MemAvailable")
+    if available is None:
+        available = fields.get("MemFree", 0.0) + fields.get("Buffers", 0.0) + fields.get("Cached", 0.0)
+    if total <= 0 or available is None:
+        return None
+    return _clamp_percent(((total - available) * 100.0) / total)
+
+
+def _collect_system_resource_metrics() -> dict[str, Any]:
+    cpu: float | None = None
+    memory: float | None = None
+    source = "unavailable"
+
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        cpu = _clamp_percent(psutil.cpu_percent(interval=0.05))
+        memory = _clamp_percent(psutil.virtual_memory().percent)
+        source = "psutil"
+    except Exception:
+        cpu = _read_proc_cpu_percent()
+        memory = _read_proc_memory_percent()
+        if cpu is not None or memory is not None:
+            source = "procfs"
+
+    return {
+        "cpu": cpu if cpu is not None else 0.0,
+        "memory": memory if memory is not None else 0.0,
+        "resource_metrics": {
+            "source": source,
+            "cpu_available": cpu is not None,
+            "memory_available": memory is not None,
+            "sampled_at": datetime.now().isoformat(),
+        },
+    }
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1425,6 +1544,103 @@ def _get_first_coordinator(hass: HomeAssistant) -> SmartAgentCoordinator | None:
     return None
 
 
+def _build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordinator) -> dict[str, Any]:
+    """Build the presence sensor editor payload shared by HTTP and HA WS UIs."""
+    import json as _json
+
+    presence_kw = getattr(coord, "_PRESENCE_KW", (
+        "occupancy", "presence", "motion", "人体", "存在", "有人", "移动",
+        "ren_ti", "cun_zai", "radar", "mmwave", "雷达",
+        "person_occupancy", "object_count",
+    ))
+
+    sensors: list[dict[str, Any]] = []
+    fusion_registry = getattr(coord, "_fusion_registry", None)
+    device_info = coord.device_info if isinstance(coord.device_info, dict) else {}
+
+    for st in hass.states.async_all("binary_sensor"):
+        eid = st.entity_id
+        friendly = st.attributes.get("friendly_name", eid)
+        check_str = (friendly + eid).lower()
+        if not any(str(kw).lower() in check_str for kw in presence_kw):
+            continue
+
+        info = device_info.get(eid) or {}
+        fusion_scope = None
+        if fusion_registry is not None:
+            scope = fusion_registry.get_scope_for_entity(eid)
+            if scope is not None:
+                fusion_scope = scope.display_name
+
+        sensors.append({
+            "entity_id": eid,
+            "name": info.get("name") or friendly,
+            "room": info.get("room", ""),
+            "state": st.state,
+            "sensor_type": info.get("sensor_type", ""),
+            "in_sa": eid in device_info,
+            "fusion_scope": fusion_scope,
+        })
+
+    entry = getattr(coord, "_entry", None)
+    fusion_raw = ((entry.options or {}).get("presence_fusion", "[]") if entry else "[]") or "[]"
+    try:
+        fusion_config = _json.loads(fusion_raw)
+        if not isinstance(fusion_config, list):
+            fusion_config = []
+    except Exception:
+        fusion_config = []
+
+    rooms = sorted({
+        info.get("room", "")
+        for info in device_info.values()
+        if info.get("room", "")
+    })
+
+    return {
+        "sensors": sensors,
+        "fusion_config": fusion_config,
+        "rooms": rooms,
+    }
+
+
+async def _async_save_presence_sensor_type(
+    hass: HomeAssistant,
+    coord: SmartAgentCoordinator,
+    entity_id: str,
+    sensor_type: str,
+) -> dict[str, Any]:
+    """Persist a managed presence sensor's type classification."""
+    eid = entity_id.strip()
+    s_type = sensor_type.strip().lower()
+    if not eid:
+        return {"ok": False, "error": "entity_id required", "status": 400}
+    if s_type not in ("", "pir", "mmwave", "frigate"):
+        return {
+            "ok": False,
+            "error": "sensor_type must be '', 'pir', 'mmwave' or 'frigate'",
+            "status": 400,
+        }
+    if eid not in coord.device_info:
+        return {"ok": False, "error": f"设备未纳管: {eid}", "status": 404}
+
+    from datetime import datetime as _dt_s
+    now_s = _dt_s.now().isoformat()
+
+    def _db_update() -> bool:
+        return bool(coord._db.execute(
+            "UPDATE devices SET sensor_type=?, updated=? WHERE entity_id=?",
+            (s_type, now_s, eid),
+        ))
+
+    db_ok = await hass.async_add_executor_job(_db_update)
+    if not db_ok:
+        return {"ok": False, "error": "保存 sensor_type 失败", "status": 500}
+
+    coord.device_info[eid]["sensor_type"] = s_type
+    return {"ok": True, "entity_id": eid, "sensor_type": s_type, "status": 200}
+
+
 class SmartAgentDevicesView(HomeAssistantView):
     """设备列表与批量新增接口（/api/v1/devices*）。"""
 
@@ -1757,6 +1973,90 @@ class SmartAgentDeviceControlView(HomeAssistantView):
         if not ok:
             return self.json({"ok": False, "error": "blocked_or_failed"}, status_code=409)
         return self.json({"ok": True, "entity_id": eid, "service": service})
+
+
+class SmartAgentPresenceSensorsView(HomeAssistantView):
+    """存在传感器类型与融合域编辑器数据接口。"""
+
+    url = "/api/v1/presence/sensors"
+    name = "api:smart_agent:v1:presence:sensors"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        hass = request.app["hass"]
+        coord = _get_first_coordinator(hass)
+        if coord is None:
+            return self.json({"sensors": [], "fusion_config": [], "rooms": []})
+
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        addon_client = getattr(coord, "_addon_client", None)
+        if (not is_addon_proxy) and addon_client is not None:
+            try:
+                proxied = await addon_client.request_json("GET", "/presence/sensors")
+                if isinstance(proxied, dict):
+                    normalized = _json_from_addon_http_result(proxied)
+                    if normalized is not None:
+                        payload, status = normalized
+                        if status in (404, 405):
+                            return self.json(_addon_endpoint_missing_payload("presence_sensors"), status_code=status)
+                        return self.json(payload, status_code=status)
+                    return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
+            except Exception as exc:
+                _LOGGER.debug("[PresenceSensors] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
+
+        return self.json(_build_presence_sensors_payload(hass, coord))
+
+
+class SmartAgentPresenceSensorTypeView(HomeAssistantView):
+    """保存存在传感器类型分类。"""
+
+    url = "/api/v1/presence/sensors/type"
+    name = "api:smart_agent:v1:presence:sensors:type"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        hass = request.app["hass"]
+        coord = _get_first_coordinator(hass)
+        if coord is None:
+            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("JSON body must be object")
+        except Exception:
+            return self.json({"ok": False, "error": "invalid JSON"}, status_code=400)
+
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        addon_client = getattr(coord, "_addon_client", None)
+        if (not is_addon_proxy) and addon_client is not None:
+            try:
+                proxied = await addon_client.request_json("POST", "/presence/sensors/type", body=body)
+                if isinstance(proxied, dict):
+                    normalized = _json_from_addon_http_result(proxied)
+                    if normalized is not None:
+                        payload, status = normalized
+                        if status in (404, 405):
+                            return self.json(_addon_endpoint_missing_payload("presence_sensor_type"), status_code=status)
+                        return self.json(payload, status_code=status)
+                    return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
+            except Exception as exc:
+                _LOGGER.debug("[PresenceSensorType] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
+
+        result = await _async_save_presence_sensor_type(
+            hass,
+            coord,
+            str(body.get("entity_id", "") or ""),
+            str(body.get("sensor_type", "") or ""),
+        )
+        status = int(result.pop("status", 200) or 200)
+        return self.json(result, status_code=status)
 
 
 class SmartAgentRoomsView(HomeAssistantView):
@@ -2208,8 +2508,34 @@ class SmartAgentSystemStatusView(HomeAssistantView):
                 status_code=403,
             )
         hass = request.app["hass"]
+
+        resource_metrics_cache = None
+
+        async def _resource_metrics():
+            nonlocal resource_metrics_cache
+            if resource_metrics_cache is None:
+                metrics_fn = globals().get("_collect_system_resource_metrics")
+                if callable(metrics_fn):
+                    executor = getattr(hass, "async_add_executor_job", None)
+                    resource_metrics_cache = await executor(metrics_fn) if callable(executor) else metrics_fn()
+                else:
+                    resource_metrics_cache = {
+                        "cpu": 0.0,
+                        "memory": 0.0,
+                        "resource_metrics": {},
+                    }
+            return resource_metrics_cache
+
+        def _has_real_metric(value: Any) -> bool:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return False
+            return 0 < numeric <= 100
+
         coord = _get_first_coordinator(hass)
         if coord is None or not hasattr(coord, "engine"):
+            resource_metrics = await _resource_metrics()
             return self.json({
                 "gateway": "offline",
                 "core": "offline",
@@ -2219,8 +2545,9 @@ class SmartAgentSystemStatusView(HomeAssistantView):
                 "devices_managed": 0,
                 "active_scenes": 0,
                 "voice_provider": "unknown",
-                "cpu": 0,
-                "memory": 0,
+                "cpu": resource_metrics.get("cpu", 0.0),
+                "memory": resource_metrics.get("memory", 0.0),
+                "resource_metrics": resource_metrics.get("resource_metrics", {}),
                 "compat_summary": {
                     "any_exceeded": False,
                     "hits_24h_total": 0,
@@ -2246,6 +2573,12 @@ class SmartAgentSystemStatusView(HomeAssistantView):
                         payload.setdefault("ha", "online")
                         payload.setdefault("gateway", "online")
                         payload.setdefault("core", "online")
+                        resource_metrics = await _resource_metrics()
+                        if not _has_real_metric(payload.get("cpu")):
+                            payload["cpu"] = resource_metrics.get("cpu", 0.0)
+                        if not _has_real_metric(payload.get("memory")):
+                            payload["memory"] = resource_metrics.get("memory", 0.0)
+                        payload.setdefault("resource_metrics", resource_metrics.get("resource_metrics", {}))
                         payload.setdefault("compat_summary", _build_compat_summary_payload(hass))
                         try:
                             caps = await _addon_client.get_capabilities()
@@ -2268,6 +2601,7 @@ class SmartAgentSystemStatusView(HomeAssistantView):
         scenes = getattr(coord, "_ai_scenes_cache", [])
         active_scenes = sum(1 for s in scenes if isinstance(s, dict) and s.get("status") == "active")
         voice_provider = coord.ollama_model if coord.engine == "local" else coord.online_model
+        resource_metrics = await _resource_metrics()
 
         try:
             compat_summary = _build_compat_summary_payload(hass)
@@ -2291,8 +2625,9 @@ class SmartAgentSystemStatusView(HomeAssistantView):
             "devices_managed": len(getattr(coord, "device_info", {}) or {}),
             "active_scenes": active_scenes,
             "voice_provider": voice_provider or "unknown",
-            "cpu": 0,
-            "memory": 0,
+            "cpu": resource_metrics.get("cpu", 0.0),
+            "memory": resource_metrics.get("memory", 0.0),
+            "resource_metrics": resource_metrics.get("resource_metrics", {}),
             "compat_summary": compat_summary,
         })
 
@@ -4149,6 +4484,22 @@ class SmartAgentModeView(HomeAssistantView):
         if mode not in ("home", "showroom"):
             return self.json(_json_error_payload("invalid mode", "validation_error", False), status_code=400)
 
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        _addon_client = getattr(coord, "_addon_client", None)
+        if (not is_addon_proxy) and _addon_client is not None:
+            try:
+                proxied = await _addon_client.request_json("POST", "/mode", body={"mode": mode})
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("mode"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("mode"), status_code=502)
+            except Exception as exc:
+                _LOGGER.debug("[Mode] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("mode"), status_code=502)
+
         await coord.async_set_mode(mode)
         return self.json({"ok": True, "mode": mode})
 
@@ -4175,6 +4526,30 @@ class SmartAgentShowroomSceneView(HomeAssistantView):
         scene = str((body or {}).get("scene", "") or "").strip()
         custom_prompt = str((body or {}).get("custom_prompt", "") or "").strip()
         is_command = bool((body or {}).get("is_command", False))
+
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        _addon_client = getattr(coord, "_addon_client", None)
+        if (not is_addon_proxy) and _addon_client is not None:
+            try:
+                proxied = await _addon_client.request_json(
+                    "POST",
+                    "/showroom/scene",
+                    body={
+                        "scene": scene,
+                        "custom_prompt": custom_prompt,
+                        "is_command": is_command,
+                    },
+                )
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("showroom_scene"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
+            except Exception as exc:
+                _LOGGER.debug("[ShowroomScene] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
 
         await coord.async_set_showroom_scene(
             scene_key=scene,
@@ -4207,12 +4582,39 @@ class SmartAgentShowroomSceneConfigView(HomeAssistantView):
         if not scene_key:
             return self.json(_json_error_payload("scene_key required", "validation_error", False), status_code=400)
 
+        patch_body = {
+            "scene_key": scene_key,
+            "label": (body or {}).get("label"),
+            "virtual_time": (body or {}).get("virtual_time"),
+            "scene_desc": (body or {}).get("scene_desc"),
+            "hint": (body or {}).get("hint"),
+        }
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        _addon_client = getattr(coord, "_addon_client", None)
+        if (not is_addon_proxy) and _addon_client is not None:
+            try:
+                proxied = await _addon_client.request_json(
+                    "POST",
+                    "/showroom/scene-config",
+                    body=patch_body,
+                )
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("showroom_scene_config"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
+            except Exception as exc:
+                _LOGGER.debug("[ShowroomSceneConfig] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
+
         await coord.async_update_showroom_scene_config(
             scene_key=scene_key,
-            label=(body or {}).get("label"),
-            virtual_time=(body or {}).get("virtual_time"),
-            scene_desc=(body or {}).get("scene_desc"),
-            hint=(body or {}).get("hint"),
+            label=patch_body.get("label"),
+            virtual_time=patch_body.get("virtual_time"),
+            scene_desc=patch_body.get("scene_desc"),
+            hint=patch_body.get("hint"),
         )
         return self.json({"ok": True, "scene_key": scene_key})
 
@@ -5261,6 +5663,8 @@ def _register_v1_views(hass: HomeAssistant) -> None:
         SmartAgentDevicesBatchAddView,
         SmartAgentDeviceDetailView,
         SmartAgentDeviceControlView,
+        SmartAgentPresenceSensorsView,
+        SmartAgentPresenceSensorTypeView,
         SmartAgentRoomsView,
         SmartAgentRoomsSyncView,
         SmartAgentRoomsTopologyView,
@@ -6466,60 +6870,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
 
-        _PRESENCE_KW = getattr(coord, "_PRESENCE_KW", (
-            "occupancy", "presence", "motion", "人体", "存在", "有人", "移动",
-            "ren_ti", "cun_zai", "radar", "mmwave", "雷达",
-            "person_occupancy", "object_count",
-        ))
-
-        sensors = []
-        for st in hass.states.async_all("binary_sensor"):
-            eid = st.entity_id
-            friendly = st.attributes.get("friendly_name", eid)
-            check_str = (friendly + eid).lower()
-            if not any(kw in check_str for kw in _PRESENCE_KW):
-                continue
-            info = coord.device_info.get(eid) or {}
-            # 融合域归属
-            fusion_scope = None
-            _fr = getattr(coord, "_fusion_registry", None)
-            if _fr is not None:
-                _sc = _fr.get_scope_for_entity(eid)
-                if _sc is not None:
-                    fusion_scope = _sc.display_name
-            sensors.append({
-                "entity_id": eid,
-                "name": info.get("name") or friendly,
-                "room": info.get("room", ""),
-                "state": st.state,
-                "sensor_type": info.get("sensor_type", ""),
-                "in_sa": eid in coord.device_info,
-                "fusion_scope": fusion_scope,
-            })
-
-        # 当前融合域配置（原始 JSON 字符串 → 解析为数组）
-        import json as _json
-        _entry = getattr(coord, "_entry", None)
-        _fusion_raw = ((_entry.options or {}).get("presence_fusion", "[]") if _entry else "[]") or "[]"
-        try:
-            fusion_config = _json.loads(_fusion_raw)
-            if not isinstance(fusion_config, list):
-                fusion_config = []
-        except Exception:
-            fusion_config = []
-
-        # 可用房间列表（供融合域编辑器使用）
-        rooms = sorted({
-            info.get("room", "")
-            for info in coord.device_info.values()
-            if info.get("room", "")
-        })
-
-        connection.send_result(msg["id"], {
-            "sensors": sensors,
-            "fusion_config": fusion_config,
-            "rooms": rooms,
-        })
+        connection.send_result(msg["id"], _build_presence_sensors_payload(hass, coord))
 
     @websocket_api.websocket_command({
         vol.Required("type"): "smart_agent/save_sensor_type",
@@ -6536,36 +6887,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
 
-        eid = msg["entity_id"].strip()
-        s_type = msg["sensor_type"].strip().lower()
-        if s_type not in ("", "pir", "mmwave", "frigate"):
-            connection.send_error(msg["id"], "invalid_input",
-                                  "sensor_type must be '', 'pir', 'mmwave' or 'frigate'")
+        result = await _async_save_presence_sensor_type(
+            hass,
+            coord,
+            msg["entity_id"],
+            msg["sensor_type"],
+        )
+        status = int(result.pop("status", 200) or 200)
+        if not result.get("ok"):
+            code = "invalid_input" if status == 400 else "not_found" if status == 404 else "db_write_failed"
+            connection.send_error(msg["id"], code, str(result.get("error") or "保存 sensor_type 失败"))
             return
 
-        # 持久化到 DB（devices 表）
-        from datetime import datetime as _dt_s
-        _now_s = _dt_s.now().isoformat()
-
-        def _db_update() -> bool:
-            return bool(coord._db.execute(
-                "UPDATE devices SET sensor_type=?, updated=? WHERE entity_id=?",
-                (s_type, _now_s, eid),
-            ))
-
-        db_ok = await hass.async_add_executor_job(_db_update)
-        if not db_ok:
-            connection.send_error(msg["id"], "db_write_failed", "保存 sensor_type 失败")
-            return
-
-        # DB 成功后再更新内存中的 device_info，避免内存/持久化漂移
-        if eid not in coord.device_info:
-            connection.send_error(msg["id"], "not_found", f"设备未纳管: {eid}")
-            return
-
-        coord.device_info[eid]["sensor_type"] = s_type
-
-        connection.send_result(msg["id"], {"ok": True, "entity_id": eid, "sensor_type": s_type})
+        connection.send_result(msg["id"], result)
 
     # ── 房间拓扑 WS ───────────────────────────────────────────────────────────
 

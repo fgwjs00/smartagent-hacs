@@ -1404,6 +1404,10 @@ class InferenceMixin:
             manual_actions_text  = bundle.get("manual_actions_text", "")
             realtime_habits      = bundle.get("realtime_habits", "")
             memory_narrative     = bundle.get("memory_narrative", "")
+            memory_constraint    = bundle.get("memory_constraint", "")
+            memory_behavior      = bundle.get("memory_behavior", "")
+            memory_reflex        = bundle.get("memory_reflex", "")
+            memory_episodic      = bundle.get("memory_episodic", "")
             rag_context          = bundle.get("rag_context", "")
             corrections_text     = bundle.get("corrections_text", "")
             baseline_hint        = bundle.get("baseline_hint", "")
@@ -1428,8 +1432,19 @@ class InferenceMixin:
             if manual_actions_text:     p2_parts.append(manual_actions_text)
             if realtime_habits:         p2_parts.append(f"实时习惯：\n{realtime_habits}")
             if rag_context:             p2_parts.append(rag_context)
-            # MemoryStore 优先；失败时用 corrections_text + baseline_hint 回退
-            if memory_narrative:
+
+            layered_memory_parts: list[str] = []
+            if memory_constraint:
+                layered_memory_parts.append(f"【Constraint 记忆层】\n{memory_constraint}")
+            if memory_behavior:
+                layered_memory_parts.append(f"【Behavior 记忆层】\n{memory_behavior}")
+            if memory_reflex:
+                layered_memory_parts.append(f"【Reflex 记忆层】\n{memory_reflex}")
+            if memory_episodic:
+                layered_memory_parts.append(f"【Episodic Runtime 记忆层】\n{memory_episodic}")
+            if layered_memory_parts:
+                p2_parts.append("\n\n".join(layered_memory_parts))
+            elif memory_narrative:
                 p2_parts.append(memory_narrative)
             else:
                 if corrections_text:    p2_parts.append(corrections_text)

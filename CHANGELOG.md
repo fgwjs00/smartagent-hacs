@@ -1,5 +1,15 @@
 # Changelog
 
+## Beta 0.0.4 - 2026-04-30
+
+Latest beta test release.
+
+- Publishes the latest SmartAgent Home Assistant integration package.
+- Includes Context Layer 2.0 context bundle assembly.
+- Adds Memory Domain layering for reflex, behavior, constraint, and episodic runtime memory.
+- Includes database compatibility extensions for memory layer metadata.
+- Aligns the public version with `0.0.4` for Home Assistant update detection.
+
 ## Beta 0.0.3 - 2026-04-29
 
 Latest beta test release.

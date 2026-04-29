@@ -245,6 +245,14 @@ class ContextBuilder:
         # ── 设备名称对照表（供 Add-on 构建 System Prompt）────────────────────
         device_table = c._build_device_name_table() if hasattr(c, "_build_device_name_table") else ""
 
+        # ── Context Layer 2.0: 空间范围与分层选择（先定范围，后采集）────────────
+        room_scope = trigger_room if trigger_room else "global"
+        is_large_footprint = len(getattr(c, "device_info", {}) or {}) >= 120
+        memory_layer_order = ["constraint", "behavior", "reflex", "episodic_runtime"]
+        if not trigger_room:
+            # 全局触发时先保约束，再保反射，最后补行为/片段
+            memory_layer_order = ["constraint", "reflex", "behavior", "episodic_runtime"]
+
         # ── 异步数据采集（并发执行，加速 bundle 构建）─────────────────────────
 
         async def _empty() -> str:
@@ -315,18 +323,50 @@ class ContextBuilder:
         context_text = _safe(gather_results[4])
         baseline_hint = _safe(gather_results[5])
 
-        # ── MemoryStore 房间上下文（Phase 2 v2，异步，executor）─────────────
-        # 包含：房间叙事 + baseline摘要 + presence修正（三合一）
-        # Phase 2 v2: memory_narrative 已内含 baseline_hint，当其非空时
-        # 将 bundle["baseline_hint"] 置空，避免 Add-on 端双重注入。
-        memory_narrative = await self._build_memory_narrative(c, trigger, trigger_room, now)
+        # ── MemoryStore 房间分层上下文（Context Layer 2.0，异步，executor）────
+        # 顺序：空间范围检索 -> 设备影响摘要 -> 记忆分层选择 -> budget-aware expansion
+        memory_layers = await self._build_memory_layers(c, trigger, trigger_room, now)
+        memory_constraint = memory_layers.get("constraint", "")
+        memory_behavior = memory_layers.get("behavior", "")
+        memory_reflex = memory_layers.get("reflex", "")
+        memory_episodic = memory_layers.get("episodic_runtime", "")
+
+        legacy_memory_narrative = ""
+        if not any((memory_constraint, memory_behavior, memory_reflex, memory_episodic)):
+            # 向后兼容：允许旧测试/旧路径通过 _build_memory_narrative 注入整段文本
+            legacy_memory_narrative = await self._build_memory_narrative(c, trigger, trigger_room, now)
+
+        selected_layer_text = {
+            "constraint": memory_constraint,
+            "behavior": memory_behavior,
+            "reflex": memory_reflex,
+            "episodic_runtime": memory_episodic,
+        }
+        layer_chunks: list[str] = []
+        for _layer_name in memory_layer_order:
+            _layer_text = selected_layer_text.get(_layer_name, "")
+            if not _layer_text:
+                continue
+            if is_large_footprint and _layer_name == "episodic_runtime" and trigger_room:
+                # 大体量设备场景优先局部空间高价值信息，运行时片段降级为按需补充
+                continue
+            _layer_title = {
+                "constraint": "Constraint",
+                "behavior": "Behavior",
+                "reflex": "Reflex",
+                "episodic_runtime": "Episodic Runtime",
+            }.get(_layer_name, _layer_name)
+            layer_chunks.append(f"【{_layer_title} 记忆层】\n{_layer_text}")
+        memory_narrative = (
+            f"【{trigger_room} 分层记忆上下文（Context Layer 2.0）】\n" + "\n\n".join(layer_chunks)
+            if (trigger_room and layer_chunks)
+            else (legacy_memory_narrative or "")
+        )
+
         if memory_narrative:
-            # baseline 已内嵌于 memory_narrative，清除单独字段防止重复
             baseline_hint = ""
-            # MemoryStore 成功：corrections_text 不需要（memory_narrative 已含 presence 修正），跳过 DB 查询
             corrections_text = ""
         else:
-            # MemoryStore 失败（罕见）：串行 fallback 采集房间级修正记录与基线摘要
             corrections_text = await _get_room_corrections()
             if trigger_room and hasattr(c, "_build_baseline_hint"):
                 try:
@@ -336,7 +376,6 @@ class ContextBuilder:
                 except Exception as _exc:
                     _LOGGER.debug("[ContextBuilder] baseline fallback 采集失败: %s", _exc)
                     baseline_hint = ""
-
         # ── RAG 条件性检索（Phase RAG）────────────────────────────────────────
         rag_context = ""
         if trigger_room and hasattr(c, "_db"):
@@ -437,9 +476,41 @@ class ContextBuilder:
                 "hard_min_chars": 60,
             },
             {
+                "name": "memory_constraint",
+                "text": memory_constraint,
+                "priority": 6,
+                "trim_step": 0.12,
+                "min_ratio": 0.55,
+                "hard_min_chars": 160,
+            },
+            {
+                "name": "memory_behavior",
+                "text": memory_behavior,
+                "priority": 7,
+                "trim_step": 0.15,
+                "min_ratio": 0.40,
+                "hard_min_chars": 120,
+            },
+            {
+                "name": "memory_reflex",
+                "text": memory_reflex,
+                "priority": 8,
+                "trim_step": 0.18,
+                "min_ratio": 0.25,
+                "hard_min_chars": 80,
+            },
+            {
+                "name": "memory_episodic",
+                "text": memory_episodic,
+                "priority": 9,
+                "trim_step": 0.20,
+                "min_ratio": 0.20,
+                "hard_min_chars": 60,
+            },
+            {
                 "name": "baseline_hint",
                 "text": baseline_hint,
-                "priority": 6,
+                "priority": 10,
                 "trim_step": 0.25,
                 "min_ratio": 0.0,
                 "hard_min_chars": 0,
@@ -447,7 +518,7 @@ class ContextBuilder:
             {
                 "name": "corrections_text",
                 "text": corrections_text,
-                "priority": 7,
+                "priority": 11,
                 "trim_step": 0.20,
                 "min_ratio": 0.20,
                 "hard_min_chars": 60,
@@ -455,7 +526,7 @@ class ContextBuilder:
             {
                 "name": "memory_narrative",
                 "text": memory_narrative,
-                "priority": 8,
+                "priority": 12,
                 "trim_step": 0.10,
                 "min_ratio": 0.55,
                 "hard_min_chars": 200,
@@ -535,9 +606,42 @@ class ContextBuilder:
         rag_context = clipped_map.get("rag_context", rag_context)
         realtime_habits = clipped_map.get("realtime_habits", realtime_habits)
         recent_overrides = clipped_map.get("recent_overrides", recent_overrides)
+        memory_constraint = clipped_map.get("memory_constraint", memory_constraint)
+        memory_behavior = clipped_map.get("memory_behavior", memory_behavior)
+        memory_reflex = clipped_map.get("memory_reflex", memory_reflex)
+        memory_episodic = clipped_map.get("memory_episodic", memory_episodic)
+        _mem_chunks_after_budget: list[str] = []
+        if memory_constraint:
+            _mem_chunks_after_budget.append(f"【Constraint 记忆层】\n{memory_constraint}")
+        if memory_behavior:
+            _mem_chunks_after_budget.append(f"【Behavior 记忆层】\n{memory_behavior}")
+        if memory_reflex:
+            _mem_chunks_after_budget.append(f"【Reflex 记忆层】\n{memory_reflex}")
+        if memory_episodic:
+            _mem_chunks_after_budget.append(f"【Episodic Runtime 记忆层】\n{memory_episodic}")
+        memory_narrative = (
+            f"【{trigger_room} 分层记忆上下文（Context Layer 2.0）】\n" + "\n\n".join(_mem_chunks_after_budget)
+            if (trigger_room and _mem_chunks_after_budget)
+            else (legacy_memory_narrative or "")
+        )
         baseline_hint = clipped_map.get("baseline_hint", baseline_hint)
         corrections_text = clipped_map.get("corrections_text", corrections_text)
         memory_narrative = clipped_map.get("memory_narrative", memory_narrative)
+        if not memory_narrative and any((memory_constraint, memory_behavior, memory_reflex, memory_episodic)):
+            _mem_chunks_after_budget: list[str] = []
+            if memory_constraint:
+                _mem_chunks_after_budget.append(f"【Constraint 记忆层】\n{memory_constraint}")
+            if memory_behavior:
+                _mem_chunks_after_budget.append(f"【Behavior 记忆层】\n{memory_behavior}")
+            if memory_reflex:
+                _mem_chunks_after_budget.append(f"【Reflex 记忆层】\n{memory_reflex}")
+            if memory_episodic:
+                _mem_chunks_after_budget.append(f"【Episodic Runtime 记忆层】\n{memory_episodic}")
+            if trigger_room and _mem_chunks_after_budget:
+                memory_narrative = (
+                    f"【{trigger_room} 分层记忆上下文（Context Layer 2.0）】\n"
+                    + "\n\n".join(_mem_chunks_after_budget)
+                )
         manual_actions_text = clipped_map.get("manual_actions_text", manual_actions_text)
         reflexion_antipatterns = clipped_map.get("reflexion_antipatterns", reflexion_antipatterns)
         ai_scenes_hint = clipped_map.get("ai_scenes_hint", ai_scenes_hint)
@@ -602,6 +706,7 @@ class ContextBuilder:
             "is_voice": is_voice,
             "is_global": is_global,
             "trigger_room": trigger_room,
+            "room_scope": room_scope,
             # 时间
             "time_str": time_str,
             "day_str": day_str,
@@ -629,6 +734,10 @@ class ContextBuilder:
             "realtime_habits": realtime_habits,
             "recent_overrides": recent_overrides,
             "baseline_hint": baseline_hint,
+            "memory_constraint": memory_constraint,
+            "memory_behavior": memory_behavior,
+            "memory_reflex": memory_reflex,
+            "memory_episodic": memory_episodic,
             "memory_narrative": memory_narrative,
             "rag_context": rag_context,
             "reflexion_antipatterns": reflexion_antipatterns,
@@ -706,31 +815,49 @@ class ContextBuilder:
         trigger_room: str,
         now: datetime,
     ) -> str:
-        """构建触发房间的 MemoryStore 历史上下文（Phase 2 v2 整合入口）。
-
-        Phase 2 v2：改为调用 MemoryStore.get_room_context()，整合：
-          - 房间历史记忆叙事（narrative）
-          - 设备使用基线摘要（baseline hint）
-          - 在场感知修正记录（presence_context 感知）
-
-        相比 v1 的 get_room_narrative()，减少了 context_builder 需要分别调用
-        _build_baseline_hint 的情况（baseline 现已内嵌）。
-
-        :param coordinator: 协调器实例
-        :param trigger: 触发器文本（用于判断触发类型）
-        :param trigger_room: 触发房间名
-        :param now: 当前时间
-        :return: 房间历史上下文文本，无数据时返回空字符串
-        """
-        if not trigger_room or not hasattr(coordinator, "_db"):
+        """兼容入口：将分层记忆重新拼接为单段叙事文本。"""
+        layers = await ContextBuilder._build_memory_layers(coordinator, trigger, trigger_room, now)
+        if not trigger_room:
             return ""
+        chunks: list[str] = []
+        if layers.get("constraint"):
+            chunks.append(f"【Constraint 记忆层】\n{layers['constraint']}")
+        if layers.get("behavior"):
+            chunks.append(f"【Behavior 记忆层】\n{layers['behavior']}")
+        if layers.get("reflex"):
+            chunks.append(f"【Reflex 记忆层】\n{layers['reflex']}")
+        if layers.get("episodic_runtime"):
+            chunks.append(f"【Episodic Runtime 记忆层】\n{layers['episodic_runtime']}")
+        if not chunks:
+            return ""
+        return f"【{trigger_room} 分层记忆上下文（Context Layer 2.0）】\n" + "\n\n".join(chunks)
+
+    @staticmethod
+    async def _build_memory_layers(
+        coordinator: Any,
+        trigger: str,
+        trigger_room: str,
+        now: datetime,
+    ) -> dict[str, str]:
+        """构建触发房间的分层记忆上下文（Wave 3 / Context Layer 2.0）。
+
+        通过 MemoryStore.get_room_context_layers() 输出四层结构：
+          reflex / behavior / constraint / episodic_runtime。
+        """
+        empty_layers = {
+            "reflex": "",
+            "behavior": "",
+            "constraint": "",
+            "episodic_runtime": "",
+        }
+        if not trigger_room or not hasattr(coordinator, "_db"):
+            return empty_layers
         try:
             from .memory_store import MemoryStore
             from .inference import _detect_cache_trigger_type
 
             ms_trigger_type = _detect_cache_trigger_type(trigger)
 
-            # 推断当前在场状态用于 presence_context 感知修正过滤
             current_presence = ""
             if hasattr(coordinator, "_get_room_occupancy_map"):
                 try:
@@ -749,15 +876,21 @@ class ContextBuilder:
                 device_info=coordinator.device_info,
                 get_device_name_func=getattr(coordinator, "get_device_name", None),
             )
-            # Phase 2 v2: 使用 get_room_context() 整合叙事 + 基线 + presence 修正
-            context_text = await coordinator.hass.async_add_executor_job(
-                ms.get_room_context,
+            layers = await coordinator.hass.async_add_executor_job(
+                ms.get_room_context_layers,
                 trigger_room,
                 ms_trigger_type,
                 now.hour,
                 current_presence,
             )
-            return context_text or ""
+            if not isinstance(layers, dict):
+                return empty_layers
+            return {
+                "reflex": str(layers.get("reflex", "") or ""),
+                "behavior": str(layers.get("behavior", "") or ""),
+                "constraint": str(layers.get("constraint", "") or ""),
+                "episodic_runtime": str(layers.get("episodic_runtime", "") or ""),
+            }
         except Exception as exc:
-            _LOGGER.debug("[ContextBuilder] MemoryStore 上下文获取失败（忽略）: %s", exc)
-            return ""
+            _LOGGER.debug("[ContextBuilder] MemoryStore 分层上下文获取失败（忽略）: %s", exc)
+            return empty_layers

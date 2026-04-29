@@ -198,6 +198,32 @@ class AddOnClient:
                 }
             return None
 
+    async def run_decision_fast_path(
+        self,
+        *,
+        entity_id: str,
+        new_state: str,
+        old_state: str = "",
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Run add-on Core fast-path decision orchestration."""
+        payload: dict[str, Any] = {
+            "entity_id": str(entity_id or ""),
+            "new_state": str(new_state or ""),
+            "old_state": str(old_state or ""),
+        }
+        if snapshot is not None:
+            payload["snapshot"] = snapshot
+
+        result = await self.request_json("POST", "/decision/fast-path", body=payload)
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        body = result.get("body")
+        response = body if isinstance(body, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
     async def is_available(self) -> bool:
         """检查 Add-on 是否在线（带缓存，避免每次推理都发 HTTP 请求）。
 

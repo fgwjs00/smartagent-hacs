@@ -1,8 +1,8 @@
 product: SmartAgent
-release_version: "0.0.3"
-display_version: "Beta 0.0.3"
+release_version: "0.0.4"
+display_version: "Beta 0.0.4"
 channel: "beta"
-release_date: "2026-04-28"
+release_date: "2026-04-30"
 public_release_ready: false
 
 component:
@@ -10,5 +10,5 @@ component:
   source_path: "custom_components/smart_agent"
 
 release_notes:
-  summary: "Latest beta test release with CP1-CP6 validation and updated UI package."
-  customer_visible_version: "Beta 0.0.3"
+  summary: "Latest beta test release with Context Layer 2.0 and Memory Domain updates."
+  customer_visible_version: "Beta 0.0.4"
