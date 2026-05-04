@@ -173,6 +173,45 @@ class ListenersMixin:
             f"判定抖动风暴，抑制 {self._PRESENCE_FLAP_SUPPRESS_SECS}s",
         )
 
+    def _build_presence_snapshot_for_entity(
+        self,
+        entity_id: str,
+        *,
+        blocked_actions: list[str] | None = None,
+        reasons: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """统一构建 Presence Snapshot（优先融合域，其次 PresenceInference）。"""
+        _fusion = getattr(self, "_fusion_registry", None)
+        if _fusion is not None:
+            snap = _fusion.build_presence_snapshot_for_entity(
+                entity_id,
+                blocked_actions=blocked_actions,
+                reasons=reasons,
+            )
+            if snap is not None:
+                return snap
+
+        room = (self.device_info.get(entity_id, {}) or {}).get("room", "").strip()
+        if room and hasattr(self, "_presence_inference") and self._presence_inference is not None:
+            snap = self._presence_inference.infer_room_presence_snapshot(room)
+            if reasons:
+                snap["reasons"] = list(snap.get("reasons", [])) + list(reasons)
+            if blocked_actions:
+                snap["blocked_actions"] = list(snap.get("blocked_actions", [])) + list(blocked_actions)
+            return snap
+
+        fallback_reasons = list(reasons or [])
+        fallback_reasons.append("no_room_or_inference")
+        return {
+            "state": "unknown",
+            "confidence": 0.0,
+            "reasons": fallback_reasons,
+            "enter_qualified": False,
+            "leave_qualified": False,
+            "localized_spaces": [room] if room else [],
+            "blocked_actions": list(blocked_actions or []),
+        }
+
     # ── 触发调度与合并 ────────────────────────────────────────────────────────
 
     @callback
@@ -485,6 +524,173 @@ class ListenersMixin:
 
     # ── 状态变化处理器 ────────────────────────────────────────────────────────
 
+    def _build_addon_fast_path_snapshot(self, entity_id: str) -> dict[str, Any]:
+        """Build the plain snapshot consumed by add-on Core fast-path decisions."""
+        device_info = dict(getattr(self, "device_info", {}) or {})
+        states: dict[str, str] = {}
+        for eid in set(device_info.keys()) | {str(entity_id or "")}:
+            if not eid:
+                continue
+            state = self.hass.states.get(eid)
+            if state is not None:
+                states[eid] = str(state.state or "")
+
+        topology: dict[str, list[str]] = {}
+        for room, neighbors in (getattr(self, "_room_topology_cache", {}) or {}).items():
+            if isinstance(neighbors, (set, list, tuple)):
+                topology[str(room)] = sorted({str(item) for item in neighbors if str(item or "").strip()})
+
+        snapshot: dict[str, Any] = {
+            "device_info": device_info,
+            "states": states,
+            "ai_scenes": list(getattr(self, "_ai_scenes_cache", []) or []),
+            "behavior_patterns": list(getattr(self, "_behavior_patterns_cache", []) or []),
+            "room_topology": topology,
+            "mode": str(getattr(self, "_mode", "") or ""),
+        }
+
+        for key, getter_name in (
+            ("space_snapshot", "get_space_runtime_snapshot"),
+            ("presence_snapshot", "get_presence_snapshot"),
+            ("device_capability_snapshot", "get_device_capability_snapshot"),
+        ):
+            getter = getattr(self, getter_name, None)
+            if callable(getter):
+                try:
+                    value = getter()
+                except Exception as exc:
+                    _LOGGER.debug("[Listeners] %s failed for add-on snapshot: %s", getter_name, exc)
+                    value = None
+                if isinstance(value, dict):
+                    snapshot[key] = value
+        return snapshot
+
+    async def _execute_fast_path_decision_result(
+        self,
+        result: dict[str, Any],
+        *,
+        entity_id: str,
+        source_label: str,
+    ) -> None:
+        from .intent_verifier import CMD_SOURCE_SENSOR
+
+        actions = result.get("actions", [])
+        scene = result.get("scene", source_label)
+        confidence = result.get("confidence", 90)
+        room = result.get("trigger_room") or self.device_info.get(entity_id, {}).get("room", "")
+        try:
+            defer_seconds = int(result.get("defer_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            defer_seconds = 0
+
+        if defer_seconds > 0:
+            await asyncio.sleep(defer_seconds)
+            recheck = getattr(getattr(self, "_decision_pipeline", None), "_try_departure_cache", None)
+            if callable(recheck) and recheck(entity_id, "off") is None:
+                self._sys_log(
+                    "INFO",
+                    f"[{source_label}] delayed execution cancelled after {defer_seconds}s | room={room}",
+                )
+                return
+
+        await self._execute_actions(
+            actions if isinstance(actions, list) else [],
+            trigger_summary=f"{source_label}[{scene}]",
+            scene_desc=str(scene),
+            confidence=confidence,
+            trigger_room=room,
+            is_global_cmd=False,
+            cmd_source=CMD_SOURCE_SENSOR,
+        )
+
+    def _run_local_fast_path_decision(
+        self,
+        entity_id: str,
+        new_state: str,
+        old_state: str,
+    ) -> tuple[dict[str, Any], str] | None:
+        pipeline = getattr(self, "_decision_pipeline", None)
+        if pipeline is None:
+            return None
+        scene_result = pipeline.run_ha_scene_path(entity_id, new_state)
+        if isinstance(scene_result, dict) and scene_result:
+            return scene_result, "LocalScenePathFallback"
+        fast_result = pipeline.run_fast_path(entity_id, new_state, old_state)
+        if isinstance(fast_result, dict) and fast_result:
+            return fast_result, "LocalFastPathFallback"
+        return None
+
+    async def _run_addon_fast_path_or_local_fallback(
+        self,
+        entity_id: str,
+        new_state: str,
+        old_state: str,
+        local_fallback_result: dict[str, Any] | None = None,
+        local_source_label: str | None = None,
+    ) -> None:
+        should_local_fallback = True
+        addon_client = getattr(self, "_addon_client", None)
+        if addon_client is not None:
+            try:
+                response = await addon_client.run_decision_fast_path(
+                    entity_id=entity_id,
+                    new_state=new_state,
+                    old_state=old_state,
+                    snapshot=self._build_addon_fast_path_snapshot(entity_id),
+                )
+            except Exception as exc:
+                response = None
+                _LOGGER.debug("[Listeners] add-on fast-path decision failed: %s", exc)
+            else:
+                if isinstance(response, dict):
+                    status = int(response.get("__status") or 0)
+                    result = response.get("result")
+                    if 200 <= status < 300 and response.get("matched") is True and isinstance(result, dict):
+                        self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
+                        await self._execute_fast_path_decision_result(
+                            result,
+                            entity_id=entity_id,
+                            source_label="AddonFastPath",
+                        )
+                        return
+                    if 200 <= status < 300:
+                        should_local_fallback = False
+                        self._sys_log(
+                            "INFO",
+                            f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
+                        )
+                    else:
+                        self._sys_log(
+                            "INFO",
+                            f"[Add-on FastPath] 服务异常，回退本地快路径 | status={status} matched={response.get('matched')}",
+                        )
+
+        if not should_local_fallback:
+            return
+
+        if isinstance(local_fallback_result, dict) and local_fallback_result:
+            local_fallback = local_fallback_result
+            source_label = str(local_source_label or "LocalFastPathFallback")
+        else:
+            fallback = self._run_local_fast_path_decision(entity_id, new_state, old_state)
+            if fallback is None:
+                return
+            local_fallback, source_label = fallback
+
+        if source_label == "LocalFastPathFallback":
+            await self._execute_fast_path_decision_result(
+                local_fallback,
+                entity_id=entity_id,
+                source_label="LocalFastPathFallback",
+            )
+            return
+
+        await self._execute_fast_path_decision_result(
+            local_fallback,
+            entity_id=entity_id,
+            source_label=source_label,
+        )
+
     def _make_state_handler(self):
         """Build the state-change callback."""
         @callback
@@ -537,9 +743,24 @@ class ListenersMixin:
             if _startup_elapsed < self._startup_grace:
                 return
 
-            # ── Step 0: HA AI 场景优先路径（预设场景优先于 FastBrain 和 LLM）────────
+            # ── Step 0 + FastBrain: add-on 优先路径（B1 迁移：有 add-on 时直接调用，不先跑本地）──
             from .intent_verifier import CMD_SOURCE_SENSOR
             _pipeline = self._decision_pipeline
+            if getattr(self, "_addon_client", None) is not None:
+                # add-on 优先：直接调用 add-on，fallback 由 _run_local_fast_path_decision 按需计算
+                self.hass.async_create_task(
+                    self._run_addon_fast_path_or_local_fallback(
+                        entity_id,
+                        new_s,
+                        old_s,
+                        None,
+                        None,
+                    )
+                )
+                return
+            # ── 无 add-on client：保持原有本地执行逻辑 ──────────────────────────────
+
+            # ── Step 0: HA AI 场景优先路径（预设场景优先于 FastBrain 和 LLM）────────
             _scene_res = _pipeline.run_ha_scene_path(entity_id, new_s)
             if _scene_res:
                 _s_actions = _scene_res.get("actions", [])
@@ -688,43 +909,26 @@ class ListenersMixin:
                                 )
                                 self._presence_on_start.pop(eid, None)
                                 return
-                            info = self.device_info.get(eid, {})
-                            _fusion = getattr(self, "_fusion_registry", None)
-                            if _fusion is not None:
-                                _scope = _fusion.get_scope_for_entity(eid)
-                                if _scope is not None:
-                                    _scope_state = _fusion.evaluate_scope(_scope)
-                                    if _scope_state == "unknown":
-                                        self._sys_log(
-                                            "INFO",
-                                            f"[融合域] {eid} 所属融合域「{_scope.display_name}」状态未知，跳过有人触发，避免误开灯",
-                                        )
-                                        self._presence_on_start.pop(eid, None)
-                                        return
-                                    if not _fusion.can_trigger_enter(_scope, eid):
-                                        self._sys_log(
-                                            "INFO",
-                                            f"[融合域] {eid} 在融合域「{_scope.display_name}」中标记为仅兜底证据源，禁止 enter 触发",
-                                        )
-                                        self._presence_on_start.pop(eid, None)
-                                        return
-                                    if _scope.strategy == "vacant_and":
-                                        enter_members = [
-                                            mid for mid in _scope.members
-                                            if _fusion.can_trigger_enter(_scope, mid)
-                                        ]
-                                        if len(enter_members) >= 2:
-                                            active_members = [
-                                                mid for mid in enter_members
-                                                if mid != eid and (self.hass.states.get(mid) and self.hass.states.get(mid).state == "on")
-                                            ]
-                                            if not active_members:
-                                                self._sys_log(
-                                                    "INFO",
-                                                    f"[融合域] {eid} 单点恢复为有人，但融合域「{_scope.display_name}」暂无其他 enter 源共同确认，跳过有人触发",
-                                                )
-                                                self._presence_on_start.pop(eid, None)
-                                                return
+                            _presence_snap = self._build_presence_snapshot_for_entity(
+                                eid,
+                                reasons=["presence_on_confirm"],
+                            )
+                            if _presence_snap.get("state") == "unknown":
+                                self._sys_log(
+                                    "INFO",
+                                    f"[PresenceSnapshot] {eid} 状态未知，跳过有人触发，避免误开灯"
+                                    f" | snapshot={_presence_snap}",
+                                )
+                                self._presence_on_start.pop(eid, None)
+                                return
+                            if not _presence_snap.get("enter_qualified", False):
+                                self._sys_log(
+                                    "INFO",
+                                    f"[PresenceSnapshot] {eid} enter 未通过，跳过有人触发"
+                                    f" | snapshot={_presence_snap}",
+                                )
+                                self._presence_on_start.pop(eid, None)
+                                return
                             self._presence_last_on[eid] = time.time()
                             self._presence_on_start.pop(eid, None)
                             name = self.get_device_name(eid)
@@ -834,33 +1038,17 @@ class ListenersMixin:
                                 self._sys_log("INFO", f"[存在去抖] {eid} (PIR) 持续无人，仅记录状态，不触发关灯推理")
                                 return
 
-                            # Phase 12.0: 存在融合域检查
-                            # 若该传感器属于某个融合域（如「客餐厅开间」），且域内仍有其他成员有人，
-                            # 则抑制本次离开触发——子区无人 ≠ 整个开间无人。
-                            _fusion = getattr(self, "_fusion_registry", None)
-                            if _fusion is not None:
-                                _scope = _fusion.get_scope_for_entity(eid)
-                                if _scope is not None:
-                                    _scope_state = _fusion.evaluate_scope(_scope)
-                                    if _scope_state == "on":
-                                        self._sys_log(
-                                            "INFO",
-                                            f"[融合域] {eid} 单独无人，但融合域「{_scope.display_name}」"
-                                            f"仍有人（{_scope_state}），抑制离开推理",
-                                        )
-                                        return
-                                    if _scope_state == "unknown":
-                                        self._sys_log(
-                                            "INFO",
-                                            f"[融合域] {eid} 离开确认时融合域「{_scope.display_name}」状态未知，抑制离开推理",
-                                        )
-                                        return
-                                    if not _fusion.can_provide_leave_evidence(_scope, eid):
-                                        self._sys_log(
-                                            "INFO",
-                                            f"[融合域] {eid} 在融合域「{_scope.display_name}」中不参与 leave 证据，抑制离开推理",
-                                        )
-                                        return
+                            _presence_snap = self._build_presence_snapshot_for_entity(
+                                eid,
+                                reasons=["presence_off_confirm"],
+                            )
+                            if not _presence_snap.get("leave_qualified", False):
+                                self._sys_log(
+                                    "INFO",
+                                    f"[PresenceSnapshot] {eid} leave 未通过，抑制离开推理"
+                                    f" | snapshot={_presence_snap}",
+                                )
+                                return
 
                             self._sys_log("INFO", f"[存在去抖] {eid} 持续无人 {self._PRESENCE_OFF_DELAY}s，确认离开，触发推理")
                             # 5A-2: presence-off 事件驱动解锁 —— 清除该房间所有用户保护锁
@@ -879,6 +1067,15 @@ class ListenersMixin:
                                     self._sys_log("INFO",
                                         f"[5A-2 柔性保护] 房间「{_dev_room}」已无人，"
                                         f"清除 {len(_cleared)} 个超过 60s 的用户保护锁: {_cleared}")
+                            _dev_room_l = _dev_room.lower() if _dev_room else ""
+                            _is_bedroom = any(k in _dev_room_l for k in ("卧室", "bedroom", "master", "guest"))
+                            if _is_bedroom:
+                                _leave_map = getattr(self, "_bedroom_last_leave_ts", None)
+                                if not isinstance(_leave_map, dict):
+                                    _leave_map = {}
+                                    self._bedroom_last_leave_ts = _leave_map
+                                _leave_map[_dev_room] = time.time()
+                                self._sys_log("INFO", f"[SleepGuard] 记录卧室离开时间戳: room={_dev_room}")
                             try:
                                 self._schedule_inference(eid, trig, new_state="off")
                             except Exception as exc:

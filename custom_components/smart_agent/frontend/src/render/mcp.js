@@ -8,7 +8,7 @@ export const mcpMethods = {
     if (!view) return;
     const cfg = this._cfg?.attributes || {};
     const mcpEnabled = cfg.mcp_enabled !== false;
-    const mcpUrl = `${window.location.origin}/api/smart_agent/mcp`;
+    const mcpUrl = `${window.location.origin}/api/v1/mcp`;
 
     view.innerHTML = `
       <div class="main">

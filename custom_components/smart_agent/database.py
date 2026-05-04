@@ -17,6 +17,18 @@ import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+from .const import (
+    MEMORY_LAYER_BEHAVIOR,
+    MEMORY_LAYER_EPISODIC,
+    MEMORY_LAYER_REFLEX,
+    MEMORY_SOURCE_BUCKET_CORRECTIONS,
+    MEMORY_SOURCE_BUCKET_DECISION_CACHE,
+    MEMORY_SOURCE_BUCKET_RULES,
+    RULES_SEMANTIC_BUCKET_BEHAVIOR,
+    RULES_SEMANTIC_BUCKET_CONSTRAINT,
+    SEMANTIC_CONTRACT_VERSION,
+    SEMANTIC_SNAPSHOT_VERSION,
+)
 from .db_service import DatabaseService
 
 if TYPE_CHECKING:
@@ -30,6 +42,7 @@ _VALID_MIGRATION_TABLES = {
     "showroom_light_preferences", "device_baseline", "device_baseline_hourly",
     "training_data", "reflexion_patterns", "arrival_baseline", "decision_cache",
     "frigate_cameras", "frigate_zones", "correction_lessons", "room_topology",
+    "device_capabilities", "memory_rule_semantics", "memory_source_registry",
 }
 
 
@@ -117,7 +130,6 @@ class DatabaseMixin:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL,
                     locked INTEGER DEFAULT 0, created TEXT)
             """)
-            _safe_add_column(conn, "rules", "semantic_layer TEXT DEFAULT 'behavior'")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS behavior_patterns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -361,6 +373,134 @@ class DatabaseMixin:
                 "memory_layer    TEXT DEFAULT 'reflex'",
             ):
                 _safe_add_column(conn, "decision_cache", _col_def)
+
+            # ── Wave 0：device_capabilities（最小契约支撑）──
+            # 语义：归档设备能力快照，作为后续 Context Bundle 组装的共享真相层。
+            # 仅新增表，不改动现有 devices / actions 逻辑。
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS device_capabilities (
+                    entity_id TEXT PRIMARY KEY,
+                    domain TEXT DEFAULT '',
+                    ops_json TEXT DEFAULT '[]',
+                    params_json TEXT DEFAULT '{{}}',
+                    control_mode TEXT DEFAULT 'shared',
+                    sensor_type TEXT DEFAULT '',
+                    snapshot_version TEXT DEFAULT '{SEMANTIC_SNAPSHOT_VERSION}',
+                    updated_at TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dev_caps_domain "
+                "ON device_capabilities(domain)"
+            )
+            for _col_def in (
+                f"snapshot_version TEXT DEFAULT '{SEMANTIC_SNAPSHOT_VERSION}'",
+                "params_json TEXT DEFAULT '{}'",
+                "control_mode TEXT DEFAULT 'shared'",
+                "sensor_type TEXT DEFAULT ''",
+            ):
+                _safe_add_column(conn, "device_capabilities", _col_def)
+
+            # ── Wave 0：memory_rule_semantics（rules 语义分流映射）──
+            # 语义：仅记录 rule -> semantic_bucket 元数据，为后续 Behavior/Constraint 分流留位。
+            # 本阶段不迁移旧 rules 数据，不改变规则执行行为。
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS memory_rule_semantics (
+                    rule_id INTEGER PRIMARY KEY,
+                    semantic_bucket TEXT NOT NULL DEFAULT '{RULES_SEMANTIC_BUCKET_BEHAVIOR}',
+                    memory_layer TEXT NOT NULL DEFAULT '{MEMORY_LAYER_BEHAVIOR}',
+                    source_bucket TEXT NOT NULL DEFAULT '{MEMORY_SOURCE_BUCKET_RULES}',
+                    contract_version TEXT DEFAULT '{SEMANTIC_CONTRACT_VERSION}',
+                    updated_at TEXT,
+                    created_at TEXT,
+                    FOREIGN KEY(rule_id) REFERENCES rules(id) ON DELETE CASCADE
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_semantics_bucket "
+                "ON memory_rule_semantics(semantic_bucket, memory_layer)"
+            )
+            for _col_def in (
+                f"semantic_bucket TEXT NOT NULL DEFAULT '{RULES_SEMANTIC_BUCKET_BEHAVIOR}'",
+                f"memory_layer TEXT NOT NULL DEFAULT '{MEMORY_LAYER_BEHAVIOR}'",
+                f"source_bucket TEXT NOT NULL DEFAULT '{MEMORY_SOURCE_BUCKET_RULES}'",
+                f"contract_version TEXT DEFAULT '{SEMANTIC_CONTRACT_VERSION}'",
+            ):
+                _safe_add_column(conn, "memory_rule_semantics", _col_def)
+
+            # ── Wave 0：memory_source_registry（来源桶登记）──
+            # 语义：声明既有数据源在记忆层中的归属，便于后续统一查询/治理。
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS memory_source_registry (
+                    source_bucket TEXT PRIMARY KEY,
+                    memory_layer TEXT NOT NULL,
+                    semantic_bucket TEXT DEFAULT '',
+                    owner_table TEXT DEFAULT '',
+                    contract_version TEXT DEFAULT '{SEMANTIC_CONTRACT_VERSION}',
+                    note TEXT DEFAULT '',
+                    updated_at TEXT,
+                    created_at TEXT
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mem_source_layer "
+                "ON memory_source_registry(memory_layer, semantic_bucket)"
+            )
+            for _col_def in (
+                "semantic_bucket TEXT DEFAULT ''",
+                "owner_table TEXT DEFAULT ''",
+                f"contract_version TEXT DEFAULT '{SEMANTIC_CONTRACT_VERSION}'",
+                "note TEXT DEFAULT ''",
+            ):
+                _safe_add_column(conn, "memory_source_registry", _col_def)
+
+            _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_source_registry "
+                "(source_bucket, memory_layer, semantic_bucket, owner_table, contract_version, note, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    MEMORY_SOURCE_BUCKET_RULES,
+                    MEMORY_LAYER_BEHAVIOR,
+                    RULES_SEMANTIC_BUCKET_BEHAVIOR,
+                    MEMORY_SOURCE_BUCKET_RULES,
+                    SEMANTIC_CONTRACT_VERSION,
+                    "Wave0 默认映射；后续按 memory_rule_semantics 精细分流",
+                    _now,
+                    _now,
+                ),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_source_registry "
+                "(source_bucket, memory_layer, semantic_bucket, owner_table, contract_version, note, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    MEMORY_SOURCE_BUCKET_DECISION_CACHE,
+                    MEMORY_LAYER_REFLEX,
+                    "",
+                    MEMORY_SOURCE_BUCKET_DECISION_CACHE,
+                    SEMANTIC_CONTRACT_VERSION,
+                    "Wave0 固定归属 Reflex Memory",
+                    _now,
+                    _now,
+                ),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_source_registry "
+                "(source_bucket, memory_layer, semantic_bucket, owner_table, contract_version, note, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    MEMORY_SOURCE_BUCKET_CORRECTIONS,
+                    MEMORY_LAYER_EPISODIC,
+                    RULES_SEMANTIC_BUCKET_CONSTRAINT,
+                    MEMORY_SOURCE_BUCKET_CORRECTIONS,
+                    SEMANTIC_CONTRACT_VERSION,
+                    "历史纠错轨迹，供后续分层检索",
+                    _now,
+                    _now,
+                ),
+            )
 
             # ── frigate_cameras: Frigate 摄像头配置 + AI 区域绑定 ──────────────────
             # 存储摄像头 ID → 房间 映射，AI 推理时直接查表获取触发房间，

@@ -15,7 +15,8 @@ import time
 import base64
 import aiohttp
 from collections import OrderedDict
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 
 from homeassistant.core import callback
 
@@ -37,6 +38,76 @@ _ACTIVITY_LABELS = [
 ]
 
 
+@dataclass(frozen=True)
+class VisionEventSnapshot:
+    """迁移期统一视觉事件快照。"""
+
+    provider: str
+    camera_id: str
+    event_id: str
+    event_type: str
+    label: str
+    sub_label: str | None
+    score: float
+    entered_zones: list[str]
+    current_zones: list[str]
+    has_snapshot: bool
+    thumbnail: str
+    timestamp: float
+
+
+class VisionProvider(Protocol):
+    """最小视觉 Provider 接口（Wave 1B）。"""
+
+    def parse_event_payload(self, payload: dict[str, Any]) -> VisionEventSnapshot | None:
+        ...
+
+    def get_trigger_room(self, camera_id: str, zone_id: str | None = None) -> str:
+        ...
+
+
+class FrigateVisionProvider:
+    """Frigate 适配器：把 Frigate 事件映射到统一 VisionProvider 接口。"""
+
+    provider_name = "frigate"
+
+    def __init__(self, owner: "FrigateMixin") -> None:
+        self._owner = owner
+
+    def parse_event_payload(self, payload: dict[str, Any]) -> VisionEventSnapshot | None:
+        after = payload.get("after") or {}
+        if not isinstance(after, dict):
+            return None
+        label = after.get("label", "")
+        if label != "person":
+            return None
+        event_id = after.get("id", "")
+        camera = after.get("camera", "unknown")
+        entered_zones = [z.lower() for z in after.get("entered_zones", []) if isinstance(z, str)]
+        current_zones = [z.lower() for z in after.get("current_zones", []) if isinstance(z, str)]
+        return VisionEventSnapshot(
+            provider=self.provider_name,
+            camera_id=camera,
+            event_id=event_id,
+            event_type=payload.get("type", ""),
+            label=label,
+            sub_label=after.get("sub_label"),
+            score=after.get("top_score", 0),
+            entered_zones=entered_zones,
+            current_zones=current_zones,
+            has_snapshot=after.get("has_snapshot", False),
+            thumbnail=after.get("thumbnail", ""),
+            timestamp=time.time(),
+        )
+
+    def get_trigger_room(self, camera_id: str, zone_id: str | None = None) -> str:
+        if zone_id:
+            room = self._owner._get_frigate_zone_room(camera_id, zone_id)
+            if room:
+                return room
+        return self._owner._get_frigate_camera_room(camera_id)
+
+
 class FrigateMixin:
     """Mixin: Frigate NVR 深度集成 — MQTT 事件驱动 + 区域感知。"""
 
@@ -48,6 +119,7 @@ class FrigateMixin:
         self._frigate_mqtt_debounce_timers: dict[str, Any] = {}
         self._frigate_zone_occupancy: dict[str, dict[str, int]] = {}
         self._frigate_visual_descriptions: dict[str, str] = {}  # event_id -> description（临时，仅供触发文本拼接）
+        self._vision_provider: VisionProvider = FrigateVisionProvider(self)
         # Phase 7G：行为识别 — 每个摄像头维护最新行为标签（持续有效，不依赖具体事件 ID）
         self._frigate_camera_activity: dict[str, dict] = {}      # camera_id -> {label, desc, ts}
         self._frigate_activity_last_analyzed: dict[str, float] = {}  # camera_id -> 上次分析时间戳
@@ -282,24 +354,19 @@ class FrigateMixin:
         except (json.JSONDecodeError, AttributeError):
             return
 
-        event_type = payload.get("type", "")
-        after = payload.get("after", {})
-        if not after:
+        snap = self._vision_provider.parse_event_payload(payload)
+        if not snap:
             return
 
-        event_id = after.get("id", "")
-        camera = after.get("camera", "unknown")
-        label = after.get("label", "")
-        sub_label = after.get("sub_label")
-        top_score = after.get("top_score", 0)
-        # 统一 zone 名称为小写，避免 Frigate 发送大小写不一致（如 Qt/qt/QT）导致冷却逻辑失效
-        entered_zones = [z.lower() for z in after.get("entered_zones", [])]
-        current_zones = [z.lower() for z in after.get("current_zones", [])]
-        has_snapshot = after.get("has_snapshot", False)
-
-        # 仅关注 person 检测（其他目标如 car/dog 可未来扩展）
-        if label != "person":
-            return
+        event_type = snap.event_type
+        event_id = snap.event_id
+        camera = snap.camera_id
+        label = snap.label
+        sub_label = snap.sub_label
+        top_score = snap.score
+        entered_zones = snap.entered_zones
+        current_zones = snap.current_zones
+        has_snapshot = snap.has_snapshot
 
         # 缓存事件（限制大小，FIFO 淘汰）
         self._frigate_events_cache[event_id] = {
@@ -312,7 +379,7 @@ class FrigateMixin:
             "current_zones": current_zones,
             "has_snapshot": has_snapshot,
             "time": time.time(),
-            "thumbnail": after.get("thumbnail", ""),
+            "thumbnail": snap.thumbnail,
         }
         if len(self._frigate_events_cache) > _MQTT_EVENT_CACHE_SIZE:
             self._frigate_events_cache.popitem(last=False)

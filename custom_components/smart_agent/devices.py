@@ -11,6 +11,17 @@ from datetime import datetime
 
 from .action_mapping import entities_to_actions, normalize_raw_actions
 from typing import Any
+from .const import (
+    DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF,
+    DEVICE_CAP_KEY_CAN_CONFIRM_LEAVE,
+    DEVICE_CAP_KEY_CAN_LOCALIZE_ZONE,
+    DEVICE_CAP_KEY_CAN_TRIGGER_ENTER,
+    DEVICE_CAP_KEY_COVERAGE_SPACES,
+    DEVICE_CAP_KEY_ENERGY_LEVEL,
+    DEVICE_CAP_KEY_RISK_LEVEL,
+    DEVICE_CAP_KEY_SHARED_FIXTURE,
+    DEVICE_CAP_KEY_SLEEP_SAFE,
+)
 
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
 
@@ -78,6 +89,106 @@ class DevicesMixin:
         except Exception:
             pass
         return ""
+
+    def get_device_capability(self, entity_id: str) -> dict[str, Any]:
+        """返回单设备能力快照（Wave 6 只读语义，默认值保持保守）。"""
+        info = dict(self.device_info.get(entity_id, {}) or {})
+        room = (info.get("room") or "").strip()
+
+        raw_spaces = info.get(DEVICE_CAP_KEY_COVERAGE_SPACES)
+        coverage_spaces: list[str] = []
+        if isinstance(raw_spaces, (list, tuple, set)):
+            for item in raw_spaces:
+                s = str(item).strip()
+                if s and s not in coverage_spaces:
+                    coverage_spaces.append(s)
+        elif room:
+            coverage_spaces = [room]
+
+        raw_shared = info.get(DEVICE_CAP_KEY_SHARED_FIXTURE)
+        explicit_truthy = {True, 1, "1", "true", "yes", "on", "explicit"}
+        shared_fixture = raw_shared in explicit_truthy
+
+        disturbance_level = str(info.get("disturbance_level") or "").lower()
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        sensor_type = str(info.get("sensor_type") or "").lower()
+
+        raw_sleep_safe = info.get(DEVICE_CAP_KEY_SLEEP_SAFE)
+        if isinstance(raw_sleep_safe, bool):
+            sleep_safe = raw_sleep_safe
+        else:
+            sleep_safe = False
+
+        raw_risk_level = str(info.get(DEVICE_CAP_KEY_RISK_LEVEL) or "").lower()
+        if raw_risk_level in {"low", "medium", "high", "critical"}:
+            risk_level = raw_risk_level
+        elif disturbance_level in {"high", "critical"} or domain in {"climate", "cover", "media_player"}:
+            risk_level = "high"
+        else:
+            risk_level = "medium"
+
+        raw_energy_level = str(info.get(DEVICE_CAP_KEY_ENERGY_LEVEL) or "").lower()
+        if raw_energy_level in {"low", "medium", "high"}:
+            energy_level = raw_energy_level
+        elif domain in {"climate", "cover", "media_player"}:
+            energy_level = "high"
+        elif domain in {"fan", "light", "switch"}:
+            energy_level = "medium"
+        else:
+            energy_level = "low"
+
+        raw_can_trigger_enter = info.get(DEVICE_CAP_KEY_CAN_TRIGGER_ENTER)
+        if isinstance(raw_can_trigger_enter, bool):
+            can_trigger_enter = raw_can_trigger_enter
+        else:
+            can_trigger_enter = sensor_type in {"pir", "mmwave", "frigate"}
+
+        raw_can_confirm_leave = info.get(DEVICE_CAP_KEY_CAN_CONFIRM_LEAVE)
+        if isinstance(raw_can_confirm_leave, bool):
+            can_confirm_leave = raw_can_confirm_leave
+        else:
+            can_confirm_leave = sensor_type in {"mmwave", "frigate"}
+
+        raw_can_block_turn_off = info.get(DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF)
+        if isinstance(raw_can_block_turn_off, bool):
+            can_block_turn_off = raw_can_block_turn_off
+        else:
+            can_block_turn_off = domain == "light" and (
+                shared_fixture or str(info.get("role") or "").lower() in {"core", "display", "safety"}
+            )
+
+        raw_can_localize_zone = info.get(DEVICE_CAP_KEY_CAN_LOCALIZE_ZONE)
+        if isinstance(raw_can_localize_zone, bool):
+            can_localize_zone = raw_can_localize_zone
+        else:
+            can_localize_zone = sensor_type in {"frigate", "mmwave"}
+
+        capability = {
+            "entity_id": entity_id,
+            "room": room,
+            "control_mode": info.get("control_mode", "shared"),
+            "sensor_type": info.get("sensor_type", ""),
+            "role": info.get("role", ""),
+            "control_zone": info.get("control_zone", room),
+            "disturbance_level": info.get("disturbance_level", ""),
+            DEVICE_CAP_KEY_COVERAGE_SPACES: coverage_spaces,
+            DEVICE_CAP_KEY_SHARED_FIXTURE: bool(shared_fixture),
+            DEVICE_CAP_KEY_SLEEP_SAFE: bool(sleep_safe),
+            DEVICE_CAP_KEY_RISK_LEVEL: risk_level,
+            DEVICE_CAP_KEY_ENERGY_LEVEL: energy_level,
+            DEVICE_CAP_KEY_CAN_TRIGGER_ENTER: bool(can_trigger_enter),
+            DEVICE_CAP_KEY_CAN_CONFIRM_LEAVE: bool(can_confirm_leave),
+            DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF: bool(can_block_turn_off),
+            DEVICE_CAP_KEY_CAN_LOCALIZE_ZONE: bool(can_localize_zone),
+        }
+        return capability
+
+    def get_device_capability_snapshot(self) -> dict[str, dict[str, Any]]:
+        """返回当前所有托管设备的能力快照（仅内存态）。"""
+        return {
+            eid: self.get_device_capability(eid)
+            for eid in self.device_info.keys()
+        }
 
     # ── 设备自动发现 ──────────────────────────────────────────────────────────
 
@@ -892,6 +1003,25 @@ class DevicesMixin:
         # 尝试删除已创建的 HA 场景实体（如有）
         await self._try_delete_ha_scene(scene_id)
         self._sys_log("INFO", f"[AI场景] 已拒绝场景: {scene_name} (id={scene_id})")
+        self.async_set_updated_data({})
+
+    async def async_archive_ai_scene(self, scene_id: int) -> None:
+        """归档 AI 场景（archived 状态）：保留记录但标记为不可用，不再参与触发与学习。"""
+        from .const import AI_SCENE_STATUS_ARCHIVED
+        rows = await self.hass.async_add_executor_job(
+            self._db.query, "SELECT status FROM ai_scenes WHERE id=?", (scene_id,)
+        )
+        if not rows:
+            self._sys_log("WARN", f"[AI场景] 归档目标不存在: id={scene_id}")
+            return
+        archive_ok = await self.hass.async_add_executor_job(
+            self._update_ai_scene_status, scene_id, AI_SCENE_STATUS_ARCHIVED
+        )
+        if not archive_ok:
+            self._sys_log("WARN", f"[AI场景] 归档状态写入失败: id={scene_id}")
+            return
+        await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
+        self._sys_log("INFO", f"[AI场景] 已归档场景 id={scene_id}")
         self.async_set_updated_data({})
 
     async def async_delete_ai_scene(self, scene_id: int) -> None:

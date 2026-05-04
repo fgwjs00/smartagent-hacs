@@ -262,7 +262,7 @@ export const aiscenesMethods = {
           // 显示预览
           preview.innerHTML = `
             <div style="font-size:13px;color:var(--sa-text-variant);margin-bottom:6px">解析结果预览</div>
-            <div style="font-weight:600;margin-bottom:4px">📋 ${d.name || "新场景"}</div>
+            <div style="font-weight:600;margin-bottom:4px">📋 ${this._esc(d.name || "新场景")}</div>
             <div style="font-size:12px;color:var(--sa-text-variant)">
               状态：${d.status === "active" ? "✅ 已直接激活" : "⏳ 待确认"}
             </div>`;
@@ -409,7 +409,7 @@ export const aiscenesMethods = {
         const id = b.dataset.id;
         b.disabled = true;
         try {
-          const resp = await this._hass.fetchWithAuth(`/api/smart_agent/export_scene_yaml?scene_id=${id}`);
+          const resp = await this._hass.fetchWithAuth(`/api/v1/scenes/export-yaml?scene_id=${id}`);
           const data = await resp.json();
           if (data.error) { this._msg("导出失败: " + data.error); return; }
 
@@ -464,7 +464,7 @@ export const aiscenesMethods = {
             write.disabled = true;
             write.textContent = "写入中...";
             try {
-              const wr = await this._hass.fetchWithAuth(`/api/smart_agent/export_scene_yaml`, {
+              const wr = await this._hass.fetchWithAuth(`/api/v1/scenes/export-yaml`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ scene_id: parseInt(id) }),

@@ -13,11 +13,14 @@ from typing import Any
 
 from homeassistant.helpers.event import async_call_later
 from homeassistant.exceptions import ServiceNotFound
+import voluptuous as vol
 
 from .const import (
     ACTION_PARAM_KEYS_COLOR,
     ACTION_PARAM_KEYS_LIGHT_SCENE,
     ACTION_PARAM_KEYS_USELESS_WHEN_OFF,
+    DEVICE_CAP_KEY_COVERAGE_SPACES,
+    DEVICE_CAP_KEY_SHARED_FIXTURE,
     MODE_SHOWROOM,
 )
 
@@ -52,6 +55,135 @@ class ActionsMixin:
 
     # 场景/脚本重复执行冷却
     _SCENE_COOLDOWN = 60        # 同一场景/脚本 N 秒内不重复执行
+
+    @staticmethod
+    def _is_night_time() -> bool:
+        """夜间窗口判定（保守）：22:00-06:00。"""
+        h = datetime.now().hour
+        return h >= 22 or h < 6
+
+    @staticmethod
+    def _room_looks_like_bedroom(room: str) -> bool:
+        """基于房间语义做卧室判定。"""
+        room_l = str(room or "").lower()
+        return any(k in room_l for k in ("卧", "bedroom", "主卧", "次卧", "儿童房", "master", "guest"))
+
+    def _apply_sleep_reentry_low_disturbance(
+        self,
+        entity_id: str,
+        domain: str,
+        service: str,
+        params: dict,
+        runtime_hints: dict,
+    ) -> tuple[str, dict]:
+        """夜间卧室二次进入时，锁定低扰动灯参数。"""
+        if domain != "light" or service != "turn_on":
+            return service, params
+        if not runtime_hints.get("sleep_reentry"):
+            return service, params
+
+        room = (self.device_info.get(entity_id) or {}).get("room", "")
+        if not (self._room_looks_like_bedroom(room) and self._is_night_time()):
+            return service, params
+
+        out = dict(params or {})
+        bri = out.get("brightness_pct")
+        if bri is None and "brightness" in out:
+            try:
+                bri = float(out.get("brightness")) / 255 * 100
+            except (TypeError, ValueError, ZeroDivisionError):
+                bri = None
+        if bri is None:
+            out["brightness_pct"] = 20
+        else:
+            try:
+                out["brightness_pct"] = min(float(bri), 30)
+            except (TypeError, ValueError):
+                out["brightness_pct"] = 20
+
+        if "color_temp_kelvin" in out:
+            try:
+                out["color_temp_kelvin"] = min(float(out["color_temp_kelvin"]), 3200)
+            except (TypeError, ValueError):
+                out["color_temp_kelvin"] = 3000
+        elif "color_temp" in out:
+            try:
+                _k = 1_000_000 / float(out["color_temp"])
+                out["color_temp_kelvin"] = min(_k, 3200)
+                out.pop("color_temp", None)
+            except (TypeError, ValueError, ZeroDivisionError):
+                out["color_temp_kelvin"] = 3000
+        else:
+            out["color_temp_kelvin"] = 3000
+
+        self._sys_log("INFO", f"[SleepGuard] 夜间卧室二次进入低扰动锁定: {entity_id} -> {out}")
+        return service, out
+
+    def _get_action_device_capability(self, entity_id: str) -> dict[str, Any]:
+        """统一动作层设备能力读取面（Wave 1B）。"""
+        if hasattr(self, "get_device_capability"):
+            try:
+                cap = self.get_device_capability(entity_id)
+                if isinstance(cap, dict):
+                    return cap
+            except Exception:
+                pass
+        info = self.device_info.get(entity_id, {}) or {}
+        room = (info.get("room") or "").strip()
+        return {
+            "entity_id": entity_id,
+            "control_mode": info.get("control_mode", "shared"),
+            "role": info.get("role", ""),
+            "control_zone": info.get("control_zone", room),
+            "disturbance_level": info.get("disturbance_level", ""),
+            "room": room,
+        }
+
+    @staticmethod
+    def _is_truthy_shared_fixture(value: Any) -> bool:
+        """统一 shared_fixture 真值判定（与设备能力快照语义对齐）。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on", "explicit"}
+        return False
+
+    @staticmethod
+    def _normalize_coverage_spaces(value: Any) -> list[str]:
+        """规范化 coverage_spaces，过滤空值并去重保序。"""
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            space = str(item or "").strip()
+            if space and space not in normalized:
+                normalized.append(space)
+        return normalized
+
+    def _resolve_action_control_spaces(self, capability: dict[str, Any]) -> set[str]:
+        """统一动作层控制空间集合解析（shared_fixture + coverage_spaces）。"""
+        room = str((capability.get("room") or "")).strip()
+        control_zone = str((capability.get("control_zone") or "")).strip()
+        coverage_spaces = self._normalize_coverage_spaces(
+            capability.get(DEVICE_CAP_KEY_COVERAGE_SPACES)
+        )
+        shared_fixture = self._is_truthy_shared_fixture(
+            capability.get(DEVICE_CAP_KEY_SHARED_FIXTURE)
+        )
+
+        spaces = {s for s in (room, control_zone) if s}
+        if shared_fixture and coverage_spaces:
+            spaces.update(coverage_spaces)
+        return spaces
+
+    def _is_cross_zone_action(self, trigger_room: str, capability: dict[str, Any]) -> bool:
+        """最小跨区判定入口：供执行期裁决复用，不改变现有判定结论。"""
+        if not trigger_room:
+            return False
+        control_spaces = self._resolve_action_control_spaces(capability)
+        if not control_spaces:
+            return False
+        return trigger_room not in control_spaces
 
     # ── 动作标准化 ────────────────────────────────────────────────────────────
 
@@ -101,7 +233,8 @@ class ActionsMixin:
 
         return {"entity_id": entity_id, "domain": domain, "service": service,
                 "params": params, "reason": action.get("reason", ""),
-                "delay_seconds": action.get("delay_seconds", 0)}
+                "delay_seconds": action.get("delay_seconds", 0),
+                "runtime_hints": action.get("runtime_hints") or {}}
 
     def _fuzzy_match_entity(self, bad_id: str, domain_hint: str) -> str | None:
         """Try to match a bad entity_id (device name) to a real entity_id."""
@@ -249,11 +382,12 @@ class ActionsMixin:
             for a in actions:
                 eid = a.get("entity_id") or a.get("entity")
                 if not eid: continue
-                dev_info = self.device_info.get(eid, {})
-                dev_room = dev_info.get("room", "").strip()
+                cap = self._get_action_device_capability(eid)
+                dev_room = (cap.get("room") or "").strip()
                 if not dev_room and hasattr(self, "_get_entity_area"):
-                    dev_room = self._get_entity_area(eid)
-                
+                    dev_room = (self._get_entity_area(eid) or "").strip()
+                cap = {**cap, "room": dev_room}
+
                 # 隔离规则（与 IntentVerifier._stage1_semantic_check 保持完全一致）：
                 # 1. 设备所在房间匹配触发房间 -> 放行
                 # 2. 豁免域 (climate/cover/scene/script/vacuum) -> 放行
@@ -261,11 +395,19 @@ class ActionsMixin:
                 # 4. 房间信息经 device_info + Registry 双重查找后仍为空 -> 放行（全局设备）
                 #    注意：仅靠 device_info 为空就豁免是不安全的，已在 _get_entity_area 回退后才豁免
                 _domain = (a.get("domain") or eid.split(".")[0]) if isinstance(eid, str) else ""
+                is_cross_zone = self._is_cross_zone_action(trigger_room, cap)
+                control_spaces = self._resolve_action_control_spaces(cap)
+                has_adjacent_space = any(
+                    hasattr(self, "_is_adjacent_room") and self._is_adjacent_room(trigger_room, space)
+                    for space in control_spaces
+                    if space
+                )
                 is_exempt = (
-                    not dev_room   # device_info + HA registry 均无区域信息，视为全局设备
-                    or dev_room == trigger_room
+                    (not dev_room and not cap.get("control_zone"))
+                    or not is_cross_zone
                     or _domain in ("climate", "cover", "scene", "script", "vacuum")
                     or a.get("is_global", False)
+                    or has_adjacent_space
                 )
 
                 if is_exempt:
@@ -457,6 +599,11 @@ class ActionsMixin:
                                     if k in ACTION_PARAM_KEYS_LIGHT_SCENE
                                 } if (assoc_domain == "scene" and orig_domain == "light" and orig_service == "turn_on") else {}
             # ─────────────────────────────────────────────────────────────────
+
+            runtime_hints = action.get("runtime_hints") or {}
+            service, params = self._apply_sleep_reentry_low_disturbance(
+                entity_id, domain, service, params, runtime_hints
+            )
 
             # script / scene 直接调用 HA 服务，不走 _do_call_service 的覆盖保护逻辑
             if domain in ("script", "scene"):

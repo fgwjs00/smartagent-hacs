@@ -54,6 +54,81 @@ class DecisionPipeline:
         """
         self._coord = coordinator
 
+    def _get_presence_snapshot(self) -> dict:
+        """优先读取统一 Presence Snapshot；不可用时返回空字典。"""
+        coord = self._coord
+        getter = getattr(coord, "get_presence_snapshot", None)
+        if callable(getter):
+            try:
+                snap = getter()
+                if isinstance(snap, dict):
+                    return snap
+            except Exception as exc:
+                _LOGGER.debug("[DecisionPipeline] get_presence_snapshot 异常，降级: %s", exc)
+        return {}
+
+    def _get_device_capability_snapshot(self) -> dict[str, dict]:
+        """优先读取统一设备能力快照；不可用时返回空字典。"""
+        coord = self._coord
+        getter = getattr(coord, "get_device_capability_snapshot", None)
+        if callable(getter):
+            try:
+                snap = getter()
+                if isinstance(snap, dict):
+                    return snap
+            except Exception as exc:
+                _LOGGER.debug("[DecisionPipeline] get_device_capability_snapshot 异常，降级: %s", exc)
+        return {}
+
+    @staticmethod
+    def _is_night_time() -> bool:
+        """夜间窗口判定（保守）：22:00-06:00。"""
+        h = datetime.now().hour
+        return h >= 22 or h < 6
+
+    @staticmethod
+    def _room_looks_like_bedroom(room: str) -> bool:
+        """基于房间语义做卧室判定。"""
+        room_l = str(room or "").lower()
+        return any(k in room_l for k in ("卧", "bedroom", "主卧", "次卧", "儿童房", "master", "guest"))
+
+    def _build_sleep_runtime_hints(self, trigger_room: str) -> dict:
+        """构建轻量睡眠运行时 hint，不引入新写库热路径。"""
+        hints = {
+            "sleep_candidate": False,
+            "night_reentry": False,
+            "sleep_reentry": False,
+        }
+        if not trigger_room or not self._room_looks_like_bedroom(trigger_room):
+            return hints
+        if not self._is_night_time():
+            return hints
+
+        hints["sleep_candidate"] = True
+        coord = self._coord
+        last_leave_map = getattr(coord, "_bedroom_last_leave_ts", {}) or {}
+        leave_ts = float(last_leave_map.get(trigger_room, 0) or 0)
+        if leave_ts > 0 and (time.time() - leave_ts) <= 30 * 60:
+            hints["night_reentry"] = True
+            hints["sleep_reentry"] = True
+        return hints
+
+    @staticmethod
+    def _attach_runtime_hints(actions: list[dict], hints: dict) -> list[dict]:
+        """将 runtime hint 注入动作，供执行期策略使用。"""
+        if not actions:
+            return actions
+        if not any(hints.values()):
+            return actions
+        enriched: list[dict] = []
+        for a in actions:
+            _a = dict(a)
+            _rh = dict(_a.get("runtime_hints") or {})
+            _rh.update(hints)
+            _a["runtime_hints"] = _rh
+            enriched.append(_a)
+        return enriched
+
     # ── Step 0: HA AI 场景优先路径 ─────────────────────────────────────────
 
     def run_ha_scene_path(self, entity_id: str, new_state: str) -> dict | None:
@@ -200,11 +275,15 @@ class DecisionPipeline:
                 _occ_map = {}
                 if hasattr(coord, "_get_room_occupancy_map"):
                     _occ_map = coord._get_room_occupancy_map()
+                _presence_snapshot = self._get_presence_snapshot()
+                _cap_snapshot = self._get_device_capability_snapshot()
                 verifier = IntentVerifier(
                     coord.hass, coord.device_info, _occ_map,
                     sys_log_func=getattr(coord, "_sys_log", None),
                     suppress_check_func=getattr(coord, "_should_suppress_action", None),
                 )
+                verifier._presence_snapshot = _presence_snapshot
+                verifier._device_capability_snapshot = _cap_snapshot
                 verifier._locked_people_rules = (
                     coord._build_locked_people_rules()
                     if hasattr(coord, "_build_locked_people_rules")
@@ -314,6 +393,8 @@ class DecisionPipeline:
                 sys_log_func=getattr(coord, "_sys_log", None),
                 suppress_check_func=getattr(coord, "_should_suppress_action", None),
             )
+            verifier._presence_snapshot = self._get_presence_snapshot()
+            verifier._device_capability_snapshot = self._get_device_capability_snapshot()
             verifier._room_topology = getattr(coord, "_room_topology_cache", {}) or {}
             clean_actions, rejected = verifier.verify(cached_actions, trigger_room=trigger_room)
         except Exception as exc:
@@ -456,6 +537,8 @@ class DecisionPipeline:
                 sys_log_func=getattr(coord, "_sys_log", None),
                 suppress_check_func=getattr(coord, "_should_suppress_action", None),
             )
+            verifier._presence_snapshot = self._get_presence_snapshot()
+            verifier._device_capability_snapshot = self._get_device_capability_snapshot()
             verifier._room_topology = getattr(coord, "_room_topology_cache", {}) or {}
             clean_actions, rejected = verifier.verify(cached_actions, trigger_room=trigger_room)
         except Exception as exc:
@@ -555,6 +638,8 @@ class DecisionPipeline:
                 get_baseline_func=getattr(coord, "_get_baseline", None),
                 get_arrival_baseline_func=getattr(coord, "_get_arrival_baseline_for_room", None),
             )
+            fb._presence_snapshot = self._get_presence_snapshot()
+            fb._device_capability_snapshot = self._get_device_capability_snapshot()
             fb._room_topology_cache = getattr(coord, "_room_topology_cache", {}) or {}
             # Phase 13: 注入昼夜节律引擎
             fb._circadian_engine = getattr(coord, "_circadian_engine", None)
@@ -597,8 +682,12 @@ class DecisionPipeline:
                 sys_log_func=getattr(coord, "_sys_log", None),
                 suppress_check_func=getattr(coord, "_should_suppress_action", None),
             )
+            verifier._presence_snapshot = self._get_presence_snapshot()
+            verifier._device_capability_snapshot = self._get_device_capability_snapshot()
             verifier._room_topology = getattr(coord, "_room_topology_cache", {}) or {}
             clean_actions, rejected = verifier.verify(actions, trigger_room=trigger_room)
+            sleep_hints = self._build_sleep_runtime_hints(trigger_room)
+            clean_actions = self._attach_runtime_hints(clean_actions, sleep_hints)
             if rejected and hasattr(coord, "_sys_log"):
                 _rej_detail = ", ".join(
                     "{eid}({reason})".format(

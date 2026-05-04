@@ -11839,7 +11839,7 @@ md-filled-tonal-button.dim {
             }
             preview.innerHTML = `
             <div style="font-size:13px;color:var(--sa-text-variant);margin-bottom:6px">解析结果预览</div>
-            <div style="font-weight:600;margin-bottom:4px">📋 ${d3.name || "新场景"}</div>
+            <div style="font-weight:600;margin-bottom:4px">📋 ${this._esc(d3.name || "新场景")}</div>
             <div style="font-size:12px;color:var(--sa-text-variant)">
               状态：${d3.status === "active" ? "✅ 已直接激活" : "⏳ 待确认"}
             </div>`;
@@ -11970,7 +11970,7 @@ md-filled-tonal-button.dim {
           const id = b3.dataset.id;
           b3.disabled = true;
           try {
-            const resp = await this._hass.fetchWithAuth(`/api/smart_agent/export_scene_yaml?scene_id=${id}`);
+            const resp = await this._hass.fetchWithAuth(`/api/v1/scenes/export-yaml?scene_id=${id}`);
             const data = await resp.json();
             if (data.error) {
               this._msg("导出失败: " + data.error);
@@ -12027,7 +12027,7 @@ md-filled-tonal-button.dim {
               write.disabled = true;
               write.textContent = "写入中...";
               try {
-                const wr = await this._hass.fetchWithAuth(`/api/smart_agent/export_scene_yaml`, {
+                const wr = await this._hass.fetchWithAuth(`/api/v1/scenes/export-yaml`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ scene_id: parseInt(id) })
@@ -14934,7 +14934,7 @@ md-filled-tonal-button.dim {
         return;
       const cfg = ((_a3 = this._cfg) == null ? void 0 : _a3.attributes) || {};
       const mcpEnabled = cfg.mcp_enabled !== false;
-      const mcpUrl = `${window.location.origin}/api/smart_agent/mcp`;
+      const mcpUrl = `${window.location.origin}/api/v1/mcp`;
       view.innerHTML = `
       <div class="main">
         <div>

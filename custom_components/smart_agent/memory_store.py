@@ -127,6 +127,28 @@ class MemoryStore:
 
         return f"【{room} 房间历史记忆（供 AI 参考，遇矛盾时请综合判断）】\n" + "\n".join(sections)
 
+    def get_room_context(
+        self,
+        room: str,
+        trigger_type: str = "arrival",
+        current_hour: int | None = None,
+        current_presence: str = "",
+    ) -> str:
+        """Phase 2 v2 整合入口 — 一次调用获取房间所有历史上下文。"""
+        layers = self.get_room_context_layers(
+            room=room,
+            trigger_type=trigger_type,
+            current_hour=current_hour,
+            current_presence=current_presence,
+        )
+        ordered = [
+            layers.get("constraint", ""),
+            layers.get("reflex", ""),
+            layers.get("behavior", ""),
+            layers.get("episodic_runtime", ""),
+        ]
+        return "\n\n".join([part for part in ordered if part])
+
     def get_room_context_layers(
         self,
         room: str,
@@ -134,16 +156,7 @@ class MemoryStore:
         current_hour: int | None = None,
         current_presence: str = "",
     ) -> dict[str, str]:
-        """Wave 3: 返回房间记忆分层视图（Reflex/Behavior/Constraint/Episodic Runtime）。
-
-        分层语义：
-          - reflex: 快反射记忆（decision_cache）
-          - behavior: 统计行为习惯（arrival/device_baseline/behavior_patterns）
-          - constraint: 高价值约束（corrections/lessons/conflicts）
-          - episodic_runtime: 近期反思与运行时片段（reflexion/presence修正）
-
-        :return: dict，键固定为 reflex/behavior/constraint/episodic_runtime
-        """
+        """Wave 3: 返回房间上下文的四层结构化读取出口。"""
         if not room:
             return {
                 "reflex": "",
@@ -154,105 +167,82 @@ class MemoryStore:
         if current_hour is None:
             current_hour = datetime.now().hour
 
-        reflex = self._build_cache_narrative(room)
-
         behavior_parts: list[str] = []
-        if trigger_type == "arrival":
-            _arrival = self._build_arrival_narrative(room, current_hour)
-            if _arrival:
-                behavior_parts.append(_arrival)
-        _baseline = self._build_baseline_hint_sync(room, current_hour)
-        if _baseline:
-            behavior_parts.append(_baseline)
-        _bp = self._build_behavior_patterns_narrative(room, current_hour)
-        if _bp:
-            behavior_parts.append(_bp)
-
+        reflex_parts: list[str] = []
         constraint_parts: list[str] = []
-        _lessons = self._build_lessons_narrative(room, current_presence)
-        if _lessons:
-            constraint_parts.append(_lessons)
-        else:
-            _corr = self._build_corrections_narrative(room)
-            if _corr:
-                constraint_parts.append(_corr)
-        if trigger_type == "arrival":
-            _conflict = self._detect_conflicts(room, current_hour)
-            if _conflict:
-                constraint_parts.append(_conflict)
-
         episodic_parts: list[str] = []
-        if current_presence in ("occupied", "empty"):
-            _presence = self._build_presence_corrections_narrative(room, current_presence)
-            if _presence:
-                episodic_parts.append(_presence)
-        _reflexion = self._build_reflexion_narrative(room)
-        if _reflexion:
-            episodic_parts.append(_reflexion)
+
+        if trigger_type == "arrival":
+            arrival_text = self._build_arrival_narrative(room, current_hour)
+            if arrival_text:
+                reflex_parts.append(arrival_text)
+            conflict_text = self._detect_conflicts(room, current_hour)
+            if conflict_text:
+                constraint_parts.append(conflict_text)
+
+        baseline_hint = self._build_baseline_hint_sync(room, current_hour)
+        if baseline_hint:
+            reflex_parts.append(baseline_hint)
+
+        cache_text = self._build_cache_narrative(room)
+        if cache_text:
+            reflex_parts.append(cache_text)
+
+        bp_text = self._build_behavior_patterns_narrative(room, current_hour)
+        if bp_text:
+            behavior_parts.append(bp_text)
+
+        lessons_text = self._build_lessons_narrative(room, current_presence)
+        if lessons_text:
+            constraint_parts.append(lessons_text)
+        elif current_presence in ("occupied", "empty"):
+            presence_corrections = self._build_presence_corrections_narrative(
+                room, current_presence
+            )
+            if presence_corrections:
+                constraint_parts.append(presence_corrections)
+
+        if current_presence not in ("occupied", "empty"):
+            corrections_text = self._build_corrections_narrative(room)
+            if corrections_text:
+                constraint_parts.append(corrections_text)
+
+        reflexion_text = self._build_reflexion_narrative(room)
+        if reflexion_text:
+            episodic_parts.append(reflexion_text)
+
+        sleep_runtime_text = self._build_sleep_runtime_narrative(room, current_hour, trigger_type)
+        if sleep_runtime_text:
+            episodic_parts.append(sleep_runtime_text)
 
         return {
-            "reflex": reflex or "",
-            "behavior": "\n\n".join(behavior_parts),
-            "constraint": "\n\n".join(constraint_parts),
-            "episodic_runtime": "\n\n".join(episodic_parts),
+            "reflex": "\n\n".join([p for p in reflex_parts if p]),
+            "behavior": "\n\n".join([p for p in behavior_parts if p]),
+            "constraint": "\n\n".join([p for p in constraint_parts if p]),
+            "episodic_runtime": "\n\n".join([p for p in episodic_parts if p]),
         }
 
-    def get_room_context(
+    def _build_sleep_runtime_narrative(
         self,
         room: str,
-        trigger_type: str = "arrival",
-        current_hour: int | None = None,
-        current_presence: str = "",
+        current_hour: int,
+        trigger_type: str,
     ) -> str:
-        """Phase 2 v2 整合入口 — 一次调用获取房间所有历史上下文。
-
-        整合 get_room_narrative() + _build_baseline_hint_sync() 为单一出口，
-        供 context_builder.py 使用，减少 P2 Prompt 碎片注入与重复。
-
-        与 get_room_narrative() 的区别：
-          - 额外包含基线摘要（device_baseline / arrival_baseline）
-          - 额外包含 Phase 3 Lite 行为戒律（correction_lessons 表，更高可读性）
-          - lessons 存在时跳过原始 presence_corrections 注入，避免内容重叠
-          - 提供更紧凑的格式，适合直接注入 P2 区
-
-        :param room:             触发房间名称
-        :param trigger_type:     触发类型（'arrival'/'departure'/'other'）
-        :param current_hour:     当前小时（0-23），None 时使用系统时间
-        :param current_presence: 当前在场状态（'occupied'/'empty'/''），用于过滤修正记录
-        :return: 自然语言上下文字符串，或空字符串
-        """
-        if not room:
+        """Wave 7: 睡眠态短期记忆注入文本（episodic runtime 轻量位点）。"""
+        room_l = str(room or "").lower()
+        is_bedroom = any(k in room_l for k in ("卧", "bedroom", "主卧", "次卧", "儿童房", "master", "guest"))
+        is_night = (current_hour >= 22 or current_hour < 6)
+        if not (is_bedroom and is_night):
             return ""
-        if current_hour is None:
-            current_hour = datetime.now().hour
 
-        layers = self.get_room_context_layers(
-            room=room,
-            trigger_type=trigger_type,
-            current_hour=current_hour,
-            current_presence=current_presence,
-        )
-
-        parts: list[str] = []
-        reflex = layers.get("reflex", "")
-        if reflex:
-            parts.append(f"【Reflex 记忆层】\n{reflex}")
-
-        behavior = layers.get("behavior", "")
-        if behavior:
-            parts.append(f"【Behavior 记忆层】\n{behavior}")
-
-        constraint = layers.get("constraint", "")
-        if constraint:
-            parts.append(f"【Constraint 记忆层】\n{constraint}")
-
-        episodic_runtime = layers.get("episodic_runtime", "")
-        if episodic_runtime:
-            parts.append(f"【Episodic Runtime 记忆层】\n{episodic_runtime}")
-
-        if not parts:
-            return ""
-        return f"【{room} 分层记忆上下文（Context Layer 2.0）】\n" + "\n\n".join(parts)
+        lines = [
+            "  [睡眠运行时线索] 当前为卧室夜间窗口，默认按“最少打扰”策略。",
+        ]
+        if trigger_type == "arrival":
+            lines.append("    → 若判定为夜间二次进入，优先低扰动照明（低亮度/暖光），避免强光。")
+        else:
+            lines.append("    → 非进入触发也需避免放大照明扰动，优先维持安静状态。")
+        return "\n".join(lines)
 
     def _build_baseline_hint_sync(self, room: str, current_hour: int) -> str:
         """Phase 2 v2：同步版设备使用基线摘要，迁移自 InferenceMixin._build_baseline_hint。

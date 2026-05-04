@@ -91,6 +91,39 @@ class RoomPresence:
         # unknown 级别：没有任何信号
         return []
 
+    def to_presence_snapshot(self) -> dict[str, Any]:
+        """将房间推断结果转换为统一 Presence Snapshot 结构。"""
+        if self.has_hw_sensor and self.sensor_state is not None:
+            state = self.sensor_state if self.sensor_state in ("on", "off") else "unknown"
+        elif self.level in ("high", "medium"):
+            state = "on"
+        elif self.level == "empty":
+            state = "off"
+        else:
+            state = "unknown"
+
+        reasons = [f"room={self.room}", f"level={self.level}"]
+        reasons.extend([f"{eid}:{desc}" for eid, desc, _w in self.signals[:8]])
+
+        enter_qualified = state == "on"
+        leave_qualified = state == "off" and not (self.has_hw_sensor and self.sensor_state == "unknown")
+
+        blocked_actions: list[str] = []
+        if state == "unknown":
+            blocked_actions.append("turn_off")
+        if self.level == "low":
+            blocked_actions.append("high_risk_off")
+
+        return {
+            "state": state,
+            "confidence": round(max(0.0, min(self.confidence, 1.0)), 3),
+            "reasons": reasons,
+            "enter_qualified": enter_qualified,
+            "leave_qualified": leave_qualified,
+            "localized_spaces": [self.room] if self.room else [],
+            "blocked_actions": blocked_actions,
+        }
+
 
 class PresenceInference:
     """
@@ -140,6 +173,15 @@ class PresenceInference:
         for room in rooms:
             result[room] = self.infer_room(room)
         return result
+
+    def infer_presence_snapshots(self) -> dict[str, dict[str, Any]]:
+        """返回所有房间统一 Presence Snapshot 结构。"""
+        all_rooms = self.infer_all_rooms()
+        return {room: presence.to_presence_snapshot() for room, presence in all_rooms.items()}
+
+    def infer_room_presence_snapshot(self, room: str) -> dict[str, Any]:
+        """返回单个房间统一 Presence Snapshot 结构。"""
+        return self.infer_room(room).to_presence_snapshot()
 
     def infer_room(self, room: str) -> RoomPresence:
         """

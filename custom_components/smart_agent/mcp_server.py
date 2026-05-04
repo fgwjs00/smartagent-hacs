@@ -12,8 +12,8 @@ class SmartAgentMCPEndpointView(HomeAssistantView):
     对外暴露安全的 HTTP POST 接口，响应 MCP 原生 tool/list 和 tool/call 请求。
     使用 HA 的原生 Long-Lived Token 进行鉴权拦截 (requires_auth=True)。
     """
-    url = "/api/smart_agent/mcp"
-    name = "api:smart_agent:mcp"
+    url = "/api/v1/mcp"
+    name = "api:smart_agent:v1:mcp"
     requires_auth = True  # HA 会自动拦截未携带正确 Bearer Token 的请求
 
     def __init__(self, hass: HomeAssistant):

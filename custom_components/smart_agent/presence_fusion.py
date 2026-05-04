@@ -319,6 +319,103 @@ class PresenceFusionRegistry:
             })
         return result
 
+    def build_presence_snapshot_for_entity(
+        self,
+        entity_id: str,
+        *,
+        blocked_actions: list[str] | None = None,
+        reasons: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """构建指定成员实体的统一 Presence Snapshot。"""
+        scope = self.get_scope_for_entity(entity_id)
+        if scope is None:
+            return None
+        return self.build_presence_snapshot_for_scope(
+            scope,
+            trigger_entity_id=entity_id,
+            blocked_actions=blocked_actions,
+            reasons=reasons,
+        )
+
+    def build_presence_snapshot_for_scope(
+        self,
+        scope: PresenceFusionScope,
+        *,
+        trigger_entity_id: str | None = None,
+        blocked_actions: list[str] | None = None,
+        reasons: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """构建融合域的统一 Presence Snapshot。"""
+        states = self._collect_member_states(scope)
+        confirmed_state = self.evaluate_scope(scope)
+
+        member_state_map = {eid: s for eid, s in states}
+        on_members = [eid for eid, s in states if s == "on"]
+        off_members = [eid for eid, s in states if s == "off"]
+        unknown_members = [eid for eid, s in states if s not in ("on", "off")]
+
+        weighted_total = 0.0
+        weighted_on = 0.0
+        for eid, s in states:
+            pol = scope.member_policies.get(eid)
+            weight = float(pol.confidence if pol else 1.0)
+            if weight <= 0:
+                weight = 0.1
+            weighted_total += weight
+            if s == "on":
+                weighted_on += weight
+
+        if confirmed_state == "on":
+            confidence = 1.0 if weighted_total <= 0 else max(0.6, min(1.0, weighted_on / weighted_total))
+        elif confirmed_state == "off":
+            confidence = 0.0
+        else:
+            confidence = 0.3 if unknown_members else 0.0
+
+        final_reasons = list(reasons or [])
+        final_reasons.append(f"scope={scope.scope_id}")
+        final_reasons.append(f"strategy={scope.strategy}")
+        if on_members:
+            final_reasons.append("on_members=" + ",".join(on_members[:6]))
+        if off_members:
+            final_reasons.append("off_members=" + ",".join(off_members[:6]))
+        if unknown_members:
+            final_reasons.append("unknown_members=" + ",".join(unknown_members[:6]))
+
+        enter_qualified = bool(
+            trigger_entity_id
+            and member_state_map.get(trigger_entity_id) == "on"
+            and self.can_trigger_enter(scope, trigger_entity_id)
+        )
+        if enter_qualified and scope.strategy == STRATEGY_AND and trigger_entity_id:
+            enter_members = [
+                mid for mid in scope.members if self.can_trigger_enter(scope, mid)
+            ]
+            if len(enter_members) >= 2:
+                peer_active = any(
+                    mid != trigger_entity_id and member_state_map.get(mid) == "on"
+                    for mid in enter_members
+                )
+                if not peer_active:
+                    enter_qualified = False
+                    final_reasons.append("vacant_and_single_source_enter_blocked")
+        leave_qualified = bool(
+            trigger_entity_id
+            and member_state_map.get(trigger_entity_id) == "off"
+            and self.can_provide_leave_evidence(scope, trigger_entity_id)
+            and confirmed_state == "off"
+        )
+
+        return {
+            "state": confirmed_state,
+            "confidence": round(max(0.0, min(confidence, 1.0)), 3),
+            "reasons": final_reasons,
+            "enter_qualified": enter_qualified,
+            "leave_qualified": leave_qualified,
+            "localized_spaces": list(scope.rooms),
+            "blocked_actions": list(blocked_actions or []),
+        }
+
     # ── 内部方法 ───────────────────────────────────────────────────────────────
 
     def _load(self, scopes_json: str) -> None:

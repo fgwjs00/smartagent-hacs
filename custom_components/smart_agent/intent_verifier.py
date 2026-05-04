@@ -30,7 +30,8 @@ IntentVerifier — 双阶段意图验证管道 (Phase 9.5 / P2.2)。
 from __future__ import annotations
 
 import logging
-from typing import Any
+from datetime import datetime
+from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -154,6 +155,57 @@ class IntentVerifier:
         self._occ_map: dict[str, list[tuple[str, str]]] = occ_map or {}
         self._sys_log = sys_log_func
         self._suppress_check = suppress_check_func
+        self._presence_snapshot: dict[str, Any] = {}
+        self._device_capability_snapshot: dict[str, dict] = {}
+
+    @staticmethod
+    def _is_truthy_shared_fixture(value: Any) -> bool:
+        """统一 shared_fixture 真值判定。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on", "explicit"}
+        return False
+
+    @staticmethod
+    def _normalize_coverage_spaces(value: Any) -> list[str]:
+        """规范化 coverage_spaces，过滤空值并去重保序。"""
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            room = str(item or "").strip()
+            if room and room not in normalized:
+                normalized.append(room)
+        return normalized
+
+    def _resolve_action_control_spaces(self, action: dict, action_room: str) -> set[str]:
+        """统一 Stage1 的控制空间判定（shared_fixture + coverage_spaces）。"""
+        spaces = {s for s in (action_room,) if s}
+        if not isinstance(action, dict):
+            return spaces
+
+        cap = self._device_capability_snapshot.get(action.get("entity_id", ""))
+        if not isinstance(cap, dict):
+            return spaces
+
+        cap_room = str((cap.get("room") or "")).strip()
+        if cap_room:
+            spaces.add(cap_room)
+        control_zone = str((cap.get("control_zone") or "")).strip()
+        if control_zone:
+            spaces.add(control_zone)
+
+        shared_fixture = self._is_truthy_shared_fixture(
+            cap.get("shared_fixture")
+        )
+        coverage_spaces = self._normalize_coverage_spaces(
+            cap.get("coverage_spaces")
+        )
+        if shared_fixture and coverage_spaces:
+            spaces.update(coverage_spaces)
+
+        return spaces
 
     def _is_adjacent_room(self, room_a: str, room_b: str) -> bool:
         """P1-2: 检查两个房间是否相邻（从 coordinator 注入的拓扑缓存查询）。"""
@@ -170,6 +222,69 @@ class IntentVerifier:
         if not topo:
             return False
         return room_b in topo.get(room_a, set())
+
+    def _is_night_time(self) -> bool:
+        """夜间窗口判定（保守）：22:00-06:00。"""
+        hour = datetime.now().hour
+        return hour >= 22 or hour < 6
+
+    @staticmethod
+    def _room_looks_like_bedroom(room: str) -> bool:
+        """基于房间语义做卧室判定。"""
+        if not room:
+            return False
+        room_l = str(room).lower()
+        return any(k in room_l for k in ("卧", "bedroom", "主卧", "次卧", "儿童房", "master", "guest"))
+
+    def _is_room_sleep_candidate(self, room: str) -> bool:
+        """卧室睡眠候选判定：卧室语义 + 夜间 + 在场/不确定在场。"""
+        if not self._room_looks_like_bedroom(room):
+            return False
+        if not self._is_night_time():
+            return False
+        sensors = self._occ_map.get(room, [])
+        if not sensors:
+            return False
+        has_on = any(s == "on" for _, s in sensors)
+        has_unknown = any(s in ("unknown", "unavailable") for _, s in sensors)
+        return has_on or has_unknown
+
+    @staticmethod
+    def _is_sleep_safe_low_disturbance(action: dict, dev_meta: dict[str, Any]) -> bool:
+        """动作是否满足低扰动放行条件。"""
+        params = action.get("params") or {}
+        if dev_meta.get("sleep_safe") is True:
+            return True
+
+        level = str(dev_meta.get("disturbance_level", "")).lower()
+        if level in ("low", "minimal", "sleep_safe"):
+            return True
+
+        brightness = params.get("brightness_pct")
+        if brightness is None and "brightness" in params:
+            try:
+                brightness = float(params.get("brightness")) / 255 * 100
+            except (TypeError, ValueError, ZeroDivisionError):
+                brightness = None
+        try:
+            if brightness is not None and float(brightness) <= 35:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        kelvin = params.get("color_temp_kelvin")
+        if kelvin is None and "color_temp" in params:
+            try:
+                kelvin = 1_000_000 / float(params.get("color_temp"))
+            except (TypeError, ValueError, ZeroDivisionError):
+                kelvin = None
+        try:
+            if kelvin is not None and float(kelvin) <= 3200:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        return False
 
     def _get_room_person_count(self, room: str) -> int:
         """读取房间人数（基于已注册 sensor 的 person_count 类实体）。"""
@@ -237,6 +352,44 @@ class IntentVerifier:
                 return True, f"P1人数锁定: 需要{op}{threshold}人，当前{people}人"
 
         return False, ""
+
+    def _get_room_presence_from_snapshot(self, room: str) -> str:
+        """从 Presence Snapshot 读取房间占用状态。"""
+        if not room or not isinstance(self._presence_snapshot, dict):
+            return ""
+        rooms = self._presence_snapshot.get("rooms")
+        if not isinstance(rooms, dict):
+            return ""
+        snap = rooms.get(room)
+        if not isinstance(snap, dict):
+            return ""
+        return str(snap.get("state", "")).lower()
+
+    def _is_action_allowed_by_capability(self, action: dict) -> tuple[bool, str]:
+        """能力快照守卫：禁止 capability 明确不支持的动作。"""
+        if not isinstance(self._device_capability_snapshot, dict):
+            return True, ""
+
+        eid = action.get("entity_id", "")
+        service = action.get("service", "")
+        domain = action.get("domain", "")
+        cap = self._device_capability_snapshot.get(eid)
+        if not isinstance(cap, dict):
+            return True, ""
+
+        cap_domain = str(cap.get("domain") or "")
+        if cap_domain and domain and cap_domain != domain:
+            return False, f"能力快照 domain 不一致: cap={cap_domain}, action={domain}"
+
+        if cap.get("controllable") is False:
+            return False, "能力快照标记为不可控设备"
+
+        if service == "turn_on" and cap.get("can_turn_on") is False:
+            return False, "能力快照不支持 turn_on"
+        if service == "turn_off" and cap.get("can_turn_off") is False:
+            return False, "能力快照不支持 turn_off"
+
+        return True, ""
 
     def _log(self, level: str, msg: str) -> None:
         """内部辅助：同时记录面板日志和原生日志。"""
@@ -409,18 +562,25 @@ class IntentVerifier:
 
             # 检查 3: 区域隔离 — 非豁免跨区动作硬拦截
             # 豁免：climate/cover/scene/script/vacuum、USER_EXPLICIT、is_global、相邻房间
-            if not action_room and hasattr(self, "_get_entity_area") and eid:
-                action_room = self._get_entity_area(eid) or ""
-            if not is_global_cmd and trigger_room and action_room and action_room != trigger_room:
+            control_spaces = self._resolve_action_control_spaces(action, action_room)
+            if not is_global_cmd and trigger_room and control_spaces and trigger_room not in control_spaces:
+                has_adjacent_space = any(
+                    self._is_adjacent_room(trigger_room, space)
+                    for space in control_spaces
+                    if space
+                )
                 is_exempt = (
                     domain in ("climate", "cover", "scene", "script", "vacuum")
                     or cmd_source == CMD_SOURCE_USER_EXPLICIT
                     or action.get("is_global", False)
-                    or self._is_adjacent_room(trigger_room, action_room)
+                    or has_adjacent_space
                 )
                 if not is_exempt:
                     _reason = (
-                        f"跨区操控拒绝: 触发={trigger_room}，设备区域={action_room}"
+                        "跨区操控拒绝: 触发={trigger}，设备控制空间={spaces}".format(
+                            trigger=trigger_room,
+                            spaces="/".join(sorted(control_spaces)),
+                        )
                     )
                     self._log("WARN",
                         f"[意图验证] ⛔{eid}: {_reason}"
@@ -429,13 +589,16 @@ class IntentVerifier:
                     continue
 
             # 检查 4: 有人区域 + 关灯 — AI 主动关灯硬拦截（USER_EXPLICIT 豁免）
-            if domain == "light" and service == "turn_off" and action_room in occupied_rooms:
+            _room_presence = self._get_room_presence_from_snapshot(action_room)
+            _room_occupied_by_snapshot = _room_presence in ("occupied", "on", "present")
+            _room_uncertain_by_snapshot = _room_presence in ("unknown", "uncertain")
+            if domain == "light" and service == "turn_off" and (action_room in occupied_rooms or _room_occupied_by_snapshot):
                 if cmd_source == CMD_SOURCE_USER_EXPLICIT:
                     self._log("WARN",
                         f"[意图验证] 用户主动关灯 {eid}，区域 {action_room} 有人在场，已放行（USER_EXPLICIT）"
                     )
                 else:
-                    if action_room in uncertain_rooms:
+                    if action_room in uncertain_rooms or _room_uncertain_by_snapshot:
                         _reason = (
                             f"占用状态不确定关灯拒绝: 区域 {action_room} 存在 unknown/unavailable，"
                             "按 fail-closed 拒绝"
@@ -455,7 +618,23 @@ class IntentVerifier:
                 rejected.append({**action, "reject_reason": _blocked_reason})
                 continue
 
-            # 检查 6: 修正历史硬拦截 — 用户多次纠正过的动作直接拒绝（USER_EXPLICIT 豁免）
+            # 检查 6: capability 快照守卫（fail-closed on explicit deny）
+            _cap_ok, _cap_reason = self._is_action_allowed_by_capability(action)
+            if not _cap_ok:
+                self._log("WARN", f"[意图验证] ⛔{eid}: {_cap_reason}")
+                rejected.append({**action, "reject_reason": _cap_reason})
+                continue
+
+            # 检查 6.5: SleepGuard（卧室睡眠候选状态下阻止高扰动开灯）
+            if domain == "light" and service == "turn_on" and self._is_room_sleep_candidate(action_room):
+                dev_meta = (self.device_info.get(eid) or {})
+                if not self._is_sleep_safe_low_disturbance(action, dev_meta):
+                    _reason = "SleepGuard: 卧室睡眠候选状态下拒绝高扰动开灯"
+                    self._log("WARN", f"[意图验证] ⛔{eid}: {_reason}")
+                    rejected.append({**action, "reject_reason": _reason})
+                    continue
+
+            # 检查 7: 修正历史硬拦截 — 用户多次纠正过的动作直接拒绝（USER_EXPLICIT 豁免）
             # _suppress_check 返回 True 时表示用户曾多次纠正该操作，代码层硬拦截。
             if (
                 service == "turn_on"

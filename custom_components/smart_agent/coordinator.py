@@ -123,6 +123,11 @@ from .const import (
     STARTUP_GRACE_SECONDS,
     TARGET_DOMAINS,
     TERMINAL_LOGS_MAX,
+    DEVICE_CAP_KEY_COVERAGE_SPACES,
+    DEVICE_CAP_KEY_SHARED_FIXTURE,
+    SPACE_SNAPSHOT_KEY_ROOM_TOPOLOGY,
+    SPACE_SNAPSHOT_KEY_SHARED_CONTROL_ZONES,
+    SPACE_SNAPSHOT_KEY_SHOWROOM_ZONE_MAP,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -1401,3 +1406,65 @@ class SmartAgentCoordinator(
                     pass
             result.append(info)
         return result
+
+    def get_space_runtime_snapshot(self) -> dict[str, Any]:
+        """返回空间运行时快照（只读内存态，不触发 DB 热路径）。"""
+        room_topology: dict[str, list[str]] = {}
+        for room, neighbors in (self._room_topology_cache or {}).items():
+            room_name = str(room or "").strip()
+            if not room_name:
+                continue
+            clean_neighbors: list[str] = []
+            if isinstance(neighbors, (set, list, tuple)):
+                for nb in neighbors:
+                    nb_name = str(nb or "").strip()
+                    if nb_name and nb_name != room_name and nb_name not in clean_neighbors:
+                        clean_neighbors.append(nb_name)
+            room_topology[room_name] = sorted(clean_neighbors)
+
+        showroom_zone_map: dict[str, str] = {}
+        for room, role in (self._showroom_zone_map or {}).items():
+            room_name = str(room or "").strip()
+            role_name = str(role or "").strip()
+            if room_name and role_name:
+                showroom_zone_map[room_name] = role_name
+
+        shared_control_zones: dict[str, list[str]] = {}
+        device_coverage: dict[str, list[str]] = {}
+        space_roles: dict[str, str] = {}
+        capability_snapshot = self.get_device_capability_snapshot()
+        for entity_id, cap in capability_snapshot.items():
+            if not isinstance(cap, dict):
+                continue
+            raw_spaces = cap.get(DEVICE_CAP_KEY_COVERAGE_SPACES)
+            coverage_spaces = []
+            if isinstance(raw_spaces, list):
+                for room in raw_spaces:
+                    room_name = str(room or "").strip()
+                    if room_name and room_name not in coverage_spaces:
+                        coverage_spaces.append(room_name)
+            room = str(cap.get("room") or "").strip()
+            if room and room not in coverage_spaces:
+                coverage_spaces.append(room)
+            for room_name in coverage_spaces:
+                device_coverage.setdefault(room_name, []).append(entity_id)
+                if room_name not in space_roles:
+                    space_roles[room_name] = self.get_zone_role(room_name) if hasattr(self, "get_zone_role") else ""
+
+            if cap.get(DEVICE_CAP_KEY_SHARED_FIXTURE) is not True:
+                continue
+            for room_name in coverage_spaces:
+                shared_control_zones.setdefault(room_name, []).append(entity_id)
+
+        for room_name, entities in shared_control_zones.items():
+            shared_control_zones[room_name] = sorted({e for e in entities if isinstance(e, str) and e.strip()})
+        for room_name, entities in device_coverage.items():
+            device_coverage[room_name] = sorted({e for e in entities if isinstance(e, str) and e.strip()})
+
+        return {
+            SPACE_SNAPSHOT_KEY_ROOM_TOPOLOGY: room_topology,
+            SPACE_SNAPSHOT_KEY_SHOWROOM_ZONE_MAP: showroom_zone_map,
+            SPACE_SNAPSHOT_KEY_SHARED_CONTROL_ZONES: shared_control_zones,
+            "space_roles": space_roles,
+            "device_coverage": device_coverage,
+        }

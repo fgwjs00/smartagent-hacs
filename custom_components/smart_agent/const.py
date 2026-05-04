@@ -333,6 +333,79 @@ LOG_MEM_MAX = 500                 # 内存实时日志最大条数
 
 CONF_LOG_RETENTION = "log_retention_days"   # 可配置日志保留天数
 
+# ── Wave 0：共享语义契约（冻结键名，不引入行为变更）────────────────────────────
+SEMANTIC_CONTRACT_VERSION = "wave0-v1"
+SEMANTIC_SNAPSHOT_VERSION = "v1"
+
+# 记忆层与来源桶（供 rules/decision_cache 语义归档使用）
+MEMORY_LAYER_BEHAVIOR = "behavior"
+MEMORY_LAYER_CONSTRAINT = "constraint"
+MEMORY_LAYER_REFLEX = "reflex"
+MEMORY_LAYER_EPISODIC = "episodic"
+
+MEMORY_SOURCE_BUCKET_RULES = "rules"
+MEMORY_SOURCE_BUCKET_DECISION_CACHE = "decision_cache"
+MEMORY_SOURCE_BUCKET_CORRECTIONS = "corrections"
+MEMORY_SOURCE_BUCKET_PATROL = "patrol"
+
+# rules 语义桶（后续分流到 Behavior / Constraint Memory）
+RULES_SEMANTIC_BUCKET_BEHAVIOR = "behavior"
+RULES_SEMANTIC_BUCKET_CONSTRAINT = "constraint"
+
+# Snapshot / Bundle / Trace 顶层键
+KEY_SPACE_SNAPSHOT = "space_snapshot"
+KEY_PRESENCE_SNAPSHOT = "presence_snapshot"
+KEY_DEVICE_CAPABILITIES = "device_capabilities"
+KEY_CONTEXT_BUNDLE = "context_bundle"
+KEY_DECISION_TRACE = "decision_trace"
+
+# 通用版本键
+KEY_VERSION = "version"
+KEY_SCHEMA_VERSION = "schema_version"
+
+# Space Snapshot 关键字段
+SPACE_SNAPSHOT_ROOM_ID = "room_id"
+SPACE_SNAPSHOT_ROOM_NAME = "room_name"
+SPACE_SNAPSHOT_TOPOLOGY = "topology"
+SPACE_SNAPSHOT_NEIGHBORS = "neighbors"
+SPACE_SNAPSHOT_ZONES = "zones"
+
+# Presence Snapshot 关键字段
+PRESENCE_SNAPSHOT_SCOPE_ID = "scope_id"
+PRESENCE_SNAPSHOT_SCOPE_NAME = "scope_name"
+PRESENCE_SNAPSHOT_STATE = "state"
+PRESENCE_SNAPSHOT_CONFIDENCE = "confidence"
+PRESENCE_SNAPSHOT_MEMBERS = "members"
+PRESENCE_SNAPSHOT_UPDATED_AT = "updated_at"
+
+# Device Capability 关键字段
+DEVICE_CAPABILITY_ENTITY_ID = "entity_id"
+DEVICE_CAPABILITY_DOMAIN = "domain"
+DEVICE_CAPABILITY_OPS = "ops"
+DEVICE_CAPABILITY_CONTROL_MODE = "control_mode"
+DEVICE_CAPABILITY_SENSOR_TYPE = "sensor_type"
+DEVICE_CAPABILITY_PARAMS = "params"
+DEVICE_CAPABILITY_UPDATED_AT = "updated_at"
+
+# Context Bundle 关键字段
+CONTEXT_BUNDLE_TRIGGER = "trigger"
+CONTEXT_BUNDLE_ROOM = "room"
+CONTEXT_BUNDLE_TIME = "time"
+CONTEXT_BUNDLE_MEMORY_LAYERS = "memory_layers"
+CONTEXT_BUNDLE_P1 = "p1"
+CONTEXT_BUNDLE_P2 = "p2"
+CONTEXT_BUNDLE_P3 = "p3"
+
+# Decision Trace 关键字段
+DECISION_TRACE_TRACE_ID = "trace_id"
+DECISION_TRACE_STAGE = "stage"
+DECISION_TRACE_PATH = "path"
+DECISION_TRACE_INPUT_HASH = "input_hash"
+DECISION_TRACE_OUTPUT = "output"
+DECISION_TRACE_CONFIDENCE = "confidence"
+DECISION_TRACE_REASON = "reason"
+DECISION_TRACE_CREATED_AT = "created_at"
+
 # Timing
 STARTUP_GRACE_SECONDS = 30
 MERGE_WINDOW_SECONDS = 3
@@ -385,6 +458,7 @@ AI_SCENE_COOCCUR_WINDOW_MIN = 10    # 共现时间窗口（分钟）
 AI_SCENE_STATUS_PENDING = "pending"
 AI_SCENE_STATUS_ACTIVE = "active"
 AI_SCENE_STATUS_REJECTED = "rejected"
+AI_SCENE_STATUS_ARCHIVED = "archived"
 
 # 场景动作参数白名单（统一收敛，供 inference/patrol/actions/devices 复用）
 ACTION_PARAM_KEYS_COMMON = (
@@ -626,6 +700,21 @@ RAG_BEHAVIOR_MIN_CONFIDENCE: int = 40           # 行为模式最低置信度
 # ── 房间拓扑关系类型（Phase P1-2）────────────────────────────────────────────
 ROOM_RELATION_ADJACENT: str = "adjacent"        # 相邻（如客厅-走廊）
 ROOM_RELATION_CONNECTED: str = "connected"      # 连通（如开放式客餐厅）
+
+# ── Wave 6: 空间运行时 / 设备能力快照键名（统一常量，避免分散硬编码）────────────
+SPACE_SNAPSHOT_KEY_ROOM_TOPOLOGY = "room_topology"
+SPACE_SNAPSHOT_KEY_SHOWROOM_ZONE_MAP = "showroom_zone_map"
+SPACE_SNAPSHOT_KEY_SHARED_CONTROL_ZONES = "shared_control_zones"
+
+DEVICE_CAP_KEY_COVERAGE_SPACES = "coverage_spaces"
+DEVICE_CAP_KEY_SHARED_FIXTURE = "shared_fixture"
+DEVICE_CAP_KEY_SLEEP_SAFE = "sleep_safe"
+DEVICE_CAP_KEY_RISK_LEVEL = "risk_level"
+DEVICE_CAP_KEY_ENERGY_LEVEL = "energy_level"
+DEVICE_CAP_KEY_CAN_TRIGGER_ENTER = "can_trigger_enter"
+DEVICE_CAP_KEY_CAN_CONFIRM_LEAVE = "can_confirm_leave"
+DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF = "can_block_turn_off"
+DEVICE_CAP_KEY_CAN_LOCALIZE_ZONE = "can_localize_zone"
 
 # ── 中国法定节假日（Phase P0-2 特征工程）─────────────────────────────────────
 # 每年需更新；节假日期间 AI 行为应参照周末模式

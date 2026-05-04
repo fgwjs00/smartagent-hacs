@@ -1,5 +1,12 @@
 # Changelog
 
+## Beta 0.0.5 - 2026-05-04
+
+Latest beta test release.
+
+- Publishes the latest SmartAgent Home Assistant integration package.
+- Aligns the public version with `0.0.5` for Home Assistant update detection.
+
 ## Beta 0.0.4 - 2026-04-30
 
 Latest beta test release.

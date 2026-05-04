@@ -11,11 +11,48 @@ class FeatureEncoder:
     负责将 HA 的状态（时间、触发器、设备状态等）提取并格式化为字典特征。
     在未来，该字典可直接转换为 numpy 数组输入给本地极速小模型。
     """
-    def __init__(self, hass, device_info, db_query_func=None, room_topology=None):
+    def __init__(self, hass, device_info, db_query_func=None, room_topology=None,
+                 capability_getter=None, device_capability_snapshot=None):
         self.hass = hass
         self.device_info = device_info
         self._db_query = db_query_func          # 可选，用于 recent_activity_level
         self._room_topology = room_topology or {}  # 可选，用于 adjacent_occupied_count
+        self._capability_getter = capability_getter
+        self._device_capability_snapshot = device_capability_snapshot or {}
+
+    def _get_device_capability(self, entity_id: str) -> dict:
+        """统一读取设备能力，优先复用 coordinator/devices 的快照接口。"""
+        if hasattr(self, "_device_capability_snapshot") and isinstance(self._device_capability_snapshot, dict):
+            snap = self._device_capability_snapshot.get(entity_id)
+            if isinstance(snap, dict):
+                return snap
+        getter = getattr(self, "_capability_getter", None)
+        if callable(getter):
+            try:
+                cap = getter(entity_id)
+                if isinstance(cap, dict):
+                    return cap
+            except Exception:
+                pass
+        raw = self.device_info.get(entity_id, {}) or {}
+        room = raw.get("room", "")
+        return {
+            "room": room,
+            "control_mode": raw.get("control_mode", "shared"),
+            "sensor_type": raw.get("sensor_type", ""),
+            "role": raw.get("role", ""),
+            "control_zone": raw.get("control_zone", room),
+            "disturbance_level": raw.get("disturbance_level", ""),
+            "coverage_spaces": raw.get("coverage_spaces", [room] if room else []),
+            "shared_fixture": raw.get("shared_fixture", False),
+            "sleep_safe": raw.get("sleep_safe", False),
+            "risk_level": raw.get("risk_level", "medium"),
+            "energy_level": raw.get("energy_level", "medium"),
+            "can_trigger_enter": raw.get("can_trigger_enter", False),
+            "can_confirm_leave": raw.get("can_confirm_leave", False),
+            "can_block_turn_off": raw.get("can_block_turn_off", False),
+            "can_localize_zone": raw.get("can_localize_zone", False),
+        }
 
     def encode(self, entity_id: str, new_state: str, old_state: str = "") -> dict:
         """
@@ -41,8 +78,8 @@ class FeatureEncoder:
         }
         
         # 提取触发实体的房间信息
-        dev_info = self.device_info.get(entity_id, {})
-        room = dev_info.get("room", "")
+        trigger_cap = self._get_device_capability(entity_id)
+        room = trigger_cap.get("room", "")
         features["trigger_room"] = room
         
         # 获取同房间内设备状态 (构建局部感知上下文)
@@ -53,7 +90,8 @@ class FeatureEncoder:
         room_devices = {}
         ctrl_domains = {"light", "switch", "climate", "fan", "cover", "media_player"}
         if room:
-            for eid, info in self.device_info.items():
+            for eid in self.device_info.keys():
+                info = self._get_device_capability(eid)
                 if info.get("room") != room:
                     continue
                 if info.get("control_mode", "shared") == "ha":
@@ -115,9 +153,9 @@ class FeatureEncoder:
             eid = state.entity_id.lower()
             name = state.attributes.get("friendly_name", eid).lower()
             if any(kw in eid or kw in name for kw in kw_list):
-                dev_info = self.device_info.get(state.entity_id, {})
-                dev_room = dev_info.get("room", "").lower()
-                
+                cap = self._get_device_capability(state.entity_id)
+                dev_room = cap.get("room", "").lower()
+
                 if dev_room == room_lower or room_lower in eid or room_lower in name:
                     try:
                         count = int(float(state.state))
@@ -173,8 +211,8 @@ class FeatureEncoder:
             name = (state.attributes.get("friendly_name") or eid).lower()
             if not any(kw in eid or kw in name for kw in self._PRESENCE_KW):
                 continue
-            dev_info = self.device_info.get(state.entity_id, {})
-            dev_room = dev_info.get("room", "").lower()
+            cap = self._get_device_capability(state.entity_id)
+            dev_room = cap.get("room", "").lower()
             if dev_room != room_lower and room_lower not in eid:
                 continue
             if state.state != "on":
@@ -267,8 +305,8 @@ class FeatureEncoder:
                 name = (state.attributes.get("friendly_name") or eid).lower()
                 if not any(kw in eid or kw in name for kw in self._PRESENCE_KW):
                     continue
-                dev_info = self.device_info.get(state.entity_id, {})
-                dev_room = dev_info.get("room", "").lower()
+                cap = self._get_device_capability(state.entity_id)
+                dev_room = cap.get("room", "").lower()
                 if dev_room == adj_lower and state.state == "on":
                     count += 1
                     break  # 该相邻房间已确认有人，跳到下一个

@@ -107,6 +107,12 @@ class FastBrainEngine:
                 self.hass, self.device_info,
                 db_query_func=getattr(self, "_db", None) and self._db.query,
                 room_topology=getattr(self, "_room_topology_cache", None),
+                capability_getter=getattr(self, "get_device_capability", None),
+                device_capability_snapshot=(
+                    self.get_device_capability_snapshot()
+                    if hasattr(self, "get_device_capability_snapshot")
+                    else None
+                ),
             )
             features = encoder.encode(entity_id, new_state, old_state)
 

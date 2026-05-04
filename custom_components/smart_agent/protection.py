@@ -205,6 +205,7 @@ class ProtectionMixin:
         结构：{room_name: [(entity_id, state), ...]}
 
         数据来源（按优先级）：
+          0. 统一 Presence Snapshot（若可用）
           1. 融合域（PresenceFusionRegistry）：覆盖了某房间的域，优先使用域聚合状态
           2. PresenceInference 虚拟推断（无传感器家庭兜底）
           3. 原始传感器扫描（向后兼容）
@@ -213,6 +214,30 @@ class ProtectionMixin:
           单个子区传感器（如 Frigate zone）触发无人 ≠ 整个开间无人。
           融合域通过 OR/AND 策略汇聚多个传感器，给出整体存在判断。
         """
+        # ── 0. 统一 Presence Snapshot（Wave 2 优先读取）
+        _get_presence_snapshot = getattr(self, "get_presence_snapshot", None)
+        if callable(_get_presence_snapshot):
+            try:
+                _snap = _get_presence_snapshot()
+                if isinstance(_snap, dict):
+                    _rooms = _snap.get("rooms")
+                    if isinstance(_rooms, dict) and _rooms:
+                        _mapped: dict[str, list[tuple[str, str]]] = {}
+                        for _room, _info in _rooms.items():
+                            if not isinstance(_info, dict):
+                                continue
+                            _state = str(_info.get("state", "")).lower()
+                            if _state in ("occupied", "on", "present"):
+                                _mapped[_room] = [("snapshot", "on")]
+                            elif _state in ("vacant", "off", "empty"):
+                                _mapped[_room] = [("snapshot", "off")]
+                            elif _state in ("unknown", "uncertain"):
+                                _mapped[_room] = [("snapshot", "unknown")]
+                        if _mapped:
+                            return _mapped
+            except Exception as exc:
+                _LOGGER.debug("[Protection] get_presence_snapshot 异常，降级: %s", exc)
+
         # ── 优先尝试使用 PresenceInference 引擎（包含硬件传感器判断和软推断兜底）
         if hasattr(self, "_presence_inference") and self._presence_inference is not None:
             try:

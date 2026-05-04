@@ -27,6 +27,18 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN, MODE_HOME, MODE_SHOWROOM
 from .coordinator import SmartAgentCoordinator
+from .ha_adapter import (
+    async_call_service,
+    async_execute_command_envelope,
+    async_get_state,
+    get_ai_scenes_cache_snapshot,
+    get_device_info_snapshot,
+    get_habits_cache_snapshot,
+    get_room_topology_cache_snapshot,
+    get_rules_snapshot,
+    get_transactions_cache_snapshot,
+    list_binary_sensor_states,
+)
 
 
 # AI Scene snake_case/legacy 仅作为迁移兼容入口，统一集中管理。
@@ -968,6 +980,28 @@ def _normalize_addon_diagnostics(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def _default_wave_semantics_payload(mode: str = "unknown") -> dict[str, Any]:
+    return {
+        "schema": "wave4a_v1",
+        "snapshot_observability": {
+            "presence_fusion_summary": False,
+            "topology_summary": False,
+            "status_source": "system_diagnostics",
+        },
+        "capability_observability": {
+            "addon_capabilities": False,
+            "bridge_mode": "local_first_with_fallback",
+            "ha_adapter_bridge": True,
+        },
+        "context_layer_observability": {
+            "contracts_summary": False,
+            "compat_summary": True,
+            "ha_adapter_bridge": True,
+            "core_mode": str(mode or "unknown"),
+        },
+    }
+
+
 def _status_error_type(status: int, fallback: str = "upstream_rejected") -> str:
     mapping = {
         400: "bad_request",
@@ -1059,6 +1093,18 @@ def _addon_endpoint_missing_payload(scope: str) -> dict[str, Any]:
         retryable=False,
         scope=scope,
     )
+
+
+def _default_capability_dry_run_payload() -> dict[str, Any]:
+    """capability dry-run 最小安全骨架：默认仅给建议，不执行真实动作。"""
+    return {
+        "ok": True,
+        "capability": "unknown",
+        "dry_run": True,
+        "suggested_actions": [],
+        "risk_level": "high",
+        "reject_reasons": ["dry_run_only"],
+    }
 
 
 def _addon_list_read_strict_response(
@@ -1172,28 +1218,29 @@ class SmartAgentLogDatesView(HomeAssistantView):
 
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                dates = await _addon_client.get_log_dates()
-                if isinstance(dates, list):
-                    return self.json(dates)
-                proxied = _addon_result_payload_status(dates if isinstance(dates, dict) else None)
-                if proxied is not None:
-                    payload, status = proxied
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("logs_dates"), status_code=status)
-                    return self.json(payload, status_code=status)
-                return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[LogDates] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("logs_dates"), status_code=404)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
 
-        dates = await hass.async_add_executor_job(coord.get_log_dates)
-        return self.json(dates)
+        try:
+            dates = await _addon_client.get_log_dates()
+            if isinstance(dates, list):
+                return self.json(dates)
+            proxied = _addon_result_payload_status(dates if isinstance(dates, dict) else None)
+            if proxied is not None:
+                payload, status = proxied
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("logs_dates"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[LogDates] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
 
 
 class SmartAgentLogContentView(HomeAssistantView):
@@ -1228,33 +1275,27 @@ class SmartAgentLogContentView(HomeAssistantView):
             )
 
         coord = _get_first_coordinator(hass)
-        if coord is not None:
-            is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-            _addon_client = getattr(coord, "_addon_client", None)
-            if (not is_addon_proxy) and _addon_client is not None:
-                try:
-                    content = await _addon_client.get_log_content(str(date))
-                    if isinstance(content, dict):
-                        payload, status = _json_from_addon_result(content)
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("logs_content"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
-                except Exception as exc:
-                    _LOGGER.debug("[LogContent] add-on proxy failed: %s", exc)
-                    return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
+        if coord is None:
+            return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
 
-        if coord is not None:
-            content = await hass.async_add_executor_job(coord.read_log_file, date)
-            return self.json({"date": date, "content": content})
-        return self.json(
-            _json_error_payload(
-                error="coordinator_not_found",
-                error_type="not_found",
-                retryable=False,
-            ),
-            status_code=404,
-        )
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        _addon_client = getattr(coord, "_addon_client", None)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("logs_content"), status_code=404)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
+
+        try:
+            content = await _addon_client.get_log_content(str(date))
+            if isinstance(content, dict):
+                payload, status = _json_from_addon_result(content)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("logs_content"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[LogContent] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
 
 
 class SmartAgentLogInfoView(HomeAssistantView):
@@ -1271,25 +1312,26 @@ class SmartAgentLogInfoView(HomeAssistantView):
 
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({})
+            return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                info = await _addon_client.get_log_info()
-                if isinstance(info, dict):
-                    payload, status = _json_from_addon_result(info)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("logs_info"), status_code=status)
-                    return self.json(payload, status_code=status)
-                return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[LogInfo] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("logs_info"), status_code=404)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
 
-        info = await hass.async_add_executor_job(coord.get_log_info)
-        return self.json(info)
+        try:
+            info = await _addon_client.get_log_info()
+            if isinstance(info, dict):
+                payload, status = _json_from_addon_result(info)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("logs_info"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[LogInfo] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
 
 
 class SmartAgentSceneExportView(HomeAssistantView):
@@ -1497,7 +1539,7 @@ class SmartAgentSceneExportView(HomeAssistantView):
             return {"count": len(automations), "file": target_file}
 
         try:
-            write_result = await hass.async_add_executor_job(_write_file)
+            write_result = await hass.async_add_executor_job( _write_file)
         except Exception as exc:
             return self.json(
                 _json_error_payload(
@@ -1511,7 +1553,7 @@ class SmartAgentSceneExportView(HomeAssistantView):
         # 调用 automation.reload 让 HA 立即加载新的自动化（需要用户已配置 !include）
         reload_ok = False
         try:
-            await hass.services.async_call("automation", "reload", {})
+            await async_call_service(hass, "automation", "reload", {})
             reload_ok = True
         except Exception:
             pass  # reload 失败不影响文件写入结果
@@ -1556,11 +1598,12 @@ def _build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordi
 
     sensors: list[dict[str, Any]] = []
     fusion_registry = getattr(coord, "_fusion_registry", None)
-    device_info = coord.device_info if isinstance(coord.device_info, dict) else {}
+    device_info = get_device_info_snapshot(coord)
 
-    for st in hass.states.async_all("binary_sensor"):
-        eid = st.entity_id
-        friendly = st.attributes.get("friendly_name", eid)
+    for row in list_binary_sensor_states(hass):
+        eid = str(row.get("entity_id", "") or "")
+        attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+        friendly = attrs.get("friendly_name", eid)
         check_str = (friendly + eid).lower()
         if not any(str(kw).lower() in check_str for kw in presence_kw):
             continue
@@ -1572,11 +1615,13 @@ def _build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordi
             if scope is not None:
                 fusion_scope = scope.display_name
 
+        state_obj = async_get_state(hass, eid)
+        runtime_state = getattr(state_obj, "state", None) if state_obj is not None else None
         sensors.append({
             "entity_id": eid,
             "name": info.get("name") or friendly,
             "room": info.get("room", ""),
-            "state": st.state,
+            "state": str(runtime_state if runtime_state is not None else (row.get("state", "") or "")),
             "sensor_type": info.get("sensor_type", ""),
             "in_sa": eid in device_info,
             "fusion_scope": fusion_scope,
@@ -1621,7 +1666,8 @@ async def _async_save_presence_sensor_type(
             "error": "sensor_type must be '', 'pir', 'mmwave' or 'frigate'",
             "status": 400,
         }
-    if eid not in coord.device_info:
+    device_info_snapshot = get_device_info_snapshot(coord)
+    if eid not in device_info_snapshot:
         return {"ok": False, "error": f"设备未纳管: {eid}", "status": 404}
 
     from datetime import datetime as _dt_s
@@ -1654,55 +1700,38 @@ class SmartAgentDevicesView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("devices"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("devices"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(_addon_client, "GET", ("/devices",))
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("devices"), status_code=502)
 
-                devices = await _addon_client.get_devices()
-                rows = _addon_result_list_body(devices if isinstance(devices, dict) else None)
-                if rows is not None:
-                    return self.json(rows)
-                strict = _addon_list_read_strict_response(devices, scope="devices")
-                payload, status = strict
-                if status >= 400:
-                    return self.json(payload, status_code=status)
-                if isinstance(payload, list):
-                    return self.json(payload)
-                return self.json(_addon_unreachable_payload("devices"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[Devices] add-on devices proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("devices"), status_code=502)
+        try:
+            rows, proxied_error = await _addon_probe_list_result(_addon_client, "GET", ("/devices",))
+            if proxied_error is not None:
+                payload, status = proxied_error
+                return self.json(payload, status_code=status)
+            if rows is not None:
+                return self.json(rows)
 
-        device_info = coord.device_info
-        if not isinstance(device_info, dict):
-            return self.json([])
-
-        snapshot = device_info.copy()
-        devices = []
-        for eid, info in snapshot.items():
-            st = hass.states.get(eid)
-            devices.append({
-                "entity_id": eid,
-                "name": info.get("name", eid),
-                "domain": eid.split(".", 1)[0],
-                "room": info.get("room", ""),
-                "state": st.state if st else "unknown",
-                "available": st is not None and st.state not in ("unavailable", "unknown"),
-                "type": info.get("type", ""),
-                "ops": info.get("ops", ""),
-                "control_mode": info.get("control_mode", "shared"),
-                "sensor_type": info.get("sensor_type", ""),
-            })
-        return self.json(devices)
+            devices = await _addon_client.get_devices()
+            rows = _addon_result_list_body(devices if isinstance(devices, dict) else None)
+            if rows is not None:
+                return self.json(rows)
+            strict = _addon_list_read_strict_response(devices, scope="devices")
+            payload, status = strict
+            if status >= 400:
+                return self.json(payload, status_code=status)
+            if isinstance(payload, list):
+                return self.json(payload)
+            return self.json(_addon_unreachable_payload("devices"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[Devices] add-on devices proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("devices"), status_code=502)
 
 
 class SmartAgentDevicesDiscoverView(HomeAssistantView):
@@ -1718,7 +1747,7 @@ class SmartAgentDevicesDiscoverView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("devices_discover"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
@@ -1743,8 +1772,7 @@ class SmartAgentDevicesDiscoverView(HomeAssistantView):
                 _LOGGER.debug("[DevicesDiscover] add-on proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("devices_discover"), status_code=502)
 
-        discovered = await coord._async_discover_devices()
-        return self.json(discovered or [])
+        return self.json(_addon_unreachable_payload("devices_discover"), status_code=502)
 
 
 class SmartAgentDevicesBatchAddView(HomeAssistantView):
@@ -1761,7 +1789,7 @@ class SmartAgentDevicesBatchAddView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("devices_batch_add"), status_code=502)
 
         try:
             body = await request.json()
@@ -1799,8 +1827,7 @@ class SmartAgentDevicesBatchAddView(HomeAssistantView):
                 _LOGGER.debug("[DevicesBatchAdd] add-on proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("devices_batch_add"), status_code=502)
 
-        added = await coord.async_batch_add_devices(entities)
-        return self.json({"ok": True, "added": added})
+        return self.json(_addon_unreachable_payload("devices_batch_add"), status_code=502)
 
 
 class SmartAgentDeviceDetailView(HomeAssistantView):
@@ -1816,7 +1843,7 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
 
         try:
             body = await request.json()
@@ -1826,41 +1853,27 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
         eid = entity_id.strip()
         if not eid:
             return self.json({"ok": False, "error": "entity_id required"}, status_code=400)
-        if eid not in coord.device_info:
-            return self.json({"ok": False, "error": f"device not found: {eid}"}, status_code=404)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json("PATCH", f"/devices/{eid}", body=body if isinstance(body, dict) else {})
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("device_patch"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    else:
-                        return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
-                else:
-                    return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[DevicePatch] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("device_patch"), status_code=404)
 
-        await coord.async_svc_update_device(
-            eid,
-            name=str(body.get("name", "") or ""),
-            room=str(body.get("room", "") or ""),
-            dev_type=str(body.get("type", "") or ""),
-            ops=str(body.get("ops", "") or ""),
-            sensor_type=str(body.get("sensor_type", "") or ""),
-        )
-        mode_raw = str(body.get("control_mode", "") or "").strip().lower()
-        if mode_raw in {"ai", "ha", "shared"}:
-            await coord.async_set_device_control_mode(eid, mode_raw)
-        return self.json({"ok": True, "entity_id": eid})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json("PATCH", f"/devices/{eid}", body=body if isinstance(body, dict) else {})
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("device_patch"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[DevicePatch] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
 
     async def delete(self, request: web.Request, entity_id: str) -> web.Response:
         if (err := _view_admin_check(request)):
@@ -1868,36 +1881,32 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("device_delete"), status_code=502)
 
         eid = entity_id.strip()
         if not eid:
             return self.json({"ok": False, "error": "entity_id required"}, status_code=400)
-        if eid not in coord.device_info:
-            return self.json({"ok": False, "error": f"device not found: {eid}"}, status_code=404)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json("DELETE", f"/devices/{eid}")
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("device_delete"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    else:
-                        return self.json(_addon_unreachable_payload("device_delete"), status_code=502)
-                else:
-                    return self.json(_addon_unreachable_payload("device_delete"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[DeviceDelete] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("device_delete"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("device_delete"), status_code=404)
 
-        await coord.async_svc_delete_device(eid)
-        return self.json({"ok": True, "entity_id": eid})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("device_delete"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json("DELETE", f"/devices/{eid}")
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("device_delete"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("device_delete"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[DeviceDelete] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("device_delete"), status_code=502)
 
 
 class SmartAgentDeviceControlView(HomeAssistantView):
@@ -1913,13 +1922,11 @@ class SmartAgentDeviceControlView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("device_control"), status_code=502)
 
         eid = entity_id.strip()
         if not eid:
             return self.json({"ok": False, "error": "entity_id required"}, status_code=400)
-        if eid not in coord.device_info:
-            return self.json({"ok": False, "error": f"device not found: {eid}"}, status_code=404)
 
         try:
             body = await request.json()
@@ -1935,44 +1942,31 @@ class SmartAgentDeviceControlView(HomeAssistantView):
             return self.json({"ok": False, "error": f"unsupported service: {service}"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json(
-                    "POST",
-                    f"/devices/{eid}/control",
-                    body={"service": service, "params": params},
-                )
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("device_control"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    else:
-                        return self.json(_addon_unreachable_payload("device_control"), status_code=502)
-                else:
-                    return self.json(_addon_unreachable_payload("device_control"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[DeviceControl] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("device_control"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("device_control"), status_code=404)
 
-        domain = eid.split(".")[0] if "." in eid else ""
-        ok = await coord._do_call_service(
-            domain=domain,
-            service=service,
-            entity_id=eid,
-            params=params,
-            reason="设备快捷控制API",
-            scene_desc="",
-            trigger_text="",
-            transaction_id=0,
-            action_seq=0,
-        )
-        if not ok:
-            return self.json({"ok": False, "error": "blocked_or_failed"}, status_code=409)
-        return self.json({"ok": True, "entity_id": eid, "service": service})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("device_control"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json(
+                "POST",
+                f"/devices/{eid}/control",
+                body={"service": service, "params": params},
+            )
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("device_control"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("device_control"), status_code=502)
+            return self.json(_addon_unreachable_payload("device_control"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[DeviceControl] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("device_control"), status_code=502)
 
 
 class SmartAgentPresenceSensorsView(HomeAssistantView):
@@ -1988,26 +1982,30 @@ class SmartAgentPresenceSensorsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"sensors": [], "fusion_config": [], "rooms": []})
+            return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and addon_client is not None:
-            try:
-                proxied = await addon_client.request_json("GET", "/presence/sensors")
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("presence_sensors"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[PresenceSensors] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("presence_sensors"), status_code=404)
 
-        return self.json(_build_presence_sensors_payload(hass, coord))
+        addon_client = getattr(coord, "_addon_client", None)
+        if addon_client is None:
+            return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
+
+        try:
+            proxied = await addon_client.request_json("GET", "/presence/sensors")
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("presence_sensors"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
+            return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[PresenceSensors] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
 
 
 class SmartAgentPresenceSensorTypeView(HomeAssistantView):
@@ -2023,40 +2021,43 @@ class SmartAgentPresenceSensorTypeView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(
+                _json_error_payload("coordinator_not_found", "not_found", False),
+                status_code=404,
+            )
 
         try:
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be object")
         except Exception:
-            return self.json({"ok": False, "error": "invalid JSON"}, status_code=400)
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False),
+                status_code=400,
+            )
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and addon_client is not None:
-            try:
-                proxied = await addon_client.request_json("POST", "/presence/sensors/type", body=body)
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("presence_sensor_type"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[PresenceSensorType] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("presence_sensor_type"), status_code=404)
 
-        result = await _async_save_presence_sensor_type(
-            hass,
-            coord,
-            str(body.get("entity_id", "") or ""),
-            str(body.get("sensor_type", "") or ""),
-        )
-        status = int(result.pop("status", 200) or 200)
-        return self.json(result, status_code=status)
+        addon_client = getattr(coord, "_addon_client", None)
+        if addon_client is None:
+            return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
+
+        try:
+            proxied = await addon_client.request_json("POST", "/presence/sensors/type", body=body)
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("presence_sensor_type"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
+            return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[PresenceSensorType] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("presence_sensor_type"), status_code=502)
 
 
 class SmartAgentRoomsView(HomeAssistantView):
@@ -2072,49 +2073,38 @@ class SmartAgentRoomsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("rooms"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("rooms"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(_addon_client, "GET", ("/rooms",))
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("rooms"), status_code=502)
 
-                rooms = await _addon_client.get_rooms()
-                rows = _addon_result_list_body(rooms if isinstance(rooms, dict) else None)
-                if rows is not None:
-                    return self.json(rows)
-                strict = _addon_list_read_strict_response(rooms, scope="rooms")
-                payload, status = strict
-                if status >= 400:
-                    return self.json(payload, status_code=status)
-                if isinstance(payload, list):
-                    return self.json(payload)
-                return self.json(_addon_unreachable_payload("rooms"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[Rooms] add-on rooms proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("rooms"), status_code=502)
+        try:
+            rows, proxied_error = await _addon_probe_list_result(_addon_client, "GET", ("/rooms",))
+            if proxied_error is not None:
+                payload, status = proxied_error
+                return self.json(payload, status_code=status)
+            if rows is not None:
+                return self.json(rows)
 
-        room_counts: dict[str, int] = {}
-        device_info = coord.device_info if isinstance(coord.device_info, dict) else {}
-        for info in device_info.values():
-            if not isinstance(info, dict):
-                continue
-            room = (info.get("room") or "").strip()
-            if not room:
-                continue
-            room_counts[room] = room_counts.get(room, 0) + 1
-
-        rooms = [
-            {"id": room, "name": room, "device_count": cnt}
-            for room, cnt in sorted(room_counts.items(), key=lambda x: x[0])
-        ]
-        return self.json(rooms)
+            rooms = await _addon_client.get_rooms()
+            rows = _addon_result_list_body(rooms if isinstance(rooms, dict) else None)
+            if rows is not None:
+                return self.json(rows)
+            strict = _addon_list_read_strict_response(rooms, scope="rooms")
+            payload, status = strict
+            if status >= 400:
+                return self.json(payload, status_code=status)
+            if isinstance(payload, list):
+                return self.json(payload)
+            return self.json(_addon_unreachable_payload("rooms"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[Rooms] add-on rooms proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("rooms"), status_code=502)
 
 
 class SmartAgentRoomsSyncView(HomeAssistantView):
@@ -2130,30 +2120,30 @@ class SmartAgentRoomsSyncView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json("POST", "/rooms/sync", body={})
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("rooms_sync"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    else:
-                        return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
-                else:
-                    return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[RoomsSync] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("rooms_sync"), status_code=404)
 
-        result = await coord.async_sync_rooms_to_ha()
-        return self.json({"ok": True, **(result or {})})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json("POST", "/rooms/sync", body={})
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("rooms_sync"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
+            return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[RoomsSync] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
 
 
 class SmartAgentRoomsTopologyView(HomeAssistantView):
@@ -2169,38 +2159,33 @@ class SmartAgentRoomsTopologyView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "GET",
-                    ("/rooms/topology",),
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
-            except Exception as exc:
-                _LOGGER.debug("[RoomsTopology] add-on topology list proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
 
-        def _query_topology_rows() -> list[dict[str, Any]]:
-            try:
-                rows = coord._db.query(
-                    "SELECT room_a, room_b, relation FROM room_topology",
-                    (),
-                )
-            except Exception:
-                return []
-            return [r for r in (rows or []) if isinstance(r, dict)]
-
-        rows = await hass.async_add_executor_job(_query_topology_rows)
-        return self.json(rows)
+        try:
+            rows, proxied_error = await _addon_probe_list_result(
+                _addon_client,
+                "GET",
+                ("/rooms/topology",),
+            )
+            if proxied_error is not None:
+                payload, status = proxied_error
+                return self.json(payload, status_code=status)
+            if rows is not None:
+                return self.json(rows)
+            topo = await _addon_client.get_rooms_topology()
+            payload, status = _addon_list_read_strict_response(topo, scope="rooms_topology")
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[RoomsTopology] add-on topology list proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
 
     async def post(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
@@ -2216,68 +2201,27 @@ class SmartAgentRoomsTopologyView(HomeAssistantView):
             body = {}
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json("POST", "/rooms/topology", body=(body if isinstance(body, dict) else {}))
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=status)
-                        else:
-                            return self.json(payload, status_code=status)
-                    else:
-                        return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
-                else:
-                    return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[RoomsTopology] add-on topology save proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
-
-        rows = body.get("topology") if isinstance(body, dict) else None
-        if not isinstance(rows, list):
-            return self.json({"ok": False, "error": "invalid topology"}, status_code=400)
-
-        normalized: list[tuple[str, str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            a = str(item.get("room_a", "") or "").strip()
-            b = str(item.get("room_b", "") or "").strip()
-            relation = str(item.get("relation", "adjacent") or "adjacent").strip() or "adjacent"
-            if not a or not b or a == b:
-                continue
-            k = tuple(sorted((a, b)))
-            if k in seen:
-                continue
-            seen.add(k)
-            normalized.append((k[0], k[1], relation))
-
-        def _write_topology() -> bool:
-            conn = coord._db.get_raw_connection()
-            with coord._db._write_lock:
-                conn.execute("DELETE FROM room_topology")
-                if normalized:
-                    conn.executemany(
-                        "INSERT INTO room_topology (room_a, room_b, relation) VALUES (?,?,?)",
-                        normalized,
-                    )
-                conn.commit()
-            return True
-
-        ok = await hass.async_add_executor_job(_write_topology)
-        if not ok:
-            return self.json({"ok": False, "error": "db_write_failed"}, status_code=500)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
 
         try:
-            coord._refresh_room_topology_cache()
-        except Exception:
-            pass
-
-        return self.json({"ok": True, "count": len(normalized)})
+            proxied = await _addon_client.request_json("POST", "/rooms/topology", body=(body if isinstance(body, dict) else {}))
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=status)
+                    return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
+            return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[RoomsTopology] add-on topology save proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
 
 class SmartAgentAiScenesView(HomeAssistantView):
     """AI 场景列表接口（canonical + 迁移兼容入口）。"""
@@ -2294,7 +2238,7 @@ class SmartAgentAiScenesView(HomeAssistantView):
         _record_legacy_route_hit_if_needed(hass, request)
         coord = _get_first_coordinator(hass)
         if coord is None or isinstance(coord, bool):
-            return self.json([])
+            return self.json(_addon_unreachable_payload("ai_scenes"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
 
@@ -2312,33 +2256,22 @@ class SmartAgentAiScenesView(HomeAssistantView):
                 if rows is not None:
                     return self.json(rows)
 
-                scenes = await _addon_client.get_ai_scenes()
-                proxied = _addon_result_payload_status(scenes if isinstance(scenes, dict) else None)
-                if proxied is not None:
-                    payload, status = proxied
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("ai_scenes"), status_code=status)
-                    return self.json(payload, status_code=status)
-                if isinstance(scenes, list):
-                    return self.json(scenes)
-                if isinstance(scenes, dict):
-                    rows = _addon_result_list_body(scenes)
-                    if rows is not None:
-                        return self.json(rows)
+                # probe 未返回 rows 且无结构化透传错误时，统一视为 add-on 不可达；
+                # 不再调用 legacy get_ai_scenes() 二次兜底，保持单入口代理语义。
+                return self.json(_addon_unreachable_payload("ai_scenes"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[AiScenes] add-on scenes proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("ai_scenes"), status_code=502)
 
-        scenes = coord._ai_scenes_cache if isinstance(coord._ai_scenes_cache, list) else []
-        return self.json(scenes)
+        return self.json(_addon_unreachable_payload("ai_scenes"), status_code=502)
 
 
 class SmartAgentAiSceneActionView(HomeAssistantView):
-    """AI 场景审批/拒绝接口（canonical + 迁移兼容入口）。"""
+    """AI 场景审批/拒绝接口（canonical）。"""
 
     url = "/api/v1/ai-scenes/approve"
     extra_urls = [
         "/api/v1/ai-scenes/reject",
-        *AI_SCENE_ACTION_MIGRATION_COMPAT_URLS,
     ]
     name = "api:smart_agent:v1:ai_scenes:action"
     requires_auth = True
@@ -2348,28 +2281,9 @@ class SmartAgentAiSceneActionView(HomeAssistantView):
             return err
         hass = request.app["hass"]
         _record_legacy_route_hit_if_needed(hass, request)
-        if _is_ai_scene_legacy_write_path(request) and not _ACCEPT_LEGACY_AI_SCENE_SNAKE_WRITE:
-            return self.json(
-                _legacy_reject_payload(
-                    legacy_group="ai_scene_snake_case_write",
-                    env_name="SA_ACCEPT_LEGACY_AI_SCENE_SNAKE_WRITE",
-                ),
-                status_code=410,
-            )
-        dryoff_target, _ = _legacy_dryoff_hit_target(hass, request)
-        if dryoff_target == "ai_scene_snake_write":
-            audit = _record_legacy_dryoff_block(hass, request, target_tag=dryoff_target)
-            return self.json(
-                _legacy_dryoff_reject_payload(
-                    legacy_group="ai_scene_snake_case_write",
-                    target_tag=dryoff_target,
-                    audit=audit,
-                ),
-                status_code=410,
-            )
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("ai_scene_action"), status_code=502)
 
         path = request.path.lower()
         act = "reject" if "reject" in path else "approve"
@@ -2388,36 +2302,31 @@ class SmartAgentAiSceneActionView(HomeAssistantView):
             return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("ai_scene_action"), status_code=404)
 
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                result = await _addon_client.post_ai_scene_action(act, sid)
-                if isinstance(result, dict):
-                    payload, status = _json_from_addon_result(result)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("ai_scene_action"), status_code=status)
-                    return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("ai_scene_action"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[AiSceneAction] add-on action proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("ai_scene_action"), status_code=502)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("ai_scene_action"), status_code=502)
 
-        if act == "approve":
-            await coord.async_approve_ai_scene(sid)
-        else:
-            await coord.async_reject_ai_scene(sid)
-
-        return self.json({"ok": True, "id": sid, "action": act})
+        try:
+            result = await _addon_client.post_ai_scene_action(act, sid)
+            if isinstance(result, dict):
+                payload, status = _json_from_addon_result(result)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("ai_scene_action"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("ai_scene_action"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[AiSceneAction] add-on action proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("ai_scene_action"), status_code=502)
 
 
 
 class SmartAgentAiSceneTriggerView(HomeAssistantView):
-    """AI 场景触发接口（canonical + 迁移兼容入口）。"""
+    """AI 场景触发接口（canonical）。"""
 
     url = "/api/v1/ai-scenes/{scene_id}/trigger"
-    extra_urls = AI_SCENE_TRIGGER_MIGRATION_COMPAT_URLS
     name = "api:smart_agent:v1:ai_scenes:trigger"
     requires_auth = True
 
@@ -2426,28 +2335,9 @@ class SmartAgentAiSceneTriggerView(HomeAssistantView):
             return err
         hass = request.app["hass"]
         _record_legacy_route_hit_if_needed(hass, request)
-        if _is_ai_scene_legacy_write_path(request) and not _ACCEPT_LEGACY_AI_SCENE_SNAKE_WRITE:
-            return self.json(
-                _legacy_reject_payload(
-                    legacy_group="ai_scene_snake_case_write",
-                    env_name="SA_ACCEPT_LEGACY_AI_SCENE_SNAKE_WRITE",
-                ),
-                status_code=410,
-            )
-        dryoff_target, _ = _legacy_dryoff_hit_target(hass, request)
-        if dryoff_target == "ai_scene_snake_write":
-            audit = _record_legacy_dryoff_block(hass, request, target_tag=dryoff_target)
-            return self.json(
-                _legacy_dryoff_reject_payload(
-                    legacy_group="ai_scene_snake_case_write",
-                    target_tag=dryoff_target,
-                    audit=audit,
-                ),
-                status_code=410,
-            )
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("ai_scene_trigger"), status_code=502)
 
         sid_raw = scene_id
         if not sid_raw:
@@ -2465,24 +2355,24 @@ class SmartAgentAiSceneTriggerView(HomeAssistantView):
             return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("ai_scene_trigger"), status_code=404)
 
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                result = await _addon_client.trigger_ai_scene(sid)
-                if isinstance(result, dict):
-                    payload, status = _json_from_addon_result(result)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("ai_scene_trigger"), status_code=status)
-                    return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("ai_scene_trigger"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[AiSceneTrigger] add-on trigger proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("ai_scene_trigger"), status_code=502)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("ai_scene_trigger"), status_code=502)
 
-        await coord.async_trigger_ai_scene(sid)
-        return self.json({"ok": True, "id": sid})
+        try:
+            result = await _addon_client.trigger_ai_scene(sid)
+            if isinstance(result, dict):
+                payload, status = _json_from_addon_result(result)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("ai_scene_trigger"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("ai_scene_trigger"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[AiSceneTrigger] add-on trigger proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("ai_scene_trigger"), status_code=502)
 
 
 
@@ -2534,102 +2424,39 @@ class SmartAgentSystemStatusView(HomeAssistantView):
             return 0 < numeric <= 100
 
         coord = _get_first_coordinator(hass)
-        if coord is None or not hasattr(coord, "engine"):
-            resource_metrics = await _resource_metrics()
-            return self.json({
-                "gateway": "offline",
-                "core": "offline",
-                "ha": "online",
-                "mode": "unknown",
-                "uptime_sec": 0,
-                "devices_managed": 0,
-                "active_scenes": 0,
-                "voice_provider": "unknown",
-                "cpu": resource_metrics.get("cpu", 0.0),
-                "memory": resource_metrics.get("memory", 0.0),
-                "resource_metrics": resource_metrics.get("resource_metrics", {}),
-                "compat_summary": {
-                    "any_exceeded": False,
-                    "hits_24h_total": 0,
-                    "hits_7d_total": 0,
-                    "noisy_routes_count": 0,
-                    "compat_risk_level": "low",
-                    "rollout_switches": _build_legacy_rollout_and_dryoff_payload(hass),
-                },
-            })
-
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
 
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
+        _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
+        if not is_addon_proxy:
+            if _addon_client is None:
+                return self.json(_addon_unreachable_payload("system_status"), status_code=502)
             try:
                 proxied = await _addon_client.request_json("GET", "/system/status")
                 converted = _json_from_addon_http_result(proxied)
-                if converted is not None:
-                    payload, status = converted
+                if converted is None:
+                    return self.json(_addon_unreachable_payload("system_status"), status_code=502)
+                payload, status = converted
+                if isinstance(payload, dict):
+                    payload["addon_diagnostics"] = _normalize_addon_diagnostics(payload.get("addon_diagnostics"))
+                if status < 400:
                     if isinstance(payload, dict):
-                        payload["addon_diagnostics"] = _normalize_addon_diagnostics(payload.get("addon_diagnostics"))
-                    if status < 400:
-                        payload.setdefault("ha", "online")
-                        payload.setdefault("gateway", "online")
-                        payload.setdefault("core", "online")
-                        resource_metrics = await _resource_metrics()
-                        if not _has_real_metric(payload.get("cpu")):
-                            payload["cpu"] = resource_metrics.get("cpu", 0.0)
-                        if not _has_real_metric(payload.get("memory")):
-                            payload["memory"] = resource_metrics.get("memory", 0.0)
-                        payload.setdefault("resource_metrics", resource_metrics.get("resource_metrics", {}))
-                        payload.setdefault("compat_summary", _build_compat_summary_payload(hass))
-                        try:
-                            caps = await _addon_client.get_capabilities()
-                            if isinstance(caps, dict) and caps:
-                                payload["addon_capabilities"] = caps
-                        except Exception:
-                            pass
-                        try:
-                            core_status = await _addon_client.get_core_status()
-                            if isinstance(core_status, dict) and core_status:
-                                payload["addon_core_status"] = core_status
-                        except Exception:
-                            pass
-                    return self.json(payload, status_code=status)
+                        payload.setdefault("wave_semantics", _default_wave_semantics_payload(payload.get("mode", "unknown")))
+                    payload.setdefault("ha", "online")
+                    payload.setdefault("gateway", "online")
+                    payload.setdefault("core", "online")
+                    resource_metrics = await _resource_metrics()
+                    if not _has_real_metric(payload.get("cpu")):
+                        payload["cpu"] = resource_metrics.get("cpu", 0.0)
+                    if not _has_real_metric(payload.get("memory")):
+                        payload["memory"] = resource_metrics.get("memory", 0.0)
+                    payload.setdefault("resource_metrics", resource_metrics.get("resource_metrics", {}))
+                    payload.setdefault("compat_summary", _build_compat_summary_payload(hass))
+                return self.json(payload, status_code=status)
             except Exception as exc:
                 _LOGGER.debug("[SystemStatus] add-on status proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("system_status"), status_code=502)
 
-        uptime = max(0, int(time.time() - float(getattr(coord, "_startup_time", time.time()))))
-        scenes = getattr(coord, "_ai_scenes_cache", [])
-        active_scenes = sum(1 for s in scenes if isinstance(s, dict) and s.get("status") == "active")
-        voice_provider = coord.ollama_model if coord.engine == "local" else coord.online_model
-        resource_metrics = await _resource_metrics()
-
-        try:
-            compat_summary = _build_compat_summary_payload(hass)
-        except Exception as exc:
-            _LOGGER.warning("[SystemStatus] build compat summary failed in HA fallback: %s", exc)
-            compat_summary = {
-                "any_exceeded": False,
-                "hits_24h_total": 0,
-                "hits_7d_total": 0,
-                "noisy_routes_count": 0,
-                "compat_risk_level": "unknown",
-                "rollout_switches": {},
-            }
-
-        return self.json({
-            "gateway": "online",
-            "core": "online",
-            "ha": "online",
-            "mode": coord.engine,
-            "uptime_sec": uptime,
-            "devices_managed": len(getattr(coord, "device_info", {}) or {}),
-            "active_scenes": active_scenes,
-            "voice_provider": voice_provider or "unknown",
-            "cpu": resource_metrics.get("cpu", 0.0),
-            "memory": resource_metrics.get("memory", 0.0),
-            "resource_metrics": resource_metrics.get("resource_metrics", {}),
-            "compat_summary": compat_summary,
-        })
+        return self.json(_addon_endpoint_missing_payload("system_status"), status_code=404)
 
 
 class SmartAgentCompatStatsView(HomeAssistantView):
@@ -2740,100 +2567,47 @@ class SmartAgentDashboardSummaryView(HomeAssistantView):
             return err
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
-        if coord is None:
-            return self.json({
-                "ok": True,
-                "decisions_today": 0,
-                "corrections_today": 0,
-                "action_total_7d": 0,
-                "action_success_rate_7d": 0.0,
-                "compat_summary": {
-                    "any_exceeded": False,
-                    "hits_24h_total": 0,
-                    "hits_7d_total": 0,
-                    "noisy_routes_count": 0,
-                    "compat_risk_level": "low",
-                    "rollout_switches": _build_legacy_rollout_and_dryoff_payload(hass),
-                },
-            })
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-
-        _addon_client = getattr(coord, "_addon_client", None)
+        _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
                 proxied = await _addon_client.request_json("GET", "/dashboard/summary")
                 converted = _json_from_addon_http_result(proxied)
                 if converted is not None:
                     payload, status = converted
-                    if isinstance(payload, dict):
-                        payload["addon_diagnostics"] = _normalize_addon_diagnostics(payload.get("addon_diagnostics"))
-                    if status < 400 and isinstance(payload, dict):
-                        payload.setdefault("decisions_today", 0)
-                        payload.setdefault("corrections_today", 0)
-                        payload.setdefault("action_total_7d", 0)
-                        payload.setdefault("action_success_rate_7d", 0.0)
-                        payload.setdefault("compat_summary", _build_compat_summary_payload(hass))
-                        try:
-                            caps = await _addon_client.get_capabilities()
-                            if isinstance(caps, dict) and caps:
-                                payload["addon_capabilities"] = caps
-                        except Exception:
-                            pass
-                        try:
-                            core_status = await _addon_client.get_core_status()
-                            if isinstance(core_status, dict) and core_status:
-                                payload["addon_core_status"] = core_status
-                        except Exception:
-                            pass
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("dashboard_summary"), status_code=status)
+                    if status >= 400:
+                        return self.json(payload, status_code=status)
+                    if not isinstance(payload, dict):
+                        return self.json(_addon_unreachable_payload("dashboard_summary"), status_code=502)
+                    payload["addon_diagnostics"] = _normalize_addon_diagnostics(payload.get("addon_diagnostics"))
+                    payload.setdefault("decisions_today", 0)
+                    payload.setdefault("corrections_today", 0)
+                    payload.setdefault("action_total_7d", 0)
+                    payload.setdefault("action_success_rate_7d", 0.0)
+                    try:
+                        caps = await _addon_client.get_capabilities()
+                        if isinstance(caps, dict) and caps:
+                            payload["addon_capabilities"] = caps
+                    except Exception:
+                        pass
+                    try:
+                        core_status = await _addon_client.get_core_status()
+                        if isinstance(core_status, dict) and core_status:
+                            payload["addon_core_status"] = core_status
+                    except Exception:
+                        pass
                     return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("dashboard_summary"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[DashboardSummary] add-on summary proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("dashboard_summary"), status_code=502)
 
-        def _collect() -> dict[str, Any]:
-            quality = coord._get_action_quality_stats()
-            cache_stats = coord._get_decision_cache_stats()
-            corrections = coord._get_recent_corrections(limit=5)
-            db = getattr(coord, "_db", None)
-            from datetime import date as _date
-
-            today_str = _date.today().isoformat()
-            decisions_today = 0
-            corrections_today = 0
-            if db is not None:
-                try:
-                    inf_rows = db.query(
-                        "SELECT COUNT(*) AS cnt FROM events WHERE type='AI_Inference' AND time >= ?",
-                        (today_str,),
-                    )
-                    decisions_today = int((inf_rows[0].get("cnt") if inf_rows else 0) or 0)
-                except Exception as ex:
-                    _LOGGER.debug("[DashboardSummary] 查询 decisions_today 失败: %s", ex)
-                try:
-                    cor_rows = db.query(
-                        "SELECT COUNT(*) AS cnt FROM corrections WHERE time >= ?",
-                        (today_str,),
-                    )
-                    corrections_today = int((cor_rows[0].get("cnt") if cor_rows else 0) or 0)
-                except Exception as ex:
-                    _LOGGER.debug("[DashboardSummary] 查询 corrections_today 失败: %s", ex)
-            return {
-                "device_count": len(coord.device_info),
-                "rule_count": len(coord._rules),
-                "habit_count": len(coord._habits),
-                "decisions_today": decisions_today,
-                "corrections_today": corrections_today,
-                "action_total_7d": int(quality.get("total", 0) or 0),
-                "action_success_rate_7d": float(quality.get("rate", 0) or 0),
-                "decision_cache_total": int(cache_stats.get("total", 0) or 0),
-                "decision_cache_rooms": int(cache_stats.get("rooms", 0) or 0),
-                "recent_corrections": len(corrections),
-                "compat_summary": _build_compat_summary_payload(hass),
-            }
-
-        summary = await hass.async_add_executor_job(_collect)
-        return self.json(summary)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("dashboard_summary"), status_code=404)
+        return self.json(_addon_unreachable_payload("dashboard_summary"), status_code=502)
 
 
 def _build_presence_fusion_summary(coord) -> list[dict]:
@@ -2852,8 +2626,8 @@ def _build_presence_fusion_summary(coord) -> list[dict]:
 def _build_topology_summary(coord) -> dict[str, Any]:
     """汇总 room topology 统计，供 diagnostics/UI 使用。"""
     try:
-        topo_cache = getattr(coord, "_room_topology_cache", {}) or {}
-        if isinstance(topo_cache, dict) and topo_cache:
+        topo_cache = get_room_topology_cache_snapshot(coord)
+        if topo_cache:
             rooms = sorted(str(r) for r in topo_cache.keys())
             edge_count = int(sum(len(v or set()) for v in topo_cache.values()) / 2)
             isolated = [r for r, v in topo_cache.items() if not v]
@@ -2907,65 +2681,46 @@ class SmartAgentDiagnosticsView(HomeAssistantView):
             return err
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
-        if coord is None:
-            return self.json({
-                "ok": True,
-                "compat_summary": {
-                    "any_exceeded": False,
-                    "hits_24h_total": 0,
-                    "hits_7d_total": 0,
-                    "noisy_routes_count": 0,
-                    "compat_risk_level": "low",
-                    "rollout_switches": _build_legacy_rollout_and_dryoff_payload(hass),
-                },
-                "presence_fusion_summary": [],
-                "topology_summary": {
-                    "configured_rooms": 0,
-                    "edge_count": 0,
-                    "isolated_rooms": [],
-                },
-            })
-
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
 
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json("GET", "/system/diagnostics")
-                if isinstance(proxied, dict) and int(proxied.get("status_code", 0) or 0) in (404, 405):
-                    proxied = await _addon_client.request_json("GET", "/diagnostics")
-                converted = _json_from_addon_http_result(proxied)
-                if converted is not None:
-                    payload, status = converted
-                    if isinstance(payload, dict):
-                        payload["addon_diagnostics"] = _normalize_addon_diagnostics(payload.get("addon_diagnostics"))
-                    if status < 400 and isinstance(payload, dict):
-                        payload.setdefault("compat_summary", _build_compat_summary_payload(hass))
-                        payload.setdefault("presence_fusion_summary", _build_presence_fusion_summary(coord))
-                        payload.setdefault("topology_summary", _build_topology_summary(coord))
-                        try:
-                            caps = await _addon_client.get_capabilities()
-                            if isinstance(caps, dict) and caps:
-                                payload["addon_capabilities"] = caps
-                        except Exception:
-                            pass
-                        try:
-                            core_status = await _addon_client.get_core_status()
-                            if isinstance(core_status, dict) and core_status:
-                                payload["addon_core_status"] = core_status
-                        except Exception:
-                            pass
-                    return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[Diagnostics] add-on diagnostics failed: %s", exc)
-                return self.json(_addon_unreachable_payload("system_diagnostics"), status_code=502)
+        _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("system_diagnostics"), status_code=404)
 
-        return self.json({
-            "ok": True,
-            "compat_summary": _build_compat_summary_payload(hass),
-            "presence_fusion_summary": _build_presence_fusion_summary(coord),
-            "topology_summary": _build_topology_summary(coord),
-        })
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("system_diagnostics"), status_code=502)
+        try:
+            proxied = await _addon_client.request_json("GET", "/system/diagnostics")
+            if isinstance(proxied, dict) and int(proxied.get("status_code", 0) or 0) in (404, 405):
+                proxied = await _addon_client.request_json("GET", "/diagnostics")
+            converted = _json_from_addon_http_result(proxied)
+            if converted is None:
+                return self.json(_addon_unreachable_payload("system_diagnostics"), status_code=502)
+            payload, status = converted
+            if isinstance(payload, dict):
+                payload["addon_diagnostics"] = _normalize_addon_diagnostics(payload.get("addon_diagnostics"))
+            if status < 400 and isinstance(payload, dict):
+                payload.setdefault("wave_semantics", _default_wave_semantics_payload(payload.get("mode", "unknown")))
+                payload.setdefault("compat_summary", _build_compat_summary_payload(hass))
+                payload.setdefault("presence_fusion_summary", _build_presence_fusion_summary(coord))
+                payload.setdefault("topology_summary", _build_topology_summary(coord))
+                try:
+                    caps = await _addon_client.get_capabilities()
+                    if isinstance(caps, dict) and caps:
+                        payload["addon_capabilities"] = caps
+                except Exception:
+                    pass
+                try:
+                    core_status = await _addon_client.get_core_status()
+                    if isinstance(core_status, dict) and core_status:
+                        payload["addon_core_status"] = core_status
+                except Exception:
+                    pass
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[Diagnostics] add-on diagnostics failed: %s", exc)
+            return self.json(_addon_unreachable_payload("system_diagnostics"), status_code=502)
+
 
 
 class SmartAgentSystemSettingsView(HomeAssistantView):
@@ -2982,29 +2737,31 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({})
+            return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                settings = await _addon_client.get_system_settings()
-                if isinstance(settings, dict):
-                    normalized = _json_from_addon_http_result(settings)
-                    if normalized is not None:
-                        payload, status = normalized
-                    else:
-                        payload, status = _json_from_addon_result(settings)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("settings_system_get"), status_code=status)
-                    return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[SystemSettingsGet] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("settings_system_get"), status_code=404)
 
-        return self.json(coord.get_config_attributes())
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
+
+        try:
+            settings = await _addon_client.get_system_settings()
+            if isinstance(settings, dict):
+                normalized = _json_from_addon_http_result(settings)
+                if normalized is not None:
+                    payload, status = normalized
+                else:
+                    payload, status = _json_from_addon_result(settings)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("settings_system_get"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[SystemSettingsGet] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
 
     async def post(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
@@ -3012,37 +2769,48 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(
+                _json_error_payload("coordinator_not_found", "not_found", False),
+                status_code=404,
+            )
 
         try:
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be object")
         except Exception:
-            return self.json({"ok": False, "error": "invalid JSON"}, status_code=400)
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False),
+                status_code=400,
+            )
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_system_settings(body)
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                    else:
-                        payload, status = _json_from_addon_result(proxied)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("settings_system_post"), status_code=status)
-                    return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("settings_system_post"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[SystemSettingsPost] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("settings_system_post"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("settings_system_post"), status_code=404)
 
-        await hass.services.async_call(DOMAIN, "update_config", body, blocking=True)
-        return self.json({"ok": True})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("settings_system_post"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_system_settings(body)
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                else:
+                    payload, status = _json_from_addon_result(proxied)
+                if status in (404, 405):
+                    try:
+                        await async_call_service(hass, DOMAIN, "update_config", body, blocking=True)
+                    except Exception as fallback_exc:
+                        _LOGGER.debug("[SystemSettingsPost] local fallback update_config failed: %s", fallback_exc)
+                    return self.json(_addon_endpoint_missing_payload("settings_system_post"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("settings_system_post"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[SystemSettingsPost] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("settings_system_post"), status_code=502)
 
 
 class SmartAgentAuthLoginView(HomeAssistantView):
@@ -3071,8 +2839,10 @@ class SmartAgentAuthLoginView(HomeAssistantView):
                 if isinstance(proxied, dict):
                     payload, status = _json_from_addon_result(proxied)
                     return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("auth_login"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[AuthLogin] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("auth_login"), status_code=502)
 
         user = request.get("hass_user")
         source_token = ""
@@ -3133,8 +2903,10 @@ class SmartAgentAuthMeView(HomeAssistantView):
                 if isinstance(proxied, dict):
                     payload, status = _json_from_addon_result(proxied)
                     return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("auth_me"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[AuthMe] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("auth_me"), status_code=502)
 
         user = await _resolve_user_by_auth_session(hass, session_token) if session_token else None
         auth_mode = "gateway_session"
@@ -3176,8 +2948,10 @@ class SmartAgentAuthLogoutView(HomeAssistantView):
                 if isinstance(proxied, dict):
                     payload, status = _json_from_addon_result(proxied)
                     return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("auth_logout"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[AuthLogout] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("auth_logout"), status_code=502)
 
         if session_token:
             sessions = _get_auth_sessions(hass)
@@ -3405,36 +3179,34 @@ class SmartAgentMemoryProfilesView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("memory_profiles"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("memory_profiles"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "GET",
-                    ("/memory/profiles",),
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("memory_profiles"), status_code=502)
 
-                rows = await _addon_client.get_memory_profiles()
-                payload, status = _addon_list_read_strict_response(rows, scope="memory_profiles")
+        try:
+            rows, proxied_error = await _addon_probe_list_result(
+                _addon_client,
+                "GET",
+                ("/memory/profiles",),
+            )
+            if proxied_error is not None:
+                payload, status = proxied_error
                 return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[MemoryProfiles] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("memory_profiles"), status_code=502)
+            if rows is not None:
+                return self.json(rows)
 
-        rows = [
-            {"id": idx, "content": content, "locked": bool(locked), "weight": 0}
-            for idx, (content, locked) in enumerate(getattr(coord, "_rules", []) or [])
-            if isinstance(content, str)
-        ]
-        return self.json(rows)
+            rows = await _addon_client.get_memory_profiles()
+            payload, status = _addon_list_read_strict_response(rows, scope="memory_profiles")
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[MemoryProfiles] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("memory_profiles"), status_code=502)
 
 
 class SmartAgentMemoryHabitsView(HomeAssistantView):
@@ -3450,36 +3222,23 @@ class SmartAgentMemoryHabitsView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("memory_habits"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("memory_habits"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "GET",
-                    ("/memory/habits",),
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("memory_habits"), status_code=502)
 
-                rows = await _addon_client.get_memory_habits()
-                payload, status = _addon_list_read_strict_response(rows, scope="memory_habits")
-                return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[MemoryHabits] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("memory_habits"), status_code=502)
-
-        rows = [
-            {"id": idx, "content": content, "locked": bool(locked), "score": 0}
-            for idx, (content, locked) in enumerate(getattr(coord, "_habits", []) or [])
-            if isinstance(content, str)
-        ]
-        return self.json(rows)
+        try:
+            rows = await _addon_client.get_memory_habits()
+            payload, status = _addon_list_read_strict_response(rows, scope="memory_habits")
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[MemoryHabits] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("memory_habits"), status_code=502)
 
 
 class SmartAgentLearningStatsView(HomeAssistantView):
@@ -3495,12 +3254,7 @@ class SmartAgentLearningStatsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({
-                "decisions_today": 0,
-                "corrections_today": 0,
-                "patterns_count": 0,
-                "habits_count": 0,
-            })
+            return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
@@ -3571,7 +3325,7 @@ class SmartAgentProfileActionView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("profile_action"), status_code=502)
 
         try:
             body = await request.json()
@@ -3587,25 +3341,27 @@ class SmartAgentProfileActionView(HomeAssistantView):
             return self.json({"ok": False, "error": "content required"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_profile_action(act, content)
-                if isinstance(proxied, dict):
-                    payload, status = _json_from_addon_result(proxied)
-                    return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[ProfileAction] add-on proxy failed: %s", exc)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("profile_action"), status_code=404)
 
-        if act == "add":
-            await coord.async_svc_add_rule(content)
-        elif act == "delete":
-            await coord.async_svc_delete_rule(content)
-        elif act in ("toggle-lock", "toggle_lock"):
-            await coord.async_svc_toggle_rule_lock(content)
-        else:
-            return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
-        return self.json({"ok": True, "action": act})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("profile_action"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_profile_action(act, content)
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                normalized = _json_from_addon_result(proxied) if isinstance(proxied, dict) and "__status" in proxied else None
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("profile_action"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("profile_action"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[ProfileAction] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("profile_action"), status_code=502)
 
 
 class SmartAgentHabitActionView(HomeAssistantView):
@@ -3622,7 +3378,7 @@ class SmartAgentHabitActionView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("habit_action"), status_code=502)
 
         try:
             body = await request.json()
@@ -3638,25 +3394,27 @@ class SmartAgentHabitActionView(HomeAssistantView):
             return self.json({"ok": False, "error": "content required"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_habit_action(act, content)
-                if isinstance(proxied, dict):
-                    payload, status = _json_from_addon_result(proxied)
-                    return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[HabitAction] add-on proxy failed: %s", exc)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("habit_action"), status_code=404)
 
-        if act == "add":
-            await coord.async_svc_add_habit(content)
-        elif act == "delete":
-            await coord.async_svc_delete_habit(content)
-        elif act in ("toggle-lock", "toggle_lock"):
-            await coord.async_svc_toggle_habit_lock(content)
-        else:
-            return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
-        return self.json({"ok": True, "action": act})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("habit_action"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_habit_action(act, content)
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                normalized = _json_from_addon_result(proxied) if isinstance(proxied, dict) and "__status" in proxied else None
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("habit_action"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("habit_action"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[HabitAction] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("habit_action"), status_code=502)
 
 
 class SmartAgentCorrectionsView(HomeAssistantView):
@@ -3669,62 +3427,39 @@ class SmartAgentCorrectionsView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
-        hass = request.app["hass"]
-        coord = _get_first_coordinator(hass)
+        coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("corrections"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "GET",
-                    ("/corrections",),
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("corrections"), status_code=404)
 
-                rows = await _addon_client.get_corrections()
-                payload, status = _addon_list_read_strict_response(rows, scope="corrections")
-                return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[Corrections] add-on proxy failed: %s", exc)
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("corrections"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json("GET", "/corrections")
+            if not isinstance(proxied, dict):
                 return self.json(_addon_unreachable_payload("corrections"), status_code=502)
 
-        def _collect_local_rows() -> list[dict[str, Any]]:
-            db = getattr(coord, "_db", None)
-            if db is None:
-                return []
-            try:
-                rows = db.query(
-                    "SELECT id, entity_id, scene_desc, ai_service, time FROM corrections "
-                    "ORDER BY correction_count DESC, time DESC LIMIT 200"
-                )
-            except Exception as exc:
-                _LOGGER.debug("[Corrections] local query failed: %s", exc)
-                return []
-            result: list[dict[str, Any]] = []
-            for row in rows or []:
-                if not isinstance(row, dict):
-                    continue
-                result.append(
-                    {
-                        "id": row.get("id"),
-                        "entity_id": row.get("entity_id") or "",
-                        "scene": row.get("scene_desc") or "",
-                        "action": row.get("ai_service") or "",
-                        "created_at": row.get("time") or "",
-                    }
-                )
-            return result
+            rows = _addon_result_list_body(proxied)
+            if rows is not None:
+                return self.json(rows)
 
-        rows = await hass.async_add_executor_job(_collect_local_rows)
-        return self.json(rows)
+            normalized = _json_from_addon_http_result(proxied)
+            if normalized is not None:
+                payload, status = normalized
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("corrections"), status_code=status)
+                if status >= 400:
+                    return self.json(payload, status_code=status)
+
+            return self.json(_addon_unreachable_payload("corrections"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[Corrections] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("corrections"), status_code=502)
 
 
 class SmartAgentCorrectionActionView(HomeAssistantView):
@@ -3748,47 +3483,47 @@ class SmartAgentCorrectionActionView(HomeAssistantView):
 
         entity_id = str((body or {}).get("entity_id", "") or "").strip()
 
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json(_addon_unreachable_payload("correction_action"), status_code=502)
+
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(_get_first_coordinator(request.app["hass"]), "_addon_client", None)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("correction_action"), status_code=404)
+
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("correction_action"), status_code=502)
 
         if act == "dismiss":
-            if (not is_addon_proxy) and _addon_client is not None:
-                try:
-                    proxied = await _addon_client.post_correction_action("dismiss", entity_id or None)
-                    if isinstance(proxied, dict):
-                        payload, status = _json_from_addon_result(proxied)
-                        return self.json(payload, status_code=status)
-                except Exception as exc:
-                    _LOGGER.debug("[CorrectionAction] add-on dismiss proxy failed: %s", exc)
-            payload: dict[str, Any] = {}
-            if entity_id:
-                payload["entity_id"] = entity_id
-            await request.app["hass"].services.async_call(
-                DOMAIN,
-                "dismiss_ai_action",
-                payload,
-                blocking=True,
-            )
-            return self.json({"ok": True, "action": act, "entity_id": entity_id or None})
+            try:
+                proxied = await _addon_client.post_correction_action("dismiss", entity_id or None)
+                normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+                if normalized is None:
+                    return self.json(_addon_unreachable_payload("correction_action"), status_code=502)
+                payload, status = normalized
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("correction_action"), status_code=status)
+                return self.json(payload, status_code=status)
+            except Exception as exc:
+                _LOGGER.debug("[CorrectionAction] add-on dismiss proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("correction_action"), status_code=502)
 
         if act == "report":
             if not entity_id:
                 return self.json({"ok": False, "error": "entity_id required"}, status_code=400)
-            if (not is_addon_proxy) and _addon_client is not None:
-                try:
-                    proxied = await _addon_client.post_correction_action("report", entity_id)
-                    if isinstance(proxied, dict):
-                        payload, status = _json_from_addon_result(proxied)
-                        return self.json(payload, status_code=status)
-                except Exception as exc:
-                    _LOGGER.debug("[CorrectionAction] add-on report proxy failed: %s", exc)
-            await request.app["hass"].services.async_call(
-                DOMAIN,
-                "report_correction",
-                {"entity_id": entity_id},
-                blocking=True,
-            )
-            return self.json({"ok": True, "action": act, "entity_id": entity_id})
+            try:
+                proxied = await _addon_client.post_correction_action("report", entity_id)
+                normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+                if normalized is None:
+                    return self.json(_addon_unreachable_payload("correction_action"), status_code=502)
+                payload, status = normalized
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("correction_action"), status_code=status)
+                return self.json(payload, status_code=status)
+            except Exception as exc:
+                _LOGGER.debug("[CorrectionAction] add-on report proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("correction_action"), status_code=502)
 
         return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
 
@@ -3805,213 +3540,39 @@ class SmartAgentTransactionsView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json([])
-
-        status_filter = str(request.query.get("status", "") or "").strip().lower()
-        scene_filter = str(request.query.get("scene", "") or "").strip().lower()
-        keyword_filter = str(request.query.get("keyword", "") or "").strip().lower()
-        from_filter = str(request.query.get("from", "") or "").strip()
-        to_filter = str(request.query.get("to", "") or "").strip()
-
-        def _parse_query_bool(name: str) -> bool:
-            raw = str(request.query.get(name, "") or "").strip().lower()
-            return raw in {"1", "true", "yes", "on"}
-
-        has_failed_filter = _parse_query_bool("has_failed")
-        has_blocked_filter = _parse_query_bool("has_blocked")
-
-        def _parse_time_filter(raw: str, *, is_end: bool) -> datetime | None:
-            text = str(raw or "").strip()
-            if not text:
-                return None
-            normalized = text.replace("Z", "+00:00")
-            parsed: datetime | None = None
-            try:
-                parsed = datetime.fromisoformat(normalized)
-            except Exception:
-                parsed = None
-            if parsed is None:
-                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                    try:
-                        parsed = datetime.strptime(text, fmt)
-                        if fmt == "%Y-%m-%d" and is_end:
-                            parsed = parsed + timedelta(days=1) - timedelta(seconds=1)
-                        break
-                    except Exception:
-                        continue
-            if parsed is None:
-                return None
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-            return parsed
-
-        from_dt = _parse_time_filter(from_filter, is_end=False)
-        to_dt = _parse_time_filter(to_filter, is_end=True)
-
-        def _extract_row_created_at(row: dict[str, Any]) -> datetime | None:
-            raw = row.get("created_at")
-            if raw in (None, ""):
-                raw = row.get("time")
-            if raw in (None, ""):
-                return None
-            if isinstance(raw, (int, float)):
-                try:
-                    return datetime.fromtimestamp(float(raw))
-                except Exception:
-                    return None
-            text = str(raw).strip()
-            if not text:
-                return None
-            normalized = text.replace("Z", "+00:00")
-            parsed: datetime | None = None
-            try:
-                parsed = datetime.fromisoformat(normalized)
-            except Exception:
-                parsed = None
-            if parsed is None:
-                for fmt in (
-                    "%Y-%m-%d %H:%M:%S.%f",
-                    "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%d %H:%M",
-                    "%Y-%m-%d",
-                ):
-                    try:
-                        parsed = datetime.strptime(text, fmt)
-                        break
-                    except Exception:
-                        continue
-            if parsed is None:
-                return None
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-            return parsed
-
-        def _safe_int(value: Any) -> int:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return 0
+            return self.json(_addon_unreachable_payload("transactions"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
 
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "GET",
-                    ("/transactions",),
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    source_rows = rows
-                else:
-                    txns = await _addon_client.get_transactions()
-                    source_rows: list[dict[str, Any]] | None = None
-                    proxied = _addon_result_payload_status(txns if isinstance(txns, dict) else None)
-                    if proxied is not None:
-                        payload, status = proxied
-                        if status in (404, 405):
-                            return self.json(_addon_endpoint_missing_payload("transactions"), status_code=status)
-                        return self.json(payload, status_code=status)
-                    if source_rows is None:
-                        if isinstance(txns, list):
-                            source_rows = [r for r in txns if isinstance(r, dict)]
-                        elif isinstance(txns, dict):
-                            parsed_rows = _addon_result_list_body(txns)
-                            if parsed_rows is not None:
-                                source_rows = parsed_rows
-                    if source_rows is None:
-                        return self.json(_addon_unreachable_payload("transactions"), status_code=502)
+                proxied = await _addon_client.request_json("GET", "/transactions")
+                if not isinstance(proxied, dict):
+                    return self.json(_addon_unreachable_payload("transactions"), status_code=502)
 
-                def _match_row(row: dict[str, Any]) -> bool:
-                    row_status = str(row.get("status", "") or "").strip().lower()
-                    row_scene = str(row.get("scene", "") or row.get("scene_desc", "") or "").strip().lower()
-                    row_id = str(row.get("transaction_id", "") or row.get("id", "") or "").strip().lower()
-                    row_created = _extract_row_created_at(row)
-                    haystack = " ".join(
-                        [
-                            row_scene,
-                            row_status,
-                            row_id,
-                            str(row.get("trigger_summary", "") or "").strip().lower(),
-                            str(row.get("result_json", "") or "").strip().lower(),
-                        ]
-                    )
-                    if status_filter and row_status != status_filter:
-                        return False
-                    if scene_filter and scene_filter not in row_scene:
-                        return False
-                    if keyword_filter and keyword_filter not in haystack:
-                        return False
-                    if from_dt is not None:
-                        if row_created is None or row_created < from_dt:
-                            return False
-                    if to_dt is not None:
-                        if row_created is None or row_created > to_dt:
-                            return False
-                    row_failed_count = _safe_int(row.get("failed_count", 0))
-                    row_blocked_count = _safe_int(row.get("blocked_count", 0))
-                    if has_failed_filter and not (row_failed_count > 0 or row_status == "failed"):
-                        return False
-                    if has_blocked_filter and not (row_blocked_count > 0 or row_status == "blocked"):
-                        return False
-                    return True
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is None:
+                    return self.json(_addon_unreachable_payload("transactions"), status_code=502)
+                payload, status = normalized
 
-                filtered_rows = [
-                    {k: v for k, v in row.items() if k != "pre_states_json"}
-                    for row in source_rows
-                    if _match_row(row)
-                ]
-                return self.json(filtered_rows)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("transactions"), status_code=status)
+
+                if 200 <= status < 300:
+                    raw_body = proxied.get("body")
+                    if isinstance(raw_body, list):
+                        return self.json(raw_body, status_code=status)
+                    if isinstance(raw_body, dict) and isinstance(raw_body.get("data"), list):
+                        return self.json(raw_body, status_code=status)
+                    return self.json(_addon_unreachable_payload("transactions"), status_code=502)
+
+                return self.json(payload, status_code=status)
             except Exception as exc:
                 _LOGGER.debug("[Transactions] add-on transactions proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("transactions"), status_code=502)
 
-        txns = coord._transactions_cache if isinstance(coord._transactions_cache, list) else []
-
-        def _match_local(row: dict[str, Any]) -> bool:
-            row_status = str(row.get("status", "") or "").strip().lower()
-            row_scene = str(row.get("scene_desc", "") or row.get("scene", "") or "").strip().lower()
-            row_id = str(row.get("transaction_id", "") or row.get("id", "") or "").strip().lower()
-            row_created = _extract_row_created_at(row)
-            haystack = " ".join(
-                [
-                    row_scene,
-                    row_status,
-                    row_id,
-                    str(row.get("trigger_summary", "") or "").strip().lower(),
-                    str(row.get("result_json", "") or "").strip().lower(),
-                ]
-            )
-            if status_filter and row_status != status_filter:
-                return False
-            if scene_filter and scene_filter not in row_scene:
-                return False
-            if keyword_filter and keyword_filter not in haystack:
-                return False
-            if from_dt is not None:
-                if row_created is None or row_created < from_dt:
-                    return False
-            if to_dt is not None:
-                if row_created is None or row_created > to_dt:
-                    return False
-            row_failed_count = _safe_int(row.get("failed_count", 0))
-            row_blocked_count = _safe_int(row.get("blocked_count", 0))
-            if has_failed_filter and not (row_failed_count > 0 or row_status == "failed"):
-                return False
-            if has_blocked_filter and not (row_blocked_count > 0 or row_status == "blocked"):
-                return False
-            return True
-
-        result = [
-            {k: v for k, v in t.items() if k != "pre_states_json"}
-            for t in txns
-            if isinstance(t, dict) and _match_local(t)
-        ]
-        return self.json(result)
+        return self.json(_addon_unreachable_payload("transactions"), status_code=502)
 
 
 class SmartAgentTransactionDetailView(HomeAssistantView):
@@ -4064,6 +3625,65 @@ class SmartAgentTransactionDetailView(HomeAssistantView):
                 _LOGGER.debug("[TransactionsDetail] add-on detail proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("transactions_detail"), status_code=502)
 
+        return self.json(_addon_unreachable_payload("transactions_detail"), status_code=502)
+
+
+class SmartAgentDecisionTraceView(HomeAssistantView):
+    """统一 Decision Trace 读取接口（最小聚合视图）。"""
+
+    url = "/api/v1/decision-trace/{txn_id}"
+    name = "api:smart_agent:v1:decision-trace:detail"
+    requires_auth = True
+
+    async def get(self, request: web.Request, txn_id: str | None = None) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json(
+                _json_error_payload("coordinator_not_found", "not_found", False),
+                status_code=404,
+            )
+
+        try:
+            tid = int(txn_id)
+        except (TypeError, ValueError):
+            return self.json(
+                _json_error_payload("invalid_transaction_id", "bad_request", False),
+                status_code=400,
+            )
+        if tid <= 0:
+            return self.json(
+                _json_error_payload("invalid_transaction_id", "bad_request", False),
+                status_code=400,
+            )
+
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        _addon_client = getattr(coord, "_addon_client", None)
+        if (not is_addon_proxy) and _addon_client is not None:
+            try:
+                get_trace = getattr(_addon_client, "get_decision_trace_detail", None)
+                if callable(get_trace):
+                    proxied = await get_trace(tid)
+                else:
+                    proxied = await _addon_client.request_json("GET", f"/decision-trace/{tid}")
+                if isinstance(proxied, dict):
+                    normalized = _json_from_addon_http_result(proxied)
+                    if normalized is not None:
+                        payload, status = normalized
+                        if status in (404, 405):
+                            return self.json(_addon_endpoint_missing_payload("decision_trace_detail"), status_code=status)
+                        return self.json(payload, status_code=status)
+                    else:
+                        return self.json(_addon_unreachable_payload("decision_trace_detail"), status_code=502)
+                return self.json(_addon_unreachable_payload("decision_trace_detail"), status_code=502)
+            except Exception as exc:
+                _LOGGER.debug("[DecisionTrace] add-on detail proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("decision_trace_detail"), status_code=502)
+
+        if not is_addon_proxy:
+            return self.json(_addon_unreachable_payload("decision_trace_detail"), status_code=502)
+
         txns = coord._transactions_cache if isinstance(coord._transactions_cache, list) else []
         detail = next(
             (
@@ -4075,9 +3695,58 @@ class SmartAgentTransactionDetailView(HomeAssistantView):
             None,
         )
         if detail is None:
-            return self.json({"ok": False, "error": "transaction not found"}, status_code=404)
-        return self.json(detail)
+            return self.json(
+                _json_error_payload("trace_not_found", "not_found", False),
+                status_code=404,
+            )
 
+        raw_actions = detail.get("result_json", detail.get("actions", []))
+        if isinstance(raw_actions, str):
+            try:
+                raw_actions = json.loads(raw_actions)
+            except Exception:
+                raw_actions = []
+        if not isinstance(raw_actions, list):
+            raw_actions = []
+
+        _status = detail.get("status", "")
+        _created_at = detail.get("created_at", detail.get("time", ""))
+        _confidence = detail.get("confidence", 0)
+        _action_count = detail.get("action_count", 0)
+        _blocked_count = detail.get("blocked_count", 0)
+        _failed_count = detail.get("failed_count", 0)
+
+        trace_payload = {
+            "trace_version": "1.0",
+            "trace_source": "ha_local_cache",
+            "transaction_id": tid,
+            "trigger": detail.get("trigger_summary", ""),
+            "scene": detail.get("scene_desc", detail.get("scene", "")),
+            "status": _status,
+            "summary": {
+                "status": _status,
+                "confidence": _confidence,
+                "action_count": _action_count,
+                "blocked_count": _blocked_count,
+                "failed_count": _failed_count,
+                "created_at": _created_at,
+            },
+            "context_snapshot": {
+                "confidence": _confidence,
+                "action_count": _action_count,
+                "blocked_count": _blocked_count,
+                "failed_count": _failed_count,
+                "created_at": _created_at,
+            },
+            "actions": raw_actions,
+            "verification": {
+                "blocked_count": _blocked_count,
+                "failed_count": _failed_count,
+            },
+            "final_outcome": _status,
+            "raw": detail,
+        }
+        return self.json(trace_payload)
 
 class SmartAgentTransactionRollbackView(HomeAssistantView):
     """事务回滚接口。"""
@@ -4142,8 +3811,7 @@ class SmartAgentTransactionRollbackView(HomeAssistantView):
                 _LOGGER.debug("[TxnRollback] add-on rollback proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("transactions_rollback"), status_code=502)
 
-        await coord.async_rollback_transaction(tid)
-        return self.json({"ok": True, "id": tid})
+        return self.json(_addon_unreachable_payload("transactions_rollback"), status_code=502)
 
 
 class SmartAgentEnergyView(HomeAssistantView):
@@ -4158,41 +3826,45 @@ class SmartAgentEnergyView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None or isinstance(coord, bool):
-            return self.json([])
+            return self.json(_addon_unreachable_payload("energy"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "GET",
-                    ("/energy",),
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("energy"), status_code=404)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("energy"), status_code=502)
+
+        try:
+            rows, proxied_error = await _addon_probe_list_result(
+                _addon_client,
+                "GET",
+                ("/energy",),
+            )
+            if proxied_error is not None:
+                payload, status = proxied_error
+                return self.json(payload, status_code=status)
+            if rows is not None:
+                return self.json(rows)
+
+            stats = await _addon_client.get_energy()
+            proxied = _addon_result_payload_status(stats if isinstance(stats, dict) else None)
+            if proxied is not None:
+                payload, status = proxied
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("energy"), status_code=status)
+                return self.json(payload, status_code=status)
+            if isinstance(stats, list):
+                return self.json(stats)
+            if isinstance(stats, dict):
+                rows = _addon_result_list_body(stats)
                 if rows is not None:
                     return self.json(rows)
+        except Exception as exc:
+            _LOGGER.debug("[Energy] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("energy"), status_code=502)
 
-                stats = await _addon_client.get_energy()
-                proxied = _addon_result_payload_status(stats if isinstance(stats, dict) else None)
-                if proxied is not None:
-                    payload, status = proxied
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("energy"), status_code=status)
-                    return self.json(payload, status_code=status)
-                if isinstance(stats, list):
-                    return self.json(stats)
-                if isinstance(stats, dict):
-                    rows = _addon_result_list_body(stats)
-                    if rows is not None:
-                        return self.json(rows)
-            except Exception as exc:
-                _LOGGER.debug("[Energy] add-on proxy failed: %s", exc)
-
-        stats = coord._energy_stats if isinstance(coord._energy_stats, list) else []
-        return self.json(stats)
+        return self.json(_addon_unreachable_payload("energy"), status_code=502)
 
 
 class SmartAgentLicenseStatusView(HomeAssistantView):
@@ -4207,7 +3879,7 @@ class SmartAgentLicenseStatusView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({})
+            return self.json(_addon_unreachable_payload("license_status"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
@@ -4218,20 +3890,17 @@ class SmartAgentLicenseStatusView(HomeAssistantView):
                     normalized = _json_from_addon_http_result(status)
                     if normalized is not None:
                         payload, status_code = normalized
-                        return self.json(payload, status_code=status_code)
-                    payload, status_code = _json_from_addon_result(status)
+                    else:
+                        payload, status_code = _json_from_addon_result(status)
+                    if status_code in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("license_status"), status_code=status_code)
                     return self.json(payload, status_code=status_code)
+                return self.json(_addon_unreachable_payload("license_status"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[LicenseStatus] add-on proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("license_status"), status_code=502)
 
-        get_license_status = getattr(coord, "get_license_status", None)
-        if callable(get_license_status):
-            try:
-                return self.json(get_license_status() or {})
-            except Exception as exc:
-                _LOGGER.debug("[LicenseStatus] local status failed: %s", exc)
-        return self.json({})
+        return self.json(_addon_endpoint_missing_payload("license_status"), status_code=404)
 
 
 class SmartAgentLicenseVerifyView(HomeAssistantView):
@@ -4247,7 +3916,7 @@ class SmartAgentLicenseVerifyView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("license_verify"), status_code=502)
 
         try:
             body = await request.json()
@@ -4269,15 +3938,12 @@ class SmartAgentLicenseVerifyView(HomeAssistantView):
                     if status in (404, 405):
                         return self.json(_addon_endpoint_missing_payload("license_verify"), status_code=status)
                     return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("license_verify"), status_code=502)
+                return self.json(_addon_unreachable_payload("license_verify"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[LicenseVerify] add-on proxy failed: %s", exc)
                 return self.json(_addon_unreachable_payload("license_verify"), status_code=502)
 
-        result = await coord.async_verify_license(key=key)
-        return self.json(result or {})
-
+        return self.json(_addon_endpoint_missing_payload("license_verify"), status_code=404)
 
 class SmartAgentBackupsView(HomeAssistantView):
     """备份列表接口。"""
@@ -4292,7 +3958,7 @@ class SmartAgentBackupsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("backups"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
@@ -4324,13 +3990,9 @@ class SmartAgentBackupsView(HomeAssistantView):
                         return self.json(rows)
             except Exception as exc:
                 _LOGGER.debug("[Backups] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("backups"), status_code=502)
 
-        backup_mgr = getattr(coord, "_backup_manager", None)
-        if backup_mgr and hasattr(backup_mgr, "list_backups"):
-            backups = await hass.async_add_executor_job(backup_mgr.list_backups)
-        else:
-            backups = []
-        return self.json(backups or [])
+        return self.json(_addon_unreachable_payload("backups"), status_code=502)
 
 
 class SmartAgentBackupsActionView(HomeAssistantView):
@@ -4343,10 +4005,9 @@ class SmartAgentBackupsActionView(HomeAssistantView):
     async def post(self, request: web.Request, action: str) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
-        hass = request.app["hass"]
-        coord = _get_first_coordinator(hass)
+        coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("backups_action"), status_code=502)
 
         try:
             body = await request.json()
@@ -4355,60 +4016,27 @@ class SmartAgentBackupsActionView(HomeAssistantView):
 
         act = action.strip().lower()
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("backups_action"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_backup_action(act, body if isinstance(body, dict) else {})
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                    else:
-                        payload, status = _json_from_addon_result(proxied)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("backups_action"), status_code=status)
-                    return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("backups_action"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[BackupsAction] add-on proxy failed: %s", exc)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("backups_action"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_backup_action(act, body if isinstance(body, dict) else {})
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                normalized = _json_from_addon_result(proxied) if isinstance(proxied, dict) and "__status" in proxied else None
+            if normalized is None:
                 return self.json(_addon_unreachable_payload("backups_action"), status_code=502)
-
-        backup_mgr = getattr(coord, "_backup_manager", None)
-        if backup_mgr is None:
-            return self.json({"ok": False, "error": "backup manager unavailable"}, status_code=503)
-
-        if act == "create":
-            level = str((body or {}).get("level", "standard") or "standard")
-            note = str((body or {}).get("note", "") or "")
-            pwd = note or "smartagent"
-            result = await backup_mgr.backup_now(password=pwd, level=level)
-            return self.json(result or {})
-        if act == "restore":
-            backup_id = str((body or {}).get("backup_id", "") or "")
-            pwd = str((body or {}).get("password", "smartagent") or "smartagent")
-            result = await backup_mgr.restore_backup(backup_id=backup_id, password=pwd)
-            return self.json(result or {})
-        if act == "delete":
-            backup_id = str((body or {}).get("backup_id", "") or "").strip()
-            if not backup_id:
-                return self.json({"ok": False, "error": "backup_id required"}, status_code=400)
-
-            def _delete_local() -> bool:
-                import os as _os
-                backup_dir = _os.path.join(hass.config.config_dir, "smart_agent_backups")
-                fpath = _os.path.join(backup_dir, f"{backup_id}.enc")
-                if not _os.path.exists(fpath):
-                    return False
-                _os.remove(fpath)
-                return True
-
-            deleted = await hass.async_add_executor_job(_delete_local)
-            if not deleted:
-                return self.json({"ok": False, "error": "backup not found"}, status_code=404)
-            return self.json({"ok": True, "action": "delete", "backup_id": backup_id})
-
-        return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("backups_action"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[BackupsAction] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("backups_action"), status_code=502)
 
 
 class SmartAgentAiSceneOpsView(HomeAssistantView):
@@ -4443,8 +4071,10 @@ class SmartAgentAiSceneOpsView(HomeAssistantView):
                 if isinstance(proxied, dict):
                     payload, status = _json_from_addon_result(proxied)
                     return self.json(payload, status_code=status)
+                return self.json(_addon_unreachable_payload("ai_scene_ops"), status_code=502)
             except Exception as exc:
                 _LOGGER.debug("[AiSceneOps] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("ai_scene_ops"), status_code=502)
 
         if path.endswith("/analyze"):
             await coord.async_run_pattern_analysis()
@@ -4473,7 +4103,7 @@ class SmartAgentModeView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("mode"), status_code=502)
 
         try:
             body = await request.json()
@@ -4485,23 +4115,25 @@ class SmartAgentModeView(HomeAssistantView):
             return self.json(_json_error_payload("invalid mode", "validation_error", False), status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json("POST", "/mode", body={"mode": mode})
-                normalized = _json_from_addon_http_result(proxied)
-                if normalized is not None:
-                    payload, status = normalized
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("mode"), status_code=status)
-                    return self.json(payload, status_code=status)
-                return self.json(_addon_unreachable_payload("mode"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[Mode] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("mode"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("mode"), status_code=404)
 
-        await coord.async_set_mode(mode)
-        return self.json({"ok": True, "mode": mode})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("mode"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json("POST", "/mode", body={"mode": mode})
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("mode"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("mode"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[Mode] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("mode"), status_code=502)
 
 
 class SmartAgentShowroomSceneView(HomeAssistantView):
@@ -4516,7 +4148,7 @@ class SmartAgentShowroomSceneView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
 
         try:
             body = await request.json()
@@ -4528,35 +4160,33 @@ class SmartAgentShowroomSceneView(HomeAssistantView):
         is_command = bool((body or {}).get("is_command", False))
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json(
-                    "POST",
-                    "/showroom/scene",
-                    body={
-                        "scene": scene,
-                        "custom_prompt": custom_prompt,
-                        "is_command": is_command,
-                    },
-                )
-                normalized = _json_from_addon_http_result(proxied)
-                if normalized is not None:
-                    payload, status = normalized
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("showroom_scene"), status_code=status)
-                    return self.json(payload, status_code=status)
-                return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[ShowroomScene] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("showroom_scene"), status_code=404)
 
-        await coord.async_set_showroom_scene(
-            scene_key=scene,
-            custom_prompt=custom_prompt,
-            is_command=is_command,
-        )
-        return self.json({"ok": True, "scene": scene, "is_command": is_command})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json(
+                "POST",
+                "/showroom/scene",
+                body={
+                    "scene": scene,
+                    "custom_prompt": custom_prompt,
+                    "is_command": is_command,
+                },
+            )
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("showroom_scene"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[ShowroomScene] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("showroom_scene"), status_code=502)
 
 
 class SmartAgentShowroomSceneConfigView(HomeAssistantView):
@@ -4571,7 +4201,7 @@ class SmartAgentShowroomSceneConfigView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
 
         try:
             body = await request.json()
@@ -4590,33 +4220,29 @@ class SmartAgentShowroomSceneConfigView(HomeAssistantView):
             "hint": (body or {}).get("hint"),
         }
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.request_json(
-                    "POST",
-                    "/showroom/scene-config",
-                    body=patch_body,
-                )
-                normalized = _json_from_addon_http_result(proxied)
-                if normalized is not None:
-                    payload, status = normalized
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("showroom_scene_config"), status_code=status)
-                    return self.json(payload, status_code=status)
-                return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[ShowroomSceneConfig] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("showroom_scene_config"), status_code=404)
 
-        await coord.async_update_showroom_scene_config(
-            scene_key=scene_key,
-            label=patch_body.get("label"),
-            virtual_time=patch_body.get("virtual_time"),
-            scene_desc=patch_body.get("scene_desc"),
-            hint=patch_body.get("hint"),
-        )
-        return self.json({"ok": True, "scene_key": scene_key})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
+
+        try:
+            proxied = await _addon_client.request_json(
+                "POST",
+                "/showroom/scene-config",
+                body=patch_body,
+            )
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("showroom_scene_config"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[ShowroomSceneConfig] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("showroom_scene_config"), status_code=502)
 
 
 class SmartAgentPatrolTriggerView(HomeAssistantView):
@@ -4631,30 +4257,30 @@ class SmartAgentPatrolTriggerView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_patrol_trigger()
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                    else:
-                        payload, status = _json_from_addon_result(proxied)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("patrol_trigger"), status_code=status)
-                    return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[PatrolTrigger] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("patrol_trigger"), status_code=404)
 
-        await coord.async_run_pattern_analysis()
-        return self.json({"ok": True})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_patrol_trigger()
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
+                normalized = _json_from_addon_result(proxied) if isinstance(proxied, dict) and "__status" in proxied else None
+            if normalized is None:
+                return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("patrol_trigger"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[PatrolTrigger] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
 
 
 class SmartAgentDevicePairStartView(HomeAssistantView):
@@ -4935,36 +4561,33 @@ class SmartAgentVisionCamerasView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("vision_cameras"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "GET",
-                    ("/vision/cameras",),
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("vision_cameras"), status_code=404)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("vision_cameras"), status_code=502)
 
-                cameras = await _addon_client.get_vision_cameras()
-                payload, status = _addon_list_read_strict_response(cameras, scope="vision_cameras")
+        try:
+            rows, proxied_error = await _addon_probe_list_result(
+                _addon_client,
+                "GET",
+                ("/vision/cameras",),
+            )
+            if proxied_error is not None:
+                payload, status = proxied_error
                 return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[VisionCameras] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("vision_cameras"), status_code=502)
+            if rows is not None:
+                return self.json(rows)
 
-        def _db_query():
-            rows = coord._db.query("SELECT * FROM frigate_cameras ORDER BY created_at DESC")
-            return [dict(r) for r in (rows or [])]
-
-        cameras = await hass.async_add_executor_job(_db_query)
-        return self.json(cameras)
+            cameras = await _addon_client.get_vision_cameras()
+            payload, status = _addon_list_read_strict_response(cameras, scope="vision_cameras")
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[VisionCameras] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("vision_cameras"), status_code=502)
 
 
 class SmartAgentVisionCamerasActionView(HomeAssistantView):
@@ -5022,7 +4645,7 @@ class SmartAgentVisionCamerasActionView(HomeAssistantView):
             for k in ("friendly_name", "rtsp_url"):
                 if not str((body or {}).get(k, "") or "").strip():
                     return self.json({"ok": False, "error": f"{k} required"}, status_code=400)
-            await hass.services.async_call(DOMAIN, "register_frigate_camera", {
+            await async_call_service(hass, DOMAIN, "register_frigate_camera", {
                 "friendly_name": str(body.get("friendly_name", "") or "").strip(),
                 "rtsp_url": str(body.get("rtsp_url", "") or "").strip(),
                 "room": str(body.get("room", "") or "").strip(),
@@ -5037,7 +4660,7 @@ class SmartAgentVisionCamerasActionView(HomeAssistantView):
             camera_id = str((body or {}).get("camera_id", "") or "").strip()
             if not camera_id:
                 return self.json({"ok": False, "error": "camera_id required"}, status_code=400)
-            await hass.services.async_call(DOMAIN, "delete_frigate_camera", {"camera_id": camera_id}, blocking=True)
+            await async_call_service(hass, DOMAIN, "delete_frigate_camera", {"camera_id": camera_id}, blocking=True)
             return self.json({"ok": True, "action": "delete", "camera_id": camera_id})
 
         return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
@@ -5057,7 +4680,7 @@ class SmartAgentVisionZonesView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json([])
+            return self.json(_addon_unreachable_payload("vision_zones"), status_code=502)
 
         try:
             body = await request.json()
@@ -5069,33 +4692,30 @@ class SmartAgentVisionZonesView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                rows, proxied_error = await _addon_probe_list_result(
-                    _addon_client,
-                    "POST",
-                    ("/vision/zones",),
-                    {"camera_id": camera_id},
-                )
-                if proxied_error is not None:
-                    payload, status = proxied_error
-                    return self.json(payload, status_code=status)
-                if rows is not None:
-                    return self.json(rows)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("vision_zones"), status_code=404)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("vision_zones"), status_code=502)
 
-                zones = await _addon_client.get_vision_zones(camera_id)
-                payload, status = _addon_list_read_strict_response(zones, scope="vision_zones")
+        try:
+            rows, proxied_error = await _addon_probe_list_result(
+                _addon_client,
+                "POST",
+                ("/vision/zones",),
+                {"camera_id": camera_id},
+            )
+            if proxied_error is not None:
+                payload, status = proxied_error
                 return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[VisionZones] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("vision_zones"), status_code=502)
+            if rows is not None:
+                return self.json(rows)
 
-        def _db_query():
-            rows = coord._db.query("SELECT zone_id, friendly_name, room FROM frigate_zones WHERE camera_id=?", (camera_id,))
-            return [dict(r) for r in (rows or [])]
-
-        zones = await hass.async_add_executor_job(_db_query)
-        return self.json(zones)
+            zones = await _addon_client.get_vision_zones(camera_id)
+            payload, status = _addon_list_read_strict_response(zones, scope="vision_zones")
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[VisionZones] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("vision_zones"), status_code=502)
 
 
 class SmartAgentVisionZonesSaveView(HomeAssistantView):
@@ -5180,39 +4800,31 @@ class SmartAgentMcpStatusView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({"enabled": True, "endpoint": "/api/smart_agent/mcp", "tools": []})
+            return self.json(_addon_unreachable_payload("mcp_status"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                status = await _addon_client.get_mcp_status()
-                if isinstance(status, dict):
-                    normalized = _json_from_addon_http_result(status)
-                    if normalized is not None:
-                        payload, status_code = normalized
-                    else:
-                        payload, status_code = _json_from_addon_result(status)
-                    return self.json(payload, status_code=status_code)
-            except Exception as exc:
-                _LOGGER.debug("[McpStatus] add-on proxy failed: %s", exc)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("mcp_status"), status_code=404)
 
-        cfg = coord.get_config_attributes() if hasattr(coord, "get_config_attributes") else {}
-        enabled = bool(cfg.get("mcp_enabled", True))
-        tools = [
-            "smart_control",
-            "smart_device_list",
-            "smart_recent_decisions",
-            "smart_decision_stats",
-            "smart_correction_analysis",
-            "smart_room_status",
-            "smart_health_check",
-        ]
-        return self.json({
-            "enabled": enabled,
-            "endpoint": "/api/smart_agent/mcp",
-            "tools": tools,
-        })
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("mcp_status"), status_code=502)
+
+        try:
+            status = await _addon_client.get_mcp_status()
+            if isinstance(status, dict):
+                normalized = _json_from_addon_http_result(status)
+                if normalized is not None:
+                    payload, status_code = normalized
+                else:
+                    payload, status_code = _json_from_addon_result(status)
+                if status_code in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("mcp_status"), status_code=status_code)
+                return self.json(payload, status_code=status_code)
+            return self.json(_addon_unreachable_payload("mcp_status"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[McpStatus] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("mcp_status"), status_code=502)
 
 
 class SmartAgentMcpSettingsView(HomeAssistantView):
@@ -5229,28 +4841,152 @@ class SmartAgentMcpSettingsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(
+                _json_error_payload("coordinator_not_found", "not_found", False),
+                status_code=404,
+            )
 
         try:
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("JSON body must be object")
         except Exception:
-            return self.json({"ok": False, "error": "invalid JSON"}, status_code=400)
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False),
+                status_code=400,
+            )
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_mcp_settings(body)
-                if isinstance(proxied, dict):
-                    payload, status = _json_from_addon_result(proxied)
-                    return self.json(payload, status_code=status)
-            except Exception as exc:
-                _LOGGER.debug("[McpSettings] add-on proxy failed: %s", exc)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("mcp_settings"), status_code=404)
 
-        await hass.services.async_call(DOMAIN, "update_config", body, blocking=True)
-        return self.json({"ok": True})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("mcp_settings"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_mcp_settings(body)
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
+                else:
+                    payload, status = _json_from_addon_result(proxied)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("mcp_settings"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("mcp_settings"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[McpSettings] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("mcp_settings"), status_code=502)
+
+
+class SmartAgentHaExecuteView(HomeAssistantView):
+    """HA 宿主执行边界：统一承接 CommandEnvelope。"""
+
+    url = "/api/v1/ha/execute"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:ha:execute"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False),
+                status_code=400,
+            )
+
+        if not isinstance(body, dict):
+            return self.json(
+                _json_error_payload("invalid_body", "bad_request", False),
+                status_code=400,
+            )
+
+        result = await async_execute_command_envelope(request.app["hass"], body)
+        status_code = 200 if bool(result.get("ok")) else 409
+        error_type = str(result.get("error_type") or "")
+        if error_type in {"bad_request", "safety_blocked"}:
+            status_code = 400
+        payload = dict(result)
+        payload["execution_path"] = "ha_execute_adapter"
+        return self.json(payload, status_code=status_code)
+
+
+class SmartAgentCapabilityDryRunView(HomeAssistantView):
+    """P5-C capability dry-run：仅输出建议与拒绝原因，不执行真实动作。"""
+
+    url = "/api/v1/capability/dry-run"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:capability:dry_run"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        hass = request.app["hass"]
+        coord = _get_first_coordinator(hass)
+        if coord is None:
+            return self.json(
+                _json_error_payload("coordinator_not_found", "not_found", False),
+                status_code=404,
+            )
+
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("JSON body must be object")
+        except Exception:
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False),
+                status_code=400,
+            )
+
+        capability = str(body.get("capability") or "").strip().lower()
+        if capability not in {"security", "vacuum", "appliance"}:
+            return self.json(
+                _json_error_payload(
+                    "invalid_capability",
+                    "validation_error",
+                    False,
+                    details={"allowed": ["security", "vacuum", "appliance"]},
+                ),
+                status_code=400,
+            )
+
+        payload = {
+            "capability": capability,
+            "dry_run": bool(body.get("dry_run", True)),
+            "context": body.get("context") if isinstance(body.get("context"), dict) else {},
+            "constraints": body.get("constraints") if isinstance(body.get("constraints"), dict) else {},
+        }
+
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("capability_dry_run"), status_code=404)
+
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("capability_dry_run"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_capability_dry_run(payload)
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    body_payload, status = normalized
+                else:
+                    body_payload, status = _json_from_addon_result(proxied)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("capability_dry_run"), status_code=status)
+                return self.json(body_payload, status_code=status)
+            return self.json(_addon_unreachable_payload("capability_dry_run"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[CapabilityDryRun] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("capability_dry_run"), status_code=502)
 
 
 class SmartAgentAiSceneDeleteFallbackView(HomeAssistantView):
@@ -5265,7 +5001,49 @@ class SmartAgentAiSceneDeleteFallbackView(HomeAssistantView):
             return err
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("ai_scene_delete_fallback"), status_code=502)
+
+        try:
+            sid = int(scene_id)
+        except (TypeError, ValueError):
+            return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
+        if sid <= 0:
+            return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
+
+        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("ai_scene_delete_fallback"), status_code=404)
+
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("ai_scene_delete_fallback"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_ai_scene_delete_fallback(sid)
+            if isinstance(proxied, dict):
+                payload, status = _json_from_addon_result(proxied)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("ai_scene_delete_fallback"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("ai_scene_delete_fallback"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[AiSceneDeleteFallback] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("ai_scene_delete_fallback"), status_code=502)
+
+
+class SmartAgentAiSceneArchiveView(HomeAssistantView):
+    """场景归档接口：POST /api/v1/ai-scenes/{scene_id}/archive。"""
+
+    url = "/api/v1/ai-scenes/{scene_id}/archive"
+    name = "api:smart_agent:v1:ai_scenes:archive"
+    requires_auth = True
+
+    async def post(self, request: web.Request, scene_id: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json(_addon_unreachable_payload("ai_scene_archive"), status_code=502)
 
         try:
             sid = int(scene_id)
@@ -5278,15 +5056,19 @@ class SmartAgentAiSceneDeleteFallbackView(HomeAssistantView):
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
-                proxied = await _addon_client.post_ai_scene_delete_fallback(sid)
+                proxied = await _addon_client.post_ai_scene_archive(sid)
                 if isinstance(proxied, dict):
                     payload, status = _json_from_addon_result(proxied)
+                    if status in (404, 405):
+                        return self.json(_addon_endpoint_missing_payload("ai_scene_archive"), status_code=status)
                     return self.json(payload, status_code=status)
+                else:
+                    return self.json(_addon_unreachable_payload("ai_scene_archive"), status_code=502)
             except Exception as exc:
-                _LOGGER.debug("[AiSceneDeleteFallback] add-on proxy failed: %s", exc)
+                _LOGGER.debug("[AiSceneArchive] add-on proxy failed: %s", exc)
+                return self.json(_addon_unreachable_payload("ai_scene_archive"), status_code=502)
 
-        await coord.async_delete_ai_scene(sid)
-        return self.json({"ok": True, "id": sid})
+        return self.json(_addon_unreachable_payload("ai_scene_archive"), status_code=502)
 
 
 # 极速配对临时存储 key（存于 hass.data）
@@ -5692,6 +5474,7 @@ def _register_v1_views(hass: HomeAssistant) -> None:
         SmartAgentCorrectionActionView,
         SmartAgentTransactionsView,
         SmartAgentTransactionDetailView,
+        SmartAgentDecisionTraceView,
         SmartAgentTransactionRollbackView,
         SmartAgentEnergyView,
         SmartAgentLicenseStatusView,
@@ -5713,7 +5496,10 @@ def _register_v1_views(hass: HomeAssistant) -> None:
         SmartAgentVisionZonesSaveView,
         SmartAgentMcpStatusView,
         SmartAgentMcpSettingsView,
+        SmartAgentHaExecuteView,
+        SmartAgentCapabilityDryRunView,
         SmartAgentAiSceneDeleteFallbackView,
+        SmartAgentAiSceneArchiveView,
     ):
         hass.http.register_view(view_cls())
 
@@ -6358,7 +6144,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "ops": info.get("ops", ""),
                 "sensor_type": info.get("sensor_type", ""),
             }
-            for eid, info in coord.device_info.items()
+            for eid, info in get_device_info_snapshot(coord).items()
         ]
         connection.send_result(msg["id"], {"devices": devices})
 
@@ -6374,7 +6160,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return
         habits = [
             {"index": i, "content": c, "locked": lk}
-            for i, (c, lk) in enumerate(coord._habits)
+            for i, (c, lk) in enumerate(get_habits_cache_snapshot(coord))
         ]
         connection.send_result(msg["id"], {"habits": habits})
 
@@ -6391,7 +6177,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _AI_MARKS = ("[自动修正规则]", "[强化修正规则]")
         rules = [
             {"index": i, "content": c, "locked": lk, "is_ai": any(c.startswith(m) for m in _AI_MARKS)}
-            for i, (c, lk) in enumerate(coord._rules)
+            for i, (c, lk) in enumerate(get_rules_snapshot(coord))
         ]
         connection.send_result(msg["id"], {"rules": rules})
 
@@ -6405,7 +6191,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if coord is None:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
-        scenes = coord._ai_scenes_cache if isinstance(coord._ai_scenes_cache, list) else []
+        scenes = get_ai_scenes_cache_snapshot(coord)
         connection.send_result(msg["id"], {"scenes": scenes})
 
     @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_energy_stats"})
@@ -6431,7 +6217,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if coord is None:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
-        txns = coord._transactions_cache if isinstance(coord._transactions_cache, list) else []
+        txns = get_transactions_cache_snapshot(coord)
         # 去掉超大 JSON 快照字段，只保留展示所需字段
         _DROP = {"pre_states_json"}
         result = [

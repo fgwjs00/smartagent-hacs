@@ -1088,6 +1088,33 @@ class AddOnClient:
             return self._handle_request_exception(exc)
         return None
 
+    async def get_decision_trace_detail(self, txn_id: int) -> dict[str, Any] | None:
+        """获取 decision-trace 详情（优先 add-on 服务面）。"""
+        tid = int(txn_id)
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{self._base}/decision-trace/{tid}",
+                headers=self._auth_headers,
+                timeout=_HEALTH_TIMEOUT,
+            ) as resp:
+                if resp.status in (404, 405):
+                    return None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
+                if resp.status >= 400:
+                    result.setdefault("error", f"http_{resp.status}")
+                    result.setdefault("error_type", "http_error")
+                    result.setdefault("retryable", resp.status in (408, 429, 500, 502, 503, 504))
+                result["__status"] = resp.status
+                return result
+        except Exception as exc:
+            _LOGGER.debug("[AddOnClient] get_decision_trace_detail exception: %s", self._redact_sensitive(str(exc)))
+            return self._handle_request_exception(exc)
+
     async def rollback_transaction(self, txn_id: int) -> dict[str, Any] | None:
         """回滚事务（优先 add-on 服务面）。"""
         tid = int(txn_id)
@@ -1502,6 +1529,29 @@ class AddOnClient:
                 return self._handle_request_exception(exc)
         return None
 
+    async def post_ai_scene_archive(self, scene_id: int) -> dict[str, Any] | None:
+        """归档场景（canonical /ai-scenes/{id}/archive）。"""
+        sid = int(scene_id)
+        path = f"/ai-scenes/{sid}/archive"
+        try:
+            session = await self._get_session()
+            async with session.post(
+                f"{self._base}{path}",
+                json={"id": sid},
+                headers=self._auth_headers,
+                timeout=_HEALTH_TIMEOUT,
+            ) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "id": sid}
+                result.setdefault("id", sid)
+                result["__status"] = resp.status
+                return result
+        except Exception as exc:
+            return self._handle_request_exception(exc)
+
     async def get_vision_cameras(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取视觉摄像头列表（优先 add-on 服务面）。"""
         for path in ("/vision/cameras",):
@@ -1744,6 +1794,37 @@ class AddOnClient:
                     except Exception:
                         data = {}
                     return self._build_status_result(resp.status, data)
+            except Exception as exc:
+                return self._handle_request_exception(exc)
+        return None
+
+    async def post_capability_dry_run(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """请求 capability dry-run 规划结果（仅建议，不执行）。"""
+        payload = body if isinstance(body, dict) else {}
+        for path in ("/capability/dry-run",):
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    f"{self._base}{path}",
+                    json=payload,
+                    headers=self._auth_headers,
+                    timeout=_HEALTH_TIMEOUT,
+                ) as resp:
+                    if resp.status in (404, 405):
+                        continue
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = {}
+                    result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
+                    result.setdefault("ok", 200 <= resp.status < 300)
+                    if resp.status >= 400:
+                        result["ok"] = False
+                        result.setdefault("error", f"http_{resp.status}")
+                        result.setdefault("error_type", "http_error")
+                        result.setdefault("retryable", resp.status in (408, 429, 500, 502, 503, 504))
+                    result["__status"] = resp.status
+                    return result
             except Exception as exc:
                 return self._handle_request_exception(exc)
         return None
