@@ -4,8 +4,14 @@
   "zip_release": false,
   "filename": "smart_agent.zip",
   "render_readme": true,
-  "domains": ["sensor", "switch", "binary_sensor"],
-  "country": ["CN"],
+  "domains": [
+    "sensor",
+    "switch",
+    "binary_sensor"
+  ],
+  "country": [
+    "CN"
+  ],
   "iot_class": "local_polling",
-  "homeassistant": "2024.1.0"
+  "homeassistant": "2025.12.0"
 }

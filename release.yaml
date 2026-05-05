@@ -1,67 +1,12 @@
 product: SmartAgent
-release_version: "0.0.5"
-display_version: "Beta 0.0.5"
-internal_version: "5.9.38"
-channel: "beta"
-release_date: "2026-05-04"
+release_version: 0.0.6
+display_version: Beta 0.0.6
+channel: beta
+release_date: '2026-05-05'
 public_release_ready: false
-
-repositories:
-  engineering:
-    purpose: "内部工程研发仓库"
-    suggested_name: "smartagent-dev"
-    current_repo: true
-    version_policy: "使用 internal_version 跟踪研发、迁移批次、测试和内部 CHANGELOG"
-  hacs:
-    purpose: "Home Assistant HACS integration 发布仓库"
-    suggested_name: "smartagent-hacs"
-    version_policy: "使用 release_version，客户通过 HACS 安装和升级 custom_components/smart_agent"
-  addon:
-    purpose: "Home Assistant add-on 发布仓库"
-    suggested_name: "smartagent-addons"
-    version_policy: "使用 release_version，客户通过 HA Add-on Store 安装和升级 SmartAgent add-on"
-
-components:
-  integration:
-    release_version: "0.0.5"
-    display_version: "Beta 0.0.5"
-    internal_version: "5.9.38"
-    source_path: "custom_components/smart_agent"
-    publish_repo: "smartagent-hacs"
-    release_artifact: "custom_components/smart_agent"
-  addon:
-    release_version: "0.0.5"
-    display_version: "Beta 0.0.5"
-    internal_version: "5.9.38"
-    source_path: "smartagent-addon"
-    publish_repo: "smartagent-addons"
-    addon_slug: "smart_agent_core"
-    image: "ghcr.io/fgwjs00/smart_agent"
-  management_ui:
-    release_version: "0.0.5"
-    internal_version: "5.9.38"
-    source_path: "smartagent-ui-v2"
-    packaged_path: "smartagent-addon/ui"
-  control_screen:
-    release_version: "0.0.5"
-    internal_version: "5.9.38"
-    source_path: "smart-control-screen"
-    packaged_path: "smartagent-addon/screen"
-
-compatibility:
-  min_home_assistant_version: "2025.12.0"
-  addon_required: true
-  migration_schema: "m21"
-  gateway_required: true
-
-quality_gates:
-  pytest: "python -m pytest"
-  management_ui_build: "npm --prefix smartagent-ui-v2 run build"
-  control_screen_build: "npm --prefix smart-control-screen run build"
-  addon_ui_sync: "smartagent-addon/ui must match smartagent-ui-v2/dist"
-  addon_screen_sync: "smartagent-addon/screen must match smart-control-screen/dist"
-
+component:
+  type: home_assistant_integration
+  source_path: custom_components/smart_agent
 release_notes:
-  summary: "Beta 0.0.5 测试发布，包含 CP1~CP6 收官核验和最新 UI 产物，用于内测、样机和受控试点。"
-  customer_visible_version: "Beta 0.0.5"
-  internal_trace_version: "5.9.38"
+  summary: Beta 0.0.6 test release for SmartAgent.
+  customer_visible_version: Beta 0.0.6

@@ -10,13 +10,13 @@
     "panel_custom",
     "http"
   ],
-  "documentation": "https://github.com/fgwjs00/smart_agent",
+  "documentation": "https://github.com/fgwjs00/smartagent-hacs",
   "integration_type": "device",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/fgwjs00/smart_agent/issues",
+  "issue_tracker": "https://github.com/fgwjs00/smartagent-hacs/issues",
   "requirements": [
     "aiohttp>=3.8.0",
     "cryptography>=41.0.0"
   ],
-  "version": "0.0.5"
+  "version": "0.0.6"
 }
