@@ -3257,58 +3257,24 @@ class SmartAgentLearningStatsView(HomeAssistantView):
             return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("learning_stats"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                stats = await _addon_client.get_learning_stats()
-                proxied = _addon_result_payload_status(stats if isinstance(stats, dict) else None)
-                if proxied is not None:
-                    payload, status = proxied
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("learning_stats"), status_code=status)
-                    return self.json(payload, status_code=status)
-                return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[LearningStats] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
-
-        from datetime import date as _date
-
-        today_str = _date.today().isoformat()
-
-        def _collect() -> dict[str, int]:
-            db = getattr(coord, "_db", None)
-            decisions_today = 0
-            corrections_today = 0
-            if db is not None:
-                try:
-                    inf_rows = db.query(
-                        "SELECT COUNT(*) AS cnt FROM events WHERE type='AI_Inference' AND time >= ?",
-                        (today_str,),
-                    )
-                    decisions_today = int((inf_rows[0].get("cnt") if inf_rows else 0) or 0)
-                except Exception as ex:
-                    _LOGGER.debug("[LearningStats] 查询 decisions_today 失败: %s", ex)
-                try:
-                    cor_rows = db.query(
-                        "SELECT COUNT(*) AS cnt FROM corrections WHERE time >= ?",
-                        (today_str,),
-                    )
-                    corrections_today = int((cor_rows[0].get("cnt") if cor_rows else 0) or 0)
-                except Exception as ex:
-                    _LOGGER.debug("[LearningStats] 查询 corrections_today 失败: %s", ex)
-
-            patterns_count = len(getattr(coord, "_behavior_patterns_cache", []) or [])
-            habits_count = len(getattr(coord, "_habits", []) or [])
-            return {
-                "decisions_today": decisions_today,
-                "corrections_today": corrections_today,
-                "patterns_count": int(patterns_count),
-                "habits_count": int(habits_count),
-            }
-
-        stats = await hass.async_add_executor_job(_collect)
-        return self.json(stats)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
+        try:
+            stats = await _addon_client.get_learning_stats()
+            proxied = _addon_result_payload_status(stats if isinstance(stats, dict) else None)
+            if proxied is not None:
+                payload, status = proxied
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("learning_stats"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[LearningStats] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
 
 
 class SmartAgentProfileActionView(HomeAssistantView):
@@ -4055,7 +4021,7 @@ class SmartAgentAiSceneOpsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
         if coord is None:
-            return self.json({"ok": False, "error": "coordinator not found"}, status_code=404)
+            return self.json(_addon_unreachable_payload("ai_scene_ops"), status_code=502)
 
         try:
             body = await request.json()
@@ -4064,31 +4030,33 @@ class SmartAgentAiSceneOpsView(HomeAssistantView):
 
         path = request.path.lower()
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("ai_scene_ops"), status_code=404)
+
+        if not (path.endswith("/analyze") or path.endswith("create-from-text")):
+            return self.json({"ok": False, "error": "unsupported action"}, status_code=400)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_ai_scene_ops(path.removeprefix("/api/v1/"), body if isinstance(body, dict) else {})
-                if isinstance(proxied, dict):
-                    payload, status = _json_from_addon_result(proxied)
-                    return self.json(payload, status_code=status)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("ai_scene_ops"), status_code=502)
+
+        try:
+            suffix = path.removeprefix("/api/v1")
+            proxied = await _addon_client.request_json(
+                "POST",
+                suffix,
+                body=body if isinstance(body, dict) else {},
+            )
+            normalized = _json_from_addon_http_result(proxied if isinstance(proxied, dict) else None)
+            if normalized is None:
                 return self.json(_addon_unreachable_payload("ai_scene_ops"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[AiSceneOps] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("ai_scene_ops"), status_code=502)
-
-        if path.endswith("/analyze"):
-            await coord.async_run_pattern_analysis()
-            return self.json({"ok": True, "action": "analyze"})
-
-        if path.endswith("create-from-text"):
-            text = str((body or {}).get("text", "") or "").strip()
-            auto_activate = bool((body or {}).get("auto_activate", False))
-            if not text:
-                return self.json({"ok": False, "error": "text required"}, status_code=400)
-            result = await coord.async_create_scene_from_text(text=text, auto_activate=auto_activate)
-            return self.json(result or {})
-
-        return self.json({"ok": False, "error": "unsupported action"}, status_code=400)
+            payload, status = normalized
+            if status in (404, 405):
+                return self.json(_addon_endpoint_missing_payload("ai_scene_ops"), status_code=status)
+            return self.json(payload, status_code=status)
+        except Exception as exc:
+            _LOGGER.debug("[AiSceneOps] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("ai_scene_ops"), status_code=502)
 
 
 class SmartAgentModeView(HomeAssistantView):

@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.6 - 2026-05-05
+## Beta 0.0.9 - 2026-05-05
 
-Beta 0.0.6 test release for SmartAgent.
+Beta 0.0.9 test release for SmartAgent.
 
 - Publishes the latest SmartAgent Home Assistant integration package.
-- Aligns the public version with `0.0.6` for Home Assistant update detection.
+- Aligns the public version with `0.0.9` for Home Assistant update detection.

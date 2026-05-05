@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.6
-display_version: Beta 0.0.6
+release_version: 0.0.9
+display_version: Beta 0.0.9
 channel: beta
 release_date: '2026-05-05'
-public_release_ready: false
+public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.6 test release for SmartAgent.
-  customer_visible_version: Beta 0.0.6
+  summary: Beta 0.0.9 test release for SmartAgent.
+  customer_visible_version: Beta 0.0.9
