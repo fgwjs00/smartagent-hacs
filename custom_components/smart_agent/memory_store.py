@@ -374,6 +374,7 @@ class MemoryStore:
                        MAX(CASE WHEN presence_context = ? THEN 1 ELSE 0 END) AS is_presence_specific
                 FROM corrections
                 WHERE entity_id IN ({placeholders})
+                  AND COALESCE(lifecycle_state, 'active')='active'
                   AND presence_context IN (?, 'any')
                   AND time >= ?
                 GROUP BY entity_id, ai_service
@@ -488,6 +489,7 @@ class MemoryStore:
                        weekday_mask, confidence, hit_count
                 FROM behavior_patterns
                 WHERE entity_id IN ({placeholders})
+                  AND COALESCE(lifecycle_state, 'active')='active'
                   AND confidence >= 60
                   AND (
                     (hour_start <= hour_end AND hour_start <= ? AND hour_end >= ?)
@@ -667,6 +669,7 @@ class MemoryStore:
                        MAX(time)             AS last_time
                 FROM corrections
                 WHERE entity_id IN ({placeholders})
+                  AND COALESCE(lifecycle_state, 'active')='active'
                   AND time >= ?
                 GROUP BY entity_id, ai_service
                 ORDER BY total_count DESC
@@ -748,6 +751,7 @@ class MemoryStore:
                 SELECT entity_id, SUM(correction_count) AS total_corrections
                 FROM corrections
                 WHERE entity_id IN ({placeholders2})
+                  AND COALESCE(lifecycle_state, 'active')='active'
                   AND (ai_service LIKE '%on%' OR ai_service = '')
                   AND time >= ?
                 GROUP BY entity_id

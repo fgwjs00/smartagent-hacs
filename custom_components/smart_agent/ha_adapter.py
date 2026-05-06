@@ -16,6 +16,29 @@ def async_get_state(hass: HomeAssistant, entity_id: str) -> Any:
     return hass.states.get(entity_id)
 
 
+def _state_snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
+    """Serialize the pre-execution HA state needed for rollback/audit."""
+    state_obj = async_get_state(hass, entity_id)
+    if state_obj is None:
+        return {
+            "entity_id": entity_id,
+            "available": False,
+            "state": "",
+            "attributes": {},
+            "last_changed": "",
+            "last_updated": "",
+        }
+    attrs = getattr(state_obj, "attributes", {})
+    return {
+        "entity_id": entity_id,
+        "available": True,
+        "state": str(getattr(state_obj, "state", "") or ""),
+        "attributes": attrs if isinstance(attrs, dict) else {},
+        "last_changed": str(getattr(state_obj, "last_changed", "") or ""),
+        "last_updated": str(getattr(state_obj, "last_updated", "") or ""),
+    }
+
+
 def async_get_entity_registry(hass: HomeAssistant) -> Any:
     """最小运行时读取：返回实体 registry 快照对象。"""
     from homeassistant.helpers import entity_registry as er
@@ -316,6 +339,7 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
         )
 
     results: list[dict[str, Any]] = []
+    pre_state_snapshot: list[dict[str, Any]] = []
     for raw in commands_raw:
         started = time.monotonic()
         try:
@@ -334,6 +358,7 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
             })
             continue
 
+        pre_state_snapshot.append(_state_snapshot(hass, command["entity_id"]))
         try:
             await hass.services.async_call(
                 command["domain"],
@@ -365,6 +390,13 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
         "request_id": request_id,
         "ok": ok,
         "results": results,
+        "pre_state_snapshot": pre_state_snapshot,
+        "rollback_intent": {
+            "required": bool(pre_state_snapshot),
+            "strategy": "restore_pre_state",
+            "state_snapshot_captured": bool(pre_state_snapshot),
+            "state_snapshot": pre_state_snapshot,
+        },
         "error": str(first_error.get("error", "") if first_error else ""),
         "error_type": str(first_error.get("error_type", "") if first_error else ""),
         "retryable": bool(first_error.get("retryable", False) if first_error else False),
