@@ -338,9 +338,30 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
             details=details,
         )
 
+    policy = (envelope or {}).get("execution_policy")
+    policy = policy if isinstance(policy, dict) else {}
+    stop_on_first_error = bool(policy.get("stop_on_first_error", True))
     results: list[dict[str, Any]] = []
     pre_state_snapshot: list[dict[str, Any]] = []
+    stopped_after_error = False
     for raw in commands_raw:
+        if stopped_after_error:
+            entity_id = str(raw.get("entity_id", "") if isinstance(raw, dict) else "")
+            domain = str(raw.get("domain", "") if isinstance(raw, dict) else "")
+            service = str(raw.get("service", "") if isinstance(raw, dict) else "")
+            results.append({
+                "entity_id": entity_id,
+                "domain": domain,
+                "service": service,
+                "ok": False,
+                "status": "skipped",
+                "error": "command_skipped_after_failure",
+                "error_type": "execution_skipped",
+                "retryable": False,
+                "latency_ms": 0,
+                "data": {},
+            })
+            continue
         started = time.monotonic()
         try:
             command = _normalize_command(raw)
@@ -355,7 +376,10 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "data": {},
+                "status": "failed",
             })
+            if stop_on_first_error:
+                stopped_after_error = True
             continue
 
         pre_state_snapshot.append(_state_snapshot(hass, command["entity_id"]))
@@ -373,6 +397,7 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 "error_type": "",
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
+                "status": "succeeded",
             })
         except Exception as exc:
             results.append({
@@ -382,20 +407,42 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 "error_type": "ha_service_error",
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
+                "status": "failed",
             })
+            if stop_on_first_error:
+                stopped_after_error = True
 
     ok = bool(results) and all(bool(item.get("ok")) for item in results)
     first_error = next((item for item in results if not item.get("ok")), None)
+    succeeded_count = sum(1 for item in results if bool(item.get("ok")))
+    failed_count = sum(1 for item in results if not bool(item.get("ok")) and item.get("status") != "skipped")
+    skipped_count = sum(1 for item in results if item.get("status") == "skipped")
+    partial_success = succeeded_count > 0 and (failed_count > 0 or skipped_count > 0)
+    rollback_available = bool(pre_state_snapshot)
+    rollback_mode = "manual" if rollback_available else "not_supported"
     return {
         "request_id": request_id,
         "ok": ok,
         "results": results,
         "pre_state_snapshot": pre_state_snapshot,
+        "partial_success": partial_success,
+        "stop_on_first_error": stop_on_first_error,
+        "command_status": {
+            "succeeded": succeeded_count,
+            "failed": failed_count,
+            "skipped": skipped_count,
+            "partial_success": partial_success,
+        },
+        "rollback_available": rollback_available,
+        "rollback_mode": rollback_mode,
         "rollback_intent": {
             "required": bool(pre_state_snapshot),
             "strategy": "restore_pre_state",
             "state_snapshot_captured": bool(pre_state_snapshot),
             "state_snapshot": pre_state_snapshot,
+            "available": rollback_available,
+            "mode": rollback_mode,
+            "failure_policy": "stop_on_first_error" if stop_on_first_error else "continue_on_error",
         },
         "error": str(first_error.get("error", "") if first_error else ""),
         "error_type": str(first_error.get("error_type", "") if first_error else ""),

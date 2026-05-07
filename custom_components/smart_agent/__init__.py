@@ -962,6 +962,14 @@ def _extract_bearer_token(request: web.Request) -> str:
     return ""
 
 
+def _is_addon_internal_execute_request(request: web.Request) -> bool:
+    return (
+        str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() == "addon"
+        and str(request.headers.get("X-SA-Internal-Execute", "") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
 def _json_error_payload(error: str, error_type: str, retryable: bool, **extra: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": False,
@@ -4860,6 +4868,16 @@ class SmartAgentHaExecuteView(HomeAssistantView):
     async def post(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
+        if not _is_addon_internal_execute_request(request):
+            return self.json(
+                _json_error_payload(
+                    "ha_execute_requires_addon_internal",
+                    "auth_failed",
+                    False,
+                    execution_path="ha_execute_adapter",
+                ),
+                status_code=403,
+            )
         try:
             body = await request.json()
         except Exception:
