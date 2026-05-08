@@ -1561,6 +1561,70 @@ def _build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordi
     }
 
 
+def _local_device_rows(coord: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for eid, info in get_device_info_snapshot(coord).items():
+        if not isinstance(info, dict):
+            continue
+        rows.append({"entity_id": str(eid), **dict(info)})
+    return rows
+
+
+def _local_room_rows(coord: Any) -> list[dict[str, Any]]:
+    rooms: dict[str, dict[str, Any]] = {}
+    for info in get_device_info_snapshot(coord).values():
+        if not isinstance(info, dict):
+            continue
+        room = str(info.get("room") or info.get("area") or "").strip()
+        if not room:
+            continue
+        row = rooms.setdefault(room, {"id": room, "name": room, "device_count": 0})
+        row["device_count"] = int(row.get("device_count", 0)) + 1
+    return sorted(rooms.values(), key=lambda row: str(row.get("name", "")))
+
+
+def _local_room_topology_rows(coord: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    db = getattr(coord, "_db", None)
+    if db is not None and hasattr(db, "query"):
+        try:
+            raw_rows = db.query("SELECT room_a, room_b, relation FROM room_topology", ()) or []
+        except Exception:
+            raw_rows = []
+        for row in raw_rows:
+            if isinstance(row, dict):
+                room_a = str(row.get("room_a") or "").strip()
+                room_b = str(row.get("room_b") or "").strip()
+                relation = str(row.get("relation") or "adjacent").strip() or "adjacent"
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                room_a = str(row[0] or "").strip()
+                room_b = str(row[1] or "").strip()
+                relation = str(row[2] if len(row) > 2 else "adjacent").strip() or "adjacent"
+            else:
+                continue
+            if room_a and room_b:
+                rows.append({"room_a": room_a, "room_b": room_b, "relation": relation})
+        if rows:
+            return rows
+
+    topology = get_room_topology_cache_snapshot(coord)
+    seen: set[tuple[str, str]] = set()
+    for room_a, neighbors in topology.items():
+        left = str(room_a or "").strip()
+        if not left:
+            continue
+        for room_b in neighbors or set():
+            right = str(room_b or "").strip()
+            if not right:
+                continue
+            key = tuple(sorted((left, right)))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"room_a": left, "room_b": right, "relation": "adjacent"})
+    return sorted(rows, key=lambda row: (str(row.get("room_a", "")), str(row.get("room_b", ""))))
+
+
 async def _async_save_presence_sensor_type(
     hass: HomeAssistant,
     coord: SmartAgentCoordinator,
@@ -1616,7 +1680,7 @@ class SmartAgentDevicesView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("devices"), status_code=404)
+            return self.json(_local_device_rows(coord))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -1662,6 +1726,14 @@ class SmartAgentDevicesDiscoverView(HomeAssistantView):
             return self.json(_addon_unreachable_payload("devices_discover"), status_code=502)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            try:
+                rows = await coord._async_discover_devices()
+                return self.json([row for row in (rows or []) if isinstance(row, dict)])
+            except Exception as exc:
+                _LOGGER.debug("[DevicesDiscover] local HA discovery failed: %s", exc)
+                return self.json(_addon_unreachable_payload("devices_discover"), status_code=502)
+
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -1720,6 +1792,14 @@ class SmartAgentDevicesBatchAddView(HomeAssistantView):
             return self.json({"ok": False, "error": "entities required"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            try:
+                added = await coord.async_batch_add_devices(entities)
+                return self.json({"ok": True, "added": int(added or 0), "count": int(added or 0)})
+            except Exception as exc:
+                _LOGGER.debug("[DevicesBatchAdd] local HA batch add failed: %s", exc)
+                return self.json(_addon_unreachable_payload("devices_batch_add"), status_code=502)
+
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -1898,7 +1978,7 @@ class SmartAgentPresenceSensorsView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("presence_sensors"), status_code=404)
+            return self.json(_build_presence_sensors_payload(hass, coord))
 
         addon_client = getattr(coord, "_addon_client", None)
         if addon_client is None:
@@ -1989,7 +2069,7 @@ class SmartAgentRoomsView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("rooms"), status_code=404)
+            return self.json(_local_room_rows(coord))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -2036,7 +2116,15 @@ class SmartAgentRoomsSyncView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("rooms_sync"), status_code=404)
+            try:
+                result = await coord.async_sync_rooms_to_ha()
+                payload = {"ok": True}
+                if isinstance(result, dict):
+                    payload.update(result)
+                return self.json(payload)
+            except Exception as exc:
+                _LOGGER.debug("[RoomsSync] local HA rooms sync failed: %s", exc)
+                return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -2075,7 +2163,7 @@ class SmartAgentRoomsTopologyView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=404)
+            return self.json(_local_room_topology_rows(coord))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
