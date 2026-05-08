@@ -28,6 +28,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -1088,13 +1089,16 @@ class AddOnClient:
             return self._handle_request_exception(exc)
         return None
 
-    async def get_decision_trace_detail(self, txn_id: int) -> dict[str, Any] | None:
+    async def get_decision_trace_detail(self, txn_id: int | str) -> dict[str, Any] | None:
         """获取 decision-trace 详情（优先 add-on 服务面）。"""
-        tid = int(txn_id)
+        tid = str(txn_id or "").strip()
+        if not tid:
+            return None
+        encoded_tid = quote(tid, safe="")
         try:
             session = await self._get_session()
             async with session.get(
-                f"{self._base}/decision-trace/{tid}",
+                f"{self._base}/decision-trace/{encoded_tid}",
                 headers=self._auth_headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:

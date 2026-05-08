@@ -861,6 +861,7 @@ class DevicesMixin:
         """
         import json as _json
         from .const import AI_SCENE_STATUS_ACTIVE
+        from .ha_adapter import async_create_scene, async_reload_scenes
 
         # 先刷新缓存读取 pending 记录（不提前设 active）
         await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
@@ -919,7 +920,7 @@ class DevicesMixin:
             )
             if yaml_ok:
                 # 调用 scene.reload 令 HA 立即识别新场景
-                await self.hass.services.async_call("scene", "reload", {})
+                await async_reload_scenes(self.hass)
                 # 记录 ha_entity_id 到数据库
                 _ha_entity_ok = await self.hass.async_add_executor_job(
                     self._update_ai_scene_ha_entity, scene_id, ha_scene_eid
@@ -935,10 +936,7 @@ class DevicesMixin:
                     )
             else:
                 # YAML 写入失败时降级为 scene.create（易失但功能可用）
-                await self.hass.services.async_call(
-                    "scene", "create",
-                    {"scene_id": ha_scene_id, "entities": ha_entities},
-                )
+                await async_create_scene(self.hass, scene_id=ha_scene_id, entities=ha_entities)
                 # 降级路径同样记录 ha_entity_id，FastBrain 才能复用此场景
                 _ha_entity_ok = await self.hass.async_add_executor_job(
                     self._update_ai_scene_ha_entity, scene_id, ha_scene_eid
@@ -1161,6 +1159,7 @@ class DevicesMixin:
         """
         import os as _os
         import yaml as _yaml
+        from .ha_adapter import async_reload_automations
 
         yaml_str = self.get_scene_automation_yaml(scene_id)
         if yaml_str.startswith("# 错误") or yaml_str.startswith("# 生成"):
@@ -1211,7 +1210,7 @@ class DevicesMixin:
 
         # 调用 automation.reload（静默失败：用户可能尚未配置 !include）
         try:
-            await self.hass.services.async_call("automation", "reload", {})
+            await async_reload_automations(self.hass)
         except Exception:
             pass
 
@@ -1340,14 +1339,36 @@ class DevicesMixin:
             rollback_actions = rollback_actions[:MAX_ROLLBACK]
 
         self._sys_log("INFO", f"[事务] 开始回滚事务 id={txn_id}，恢复 {len(rollback_actions)} 个设备")
-        # 直接调用服务，不走完整事务链（避免嵌套事务）
-        for act in rollback_actions:
-            try:
-                svc_data = {"entity_id": act["entity_id"]}
-                await self.hass.services.async_call(act["domain"], act["service"], svc_data)
-                self._sys_log("INFO", f"[回滚] {act['entity_id']} → {act['service']}")
-            except Exception as exc:
-                self._sys_log("WARN", f"[回滚] {act['entity_id']} 回滚失败: {exc}")
+        from .ha_adapter import async_execute_command_envelope
+
+        result = await async_execute_command_envelope(self.hass, {
+            "request_id": f"legacy-rollback:{txn_id}",
+            "commands": [
+                {
+                    "entity_id": act["entity_id"],
+                    "domain": act["domain"],
+                    "service": act["service"],
+                    "data": {},
+                }
+                for act in rollback_actions
+            ],
+            "execution_policy": {"stop_on_first_error": False},
+            "safety": {
+                "risk_level": "safe",
+                "requires_confirmation": False,
+                "reason": f"[回滚] 事务 {txn_id} 恢复到执行前状态",
+            },
+        })
+        for item in result.get("results", []) if isinstance(result, dict) else []:
+            eid = item.get("entity_id", "")
+            service = item.get("service", "")
+            if item.get("ok"):
+                self._sys_log("INFO", f"[回滚] {eid} → {service}")
+            else:
+                error = item.get("error") or item.get("status") or "unknown_error"
+                self._sys_log("WARN", f"[回滚] {eid} 回滚失败: {error}")
+        if isinstance(result, dict) and not result.get("ok"):
+            self._sys_log("WARN", f"[事务] 事务 id={txn_id} 回滚存在失败项: {result.get('error') or result.get('error_type')}")
 
         # 刷新事务缓存
         self._transactions_cache = await self.hass.async_add_executor_job(
@@ -1358,6 +1379,8 @@ class DevicesMixin:
 
     async def _try_delete_ha_scene(self, scene_id: int) -> None:
         """尝试删除对应的 HA 场景实体 scene.ai_<id>，同时从 YAML 文件中移除（静默失败）。"""
+        from .ha_adapter import async_delete_scene, async_reload_scenes
+
         ha_scene_id = f"ai_{scene_id}"
         ha_scene_eid = f"scene.{ha_scene_id}"
 
@@ -1367,7 +1390,7 @@ class DevicesMixin:
                 self._remove_scene_from_yaml, ha_scene_id
             )
             # 调用 scene.reload 使 HA 识别场景已移除
-            await self.hass.services.async_call("scene", "reload", {})
+            await async_reload_scenes(self.hass)
         except Exception as exc:
             self._sys_log("WARN", f"[AI场景] YAML 移除场景失败: {exc}")
 
@@ -1375,9 +1398,7 @@ class DevicesMixin:
         if self.hass.states.get(ha_scene_eid) is None:
             return
         try:
-            await self.hass.services.async_call(
-                "scene", "delete", {"entity_id": ha_scene_eid}
-            )
+            await async_delete_scene(self.hass, ha_scene_eid)
             self._sys_log("INFO", f"[AI场景] HA 场景实体已删除: {ha_scene_eid}")
         except Exception as exc:
             self._sys_log("WARN", f"[AI场景] 删除 HA 场景实体失败（不影响数据库操作）: {exc}")

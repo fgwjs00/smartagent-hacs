@@ -2,7 +2,7 @@
 DeviceAdapter — Phase A：设备抽象层（AI Core 可测试化）。
 
 通过抽象接口隔离 AI Core 与 HA 具体 API，允许在无 HA 环境下进行单元测试。
-当前唯一实现：HAAdapter（通过 hass.services.async_call）。
+当前唯一实现：HAAdapter（通过 SmartAgent command envelope）。
 
 Phase A 目标：功能零变化，仅为可测试性。
 Phase D 目标（6-12 月）：SmartAgent Hub 产品化时，可替换 HAAdapter 为其他实现。
@@ -81,9 +81,9 @@ class DeviceAdapter(ABC):
 
 
 class HAAdapter(DeviceAdapter):
-    """DeviceAdapter 的 HA 实现，通过 hass.services.async_call 控制设备。
+    """DeviceAdapter 的 HA 实现，通过 SmartAgent command envelope 控制设备。
 
-    这是当前唯一的生产实现。所有设备控制最终都经过此类调用 HA 的服务总线。
+    这是当前唯一的生产实现。所有设备控制最终都经过统一执行边界。
     """
 
     def __init__(self, hass: "HomeAssistant") -> None:
@@ -99,15 +99,35 @@ class HAAdapter(DeviceAdapter):
         entity_id: str,
         params: dict[str, Any] | None = None,
     ) -> bool:
-        """通过 HA 服务总线控制设备。"""
-        service_data: dict[str, Any] = {"entity_id": entity_id}
-        if params:
-            service_data.update(params)
+        """通过统一 command envelope 控制设备。"""
+        service_data: dict[str, Any] = dict(params or {})
+        service_data.pop("entity_id", None)
         try:
-            await self._hass.services.async_call(
-                domain, service, service_data, blocking=True
+            from .ha_adapter import async_execute_command_envelope
+
+            result = await async_execute_command_envelope(self._hass, {
+                "request_id": f"device-adapter:{entity_id}:{service}",
+                "commands": [{
+                    "entity_id": entity_id,
+                    "domain": domain,
+                    "service": service,
+                    "data": service_data,
+                }],
+                "execution_policy": {"stop_on_first_error": True},
+                "safety": {
+                    "risk_level": "safe",
+                    "requires_confirmation": False,
+                    "reason": "DeviceAdapter compatibility execution",
+                },
+            })
+            if isinstance(result, dict) and result.get("ok"):
+                return True
+            error = (
+                result.get("error") or result.get("error_type") or "command_envelope_failed"
+                if isinstance(result, dict)
+                else "command_envelope_failed"
             )
-            return True
+            raise RuntimeError(error)
         except Exception as exc:
             _LOGGER.warning(
                 "[HAAdapter] call_service 失败: %s.%s(%s): %s",

@@ -12,6 +12,7 @@ import time
 from collections import Counter, defaultdict
 
 from .action_mapping import entities_to_actions
+from .ha_adapter import async_call_service
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -526,7 +527,30 @@ class PatrolMixin:
                 scene_id = scene["id"]
                 self._sys_log("INFO", f"[Phase 7D] 到点自动触发 AI 场景: {scene['name']} (scene.ai_{scene_id})")
                 try:
-                    await self.hass.services.async_call("scene", "turn_on", {"entity_id": f"scene.ai_{scene_id}"})
+                    from .ha_adapter import async_execute_command_envelope
+
+                    result = await async_execute_command_envelope(self.hass, {
+                        "request_id": f"scheduled-scene:{scene_id}:{hour}",
+                        "commands": [{
+                            "entity_id": f"scene.ai_{scene_id}",
+                            "domain": "scene",
+                            "service": "turn_on",
+                            "data": {},
+                        }],
+                        "execution_policy": {"stop_on_first_error": True},
+                        "safety": {
+                            "risk_level": "safe",
+                            "requires_confirmation": False,
+                            "reason": f"[Phase 7D] 定时触发 AI 场景: {scene['name']}",
+                        },
+                    })
+                    if isinstance(result, dict) and result.get("ok"):
+                        continue
+                    raise RuntimeError(
+                        result.get("error") or result.get("error_type") or "command_envelope_failed"
+                        if isinstance(result, dict)
+                        else "command_envelope_failed"
+                    )
                 except Exception as e:
                     self._sys_log("ERROR", f"[Phase 7D] 触发定时场景失败: {e}")
                     _LOGGER.warning("Failed to trigger scheduled scene: %s", e)
@@ -1660,7 +1684,8 @@ class PatrolMixin:
         try:
             self.hass.loop.call_soon_threadsafe(
                 lambda: self.hass.async_create_task(
-                    self.hass.services.async_call(
+                    async_call_service(
+                        self.hass,
                         "persistent_notification", "create", notify_data
                     )
                 )
@@ -1959,7 +1984,8 @@ class PatrolMixin:
                 }
                 self.hass.loop.call_soon_threadsafe(
                     lambda: self.hass.async_create_task(
-                        self.hass.services.async_call(
+                        async_call_service(
+                            self.hass,
                             "persistent_notification", "create", notify_data
                         )
                     )
@@ -2246,26 +2272,53 @@ class PatrolMixin:
                     "WARN",
                     f"[ReAct Turn2] {len(still_unresponsive)} 个设备持续未响应，触发补偿重试..."
                 )
+                from .ha_adapter import async_execute_command_envelope
+
+                compensation_commands: list[dict[str, Any]] = []
                 for _ma in still_unresponsive:
                     _eid = _ma["entity_id"]
                     _domain = _eid.split(".")[0] if "." in _eid else ""
                     if not _domain:
                         continue
-                    try:
-                        if _ma["expected_on"]:
-                            # turn_on 时保留原始 service_data（亮度/色温等）
-                            _svc_data = {
-                                k: v for k, v in _ma.items()
-                                if k not in ("entity_id", "service", "expected_on")
-                            }
-                            _svc_data["entity_id"] = _eid
-                            await self.hass.services.async_call(_domain, "turn_on", _svc_data)
-                        else:
-                            await self.hass.services.async_call(
-                                _domain, "turn_off", {"entity_id": _eid}
+                    _service = "turn_on" if _ma["expected_on"] else "turn_off"
+                    _svc_data = (
+                        {
+                            k: v for k, v in _ma.items()
+                            if k not in ("entity_id", "domain", "service", "expected_on", "reason")
+                        }
+                        if _ma["expected_on"]
+                        else {}
+                    )
+                    compensation_commands.append({
+                        "entity_id": _eid,
+                        "domain": _domain,
+                        "service": _service,
+                        "data": _svc_data,
+                    })
+                try:
+                    compensation_result = await async_execute_command_envelope(self.hass, {
+                        "request_id": f"react-turn2-compensation:{int(cmd_time)}",
+                        "commands": compensation_commands,
+                        "execution_policy": {"stop_on_first_error": False},
+                        "safety": {
+                            "risk_level": "safe",
+                            "requires_confirmation": False,
+                            "reason": "[ReAct Turn2] 设备未响应补偿重试",
+                        },
+                    })
+                    for _item in (
+                        compensation_result.get("results", [])
+                        if isinstance(compensation_result, dict)
+                        else []
+                    ):
+                        if not _item.get("ok"):
+                            _LOGGER.warning(
+                                "[ReAct Turn2] 补偿命令失败 %s: %s",
+                                _item.get("entity_id"),
+                                _item.get("error") or _item.get("status"),
                             )
-                    except Exception as _retry_exc:
-                        _LOGGER.warning("[ReAct Turn2] 补偿命令失败 %s: %s", _eid, _retry_exc)
+                except Exception as _retry_exc:
+                    _LOGGER.warning("[ReAct Turn2] 补偿命令批量提交失败: %s", _retry_exc)
 
                 # 等待并验证最终补偿结果
                 await asyncio.sleep(20)

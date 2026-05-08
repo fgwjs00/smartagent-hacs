@@ -14,6 +14,7 @@ from typing import Any
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
+from .ha_adapter import async_call_service
 from .const import (
     FRIGATE_PERSON_COUNT_KW as _FRIGATE_PERSON_COUNT_KW,
     AI_ACTION_SKIP_WINDOW, URGENT_MERGE_WINDOW, NORMAL_MERGE_WINDOW,
@@ -1181,7 +1182,7 @@ class ListenersMixin:
                         f"保护 {int(pri_rec['guard_until'] - time.time())}s)")
                 trigger = self._fmt_trigger(source_type, domain, name, entity_id, old_s, new_s)
                 self.hass.async_create_task(
-                    self.hass.services.async_call("homeassistant", "update_entity", {"entity_id": entity_id})
+                    async_call_service(self.hass, "homeassistant", "update_entity", {"entity_id": entity_id})
                 )
             elif domain in location_domains:
                 trigger = self._fmt_trigger("位置", domain, name, entity_id, old_s, new_s)

@@ -11,6 +11,7 @@ import re
 import time
 from typing import Any
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import voluptuous as vol
 import aiohttp
@@ -1343,15 +1344,14 @@ class SmartAgentLogInfoView(HomeAssistantView):
 
 
 class SmartAgentSceneExportView(HomeAssistantView):
-    """Phase 7D: AI 场景导出为 HA 原生自动化 YAML 的 HTTP 接口。
+    """AI 场景 YAML 导出接口。
 
     GET  /api/v1/scenes/export-yaml?scene_id=N
-         → 返回该场景的 YAML 字符串（供前端弹窗展示/复制）
+         返回该场景的 YAML 字符串，供前端展示。
 
     POST /api/v1/scenes/export-yaml
-         Body: {"scene_id": N, "write_to_config": true}
-         → 将 YAML 写入 /config/smart_agent_automations.yaml 并调用 automation.reload
-         → 成功后用户只需一次性在 automations.yaml 添加 !include
+         Body: {"scene_id": N}
+         只代理到 add-on 场景导出 provider，HA host 不再写本地配置文件。
     """
 
     url = "/api/v1/scenes/export-yaml"
@@ -1397,39 +1397,30 @@ class SmartAgentSceneExportView(HomeAssistantView):
             )
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
-        _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                exported = await _addon_client.get_scene_yaml_export(scene_id)
-                if isinstance(exported, dict):
-                    payload, status = _json_from_addon_result(exported)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=status)
-                    return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[SceneExportGet] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=404)
 
-        yaml_content = await hass.async_add_executor_job(coord.get_scene_automation_yaml, scene_id)
-        return self.json({"scene_id": scene_id, "yaml": yaml_content})
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
+
+        try:
+            exported = await _addon_client.get_scene_yaml_export(scene_id)
+            if isinstance(exported, dict):
+                payload, status = _json_from_addon_result(exported)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=status)
+                return self.json(payload, status_code=status)
+            else:
+                return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[SceneExportGet] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
 
     async def post(self, request: web.Request) -> web.Response:
-        """POST: 写入 HA 配置目录并重载自动化。
-
-        将场景 YAML 追加/更新到 /config/smart_agent_automations.yaml，
-        随后调用 automation.reload 令 HA 立即识别新自动化。
-
-        用户只需第一次手动在 configuration.yaml 的 automation: 段加入：
-            automation: !include smart_agent_automations.yaml
-        之后所有场景批准均自动生效。
-        """
+        """POST: 将场景导出写操作代理给 add-on。"""
         if (err := _view_admin_check(request)):
             return err
-        import os as _os
-        import yaml as _yaml
-
         hass = request.app["hass"]
         try:
             body = await request.json()
@@ -1477,111 +1468,24 @@ class SmartAgentSceneExportView(HomeAssistantView):
             )
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_scene_yaml_export(body if isinstance(body, dict) else {})
-                if isinstance(proxied, dict):
-                    payload, status = _json_from_addon_result(proxied)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=status)
-                    else:
-                        return self.json(payload, status_code=status)
-                else:
-                    return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[SceneExportPost] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
 
-        # 获取 YAML 字符串
-        yaml_str = await hass.async_add_executor_job(coord.get_scene_automation_yaml, scene_id)
-        if not yaml_str:
-            return self.json(
-                _json_error_payload(
-                    error="scene_not_found",
-                    error_type="not_found",
-                    retryable=False,
-                ),
-                status_code=404,
-            )
-
-        # 解析为对象（list，每个元素是一个 automation dict）
         try:
-            new_automation = _yaml.safe_load(yaml_str)
-            if isinstance(new_automation, list) and new_automation:
-                new_automation = new_automation[0]
+            proxied = await _addon_client.post_scene_yaml_export(body if isinstance(body, dict) else {})
+            if isinstance(proxied, dict):
+                payload, status = _json_from_addon_result(proxied)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
         except Exception as exc:
-            return self.json(
-                _json_error_payload(
-                    error=f"yaml_parse_error:{exc}",
-                    error_type="internal_error",
-                    retryable=False,
-                ),
-                status_code=500,
-            )
-
-        # 目标文件路径
-        config_dir = hass.config.config_dir
-        target_file = _os.path.join(config_dir, "smart_agent_automations.yaml")
-
-        def _write_file() -> dict:
-            """在执行器线程中读取/更新/写入文件，返回操作结果。"""
-            automations: list = []
-            if _os.path.exists(target_file):
-                try:
-                    with open(target_file, encoding="utf-8") as _f:
-                        existing = _yaml.safe_load(_f)
-                    if isinstance(existing, list):
-                        automations = existing
-                except Exception:
-                    automations = []
-
-            # 用 alias 去重（同一场景重新批准时更新而不是追加）
-            alias = new_automation.get("alias", f"SmartAgent AI 场景 {scene_id}")
-            automations = [a for a in automations if a.get("alias") != alias]
-            automations.append(new_automation)
-
-            with open(target_file, "w", encoding="utf-8") as _f:
-                _yaml.dump(automations, _f, allow_unicode=True,
-                           sort_keys=False, default_flow_style=False)
-            return {"count": len(automations), "file": target_file}
-
-        try:
-            write_result = await hass.async_add_executor_job( _write_file)
-        except Exception as exc:
-            return self.json(
-                _json_error_payload(
-                    error=f"write_file_failed:{exc}",
-                    error_type="internal_error",
-                    retryable=False,
-                ),
-                status_code=500,
-            )
-
-        # 调用 automation.reload 让 HA 立即加载新的自动化（需要用户已配置 !include）
-        reload_ok = False
-        try:
-            await async_call_service(hass, "automation", "reload", {})
-            reload_ok = True
-        except Exception:
-            pass  # reload 失败不影响文件写入结果
-
-        _LOGGER.info(
-            "[Phase 7D] AI 场景 %d 已写入 %s（共 %d 条），reload=%s",
-            scene_id, write_result["file"], write_result["count"], reload_ok,
-        )
-        return self.json({
-            "success": True,
-            "scene_id": scene_id,
-            "file": write_result["file"],
-            "automation_count": write_result["count"],
-            "reload_ok": reload_ok,
-            "tip": (
-                "首次使用请在 HA configuration.yaml 的 automation: 段添加：\n"
-                "  automation: !include smart_agent_automations.yaml\n"
-                "之后重启 HA 一次，以后批准的场景均会自动生效。"
-            ),
-        })
+            _LOGGER.debug("[SceneExportPost] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("scene_yaml_export"), status_code=502)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2809,10 +2713,6 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
                 else:
                     payload, status = _json_from_addon_result(proxied)
                 if status in (404, 405):
-                    try:
-                        await async_call_service(hass, DOMAIN, "update_config", body, blocking=True)
-                    except Exception as fallback_exc:
-                        _LOGGER.debug("[SystemSettingsPost] local fallback update_config failed: %s", fallback_exc)
                     return self.json(_addon_endpoint_missing_payload("settings_system_post"), status_code=status)
                 return self.json(payload, status_code=status)
             return self.json(_addon_unreachable_payload("settings_system_post"), status_code=502)
@@ -3566,24 +3466,19 @@ class SmartAgentTransactionDetailView(HomeAssistantView):
                 status_code=404,
             )
 
-        try:
-            tid = int(txn_id)
-        except (TypeError, ValueError):
+        tid = str(txn_id or "").strip()
+        if not tid:
             return self.json(
                 _json_error_payload("invalid_transaction_id", "bad_request", False),
                 status_code=400,
             )
-        if tid <= 0:
-            return self.json(
-                _json_error_payload("invalid_transaction_id", "bad_request", False),
-                status_code=400,
-            )
+        encoded_tid = quote(tid, safe="")
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
-                proxied = await _addon_client.request_json("GET", f"/transactions/{tid}")
+                proxied = await _addon_client.request_json("GET", f"/transactions/{encoded_tid}")
                 if isinstance(proxied, dict):
                     normalized = _json_from_addon_http_result(proxied)
                     if normalized is not None:
@@ -3619,18 +3514,13 @@ class SmartAgentDecisionTraceView(HomeAssistantView):
                 status_code=404,
             )
 
-        try:
-            tid = int(txn_id)
-        except (TypeError, ValueError):
+        tid = str(txn_id or "").strip()
+        if not tid:
             return self.json(
                 _json_error_payload("invalid_transaction_id", "bad_request", False),
                 status_code=400,
             )
-        if tid <= 0:
-            return self.json(
-                _json_error_payload("invalid_transaction_id", "bad_request", False),
-                status_code=400,
-            )
+        encoded_tid = quote(tid, safe="")
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
@@ -3640,7 +3530,7 @@ class SmartAgentDecisionTraceView(HomeAssistantView):
                 if callable(get_trace):
                     proxied = await get_trace(tid)
                 else:
-                    proxied = await _addon_client.request_json("GET", f"/decision-trace/{tid}")
+                    proxied = await _addon_client.request_json("GET", f"/decision-trace/{encoded_tid}")
                 if isinstance(proxied, dict):
                     normalized = _json_from_addon_http_result(proxied)
                     if normalized is not None:
@@ -3659,29 +3549,127 @@ class SmartAgentDecisionTraceView(HomeAssistantView):
             return self.json(_addon_unreachable_payload("decision_trace_detail"), status_code=502)
 
         txns = coord._transactions_cache if isinstance(coord._transactions_cache, list) else []
-        detail = next(
+        raw_detail = next(
             (
-                {k: v for k, v in t.items() if k != "pre_states_json"}
+                t
                 for t in txns
                 if isinstance(t, dict)
-                and int(t.get("transaction_id") or t.get("id") or 0) == tid
+                and str(t.get("transaction_id") or t.get("id") or "").strip() == tid
             ),
             None,
         )
-        if detail is None:
+        if raw_detail is None:
             return self.json(
                 _json_error_payload("trace_not_found", "not_found", False),
                 status_code=404,
             )
+        detail = {k: v for k, v in raw_detail.items() if k != "pre_states_json"}
 
-        raw_actions = detail.get("result_json", detail.get("actions", []))
-        if isinstance(raw_actions, str):
+        def _decode_json_list(*values: Any) -> list[Any]:
+            import json as _json
+
+            for value in values:
+                if value in (None, ""):
+                    continue
+                parsed = value
+                if isinstance(value, str):
+                    try:
+                        parsed = _json.loads(value)
+                    except Exception:
+                        continue
+                if isinstance(parsed, list):
+                    return list(parsed)
+            return []
+
+        def _decode_json_object(value: Any) -> dict[str, Any]:
+            import json as _json
+
+            if isinstance(value, dict):
+                return dict(value)
+            if not isinstance(value, str) or not value:
+                return {}
             try:
-                raw_actions = json.loads(raw_actions)
+                parsed = _json.loads(value)
             except Exception:
-                raw_actions = []
-        if not isinstance(raw_actions, list):
-            raw_actions = []
+                return {}
+            return dict(parsed) if isinstance(parsed, dict) else {}
+
+        def _query_legacy_trace_rows(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            db = getattr(coord, "_db", None)
+            query = getattr(db, "query", None)
+            if not callable(query):
+                return []
+            try:
+                rows = query(sql, params)
+            except TypeError:
+                try:
+                    rows = query(sql, params, max_rows=100)
+                except Exception:
+                    return []
+            except Exception:
+                return []
+            if not isinstance(rows, list):
+                return []
+            normalized: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    item = dict(row)
+                except Exception:
+                    continue
+                normalized.append(item)
+            return normalized
+
+        legacy_events = [
+            row
+            for row in _query_legacy_trace_rows(
+                "SELECT time, type, detail, entity, state, source, area, confidence, transaction_id, action_seq "
+                "FROM events WHERE CAST(transaction_id AS TEXT)=? ORDER BY action_seq ASC, time ASC",
+                (tid,),
+            )
+            if row.get("type") or row.get("detail") or row.get("entity")
+        ]
+        legacy_action_results = [
+            row
+            for row in _query_legacy_trace_rows(
+                "SELECT time, entity_id, domain, service, expected_state, actual_state, verified, success, "
+                "retry_count, latency_ms, reason, transaction_id, action_seq "
+                "FROM action_results WHERE CAST(transaction_id AS TEXT)=? ORDER BY action_seq ASC, time ASC",
+                (tid,),
+            )
+            if row.get("entity_id") or row.get("service")
+        ]
+
+        raw_actions = _decode_json_list(
+            detail.get("actions"),
+            detail.get("actions_json"),
+            detail.get("result_json"),
+        )
+        raw_results = _decode_json_list(
+            detail.get("action_results"),
+            detail.get("results"),
+            detail.get("results_json"),
+            detail.get("result_json"),
+        )
+        if not raw_results and legacy_action_results:
+            raw_results = legacy_action_results
+        if not raw_actions and legacy_action_results:
+            raw_actions = [
+                {
+                    key: row.get(key)
+                    for key in ("entity_id", "domain", "service", "expected_state", "actual_state", "action_seq")
+                    if row.get(key) not in (None, "")
+                }
+                for row in legacy_action_results
+            ]
+        execution_payload = detail.get("execution") if isinstance(detail.get("execution"), dict) else {}
+        execution_payload = dict(execution_payload)
+        if raw_results:
+            execution_payload.setdefault("action_results", raw_results)
+        rollback_payload = detail.get("rollback_info") if isinstance(detail.get("rollback_info"), dict) else {}
+        rollback_payload = dict(rollback_payload)
+        pre_states = _decode_json_object(raw_detail.get("pre_states_json"))
+        if pre_states:
+            rollback_payload.setdefault("pre_states", pre_states)
 
         _status = detail.get("status", "")
         _created_at = detail.get("created_at", detail.get("time", ""))
@@ -3689,12 +3677,26 @@ class SmartAgentDecisionTraceView(HomeAssistantView):
         _action_count = detail.get("action_count", 0)
         _blocked_count = detail.get("blocked_count", 0)
         _failed_count = detail.get("failed_count", 0)
+        _trigger = detail.get("trigger_summary", "")
+        if not _trigger and legacy_events:
+            _trigger = legacy_events[0].get("detail") or legacy_events[0].get("type") or ""
+        _context_snapshot = {
+            "confidence": _confidence,
+            "action_count": _action_count,
+            "blocked_count": _blocked_count,
+            "failed_count": _failed_count,
+            "created_at": _created_at,
+        }
+        if legacy_events:
+            _context_snapshot["events"] = legacy_events
+        if legacy_action_results:
+            _context_snapshot["action_results"] = legacy_action_results
 
         trace_payload = {
             "trace_version": "1.0",
             "trace_source": "ha_local_cache",
             "transaction_id": tid,
-            "trigger": detail.get("trigger_summary", ""),
+            "trigger": _trigger,
             "scene": detail.get("scene_desc", detail.get("scene", "")),
             "status": _status,
             "summary": {
@@ -3705,18 +3707,14 @@ class SmartAgentDecisionTraceView(HomeAssistantView):
                 "failed_count": _failed_count,
                 "created_at": _created_at,
             },
-            "context_snapshot": {
-                "confidence": _confidence,
-                "action_count": _action_count,
-                "blocked_count": _blocked_count,
-                "failed_count": _failed_count,
-                "created_at": _created_at,
-            },
+            "context_snapshot": _context_snapshot,
             "actions": raw_actions,
+            "execution": execution_payload,
             "verification": {
                 "blocked_count": _blocked_count,
                 "failed_count": _failed_count,
             },
+            "rollback": rollback_payload,
             "final_outcome": _status,
             "raw": detail,
         }
@@ -4596,50 +4594,32 @@ class SmartAgentVisionCamerasActionView(HomeAssistantView):
                 act = "register"
             elif request.path.endswith("/delete"):
                 act = "delete"
+        if act not in {"register", "delete"}:
+            return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("vision_cameras_action"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.post_vision_camera_action(act, body if isinstance(body, dict) else {})
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                    else:
-                        payload, status = _json_from_addon_result(proxied)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("vision_cameras_action"), status_code=status)
-                    return self.json(payload, status_code=status)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("vision_cameras_action"), status_code=502)
+
+        try:
+            proxied = await _addon_client.post_vision_camera_action(act, body if isinstance(body, dict) else {})
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
                 else:
-                    return self.json(_addon_unreachable_payload("vision_cameras_action"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[VisionCamerasAction] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("vision_cameras_action"), status_code=502)
-
-        if act == "register":
-            for k in ("friendly_name", "rtsp_url"):
-                if not str((body or {}).get(k, "") or "").strip():
-                    return self.json({"ok": False, "error": f"{k} required"}, status_code=400)
-            await async_call_service(hass, DOMAIN, "register_frigate_camera", {
-                "friendly_name": str(body.get("friendly_name", "") or "").strip(),
-                "rtsp_url": str(body.get("rtsp_url", "") or "").strip(),
-                "room": str(body.get("room", "") or "").strip(),
-                "camera_id": str(body.get("camera_id", "") or "").strip(),
-                "min_score": float(body.get("min_score", 0.7) or 0.7),
-                "threshold": float(body.get("threshold", 0.85) or 0.85),
-                "fps": int(body.get("fps", 5) or 5),
-            }, blocking=True)
-            return self.json({"ok": True, "action": "register"})
-
-        if act == "delete":
-            camera_id = str((body or {}).get("camera_id", "") or "").strip()
-            if not camera_id:
-                return self.json({"ok": False, "error": "camera_id required"}, status_code=400)
-            await async_call_service(hass, DOMAIN, "delete_frigate_camera", {"camera_id": camera_id}, blocking=True)
-            return self.json({"ok": True, "action": "delete", "camera_id": camera_id})
-
-        return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
+                    payload, status = _json_from_addon_result(proxied)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("vision_cameras_action"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("vision_cameras_action"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[VisionCamerasAction] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("vision_cameras_action"), status_code=502)
 
 
 class SmartAgentVisionZonesView(HomeAssistantView):
@@ -4721,46 +4701,28 @@ class SmartAgentVisionZonesSaveView(HomeAssistantView):
             return self.json({"ok": False, "error": "camera_id and zone_id required"}, status_code=400)
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        if is_addon_proxy:
+            return self.json(_addon_endpoint_missing_payload("vision_zones_save"), status_code=404)
+
         _addon_client = getattr(coord, "_addon_client", None)
-        if (not is_addon_proxy) and _addon_client is not None:
-            try:
-                proxied = await _addon_client.save_vision_zone(body if isinstance(body, dict) else {})
-                if isinstance(proxied, dict):
-                    normalized = _json_from_addon_http_result(proxied)
-                    if normalized is not None:
-                        payload, status = normalized
-                    else:
-                        payload, status = _json_from_addon_result(proxied)
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("vision_zones_save"), status_code=status)
-                    return self.json(payload, status_code=status)
+        if _addon_client is None:
+            return self.json(_addon_unreachable_payload("vision_zones_save"), status_code=502)
+
+        try:
+            proxied = await _addon_client.save_vision_zone(body if isinstance(body, dict) else {})
+            if isinstance(proxied, dict):
+                normalized = _json_from_addon_http_result(proxied)
+                if normalized is not None:
+                    payload, status = normalized
                 else:
-                    return self.json(_addon_unreachable_payload("vision_zones_save"), status_code=502)
-            except Exception as exc:
-                _LOGGER.debug("[VisionZonesSave] add-on proxy failed: %s", exc)
-                return self.json(_addon_unreachable_payload("vision_zones_save"), status_code=502)
-
-        friendly_name = str((body or {}).get("friendly_name", "") or "")
-        room = str((body or {}).get("room", "") or "")
-
-        from datetime import datetime as _dt_now
-
-        def _db_upsert() -> bool:
-            now_str = _dt_now.now().isoformat()
-            return bool(coord._db.execute(
-                """INSERT INTO frigate_zones (camera_id, zone_id, friendly_name, room, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(camera_id, zone_id) DO UPDATE SET
-                     friendly_name=excluded.friendly_name,
-                     room=excluded.room,
-                     updated_at=excluded.updated_at""",
-                (camera_id, zone_id, friendly_name, room, now_str, now_str),
-            ))
-
-        ok = await hass.async_add_executor_job(_db_upsert)
-        if not ok:
-            return self.json({"ok": False, "error": "db_write_failed"}, status_code=500)
-        return self.json({"ok": True})
+                    payload, status = _json_from_addon_result(proxied)
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("vision_zones_save"), status_code=status)
+                return self.json(payload, status_code=status)
+            return self.json(_addon_unreachable_payload("vision_zones_save"), status_code=502)
+        except Exception as exc:
+            _LOGGER.debug("[VisionZonesSave] add-on proxy failed: %s", exc)
+            return self.json(_addon_unreachable_payload("vision_zones_save"), status_code=502)
 
 
 class SmartAgentMcpStatusView(HomeAssistantView):
@@ -5659,17 +5621,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         }))
 
     # ── Phase 4: AI 场景管理服务 ──────────────────────────────────────────────
+    async def _proxy_ai_scene_lifecycle(action: str, scene_id: int) -> None:
+        _addon_client = getattr(coordinator, "_addon_client", None)
+        if _addon_client is None:
+            coordinator._sys_log("WARN", "[AI场景] add-on lifecycle provider unavailable")
+            return
+
+        try:
+            if action == "approve":
+                result = await _addon_client.post_ai_scene_action("approve", scene_id)
+            elif action == "reject":
+                result = await _addon_client.post_ai_scene_action("reject", scene_id)
+            elif action == "delete":
+                result = await _addon_client.post_ai_scene_delete_fallback(scene_id)
+            elif action == "trigger":
+                result = await _addon_client.trigger_ai_scene(scene_id)
+            else:
+                coordinator._sys_log("WARN", f"[AI场景] 不支持的 lifecycle action: {action}")
+                return
+        except Exception as exc:
+            coordinator._sys_log("WARN", f"[AI场景] add-on lifecycle provider 调用失败: {exc}")
+            return
+
+        if not isinstance(result, dict):
+            coordinator._sys_log("WARN", "[AI场景] add-on lifecycle provider unavailable")
+            return
+        status = int(result.get("__status", 200) or 200)
+        if status >= 400 or result.get("ok") is False:
+            error = result.get("error") or result.get("error_type") or f"http_{status}"
+            coordinator._sys_log("WARN", f"[AI场景] add-on lifecycle provider 返回失败: {action} id={scene_id} error={error}")
+            return
+
+        coordinator._sys_log("INFO", f"[AI场景] lifecycle 已交由 add-on provider: {action} id={scene_id}")
+        coordinator.async_set_updated_data({})
+
     async def svc_approve_ai_scene(call: ServiceCall) -> None:
-        await coordinator.async_approve_ai_scene(int(call.data["id"]))
+        scene_id = int(call.data["id"])
+        await _proxy_ai_scene_lifecycle("approve", scene_id)
 
     async def svc_reject_ai_scene(call: ServiceCall) -> None:
-        await coordinator.async_reject_ai_scene(int(call.data["id"]))
+        scene_id = int(call.data["id"])
+        await _proxy_ai_scene_lifecycle("reject", scene_id)
 
     async def svc_delete_ai_scene(call: ServiceCall) -> None:
-        await coordinator.async_delete_ai_scene(int(call.data["id"]))
+        scene_id = int(call.data["id"])
+        await _proxy_ai_scene_lifecycle("delete", scene_id)
 
     async def svc_trigger_ai_scene(call: ServiceCall) -> None:
-        await coordinator.async_trigger_ai_scene(int(call.data["id"]))
+        scene_id = int(call.data["id"])
+        await _proxy_ai_scene_lifecycle("trigger", scene_id)
 
     _ai_scene_schema = vol.Schema({vol.Required("id"): vol.Coerce(int)})
     hass.services.async_register(DOMAIN, "approve_ai_scene", svc_approve_ai_scene, schema=_ai_scene_schema)
@@ -5963,134 +5963,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             vol.Required("command"): cv.string,
             vol.Optional("source", default="touch"): cv.string,
         })
-    )
-
-    # ── Frigate 摄像头配置服务（傻瓜式一键配置 + AI 区域绑定）──────────────────
-
-    async def svc_register_frigate_camera(call: ServiceCall) -> None:
-        """
-        注册或更新 Frigate 摄像头配置。
-
-        执行流程：
-        1. 生成 camera_id（cam_xxxxxxxx）
-        2. 将配置写入 Frigate config.yaml
-        3. 在 SmartAgent DB 中保存 camera→room 绑定
-        4. 重启 Frigate Add-on 使配置生效
-        """
-        from .frigate_config import (
-            find_frigate_config_path, extract_addon_slug,
-            generate_camera_id, read_frigate_config, write_frigate_config,
-            build_camera_config, add_camera_to_config, restart_frigate_addon,
-        )
-        from datetime import datetime as _dt
-
-        friendly_name = call.data["friendly_name"].strip()
-        rtsp_url = call.data["rtsp_url"].strip()
-        room = call.data.get("room", "").strip()
-        min_score = float(call.data.get("min_score", 0.7))
-        threshold = float(call.data.get("threshold", 0.85))
-        fps = int(call.data.get("fps", 5))
-        camera_id = call.data.get("camera_id", "").strip() or generate_camera_id(friendly_name)
-
-        # 查找 Frigate 配置文件（动态路径，每台设备不同）
-        config_path = await hass.async_add_executor_job(find_frigate_config_path)
-        if not config_path:
-            coordinator._sys_log("ERROR", "[Frigate配置] 未找到 Frigate 配置文件，请确认 Frigate Add-on 已安装")
-            return
-
-        # 读取现有配置，添加/更新摄像头
-        config = await hass.async_add_executor_job(read_frigate_config, config_path)
-        cam_cfg = build_camera_config(friendly_name, rtsp_url, min_score, threshold, fps)
-        config = add_camera_to_config(config, camera_id, cam_cfg, rtsp_url)
-        ok = await hass.async_add_executor_job(write_frigate_config, config_path, config)
-        if not ok:
-            coordinator._sys_log("ERROR", f"[Frigate配置] 写入配置失败: {config_path}")
-            return
-
-        # 保存 camera→room 绑定到 SmartAgent DB
-        now = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        def _db_upsert() -> bool:
-            return bool(coordinator._db.execute(
-                """INSERT INTO frigate_cameras
-                   (camera_id, friendly_name, rtsp_url, room, min_score, threshold, fps, enabled, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,1,?,?)
-                   ON CONFLICT(camera_id) DO UPDATE SET
-                   friendly_name=excluded.friendly_name,
-                   rtsp_url=excluded.rtsp_url,
-                   room=excluded.room,
-                   min_score=excluded.min_score,
-                   threshold=excluded.threshold,
-                   fps=excluded.fps,
-                   updated_at=excluded.updated_at""",
-                (camera_id, friendly_name, rtsp_url, room, min_score, threshold, fps, now, now),
-            ))
-
-        db_ok = await hass.async_add_executor_job(_db_upsert)
-        if not db_ok:
-            coordinator._sys_log("ERROR", f"[Frigate配置] 保存 camera 绑定失败: {friendly_name}({camera_id})")
-            return
-
-        # 重启 Frigate Add-on
-        addon_slug = extract_addon_slug(config_path) or "ccab4aaf_frigate"
-        await restart_frigate_addon(hass, addon_slug)
-
-        coordinator._sys_log(
-            "INFO",
-            f"[Frigate配置] 摄像头已配置: {friendly_name}({camera_id}) → 房间={room or '未绑定'}"
-        )
-
-    async def svc_delete_frigate_camera(call: ServiceCall) -> None:
-        """
-        删除 Frigate 摄像头配置。
-
-        同时从 Frigate config.yaml 和 SmartAgent DB 中移除。
-        """
-        from .frigate_config import (
-            find_frigate_config_path, extract_addon_slug,
-            read_frigate_config, write_frigate_config,
-            remove_camera_from_config, restart_frigate_addon,
-        )
-
-        camera_id = call.data["camera_id"].strip()
-
-        config_path = await hass.async_add_executor_job(find_frigate_config_path)
-        if config_path:
-            config = await hass.async_add_executor_job(read_frigate_config, config_path)
-            config = remove_camera_from_config(config, camera_id)
-            cfg_ok = await hass.async_add_executor_job(write_frigate_config, config_path, config)
-            if not cfg_ok:
-                coordinator._sys_log("ERROR", f"[Frigate配置] 删除摄像头配置写入失败: {camera_id}")
-                return
-            addon_slug = extract_addon_slug(config_path) or "ccab4aaf_frigate"
-            await restart_frigate_addon(hass, addon_slug)
-
-        def _db_delete() -> bool:
-            return bool(coordinator._db.execute(
-                "DELETE FROM frigate_cameras WHERE camera_id=?", (camera_id,)
-            ))
-
-        db_ok = await hass.async_add_executor_job(_db_delete)
-        if not db_ok:
-            coordinator._sys_log("ERROR", f"[Frigate配置] 删除 camera 绑定失败: {camera_id}")
-            return
-        coordinator._sys_log("INFO", f"[Frigate配置] 摄像头已删除: {camera_id}")
-
-    hass.services.async_register(
-        DOMAIN, "register_frigate_camera", svc_register_frigate_camera,
-        schema=vol.Schema({
-            vol.Required("friendly_name"): cv.string,
-            vol.Required("rtsp_url"): cv.string,
-            vol.Optional("room", default=""): cv.string,
-            vol.Optional("camera_id", default=""): cv.string,
-            vol.Optional("min_score", default=0.7): vol.Coerce(float),
-            vol.Optional("threshold", default=0.85): vol.Coerce(float),
-            vol.Optional("fps", default=5): vol.Coerce(int),
-        })
-    )
-    hass.services.async_register(
-        DOMAIN, "delete_frigate_camera", svc_delete_frigate_camera,
-        schema=vol.Schema({vol.Required("camera_id"): cv.string})
     )
 
     # ── WebSocket API：大数据列表通过 WS 按需下发，绕过 sensor 属性 16KB 上限 ──

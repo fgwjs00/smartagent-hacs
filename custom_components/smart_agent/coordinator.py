@@ -45,6 +45,7 @@ from .database import DatabaseMixin
 from .decision_pipeline import DecisionPipeline
 from .devices import DevicesMixin
 from .frigate import FrigateMixin
+from .ha_adapter import async_call_service
 from .inference import InferenceMixin
 from .license import LicenseMixin
 from .listeners import ListenersMixin
@@ -295,7 +296,7 @@ class SmartAgentCoordinator(
         self._env_feedback_tasks: list[dict] = []
         self._env_feedback_lock = asyncio.Lock()
         # Phase A: DeviceAdapter — AI Core 与 HA 设备层解耦（可测试化）
-        # 当前唯一实现：HAAdapter（通过 hass.services.async_call）
+        # 当前唯一实现：HAAdapter（通过 SmartAgent command envelope）
         from .device_adapter import HAAdapter
         self._device_adapter = HAAdapter(hass)
         # 全局推理互斥锁：作为无法提取房间名时的兜底（如巡检、定时、位置变化触发）
@@ -550,8 +551,12 @@ class SmartAgentCoordinator(
             return
         self._last_notify[key] = now
         self.hass.async_create_task(
-            self.hass.services.async_call("persistent_notification", "create",
-                                          {"message": message, "title": title})
+            async_call_service(
+                self.hass,
+                "persistent_notification",
+                "create",
+                {"message": message, "title": title},
+            )
         )
 
     async def _tts_speak(self, text: str, min_level: int = 1) -> None:
@@ -573,7 +578,8 @@ class SmartAgentCoordinator(
                 return
         domain, service = svc.split(".", 1)
         try:
-            await self.hass.services.async_call(
+            await async_call_service(
+                self.hass,
                 domain, service,
                 {"entity_id": target, "message": text},
             )
@@ -698,7 +704,7 @@ class SmartAgentCoordinator(
             failed = 0
             for eid in self.device_info:
                 try:
-                    await self.hass.services.async_call("homeassistant", "update_entity", {"entity_id": eid})
+                    await async_call_service(self.hass, "homeassistant", "update_entity", {"entity_id": eid})
                     refreshed += 1
                 except Exception:
                     failed += 1
@@ -1189,7 +1195,8 @@ class SmartAgentCoordinator(
             if self._express_token:
                 self._pairing_mode_end_time = time.time() + 60
                 self._sys_log("INFO", "[配对] 极速配对就绪，60 秒窗口已开启")
-                await self.hass.services.async_call(
+                await async_call_service(
+                    self.hass,
                     "persistent_notification", "create",
                     {
                         "message": "极速配对已就绪，中控屏将在数秒内自动连接。",
@@ -1200,7 +1207,8 @@ class SmartAgentCoordinator(
             else:
                 self._pairing_mode_end_time = 0
                 self._sys_log("ERROR", f"[配对] 极速配对失败: {error_msg}")
-                await self.hass.services.async_call(
+                await async_call_service(
+                    self.hass,
                     "persistent_notification", "create",
                     {
                         "message": f"极速配对令牌创建失败: {error_msg}\n请检查 HA 日志获取详情。",

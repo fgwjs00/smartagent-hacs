@@ -202,6 +202,36 @@ async def async_call_service(
     await hass.services.async_call(domain, service, payload, blocking=blocking)
 
 
+async def async_reload_scenes(hass: Any) -> None:
+    """Reload HA scene YAML through the adapter boundary."""
+    await async_call_service(hass, "scene", "reload", {})
+
+
+async def async_create_scene(
+    hass: Any,
+    *,
+    scene_id: str,
+    entities: dict[str, Any],
+) -> None:
+    """Create an ephemeral HA scene through the adapter boundary."""
+    await async_call_service(
+        hass,
+        "scene",
+        "create",
+        {"scene_id": scene_id, "entities": entities if isinstance(entities, dict) else {}},
+    )
+
+
+async def async_delete_scene(hass: Any, entity_id: str) -> None:
+    """Delete a HA scene entity through the adapter boundary."""
+    await async_call_service(hass, "scene", "delete", {"entity_id": entity_id})
+
+
+async def async_reload_automations(hass: Any) -> None:
+    """Reload HA automations through the adapter boundary."""
+    await async_call_service(hass, "automation", "reload", {})
+
+
 def list_binary_sensor_states(hass: HomeAssistant) -> list[dict[str, Any]]:
     """返回 binary_sensor 的最小只读快照列表。"""
     rows: list[dict[str, Any]] = []

@@ -410,7 +410,10 @@ async def restart_frigate_addon(hass: Any, addon_slug: str) -> bool:
     # 方式一：通过 hassio 域服务（更可靠）
     try:
         if hass.services.has_service("hassio", "addon_restart"):
-            await hass.services.async_call(
+            from .ha_adapter import async_call_service
+
+            await async_call_service(
+                hass,
                 "hassio", "addon_restart",
                 {"addon": addon_slug},
                 blocking=False,

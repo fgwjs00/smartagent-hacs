@@ -10,6 +10,7 @@ import re
 import time
 from typing import Any
 
+from .ha_adapter import async_call_service
 from .const import (
     PRIORITY_EMERGENCY, PRIORITY_USER_DIRECT, PRIORITY_AUTOMATION,
     PRIORITY_AI_LOCKED, PRIORITY_AI_LEARNED,
@@ -848,7 +849,8 @@ class ProtectionMixin:
                 # 同时发送 HA 持久通知
                 try:
                     self.hass.async_create_task(
-                        self.hass.services.async_call(
+                        async_call_service(
+                            self.hass,
                             "persistent_notification", "create",
                             {"title": "🪟 环境提醒", "message": warn_msg},
                         )

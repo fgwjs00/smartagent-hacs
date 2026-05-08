@@ -19,6 +19,7 @@ from homeassistant.helpers.event import async_call_later
 from .action_mapping import entities_to_actions, normalize_raw_actions
 from .const import ENGINE_LOCAL, ENGINE_ONLINE
 from .context_builder import _extract_trigger_room
+from .ha_adapter import async_call_service
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2595,7 +2596,8 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
                     notification_id="smart_agent_action_rejected",
                 )
             except Exception:
-                await self.hass.services.async_call(
+                await async_call_service(
+                    self.hass,
                     "persistent_notification", "create",
                     {"message": body, "title": "SmartAgent 操作提示",
                      "notification_id": "smart_agent_action_rejected"},

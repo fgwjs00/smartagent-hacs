@@ -936,9 +936,39 @@ class ActionsMixin:
                 safe_params["color_temp_kelvin"] = round(1_000_000 / mired_val)
                 self._sys_log("INFO", f"[动作] {entity_id} color_temp({mired_val}mireds)"
                               f" → color_temp_kelvin({safe_params['color_temp_kelvin']}K) 自动转换")
-        service_data = {**safe_params, "entity_id": entity_id}
+        from .ha_adapter import async_execute_command_envelope
+
+        async def _execute_enveloped_service(call_params: dict[str, Any] | None = None) -> None:
+            payload = call_params if isinstance(call_params, dict) else {}
+            result = await async_execute_command_envelope(self.hass, {
+                "request_id": f"legacy-action:{transaction_id}:{action_seq}:{entity_id}",
+                "commands": [{
+                    "entity_id": entity_id,
+                    "domain": domain,
+                    "service": service,
+                    "data": payload,
+                }],
+                "execution_policy": {"stop_on_first_error": True},
+                "safety": {
+                    "risk_level": "safe",
+                    "requires_confirmation": False,
+                    "reason": reason,
+                },
+            })
+            if isinstance(result, dict) and result.get("ok"):
+                return
+            failed = None
+            if isinstance(result, dict):
+                failed = next((item for item in result.get("results", []) if not item.get("ok")), None)
+            error = ""
+            if isinstance(failed, dict):
+                error = str(failed.get("error") or failed.get("status") or "")
+            if not error and isinstance(result, dict):
+                error = str(result.get("error") or result.get("error_type") or "")
+            raise RuntimeError(error or "command_envelope_failed")
+
         try:
-            await self.hass.services.async_call(domain, service, service_data)
+            await _execute_enveloped_service(safe_params)
             if domain in ("scene", "script") and service == "turn_on":
                 self._scene_last_exec[entity_id] = time.time()
         except Exception as call_err:
@@ -954,14 +984,12 @@ class ActionsMixin:
                     self._sys_log("WARN", f"[动作] {entity_id} 不支持色温参数 {color_keys_present}，"
                                   f"保留亮度重试: {non_color_params}")
                     try:
-                        await self.hass.services.async_call(
-                            domain, service, {"entity_id": entity_id, **non_color_params}
-                        )
+                        await _execute_enveloped_service(non_color_params)
                     except vol.Invalid:
                         # 再退一步：去除全部扩展参数
                         self._sys_log("WARN", f"[动作] {entity_id} 亮度参数也失败，去除全部扩展参数重试")
                         try:
-                            await self.hass.services.async_call(domain, service, {"entity_id": entity_id})
+                            await _execute_enveloped_service({})
                         except ServiceNotFound:
                             raise
                         except Exception as retry_err:
@@ -976,7 +1004,7 @@ class ActionsMixin:
                     # 没有可保留的参数，直接裸调用
                     self._sys_log("WARN", f"[动作] {entity_id} 不支持参数 {extra_keys}，去除后重试")
                     try:
-                        await self.hass.services.async_call(domain, service, {"entity_id": entity_id})
+                        await _execute_enveloped_service({})
                     except ServiceNotFound:
                         raise
                     except Exception as retry_err:
