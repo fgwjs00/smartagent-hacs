@@ -1104,6 +1104,36 @@ def _addon_endpoint_missing_payload(scope: str) -> dict[str, Any]:
     )
 
 
+def _patrol_trigger_plan_only_payload(reason: str = "controlled_provider_pending") -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "operation_plan_only",
+        "error_type": "plan_only",
+        "retryable": False,
+        "source": "ha_host_patrol_plan_only_fallback",
+        "contract_version": "1.1",
+        "domain": "patrol",
+        "action": "trigger",
+        "dry_run": True,
+        "executed": False,
+        "provider_status": "pending_deepening",
+        "plan": {
+            "domain": "patrol",
+            "action": "trigger",
+            "status": "plan_only",
+            "execution": "blocked",
+            "reason": reason,
+            "rollback": {
+                "supported": False,
+                "strategy": "not_supported_for_diagnostic_trigger",
+            },
+        },
+        "warnings": [
+            "patrol trigger remains plan-only until a controlled execution provider exists"
+        ],
+    }
+
+
 def _default_capability_dry_run_payload() -> dict[str, Any]:
     """capability dry-run 最小安全骨架：默认仅给建议，不执行真实动作。"""
     return {
@@ -1232,7 +1262,14 @@ class SmartAgentLogDatesView(HomeAssistantView):
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("logs_dates"), status_code=404)
+            try:
+                get_dates = getattr(coord, "get_log_dates", None)
+                if callable(get_dates):
+                    dates = await hass.async_add_executor_job(get_dates)
+                    return self.json(dates if isinstance(dates, list) else [])
+            except Exception as exc:
+                _LOGGER.debug("[LogDates] local add-on proxy fallback failed: %s", exc)
+            return self.json([])
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
 
@@ -1290,7 +1327,15 @@ class SmartAgentLogContentView(HomeAssistantView):
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("logs_content"), status_code=404)
+            try:
+                read_file = getattr(coord, "read_log_file", None)
+                content = ""
+                if callable(read_file):
+                    content = await hass.async_add_executor_job(read_file, str(date))
+                return self.json({"date": str(date), "content": str(content or "")})
+            except Exception as exc:
+                _LOGGER.debug("[LogContent] local add-on proxy fallback failed: %s", exc)
+                return self.json({"date": str(date), "content": ""})
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
 
@@ -1326,7 +1371,15 @@ class SmartAgentLogInfoView(HomeAssistantView):
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("logs_info"), status_code=404)
+            try:
+                get_info = getattr(coord, "get_log_info", None)
+                if callable(get_info):
+                    info = await hass.async_add_executor_job(get_info)
+                    if isinstance(info, (list, dict)):
+                        return self.json(info)
+            except Exception as exc:
+                _LOGGER.debug("[LogInfo] local add-on proxy fallback failed: %s", exc)
+            return self.json([])
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
 
@@ -2741,7 +2794,35 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("settings_system_get"), status_code=404)
+            try:
+                attrs = coord.get_config_attributes() if hasattr(coord, "get_config_attributes") else {}
+            except Exception as exc:
+                _LOGGER.debug("[SystemSettingsGet] local add-on proxy fallback failed: %s", exc)
+                attrs = {}
+            attrs = attrs if isinstance(attrs, dict) else {}
+            payload = {
+                "engine": "online" if str(attrs.get("engine") or getattr(coord, "engine", "local")) == "online" else "local",
+                "ollama_url": str(attrs.get("ollama_url") or getattr(coord, "ollama_url", "http://127.0.0.1:11434")),
+                "ollama_model": str(attrs.get("ollama_model") or getattr(coord, "ollama_model", "qwen3-smarthome")),
+                "online_base_url": str(attrs.get("online_base_url") or getattr(coord, "online_base_url", "")),
+                "online_model": str(attrs.get("online_model") or getattr(coord, "online_model", "qwen3.5-flash")),
+                "online_api_key": str(attrs.get("online_api_key") or ""),
+                "cloud_fallback": bool(attrs.get("cloud_fallback", getattr(coord, "_cloud_fallback", False))),
+                "vision_enabled": bool(attrs.get("vision_enabled", getattr(coord, "_vision_enabled", True))),
+                "vision_engine": "local" if str(attrs.get("vision_engine") or getattr(coord, "_vision_engine", "online")) == "local" else "online",
+                "vision_model": str(attrs.get("vision_model") or getattr(coord, "_vision_model", "qwen3.5-omni-flash")),
+                "presence_fusion": str(attrs.get("presence_fusion") or ""),
+                "confidence_auto": int(attrs.get("confidence_auto") or getattr(coord, "confidence_auto", 70)),
+                "confidence_notify": int(attrs.get("confidence_notify") or getattr(coord, "confidence_notify", 50)),
+                "cooldown": int(attrs.get("cooldown") or getattr(coord, "cooldown", 30)),
+                "mode": "showroom" if str(attrs.get("mode") or getattr(coord, "_mode", "home")) == "showroom" else "home",
+                "learning_mode": bool(attrs.get("learning_mode", getattr(coord, "_learning_mode", False))),
+                "habit_proactive_ask": bool(attrs.get("habit_proactive_ask", getattr(coord, "_habit_proactive", False))),
+                "frigate_enabled": bool(attrs.get("frigate_enabled", getattr(coord, "_frigate_enabled", True))),
+                "source": "ha_local_proxy_fallback",
+                "upstream_status": 404,
+            }
+            return self.json(payload)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -2786,7 +2867,68 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("settings_system_post"), status_code=404)
+            mode = str((body or {}).get("mode", "") or "").strip().lower()
+            if mode:
+                if mode not in (MODE_HOME, MODE_SHOWROOM):
+                    return self.json(_json_error_payload("invalid mode", "validation_error", False), status_code=400)
+                set_mode = getattr(coord, "async_set_mode", None)
+                if callable(set_mode):
+                    result = set_mode(mode)
+                    if asyncio.iscoroutine(result):
+                        await result
+                else:
+                    setattr(coord, "_mode", mode)
+
+            option_updates: dict[str, Any] = {}
+            bool_fields = {
+                "learning_mode": "_learning_mode",
+                "habit_proactive_ask": "_habit_proactive",
+                "frigate_enabled": "_frigate_enabled",
+            }
+            for key, attr in bool_fields.items():
+                if key in body:
+                    value = bool(body.get(key))
+                    setattr(coord, attr, value)
+                    option_key = "habit_proactive" if key == "habit_proactive_ask" else key
+                    option_updates[option_key] = value
+
+            entry = getattr(coord, "_entry", None)
+            config_entries = getattr(hass, "config_entries", None)
+            update_entry = getattr(config_entries, "async_update_entry", None)
+            if option_updates and entry is not None and callable(update_entry):
+                try:
+                    update_entry(entry, options={**(getattr(entry, "options", {}) or {}), **option_updates})
+                except Exception as exc:
+                    _LOGGER.debug("[SystemSettingsPost] local option persistence failed: %s", exc)
+
+            try:
+                attrs = coord.get_config_attributes() if hasattr(coord, "get_config_attributes") else {}
+            except Exception as exc:
+                _LOGGER.debug("[SystemSettingsPost] local add-on proxy fallback readback failed: %s", exc)
+                attrs = {}
+            attrs = attrs if isinstance(attrs, dict) else {}
+            return self.json({
+                "ok": True,
+                "engine": "online" if str(attrs.get("engine") or getattr(coord, "engine", "local")) == "online" else "local",
+                "ollama_url": str(attrs.get("ollama_url") or getattr(coord, "ollama_url", "http://127.0.0.1:11434")),
+                "ollama_model": str(attrs.get("ollama_model") or getattr(coord, "ollama_model", "qwen3-smarthome")),
+                "online_base_url": str(attrs.get("online_base_url") or getattr(coord, "online_base_url", "")),
+                "online_model": str(attrs.get("online_model") or getattr(coord, "online_model", "qwen3.5-flash")),
+                "cloud_fallback": bool(attrs.get("cloud_fallback", getattr(coord, "_cloud_fallback", False))),
+                "vision_enabled": bool(attrs.get("vision_enabled", getattr(coord, "_vision_enabled", True))),
+                "vision_engine": "local" if str(attrs.get("vision_engine") or getattr(coord, "_vision_engine", "online")) == "local" else "online",
+                "vision_model": str(attrs.get("vision_model") or getattr(coord, "_vision_model", "qwen3.5-omni-flash")),
+                "presence_fusion": str(attrs.get("presence_fusion") or ""),
+                "confidence_auto": int(attrs.get("confidence_auto") or getattr(coord, "confidence_auto", 70)),
+                "confidence_notify": int(attrs.get("confidence_notify") or getattr(coord, "confidence_notify", 50)),
+                "cooldown": int(attrs.get("cooldown") or getattr(coord, "cooldown", 30)),
+                "mode": "showroom" if str(attrs.get("mode") or getattr(coord, "_mode", "home")) == "showroom" else "home",
+                "learning_mode": bool(attrs.get("learning_mode", getattr(coord, "_learning_mode", False))),
+                "habit_proactive_ask": bool(attrs.get("habit_proactive_ask", getattr(coord, "_habit_proactive", False))),
+                "frigate_enabled": bool(attrs.get("frigate_enabled", getattr(coord, "_frigate_enabled", True))),
+                "source": "ha_local_proxy_fallback",
+                "upstream_status": 404,
+            })
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -3891,7 +4033,7 @@ class SmartAgentEnergyView(HomeAssistantView):
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("energy"), status_code=404)
+            return self.json([])
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("energy"), status_code=502)
 
@@ -3943,6 +4085,32 @@ class SmartAgentLicenseStatusView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
+        if is_addon_proxy:
+            payload: dict[str, Any] = {}
+            try:
+                get_status = getattr(coord, "get_license_status", None)
+                if callable(get_status):
+                    raw = get_status()
+                    if isinstance(raw, dict):
+                        payload = dict(raw)
+            except Exception as exc:
+                _LOGGER.debug("[LicenseStatus] local add-on proxy fallback failed: %s", exc)
+            if not payload:
+                payload = {
+                    "valid": False,
+                    "tier": "free",
+                    "tier_label": "免费版",
+                    "daily_limit": 30,
+                    "daily_used": 0,
+                }
+            payload.setdefault("valid", bool(payload.get("tier") in {"business", "biz", "pro", "enterprise"}))
+            payload.setdefault("tier", "free")
+            payload.setdefault("tier_label", "免费版")
+            payload.setdefault("daily_limit", 30)
+            payload.setdefault("daily_used", 0)
+            payload["source"] = "ha_local_proxy_fallback"
+            payload["upstream_status"] = 404
+            return self.json(payload)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
                 status = await _addon_client.get_license_status()
@@ -4022,6 +4190,30 @@ class SmartAgentBackupsView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         _addon_client = getattr(coord, "_addon_client", None)
+        if is_addon_proxy:
+            rows: list[dict[str, Any]] = []
+            backup_manager = getattr(coord, "_backup_manager", None)
+            if backup_manager is not None:
+                for method_name in ("list_backups", "get_backups", "list"):
+                    method = getattr(backup_manager, method_name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        result = method()
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        if isinstance(result, list):
+                            rows = [item for item in result if isinstance(item, dict)]
+                            break
+                        if isinstance(result, dict):
+                            data = result.get("data") if isinstance(result.get("data"), list) else result.get("backups")
+                            if isinstance(data, list):
+                                rows = [item for item in data if isinstance(item, dict)]
+                                break
+                    except Exception as exc:
+                        _LOGGER.debug("[Backups] local add-on proxy fallback failed via %s: %s", method_name, exc)
+                        break
+            return self.json(rows)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
                 rows, proxied_error = await _addon_probe_list_result(
@@ -4178,7 +4370,20 @@ class SmartAgentModeView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("mode"), status_code=404)
+            set_mode = getattr(coord, "async_set_mode", None)
+            if callable(set_mode):
+                result = set_mode(mode)
+                if asyncio.iscoroutine(result):
+                    await result
+            else:
+                setattr(coord, "_mode", mode)
+            current_mode = str(getattr(coord, "_mode", mode) or mode)
+            return self.json({
+                "ok": True,
+                "mode": current_mode,
+                "source": "ha_local_proxy_fallback",
+                "upstream_status": 404,
+            })
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -4323,7 +4528,7 @@ class SmartAgentPatrolTriggerView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("patrol_trigger"), status_code=404)
+            return self.json(_patrol_trigger_plan_only_payload("addon_proxy_loop_guard"), status_code=409)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -4338,7 +4543,7 @@ class SmartAgentPatrolTriggerView(HomeAssistantView):
                 return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
             payload, status = normalized
             if status in (404, 405):
-                return self.json(_addon_endpoint_missing_payload("patrol_trigger"), status_code=status)
+                return self.json(_patrol_trigger_plan_only_payload("addon_endpoint_missing"), status_code=409)
             return self.json(payload, status_code=status)
         except Exception as exc:
             _LOGGER.debug("[PatrolTrigger] add-on proxy failed: %s", exc)
@@ -4830,7 +5035,26 @@ class SmartAgentMcpStatusView(HomeAssistantView):
 
         is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("mcp_status"), status_code=404)
+            try:
+                attrs = coord.get_config_attributes() if hasattr(coord, "get_config_attributes") else {}
+            except Exception as exc:
+                _LOGGER.debug("[McpStatus] local add-on proxy fallback failed: %s", exc)
+                attrs = {}
+            attrs = attrs if isinstance(attrs, dict) else {}
+            enabled = bool(attrs.get("mcp_enabled", getattr(coord, "_mcp_enabled", True)))
+            return self.json({
+                "ok": True,
+                "enabled": enabled,
+                "status": "available" if enabled else "disabled",
+                "endpoint": "/api/smart_agent/mcp",
+                "tools": [],
+                "protocol": {
+                    "read_only_methods": ["tools/list"],
+                    "write_methods_allowed": False,
+                },
+                "source": "ha_local_proxy_fallback",
+                "upstream_status": 404,
+            })
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:

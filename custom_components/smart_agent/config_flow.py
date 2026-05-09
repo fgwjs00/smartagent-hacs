@@ -159,6 +159,32 @@ def _url_to_provider(url: str) -> str:
     return "custom"
 
 
+def _build_initial_entry_data(engine_data: dict) -> dict:
+    """Build a complete first-install config entry from engine connection data."""
+    data = dict(engine_data)
+    data.setdefault(CONF_CONFIDENCE_AUTO, DEFAULT_CONFIDENCE_AUTO)
+    data.setdefault(CONF_CONFIDENCE_NOTIFY, DEFAULT_CONFIDENCE_NOTIFY)
+    data.setdefault(CONF_COOLDOWN, DEFAULT_COOLDOWN)
+    data.setdefault(CONF_TTS_SERVICE, "")
+    data.setdefault(CONF_TTS_TARGET, "")
+    data.setdefault(CONF_TTS_LEVEL, TTS_LEVEL_OFF)
+    data.setdefault(CONF_FRIGATE_ENABLED, False)
+    data.setdefault(CONF_PRESENCE_FUSION, DEFAULT_PRESENCE_FUSION)
+    data.setdefault(CONF_QWEATHER_API_KEY, "")
+    data.setdefault(CONF_SEARXNG_URL, "")
+    data.setdefault(CONF_CLOUD_FALLBACK, True)
+    data.setdefault(CONF_VISION_ENABLED, False)
+    data.setdefault(CONF_VISION_ENGINE, ENGINE_ONLINE)
+    data.setdefault(CONF_VISION_MODEL, "qwen-vl-max")
+    data.setdefault(CONF_MODE, MODE_HOME)
+    data.setdefault(CONF_SHOWROOM_BIZ_START, DEFAULT_SHOWROOM_BIZ_START)
+    data.setdefault(CONF_SHOWROOM_BIZ_END, DEFAULT_SHOWROOM_BIZ_END)
+    data.setdefault(CONF_SHOWROOM_AREA_NAME, DEFAULT_SHOWROOM_AREA_NAME)
+    data.setdefault(CONF_SHOWROOM_EXCLUDED_SUBAREAS, DEFAULT_SHOWROOM_EXCLUDED_SUBAREAS)
+    data.setdefault(CONF_SHOWROOM_ZONE_MAP, DEFAULT_SHOWROOM_ZONE_MAP)
+    return data
+
+
 class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """多步配置流：engine → connect → options。"""
 
@@ -192,15 +218,15 @@ class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_connect_local(self, user_input: dict | None = None) -> FlowResult:
         """Step 2a: 填写 Ollama 服务 IP/URL 与模型名。"""
         if user_input is not None:
-            self._data = {
+            self._data = _build_initial_entry_data({
                 CONF_ENGINE:           ENGINE_LOCAL,
                 CONF_OLLAMA_URL:       (user_input.get(CONF_OLLAMA_URL) or DEFAULT_OLLAMA_URL).strip(),
                 CONF_OLLAMA_MODEL:     (user_input.get(CONF_OLLAMA_MODEL) or DEFAULT_OLLAMA_MODEL).strip(),
                 CONF_ONLINE_API_KEY:   "",
                 CONF_ONLINE_BASE_URL:  DEFAULT_ONLINE_BASE_URL,
                 CONF_ONLINE_MODEL:     DEFAULT_ONLINE_MODEL,
-            }
-            return await self.async_step_options()
+            })
+            return self.async_create_entry(title="AI SmartAgent", data=self._data)
 
         return self.async_show_form(
             step_id="connect_local",
@@ -232,15 +258,15 @@ class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     base_url = ONLINE_PROVIDER_URLS.get(provider, DEFAULT_ONLINE_BASE_URL)
 
             if not errors:
-                self._data = {
+                self._data = _build_initial_entry_data({
                     CONF_ENGINE:          ENGINE_ONLINE,
                     CONF_OLLAMA_URL:      DEFAULT_OLLAMA_URL,
                     CONF_OLLAMA_MODEL:    DEFAULT_OLLAMA_MODEL,
                     CONF_ONLINE_API_KEY:  key,
                     CONF_ONLINE_BASE_URL: base_url,
                     CONF_ONLINE_MODEL:    (user_input.get(CONF_ONLINE_MODEL) or DEFAULT_ONLINE_MODEL).strip(),
-                }
-                return await self.async_step_options()
+                })
+                return self.async_create_entry(title="AI SmartAgent", data=self._data)
 
         # 回显上次输入（有错误时）
         prev = user_input or {}

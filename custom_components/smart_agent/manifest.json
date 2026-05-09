@@ -7,8 +7,10 @@
   "config_flow": true,
   "dependencies": [
     "frontend",
-    "panel_custom",
     "http"
+  ],
+  "after_dependencies": [
+    "panel_custom"
   ],
   "documentation": "https://github.com/fgwjs00/smartagent-hacs",
   "integration_type": "device",
@@ -18,5 +20,5 @@
     "aiohttp>=3.8.0",
     "cryptography>=41.0.0"
   ],
-  "version": "0.0.17"
+  "version": "0.0.18"
 }

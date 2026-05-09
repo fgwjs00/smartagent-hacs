@@ -10,7 +10,7 @@
       },
       "connect_local": {
         "title": "本地 Ollama 配置",
-        "description": "填写 Ollama 服务的 IP 地址（或域名）和模型名称。\n同机部署填 `http://127.0.0.1:11434`，异机填 `http://<IP>:11434`。",
+        "description": "填写 Ollama 服务的 IP 地址（或域名）和模型名称。\n同机部署填 `http://127.0.0.1:11434`，异机填 `http://192.168.1.100:11434`。",
         "data": {
           "ollama_url":   "Ollama 地址（IP / 域名）",
           "ollama_model": "模型名称"
