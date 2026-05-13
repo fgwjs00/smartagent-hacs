@@ -36,7 +36,9 @@ from .host_read_models import (
 from .ha_adapter import (
     async_call_service,
     async_execute_command_envelope,
+    get_ai_scenes_cache_snapshot,
     get_room_topology_cache_snapshot,
+    get_transactions_cache_snapshot,
 )
 from .service_registration import register_smart_agent_services, remove_smart_agent_services, ServiceRegistration
 from .websocket_handlers import build_smart_agent_websocket_commands
@@ -1181,6 +1183,80 @@ def _addon_endpoint_missing_payload(scope: str) -> dict[str, Any]:
         retryable=False,
         scope=scope,
     )
+
+
+def _legacy_memory_rows_snapshot(
+    rows: Any,
+    *,
+    source: str,
+    defaults: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return result
+    defaults = defaults if isinstance(defaults, dict) else {}
+    for index, item in enumerate(rows):
+        if isinstance(item, dict):
+            row = dict(item)
+            row.setdefault("id", index)
+            row.setdefault("content", str(row.get("content") or row.get("text") or ""))
+            row.setdefault("locked", bool(row.get("locked", False)))
+        elif isinstance(item, (list, tuple)) and item:
+            row = {
+                "id": index,
+                "content": str(item[0] or ""),
+                "locked": bool(item[1]) if len(item) > 1 else False,
+            }
+        else:
+            row = {"id": index, "content": str(item or ""), "locked": False}
+        if str(row.get("content") or "").strip():
+            for key, value in defaults.items():
+                row.setdefault(key, value)
+            row["source"] = source
+            result.append(row)
+    return result
+
+
+def _legacy_memory_profiles_snapshot(coord: Any) -> list[dict[str, Any]]:
+    return _legacy_memory_rows_snapshot(
+        getattr(coord, "_rules", []),
+        source="ha_legacy_rules_export",
+        defaults={"weight": 0},
+    )
+
+
+def _legacy_memory_habits_snapshot(coord: Any) -> list[dict[str, Any]]:
+    return _legacy_memory_rows_snapshot(
+        getattr(coord, "_habits", []),
+        source="ha_legacy_habits_export",
+        defaults={"score": 0},
+    )
+
+
+def _legacy_corrections_snapshot(coord: Any) -> list[dict[str, Any]]:
+    db = getattr(coord, "_db", None)
+    query = getattr(db, "query", None)
+    if not callable(query):
+        return []
+    try:
+        raw_rows = query("SELECT * FROM corrections ORDER BY time DESC LIMIT 200")
+    except Exception as exc:
+        _LOGGER.debug("[Corrections] legacy snapshot read failed: %s", exc)
+        return []
+    rows: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_rows or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        row.setdefault("id", index)
+        row.setdefault("scene", row.get("scene_desc") or "")
+        row.setdefault("action", row.get("ai_service") or row.get("service") or "")
+        row.setdefault("created_at", row.get("time") or row.get("timestamp") or "")
+        row.setdefault("source", "ha_legacy_corrections_export")
+        row.setdefault("lifecycle_state", "active")
+        row.setdefault("content", str(row.get("action") or row.get("entity_id") or ""))
+        rows.append(row)
+    return rows
 
 
 def _ha_local_log_error_payload(
@@ -2338,6 +2414,12 @@ class SmartAgentAiScenesView(HomeAssistantView):
             return self.json(_addon_unreachable_payload("ai_scenes"), status_code=502)
 
         is_addon_proxy = _is_addon_proxy_request(request)
+        if is_addon_proxy:
+            rows = get_ai_scenes_cache_snapshot(coord)
+            status = str(request.query.get("status", "") or "").strip().lower()
+            if status:
+                rows = [row for row in rows if str(row.get("status") or "").strip().lower() == status]
+            return self.json(rows)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
@@ -3283,7 +3365,7 @@ class SmartAgentMemoryProfilesView(HomeAssistantView):
 
         is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("memory_profiles"), status_code=404)
+            return self.json(_legacy_memory_profiles_snapshot(coord))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -3326,7 +3408,7 @@ class SmartAgentMemoryHabitsView(HomeAssistantView):
 
         is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("memory_habits"), status_code=404)
+            return self.json(_legacy_memory_habits_snapshot(coord))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -3499,7 +3581,7 @@ class SmartAgentCorrectionsView(HomeAssistantView):
 
         is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("corrections"), status_code=404)
+            return self.json(_legacy_corrections_snapshot(coord))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -3609,6 +3691,8 @@ class SmartAgentTransactionsView(HomeAssistantView):
             return self.json(_addon_unreachable_payload("transactions"), status_code=502)
 
         is_addon_proxy = _is_addon_proxy_request(request)
+        if is_addon_proxy:
+            return self.json(get_transactions_cache_snapshot(coord))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
