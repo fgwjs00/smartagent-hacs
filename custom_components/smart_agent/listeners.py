@@ -182,6 +182,28 @@ class ListenersMixin:
         reasons: list[str] | None = None,
     ) -> dict[str, Any]:
         """统一构建 Presence Snapshot（优先融合域，其次 PresenceInference）。"""
+        room = (self.device_info.get(entity_id, {}) or {}).get("room", "").strip()
+        snapshot_fn = getattr(self, "get_presence_snapshot", None)
+        if callable(snapshot_fn) and room:
+            try:
+                root_snapshot = snapshot_fn()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] get_presence_snapshot failed: %s", exc)
+                root_snapshot = None
+            rooms = root_snapshot.get("rooms") if isinstance(root_snapshot, dict) else None
+            room_snapshot = rooms.get(room) if isinstance(rooms, dict) else None
+            if isinstance(room_snapshot, dict):
+                snap = dict(room_snapshot)
+                if reasons:
+                    snap["reasons"] = list(snap.get("reasons", [])) + list(reasons)
+                if blocked_actions:
+                    snap["blocked_actions"] = list(snap.get("blocked_actions", [])) + list(blocked_actions)
+                localized_spaces = list(snap.get("localized_spaces") or [])
+                if room not in localized_spaces:
+                    localized_spaces.insert(0, room)
+                snap["localized_spaces"] = localized_spaces
+                return snap
+
         _fusion = getattr(self, "_fusion_registry", None)
         if _fusion is not None:
             snap = _fusion.build_presence_snapshot_for_entity(
@@ -604,32 +626,13 @@ class ListenersMixin:
             cmd_source=CMD_SOURCE_SENSOR,
         )
 
-    def _run_local_fast_path_decision(
+    async def _run_addon_fast_path_fail_closed(
         self,
         entity_id: str,
         new_state: str,
         old_state: str,
-    ) -> tuple[dict[str, Any], str] | None:
-        pipeline = getattr(self, "_decision_pipeline", None)
-        if pipeline is None:
-            return None
-        scene_result = pipeline.run_ha_scene_path(entity_id, new_state)
-        if isinstance(scene_result, dict) and scene_result:
-            return scene_result, "LocalScenePathFallback"
-        fast_result = pipeline.run_fast_path(entity_id, new_state, old_state)
-        if isinstance(fast_result, dict) and fast_result:
-            return fast_result, "LocalFastPathFallback"
-        return None
-
-    async def _run_addon_fast_path_or_local_fallback(
-        self,
-        entity_id: str,
-        new_state: str,
-        old_state: str,
-        local_fallback_result: dict[str, Any] | None = None,
-        local_source_label: str | None = None,
     ) -> None:
-        should_local_fallback = True
+        should_fail_closed = True
         addon_client = getattr(self, "_addon_client", None)
         if addon_client is not None:
             try:
@@ -642,6 +645,11 @@ class ListenersMixin:
             except Exception as exc:
                 response = None
                 _LOGGER.debug("[Listeners] add-on fast-path decision failed: %s", exc)
+                self._sys_log(
+                    "ERROR",
+                    f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} reason=exception",
+                )
+                return
             else:
                 if isinstance(response, dict):
                     status = int(response.get("__status") or 0)
@@ -655,7 +663,7 @@ class ListenersMixin:
                         )
                         return
                     if 200 <= status < 300:
-                        should_local_fallback = False
+                        should_fail_closed = False
                         self._sys_log(
                             "INFO",
                             f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
@@ -663,34 +671,15 @@ class ListenersMixin:
                     else:
                         self._sys_log(
                             "INFO",
-                            f"[Add-on FastPath] 服务异常，回退本地快路径 | status={status} matched={response.get('matched')}",
+                            f"[Add-on FastPath] addon_unreachable fail-closed | status={status} matched={response.get('matched')}",
                         )
 
-        if not should_local_fallback:
-            return
-
-        if isinstance(local_fallback_result, dict) and local_fallback_result:
-            local_fallback = local_fallback_result
-            source_label = str(local_source_label or "LocalFastPathFallback")
-        else:
-            fallback = self._run_local_fast_path_decision(entity_id, new_state, old_state)
-            if fallback is None:
-                return
-            local_fallback, source_label = fallback
-
-        if source_label == "LocalFastPathFallback":
-            await self._execute_fast_path_decision_result(
-                local_fallback,
-                entity_id=entity_id,
-                source_label="LocalFastPathFallback",
+        if should_fail_closed:
+            self._sys_log(
+                "ERROR",
+                f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} reason=unreachable",
             )
-            return
-
-        await self._execute_fast_path_decision_result(
-            local_fallback,
-            entity_id=entity_id,
-            source_label=source_label,
-        )
+        return
 
     def _make_state_handler(self):
         """Build the state-change callback."""
@@ -747,19 +736,15 @@ class ListenersMixin:
             # ── Step 0 + FastBrain: add-on 优先路径（B1 迁移：有 add-on 时直接调用，不先跑本地）──
             from .intent_verifier import CMD_SOURCE_SENSOR
             _pipeline = self._decision_pipeline
-            if getattr(self, "_addon_client", None) is not None:
-                # add-on 优先：直接调用 add-on，fallback 由 _run_local_fast_path_decision 按需计算
-                self.hass.async_create_task(
-                    self._run_addon_fast_path_or_local_fallback(
-                        entity_id,
-                        new_s,
-                        old_s,
-                        None,
-                        None,
-                    )
+            self.hass.async_create_task(
+                self._run_addon_fast_path_fail_closed(
+                    entity_id,
+                    new_s,
+                    old_s,
                 )
-                return
-            # ── 无 add-on client：保持原有本地执行逻辑 ──────────────────────────────
+            )
+            return
+            # Legacy local execution below is intentionally unreachable after Phase B fail-closed.
 
             # ── Step 0: HA AI 场景优先路径（预设场景优先于 FastBrain 和 LLM）────────
             _scene_res = _pipeline.run_ha_scene_path(entity_id, new_s)

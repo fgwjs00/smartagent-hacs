@@ -163,16 +163,62 @@ class DevicesMixin:
         else:
             can_localize_zone = sensor_type in {"frigate", "mmwave"}
 
+        domain_capabilities = {
+            "light": "lighting",
+            "switch": "lighting",
+            "binary_sensor": "sensor",
+            "sensor": "sensor",
+            "climate": "climate",
+            "cover": "cover",
+            "fan": "fan",
+            "media_player": "media",
+            "alarm_control_panel": "security",
+            "lock": "security",
+            "camera": "security",
+            "vacuum": "vacuum",
+            "humidifier": "appliance",
+            "water_heater": "appliance",
+        }
+        raw_roles = info.get("roles") or info.get("role") or info.get("fixture_roles")
+        roles: list[str] = []
+        if isinstance(raw_roles, str):
+            roles = [raw_roles] if raw_roles else []
+        elif isinstance(raw_roles, (list, tuple, set)):
+            roles = [str(item).strip() for item in raw_roles if str(item).strip()]
+        if shared_fixture and "shared" not in roles:
+            roles.append("shared")
+        raw_services = info.get("supported_services") or info.get("ops")
+        if isinstance(raw_services, str):
+            supported_services = [raw_services] if raw_services else []
+        elif isinstance(raw_services, (list, tuple, set)):
+            supported_services = [str(item).strip() for item in raw_services if str(item).strip()]
+        else:
+            supported_services = []
+        capability_name = str(
+            info.get("capability")
+            or info.get("device_class")
+            or domain_capabilities.get(domain)
+            or domain
+            or "unknown"
+        )
+
         capability = {
             "entity_id": entity_id,
+            "domain": domain,
+            "capability": capability_name,
             "room": room,
+            "space_id": room,
             "control_mode": info.get("control_mode", "shared"),
             "sensor_type": info.get("sensor_type", ""),
             "role": info.get("role", ""),
+            "roles": roles,
+            "supported_services": supported_services,
             "control_zone": info.get("control_zone", room),
             "disturbance_level": info.get("disturbance_level", ""),
             DEVICE_CAP_KEY_COVERAGE_SPACES: coverage_spaces,
+            "coverage_space_ids": list(coverage_spaces),
             DEVICE_CAP_KEY_SHARED_FIXTURE: bool(shared_fixture),
+            "shared_space_ids": list(coverage_spaces) if shared_fixture else [],
             DEVICE_CAP_KEY_SLEEP_SAFE: bool(sleep_safe),
             DEVICE_CAP_KEY_RISK_LEVEL: risk_level,
             DEVICE_CAP_KEY_ENERGY_LEVEL: energy_level,
@@ -442,6 +488,61 @@ class DevicesMixin:
         self._sys_log("INFO", f"[同步] 房间同步到 HA 完成: 新建区域 {results['created_areas']}，更新实体 {results['updated_entities']}，错误 {results['errors']}")
         self.async_set_updated_data({})
         return results
+
+    async def async_sync_device_room_to_ha(self, entity_id: str, room: str) -> dict:
+        """Mirror one SmartAgent room assignment into HA's Area Registry."""
+        eid = str(entity_id or "").strip()
+        target_room = str(room or "").strip()
+        result = {
+            "ok": True,
+            "entity_id": eid,
+            "room": target_room,
+            "created_areas": 0,
+            "updated_entities": 0,
+            "errors": 0,
+            "source": "ha_area_registry_mirror",
+        }
+        if not eid:
+            result.update({"ok": False, "error": "entity_id_required", "errors": 1})
+            return result
+        if not target_room or target_room in ("待填写区域", "未知区域", "未分配"):
+            result.update({"skipped": True, "reason": "room_not_provided"})
+            return result
+
+        area_reg = ar.async_get(self.hass)
+        entity_reg = er.async_get(self.hass)
+        area_cache = {entry.name: entry.id for entry in area_reg.areas.values()}
+
+        area_id = area_cache.get(target_room)
+        if not area_id:
+            try:
+                area = area_reg.async_get_or_create(target_room)
+                area_id = area.id
+                result["created_areas"] = 1
+            except Exception as exc:
+                self._sys_log("ERROR", f"[同步] 创建设备区域 {target_room} 失败: {exc}")
+                result.update({"ok": False, "error": "area_create_failed", "errors": 1})
+                return result
+
+        result["area_id"] = area_id
+        try:
+            entry = entity_reg.async_get(eid)
+            if entry is None:
+                result.update({"ok": False, "error": "entity_not_found", "errors": 1})
+                return result
+            if entry.area_id != area_id:
+                entity_reg.async_update_entity(eid, area_id=area_id)
+                result["updated_entities"] = 1
+        except Exception as exc:
+            self._sys_log("ERROR", f"[同步] 更新设备 {eid} 区域失败: {exc}")
+            result.update({"ok": False, "error": "entity_area_update_failed", "errors": 1})
+            return result
+
+        info = self.device_info.get(eid)
+        if isinstance(info, dict):
+            info["room"] = target_room
+            self.async_set_updated_data({})
+        return result
 
     # ── 设备管辖域 ────────────────────────────────────────────────────────────
 

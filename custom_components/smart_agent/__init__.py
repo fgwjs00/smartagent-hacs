@@ -19,7 +19,6 @@ from aiohttp import web
 from homeassistant.components.frontend import async_remove_panel
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.components.panel_custom import async_register_panel
-from homeassistant.components import websocket_api
 from homeassistant.auth import models as auth_models
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -28,18 +27,21 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN, MODE_HOME, MODE_SHOWROOM
 from .coordinator import SmartAgentCoordinator
+from .host_read_models import (
+    async_save_presence_sensor_type as _async_save_presence_sensor_type,
+    build_presence_sensors_payload as _build_presence_sensors_payload,
+    local_device_rows as _local_device_rows,
+    local_room_rows as _local_room_rows,
+)
 from .ha_adapter import (
     async_call_service,
     async_execute_command_envelope,
-    async_get_state,
-    get_ai_scenes_cache_snapshot,
-    get_device_info_snapshot,
-    get_habits_cache_snapshot,
     get_room_topology_cache_snapshot,
-    get_rules_snapshot,
-    get_transactions_cache_snapshot,
-    list_binary_sensor_states,
 )
+from .service_registration import register_smart_agent_services, remove_smart_agent_services, ServiceRegistration
+from .websocket_handlers import build_smart_agent_websocket_commands
+from .websocket_registration import register_smart_agent_websocket_commands
+from .view_registration import register_host_views
 
 
 # AI Scene snake_case/legacy 仅作为迁移兼容入口，统一集中管理。
@@ -963,12 +965,89 @@ def _extract_bearer_token(request: web.Request) -> str:
     return ""
 
 
+def _is_addon_proxy_request(request: web.Request) -> bool:
+    return str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() == "addon"
+
+
 def _is_addon_internal_execute_request(request: web.Request) -> bool:
     return (
-        str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() == "addon"
+        _is_addon_proxy_request(request)
         and str(request.headers.get("X-SA-Internal-Execute", "") or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+
+
+def _ha_log_window_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _ha_log_line_matches_level(line: str, level: str) -> bool:
+    if level == "all":
+        return True
+    lowered = line.lower()
+    if level == "error":
+        return "error" in lowered or "exception" in lowered or "traceback" in lowered
+    if level == "warning":
+        return "warn" in lowered or "warning" in lowered
+    if level == "info":
+        return "info" in lowered
+    return True
+
+
+def _ha_log_content_window(content: str, query: Any) -> tuple[str, dict[str, Any]]:
+    q = query if hasattr(query, "get") else {}
+    level = str(q.get("level") or "all").strip().lower()
+    if level not in {"all", "error", "warning", "info"}:
+        level = "all"
+    keyword = str(q.get("keyword") or "").strip()
+    keyword_lower = keyword.lower()
+    max_bytes = _ha_log_window_int(q.get("max_bytes"), default=128 * 1024, minimum=1, maximum=512 * 1024)
+    tail_lines = _ha_log_window_int(q.get("tail_lines"), default=800, minimum=1, maximum=3000)
+
+    lines = str(content or "").splitlines()
+    filtered_lines = [
+        line
+        for line in lines
+        if _ha_log_line_matches_level(line, level)
+        and (not keyword_lower or keyword_lower in line.lower())
+    ]
+    tail_truncated = len(filtered_lines) > tail_lines
+    window_lines = filtered_lines[-tail_lines:]
+    window_content = "\n".join(window_lines)
+    if str(content or "").endswith("\n") and window_content:
+        window_content += "\n"
+    encoded = window_content.encode("utf-8")
+    byte_truncated = len(encoded) > max_bytes
+    if byte_truncated:
+        window_content = encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+    active = (
+        level != "all"
+        or bool(keyword)
+        or "max_bytes" in q
+        or "tail_lines" in q
+    )
+    window = {
+        "active": active,
+        "level": level,
+        "keyword": keyword,
+        "max_bytes": max_bytes,
+        "tail_lines": tail_lines,
+        "filtered": level != "all" or bool(keyword),
+        "total_lines": len(lines),
+        "matched_lines": len(filtered_lines),
+        "returned_lines": len(window_content.splitlines()),
+        "original_byte_count": len(str(content or "").encode("utf-8")),
+        "returned_byte_count": len(window_content.encode("utf-8")),
+        "tail_truncated": tail_truncated,
+        "byte_truncated": byte_truncated,
+    }
+    window["truncated"] = bool(tail_truncated or byte_truncated)
+    return window_content, window
 
 
 def _json_error_payload(error: str, error_type: str, retryable: bool, **extra: Any) -> dict[str, Any]:
@@ -1101,6 +1180,22 @@ def _addon_endpoint_missing_payload(scope: str) -> dict[str, Any]:
         error_type="not_found",
         retryable=False,
         scope=scope,
+    )
+
+
+def _ha_local_log_error_payload(
+    scope: str,
+    error: str,
+    error_type: str = "dependency_error",
+    exc: Exception | None = None,
+) -> dict[str, Any]:
+    return _json_error_payload(
+        error=error,
+        error_type=error_type,
+        retryable=True,
+        scope=scope,
+        source="ha_host_local_logs",
+        exception_type=exc.__class__.__name__ if exc is not None else None,
     )
 
 
@@ -1259,17 +1354,41 @@ class SmartAgentLogDatesView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
+            get_dates = getattr(coord, "get_log_dates", None)
+            if not callable(get_dates):
+                return self.json(
+                    _ha_local_log_error_payload(
+                        "logs_dates",
+                        "ha_local_logs_dates_reader_missing",
+                        "dependency_unreachable",
+                    ),
+                    status_code=502,
+                )
             try:
-                get_dates = getattr(coord, "get_log_dates", None)
-                if callable(get_dates):
-                    dates = await hass.async_add_executor_job(get_dates)
-                    return self.json(dates if isinstance(dates, list) else [])
+                dates = await hass.async_add_executor_job(get_dates)
             except Exception as exc:
-                _LOGGER.debug("[LogDates] local add-on proxy fallback failed: %s", exc)
-            return self.json([])
+                _LOGGER.warning("[LogDates] local add-on proxy read failed: %s", exc)
+                return self.json(
+                    _ha_local_log_error_payload(
+                        "logs_dates",
+                        "ha_local_logs_dates_read_failed",
+                        exc=exc,
+                    ),
+                    status_code=502,
+                )
+            if isinstance(dates, list):
+                return self.json(dates)
+            return self.json(
+                _ha_local_log_error_payload(
+                    "logs_dates",
+                    "ha_local_logs_dates_invalid_payload",
+                    "invalid_payload",
+                ),
+                status_code=502,
+            )
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("logs_dates"), status_code=502)
 
@@ -1324,23 +1443,48 @@ class SmartAgentLogContentView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
+            read_file = getattr(coord, "read_log_file", None)
+            if not callable(read_file):
+                return self.json(
+                    _ha_local_log_error_payload(
+                        "logs_content",
+                        "ha_local_logs_content_reader_missing",
+                        "dependency_unreachable",
+                    ),
+                    status_code=502,
+                )
             try:
-                read_file = getattr(coord, "read_log_file", None)
-                content = ""
-                if callable(read_file):
-                    content = await hass.async_add_executor_job(read_file, str(date))
-                return self.json({"date": str(date), "content": str(content or "")})
+                content = await hass.async_add_executor_job(read_file, str(date))
+                windowed_content, window = _ha_log_content_window(str(content or ""), request.query)
+                payload = {"date": str(date), "content": windowed_content}
+                if bool(window.get("active")):
+                    payload["window"] = {k: v for k, v in window.items() if k != "active"}
+                return self.json(payload)
             except Exception as exc:
-                _LOGGER.debug("[LogContent] local add-on proxy fallback failed: %s", exc)
-                return self.json({"date": str(date), "content": ""})
+                _LOGGER.warning("[LogContent] local add-on proxy read failed: %s", exc)
+                return self.json(
+                    _ha_local_log_error_payload(
+                        "logs_content",
+                        "ha_local_logs_content_read_failed",
+                        exc=exc,
+                    ),
+                    status_code=502,
+                )
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("logs_content"), status_code=502)
 
         try:
-            content = await _addon_client.get_log_content(str(date))
+            content = await _addon_client.get_log_content(
+                str(date),
+                level=request.query.get("level"),
+                keyword=request.query.get("keyword"),
+                max_bytes=request.query.get("max_bytes"),
+                tail_lines=request.query.get("tail_lines"),
+                raw=str(request.query.get("raw") or "").strip().lower() in {"1", "true", "yes", "on"},
+            )
             if isinstance(content, dict):
                 payload, status = _json_from_addon_result(content)
                 if status in (404, 405):
@@ -1368,18 +1512,41 @@ class SmartAgentLogInfoView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
+            get_info = getattr(coord, "get_log_info", None)
+            if not callable(get_info):
+                return self.json(
+                    _ha_local_log_error_payload(
+                        "logs_info",
+                        "ha_local_logs_info_reader_missing",
+                        "dependency_unreachable",
+                    ),
+                    status_code=502,
+                )
             try:
-                get_info = getattr(coord, "get_log_info", None)
-                if callable(get_info):
-                    info = await hass.async_add_executor_job(get_info)
-                    if isinstance(info, (list, dict)):
-                        return self.json(info)
+                info = await hass.async_add_executor_job(get_info)
             except Exception as exc:
-                _LOGGER.debug("[LogInfo] local add-on proxy fallback failed: %s", exc)
-            return self.json([])
+                _LOGGER.warning("[LogInfo] local add-on proxy read failed: %s", exc)
+                return self.json(
+                    _ha_local_log_error_payload(
+                        "logs_info",
+                        "ha_local_logs_info_read_failed",
+                        exc=exc,
+                    ),
+                    status_code=502,
+                )
+            if isinstance(info, (list, dict)):
+                return self.json(info)
+            return self.json(
+                _ha_local_log_error_payload(
+                    "logs_info",
+                    "ha_local_logs_info_invalid_payload",
+                    "invalid_payload",
+                ),
+                status_code=502,
+            )
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("logs_info"), status_code=502)
 
@@ -1449,7 +1616,7 @@ class SmartAgentSceneExportView(HomeAssistantView):
                 status_code=404,
             )
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=404)
 
@@ -1520,7 +1687,7 @@ class SmartAgentSceneExportView(HomeAssistantView):
                 status_code=404,
             )
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("scene_yaml_export"), status_code=404)
 
@@ -1551,171 +1718,6 @@ def _get_first_coordinator(hass: HomeAssistant) -> SmartAgentCoordinator | None:
     return None
 
 
-def _build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordinator) -> dict[str, Any]:
-    """Build the presence sensor editor payload shared by HTTP and HA WS UIs."""
-    import json as _json
-
-    presence_kw = getattr(coord, "_PRESENCE_KW", (
-        "occupancy", "presence", "motion", "人体", "存在", "有人", "移动",
-        "ren_ti", "cun_zai", "radar", "mmwave", "雷达",
-        "person_occupancy", "object_count",
-    ))
-
-    sensors: list[dict[str, Any]] = []
-    fusion_registry = getattr(coord, "_fusion_registry", None)
-    device_info = get_device_info_snapshot(coord)
-
-    for row in list_binary_sensor_states(hass):
-        eid = str(row.get("entity_id", "") or "")
-        attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
-        friendly = attrs.get("friendly_name", eid)
-        check_str = (friendly + eid).lower()
-        if not any(str(kw).lower() in check_str for kw in presence_kw):
-            continue
-
-        info = device_info.get(eid) or {}
-        fusion_scope = None
-        if fusion_registry is not None:
-            scope = fusion_registry.get_scope_for_entity(eid)
-            if scope is not None:
-                fusion_scope = scope.display_name
-
-        state_obj = async_get_state(hass, eid)
-        runtime_state = getattr(state_obj, "state", None) if state_obj is not None else None
-        sensors.append({
-            "entity_id": eid,
-            "name": info.get("name") or friendly,
-            "room": info.get("room", ""),
-            "state": str(runtime_state if runtime_state is not None else (row.get("state", "") or "")),
-            "sensor_type": info.get("sensor_type", ""),
-            "in_sa": eid in device_info,
-            "fusion_scope": fusion_scope,
-        })
-
-    entry = getattr(coord, "_entry", None)
-    fusion_raw = ((entry.options or {}).get("presence_fusion", "[]") if entry else "[]") or "[]"
-    try:
-        fusion_config = _json.loads(fusion_raw)
-        if not isinstance(fusion_config, list):
-            fusion_config = []
-    except Exception:
-        fusion_config = []
-
-    rooms = sorted({
-        info.get("room", "")
-        for info in device_info.values()
-        if info.get("room", "")
-    })
-
-    return {
-        "sensors": sensors,
-        "fusion_config": fusion_config,
-        "rooms": rooms,
-    }
-
-
-def _local_device_rows(coord: Any) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for eid, info in get_device_info_snapshot(coord).items():
-        if not isinstance(info, dict):
-            continue
-        rows.append({"entity_id": str(eid), **dict(info)})
-    return rows
-
-
-def _local_room_rows(coord: Any) -> list[dict[str, Any]]:
-    rooms: dict[str, dict[str, Any]] = {}
-    for info in get_device_info_snapshot(coord).values():
-        if not isinstance(info, dict):
-            continue
-        room = str(info.get("room") or info.get("area") or "").strip()
-        if not room:
-            continue
-        row = rooms.setdefault(room, {"id": room, "name": room, "device_count": 0})
-        row["device_count"] = int(row.get("device_count", 0)) + 1
-    return sorted(rooms.values(), key=lambda row: str(row.get("name", "")))
-
-
-def _local_room_topology_rows(coord: Any) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    db = getattr(coord, "_db", None)
-    if db is not None and hasattr(db, "query"):
-        try:
-            raw_rows = db.query("SELECT room_a, room_b, relation FROM room_topology", ()) or []
-        except Exception:
-            raw_rows = []
-        for row in raw_rows:
-            if isinstance(row, dict):
-                room_a = str(row.get("room_a") or "").strip()
-                room_b = str(row.get("room_b") or "").strip()
-                relation = str(row.get("relation") or "adjacent").strip() or "adjacent"
-            elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                room_a = str(row[0] or "").strip()
-                room_b = str(row[1] or "").strip()
-                relation = str(row[2] if len(row) > 2 else "adjacent").strip() or "adjacent"
-            else:
-                continue
-            if room_a and room_b:
-                rows.append({"room_a": room_a, "room_b": room_b, "relation": relation})
-        if rows:
-            return rows
-
-    topology = get_room_topology_cache_snapshot(coord)
-    seen: set[tuple[str, str]] = set()
-    for room_a, neighbors in topology.items():
-        left = str(room_a or "").strip()
-        if not left:
-            continue
-        for room_b in neighbors or set():
-            right = str(room_b or "").strip()
-            if not right:
-                continue
-            key = tuple(sorted((left, right)))
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({"room_a": left, "room_b": right, "relation": "adjacent"})
-    return sorted(rows, key=lambda row: (str(row.get("room_a", "")), str(row.get("room_b", ""))))
-
-
-async def _async_save_presence_sensor_type(
-    hass: HomeAssistant,
-    coord: SmartAgentCoordinator,
-    entity_id: str,
-    sensor_type: str,
-) -> dict[str, Any]:
-    """Persist a managed presence sensor's type classification."""
-    eid = entity_id.strip()
-    s_type = sensor_type.strip().lower()
-    if not eid:
-        return {"ok": False, "error": "entity_id required", "status": 400}
-    if s_type not in ("", "pir", "mmwave", "frigate"):
-        return {
-            "ok": False,
-            "error": "sensor_type must be '', 'pir', 'mmwave' or 'frigate'",
-            "status": 400,
-        }
-    device_info_snapshot = get_device_info_snapshot(coord)
-    if eid not in device_info_snapshot:
-        return {"ok": False, "error": f"设备未纳管: {eid}", "status": 404}
-
-    from datetime import datetime as _dt_s
-    now_s = _dt_s.now().isoformat()
-
-    def _db_update() -> bool:
-        return bool(coord._db.execute(
-            "UPDATE devices SET sensor_type=?, updated=? WHERE entity_id=?",
-            (s_type, now_s, eid),
-        ))
-
-    db_ok = await hass.async_add_executor_job(_db_update)
-    if not db_ok:
-        return {"ok": False, "error": "保存 sensor_type 失败", "status": 500}
-
-    coord.device_info[eid]["sensor_type"] = s_type
-    return {"ok": True, "entity_id": eid, "sensor_type": s_type, "status": 200}
-
-
 class SmartAgentDevicesView(HomeAssistantView):
     """设备列表与批量新增接口（/api/v1/devices*）。"""
 
@@ -1731,9 +1733,9 @@ class SmartAgentDevicesView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("devices"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_local_device_rows(coord))
+            return self.json(_local_device_rows(coord, hass))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -1778,7 +1780,7 @@ class SmartAgentDevicesDiscoverView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("devices_discover"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             try:
                 rows = await coord._async_discover_devices()
@@ -1844,7 +1846,7 @@ class SmartAgentDevicesBatchAddView(HomeAssistantView):
         if not entities:
             return self.json({"ok": False, "error": "entities required"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             try:
                 added = await coord.async_batch_add_devices(entities)
@@ -1899,9 +1901,51 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
         if not eid:
             return self.json({"ok": False, "error": "entity_id required"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("device_patch"), status_code=404)
+            patch_body = body if isinstance(body, dict) else {}
+            room = str(patch_body.get("room") or patch_body.get("area") or "").strip()
+            if not room:
+                sync_payload = {
+                    "ok": True,
+                    "entity_id": eid,
+                    "skipped": True,
+                    "reason": "room_not_provided",
+                    "source": "ha_area_registry_mirror",
+                }
+                return self.json(
+                    {
+                        "ok": True,
+                        "entity_id": eid,
+                        "source": "ha_area_registry_mirror",
+                        "ha_area_sync": sync_payload,
+                    }
+                )
+            sync_device_room = getattr(coord, "async_sync_device_room_to_ha", None)
+            if sync_device_room is None:
+                return self.json(_addon_endpoint_missing_payload("device_patch"), status_code=404)
+            try:
+                result = await sync_device_room(eid, room)
+                sync_payload = result if isinstance(result, dict) else {"ok": True, "result": result}
+                sync_payload.setdefault("ok", True)
+                sync_payload.setdefault("entity_id", eid)
+                sync_payload.setdefault("room", room)
+                sync_payload.setdefault("source", "ha_area_registry_mirror")
+                sync_ok = bool(sync_payload.get("ok"))
+                return self.json(
+                    {
+                        "ok": sync_ok,
+                        "entity_id": eid,
+                        "room": room,
+                        "area": room,
+                        "source": "ha_area_registry_mirror",
+                        "ha_area_sync": sync_payload,
+                    },
+                    status_code=200 if sync_ok else 502,
+                )
+            except Exception as exc:
+                _LOGGER.debug("[DevicePatch] local HA area mirror failed: %s", exc)
+                return self.json(_addon_unreachable_payload("device_patch"), status_code=502)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -1932,7 +1976,7 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
         if not eid:
             return self.json({"ok": False, "error": "entity_id required"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("device_delete"), status_code=404)
 
@@ -1986,7 +2030,7 @@ class SmartAgentDeviceControlView(HomeAssistantView):
         if service not in allowed_services:
             return self.json({"ok": False, "error": f"unsupported service: {service}"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("device_control"), status_code=404)
 
@@ -2029,7 +2073,7 @@ class SmartAgentPresenceSensorsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("presence_sensors"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_build_presence_sensors_payload(hass, coord))
 
@@ -2081,7 +2125,7 @@ class SmartAgentPresenceSensorTypeView(HomeAssistantView):
                 status_code=400,
             )
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("presence_sensor_type"), status_code=404)
 
@@ -2120,9 +2164,9 @@ class SmartAgentRoomsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("rooms"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_local_room_rows(coord))
+            return self.json(_local_room_rows(coord, hass))
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -2167,7 +2211,7 @@ class SmartAgentRoomsSyncView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("rooms_sync"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             try:
                 result = await coord.async_sync_rooms_to_ha()
@@ -2214,9 +2258,9 @@ class SmartAgentRoomsTopologyView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_local_room_topology_rows(coord))
+            return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=404)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -2253,7 +2297,7 @@ class SmartAgentRoomsTopologyView(HomeAssistantView):
         except Exception:
             body = {}
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=404)
 
@@ -2293,7 +2337,7 @@ class SmartAgentAiScenesView(HomeAssistantView):
         if coord is None or isinstance(coord, bool):
             return self.json(_addon_unreachable_payload("ai_scenes"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
@@ -2354,7 +2398,7 @@ class SmartAgentAiSceneActionView(HomeAssistantView):
         if sid <= 0:
             return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("ai_scene_action"), status_code=404)
 
@@ -2407,7 +2451,7 @@ class SmartAgentAiSceneTriggerView(HomeAssistantView):
         if sid <= 0:
             return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("ai_scene_trigger"), status_code=404)
 
@@ -2477,7 +2521,7 @@ class SmartAgentSystemStatusView(HomeAssistantView):
             return 0 < numeric <= 100
 
         coord = _get_first_coordinator(hass)
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
 
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if not is_addon_proxy:
@@ -2525,7 +2569,7 @@ class SmartAgentCompatStatsView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -2557,7 +2601,7 @@ class SmartAgentDeprecationReadinessView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -2589,7 +2633,7 @@ class SmartAgentDryoffSessionReportView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -2621,7 +2665,7 @@ class SmartAgentDashboardSummaryView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -2734,7 +2778,7 @@ class SmartAgentDiagnosticsView(HomeAssistantView):
             return err
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
 
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if is_addon_proxy:
@@ -2792,37 +2836,12 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("settings_system_get"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            try:
-                attrs = coord.get_config_attributes() if hasattr(coord, "get_config_attributes") else {}
-            except Exception as exc:
-                _LOGGER.debug("[SystemSettingsGet] local add-on proxy fallback failed: %s", exc)
-                attrs = {}
-            attrs = attrs if isinstance(attrs, dict) else {}
-            payload = {
-                "engine": "online" if str(attrs.get("engine") or getattr(coord, "engine", "local")) == "online" else "local",
-                "ollama_url": str(attrs.get("ollama_url") or getattr(coord, "ollama_url", "http://127.0.0.1:11434")),
-                "ollama_model": str(attrs.get("ollama_model") or getattr(coord, "ollama_model", "qwen3-smarthome")),
-                "online_base_url": str(attrs.get("online_base_url") or getattr(coord, "online_base_url", "")),
-                "online_model": str(attrs.get("online_model") or getattr(coord, "online_model", "qwen3.5-flash")),
-                "online_api_key": str(attrs.get("online_api_key") or ""),
-                "cloud_fallback": bool(attrs.get("cloud_fallback", getattr(coord, "_cloud_fallback", False))),
-                "vision_enabled": bool(attrs.get("vision_enabled", getattr(coord, "_vision_enabled", True))),
-                "vision_engine": "local" if str(attrs.get("vision_engine") or getattr(coord, "_vision_engine", "online")) == "local" else "online",
-                "vision_model": str(attrs.get("vision_model") or getattr(coord, "_vision_model", "qwen3.5-omni-flash")),
-                "presence_fusion": str(attrs.get("presence_fusion") or ""),
-                "confidence_auto": int(attrs.get("confidence_auto") or getattr(coord, "confidence_auto", 70)),
-                "confidence_notify": int(attrs.get("confidence_notify") or getattr(coord, "confidence_notify", 50)),
-                "cooldown": int(attrs.get("cooldown") or getattr(coord, "cooldown", 30)),
-                "mode": "showroom" if str(attrs.get("mode") or getattr(coord, "_mode", "home")) == "showroom" else "home",
-                "learning_mode": bool(attrs.get("learning_mode", getattr(coord, "_learning_mode", False))),
-                "habit_proactive_ask": bool(attrs.get("habit_proactive_ask", getattr(coord, "_habit_proactive", False))),
-                "frigate_enabled": bool(attrs.get("frigate_enabled", getattr(coord, "_frigate_enabled", True))),
-                "source": "ha_local_proxy_fallback",
-                "upstream_status": 404,
-            }
-            return self.json(payload)
+            # 收口决定（2026-05-12）：系统设置的唯一真源是 add-on core_configs。
+            # HA 侧不再作为 fallback 真源，避免"写 A 读 B"：add-on 回读时
+            # 返回 404 让 add-on 走本地存储路径。
+            return self.json(_addon_endpoint_missing_payload("settings_system_get"), status_code=404)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -2865,70 +2884,13 @@ class SmartAgentSystemSettingsView(HomeAssistantView):
                 status_code=400,
             )
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            mode = str((body or {}).get("mode", "") or "").strip().lower()
-            if mode:
-                if mode not in (MODE_HOME, MODE_SHOWROOM):
-                    return self.json(_json_error_payload("invalid mode", "validation_error", False), status_code=400)
-                set_mode = getattr(coord, "async_set_mode", None)
-                if callable(set_mode):
-                    result = set_mode(mode)
-                    if asyncio.iscoroutine(result):
-                        await result
-                else:
-                    setattr(coord, "_mode", mode)
-
-            option_updates: dict[str, Any] = {}
-            bool_fields = {
-                "learning_mode": "_learning_mode",
-                "habit_proactive_ask": "_habit_proactive",
-                "frigate_enabled": "_frigate_enabled",
-            }
-            for key, attr in bool_fields.items():
-                if key in body:
-                    value = bool(body.get(key))
-                    setattr(coord, attr, value)
-                    option_key = "habit_proactive" if key == "habit_proactive_ask" else key
-                    option_updates[option_key] = value
-
-            entry = getattr(coord, "_entry", None)
-            config_entries = getattr(hass, "config_entries", None)
-            update_entry = getattr(config_entries, "async_update_entry", None)
-            if option_updates and entry is not None and callable(update_entry):
-                try:
-                    update_entry(entry, options={**(getattr(entry, "options", {}) or {}), **option_updates})
-                except Exception as exc:
-                    _LOGGER.debug("[SystemSettingsPost] local option persistence failed: %s", exc)
-
-            try:
-                attrs = coord.get_config_attributes() if hasattr(coord, "get_config_attributes") else {}
-            except Exception as exc:
-                _LOGGER.debug("[SystemSettingsPost] local add-on proxy fallback readback failed: %s", exc)
-                attrs = {}
-            attrs = attrs if isinstance(attrs, dict) else {}
-            return self.json({
-                "ok": True,
-                "engine": "online" if str(attrs.get("engine") or getattr(coord, "engine", "local")) == "online" else "local",
-                "ollama_url": str(attrs.get("ollama_url") or getattr(coord, "ollama_url", "http://127.0.0.1:11434")),
-                "ollama_model": str(attrs.get("ollama_model") or getattr(coord, "ollama_model", "qwen3-smarthome")),
-                "online_base_url": str(attrs.get("online_base_url") or getattr(coord, "online_base_url", "")),
-                "online_model": str(attrs.get("online_model") or getattr(coord, "online_model", "qwen3.5-flash")),
-                "cloud_fallback": bool(attrs.get("cloud_fallback", getattr(coord, "_cloud_fallback", False))),
-                "vision_enabled": bool(attrs.get("vision_enabled", getattr(coord, "_vision_enabled", True))),
-                "vision_engine": "local" if str(attrs.get("vision_engine") or getattr(coord, "_vision_engine", "online")) == "local" else "online",
-                "vision_model": str(attrs.get("vision_model") or getattr(coord, "_vision_model", "qwen3.5-omni-flash")),
-                "presence_fusion": str(attrs.get("presence_fusion") or ""),
-                "confidence_auto": int(attrs.get("confidence_auto") or getattr(coord, "confidence_auto", 70)),
-                "confidence_notify": int(attrs.get("confidence_notify") or getattr(coord, "confidence_notify", 50)),
-                "cooldown": int(attrs.get("cooldown") or getattr(coord, "cooldown", 30)),
-                "mode": "showroom" if str(attrs.get("mode") or getattr(coord, "_mode", "home")) == "showroom" else "home",
-                "learning_mode": bool(attrs.get("learning_mode", getattr(coord, "_learning_mode", False))),
-                "habit_proactive_ask": bool(attrs.get("habit_proactive_ask", getattr(coord, "_habit_proactive", False))),
-                "frigate_enabled": bool(attrs.get("frigate_enabled", getattr(coord, "_frigate_enabled", True))),
-                "source": "ha_local_proxy_fallback",
-                "upstream_status": 404,
-            })
+            # 收口决定（2026-05-12）：系统设置的唯一真源是 add-on core_configs。
+            # 此前此分支在 HA coordinator 和 config entry 上做本地双写，导致
+            # "add-on 以为写自己实际写 HA"的典型"写 A 读 B"错位。
+            # 现统一返回 404，让 add-on 走自己的本地存储 + entry persist 链。
+            return self.json(_addon_endpoint_missing_payload("settings_system_post"), status_code=404)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is None:
@@ -2969,7 +2931,7 @@ class SmartAgentAuthLoginView(HomeAssistantView):
         except Exception:
             body = {}
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -3030,10 +2992,10 @@ class SmartAgentAuthMeView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         hass = request.app["hass"]
-        session_token = _extract_bearer_token(request) or str(request.query.get("token", "") or "").strip()
+        session_token = _extract_bearer_token(request)
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -3075,10 +3037,10 @@ class SmartAgentAuthLogoutView(HomeAssistantView):
 
     async def post(self, request: web.Request) -> web.Response:
         hass = request.app["hass"]
-        session_token = _extract_bearer_token(request) or str(request.query.get("token", "") or "").strip()
+        session_token = _extract_bearer_token(request)
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -3131,7 +3093,7 @@ class SmartAgentSystemBrandView(HomeAssistantView):
         if coord is None:
             return self.json({"name": "SmartAgent", "color": "#6750A4", "logoUrl": "", "deployName": ""})
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -3170,7 +3132,7 @@ class SmartAgentEventsWSView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -3319,7 +3281,7 @@ class SmartAgentMemoryProfilesView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("memory_profiles"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("memory_profiles"), status_code=404)
 
@@ -3362,7 +3324,7 @@ class SmartAgentMemoryHabitsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("memory_habits"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("memory_habits"), status_code=404)
 
@@ -3394,7 +3356,7 @@ class SmartAgentLearningStatsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("learning_stats"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("learning_stats"), status_code=404)
 
@@ -3444,7 +3406,7 @@ class SmartAgentProfileActionView(HomeAssistantView):
         if not content:
             return self.json({"ok": False, "error": "content required"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("profile_action"), status_code=404)
 
@@ -3497,7 +3459,7 @@ class SmartAgentHabitActionView(HomeAssistantView):
         if not content:
             return self.json({"ok": False, "error": "content required"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("habit_action"), status_code=404)
 
@@ -3535,7 +3497,7 @@ class SmartAgentCorrectionsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("corrections"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("corrections"), status_code=404)
 
@@ -3591,7 +3553,7 @@ class SmartAgentCorrectionActionView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("correction_action"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("correction_action"), status_code=404)
 
@@ -3646,7 +3608,7 @@ class SmartAgentTransactionsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("transactions"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
@@ -3704,7 +3666,7 @@ class SmartAgentTransactionDetailView(HomeAssistantView):
             )
         encoded_tid = quote(tid, safe="")
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -3752,7 +3714,7 @@ class SmartAgentDecisionTraceView(HomeAssistantView):
             )
         encoded_tid = quote(tid, safe="")
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -3777,6 +3739,10 @@ class SmartAgentDecisionTraceView(HomeAssistantView):
 
         if not is_addon_proxy:
             return self.json(_addon_unreachable_payload("decision_trace_detail"), status_code=502)
+
+        # Phase C: the add-on proxy path must not synthesize Decision Trace from
+        # HA local transaction/action_results tables. The add-on owns this read model.
+        return self.json(_addon_endpoint_missing_payload("decision_trace_detail"), status_code=404)
 
         txns = coord._transactions_cache if isinstance(coord._transactions_cache, list) else []
         raw_detail = next(
@@ -3990,7 +3956,7 @@ class SmartAgentTransactionRollbackView(HomeAssistantView):
                 status_code=400,
             )
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
 
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
@@ -4030,10 +3996,33 @@ class SmartAgentEnergyView(HomeAssistantView):
         if coord is None or isinstance(coord, bool):
             return self.json(_addon_unreachable_payload("energy"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
-            return self.json([])
+            cached_stats = getattr(coord, "_energy_stats", [])
+            if not isinstance(cached_stats, list):
+                return self.json([])
+            device_info = getattr(coord, "device_info", {})
+            if not isinstance(device_info, dict):
+                device_info = {}
+            rows: list[Any] = []
+            for item in cached_stats:
+                if not isinstance(item, dict):
+                    rows.append(item)
+                    continue
+                row = dict(item)
+                entity_id = str(row.get("entity_id") or "")
+                info = device_info.get(entity_id, {})
+                if not isinstance(info, dict):
+                    info = {}
+                if "triggers" not in row and "on_count" in row:
+                    row["triggers"] = row.get("on_count")
+                if not row.get("name"):
+                    row["name"] = info.get("name") or info.get("friendly_name") or entity_id
+                if not row.get("room"):
+                    row["room"] = info.get("room") or info.get("area") or ""
+                rows.append(row)
+            return self.json(rows)
         if _addon_client is None:
             return self.json(_addon_unreachable_payload("energy"), status_code=502)
 
@@ -4083,7 +4072,7 @@ class SmartAgentLicenseStatusView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("license_status"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
             payload: dict[str, Any] = {}
@@ -4152,7 +4141,7 @@ class SmartAgentLicenseVerifyView(HomeAssistantView):
             body = {}
         key = str((body or {}).get("license_key", "") or "").strip() or None
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -4188,7 +4177,7 @@ class SmartAgentBackupsView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("backups"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
             rows: list[dict[str, Any]] = []
@@ -4267,7 +4256,7 @@ class SmartAgentBackupsActionView(HomeAssistantView):
             body = {}
 
         act = action.strip().lower()
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("backups_action"), status_code=404)
 
@@ -4315,7 +4304,7 @@ class SmartAgentAiSceneOpsView(HomeAssistantView):
             body = {}
 
         path = request.path.lower()
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("ai_scene_ops"), status_code=404)
 
@@ -4368,7 +4357,7 @@ class SmartAgentModeView(HomeAssistantView):
         if mode not in ("home", "showroom"):
             return self.json(_json_error_payload("invalid mode", "validation_error", False), status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             set_mode = getattr(coord, "async_set_mode", None)
             if callable(set_mode):
@@ -4426,7 +4415,7 @@ class SmartAgentShowroomSceneView(HomeAssistantView):
         custom_prompt = str((body or {}).get("custom_prompt", "") or "").strip()
         is_command = bool((body or {}).get("is_command", False))
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("showroom_scene"), status_code=404)
 
@@ -4486,7 +4475,7 @@ class SmartAgentShowroomSceneConfigView(HomeAssistantView):
             "scene_desc": (body or {}).get("scene_desc"),
             "hint": (body or {}).get("hint"),
         }
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("showroom_scene_config"), status_code=404)
 
@@ -4526,7 +4515,7 @@ class SmartAgentPatrolTriggerView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("patrol_trigger"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_patrol_trigger_plan_only_payload("addon_proxy_loop_guard"), status_code=409)
 
@@ -4565,7 +4554,7 @@ class SmartAgentDevicePairStartView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -4631,7 +4620,7 @@ class SmartAgentVoiceSessionView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -4772,7 +4761,7 @@ class SmartAgentVoiceInterruptView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -4830,7 +4819,7 @@ class SmartAgentVisionCamerasView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("vision_cameras"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("vision_cameras"), status_code=404)
@@ -4890,7 +4879,7 @@ class SmartAgentVisionCamerasActionView(HomeAssistantView):
         if act not in {"register", "delete"}:
             return self.json({"ok": False, "error": f"unsupported action: {act}"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("vision_cameras_action"), status_code=404)
 
@@ -4939,7 +4928,7 @@ class SmartAgentVisionZonesView(HomeAssistantView):
         if not camera_id:
             return self.json({"ok": False, "error": "camera_id required"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("vision_zones"), status_code=404)
@@ -4993,7 +4982,7 @@ class SmartAgentVisionZonesSaveView(HomeAssistantView):
         if not camera_id or not zone_id:
             return self.json({"ok": False, "error": "camera_id and zone_id required"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("vision_zones_save"), status_code=404)
 
@@ -5033,7 +5022,7 @@ class SmartAgentMcpStatusView(HomeAssistantView):
         if coord is None:
             return self.json(_addon_unreachable_payload("mcp_status"), status_code=502)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             try:
                 attrs = coord.get_config_attributes() if hasattr(coord, "get_config_attributes") else {}
@@ -5106,7 +5095,7 @@ class SmartAgentMcpSettingsView(HomeAssistantView):
                 status_code=400,
             )
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("mcp_settings"), status_code=404)
 
@@ -5224,7 +5213,7 @@ class SmartAgentCapabilityDryRunView(HomeAssistantView):
             "constraints": body.get("constraints") if isinstance(body.get("constraints"), dict) else {},
         }
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("capability_dry_run"), status_code=404)
 
@@ -5270,7 +5259,7 @@ class SmartAgentAiSceneDeleteFallbackView(HomeAssistantView):
         if sid <= 0:
             return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
             return self.json(_addon_endpoint_missing_payload("ai_scene_delete_fallback"), status_code=404)
 
@@ -5312,7 +5301,7 @@ class SmartAgentAiSceneArchiveView(HomeAssistantView):
         if sid <= 0:
             return self.json({"ok": False, "error": "invalid scene id"}, status_code=400)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None)
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -5428,7 +5417,7 @@ class SmartAgentDevicePairConfirmView(HomeAssistantView):
                 status_code=400,
             )
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -5565,7 +5554,7 @@ class SmartAgentPairCreateView(HomeAssistantView):
         hass = request.app["hass"]
         coord = _get_first_coordinator(hass)
 
-        is_addon_proxy = str(request.headers.get("X-SA-Proxy-From", "") or "").lower() == "addon"
+        is_addon_proxy = _is_addon_proxy_request(request)
         _addon_client = getattr(coord, "_addon_client", None) if coord is not None else None
         if (not is_addon_proxy) and _addon_client is not None:
             try:
@@ -5698,72 +5687,6 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     return True
 
 
-def _register_v1_views(hass: HomeAssistant) -> None:
-    """Register /api/v1 REST views in the existing order."""
-    for view_cls in (
-        SmartAgentDevicesDiscoverView,
-        SmartAgentDevicesBatchAddView,
-        SmartAgentDeviceDetailView,
-        SmartAgentDeviceControlView,
-        SmartAgentPresenceSensorsView,
-        SmartAgentPresenceSensorTypeView,
-        SmartAgentRoomsView,
-        SmartAgentRoomsSyncView,
-        SmartAgentRoomsTopologyView,
-        SmartAgentAiScenesView,
-        SmartAgentAiSceneActionView,
-        SmartAgentAiSceneTriggerView,
-        SmartAgentSystemStatusView,
-        SmartAgentCompatStatsView,
-        SmartAgentDeprecationReadinessView,
-        SmartAgentDryoffSessionReportView,
-        SmartAgentDashboardSummaryView,
-        SmartAgentDiagnosticsView,
-        SmartAgentSystemSettingsView,
-        SmartAgentAuthLoginView,
-        SmartAgentAuthMeView,
-        SmartAgentAuthLogoutView,
-        SmartAgentSystemBrandView,
-        SmartAgentEventsWSView,
-        SmartAgentMemoryProfilesView,
-        SmartAgentMemoryHabitsView,
-        SmartAgentLearningStatsView,
-        SmartAgentProfileActionView,
-        SmartAgentHabitActionView,
-        SmartAgentCorrectionsView,
-        SmartAgentCorrectionActionView,
-        SmartAgentTransactionsView,
-        SmartAgentTransactionDetailView,
-        SmartAgentDecisionTraceView,
-        SmartAgentTransactionRollbackView,
-        SmartAgentEnergyView,
-        SmartAgentLicenseStatusView,
-        SmartAgentLicenseVerifyView,
-        SmartAgentBackupsView,
-        SmartAgentBackupsActionView,
-        SmartAgentAiSceneOpsView,
-        SmartAgentPatrolTriggerView,
-        SmartAgentModeView,
-        SmartAgentShowroomSceneView,
-        SmartAgentShowroomSceneConfigView,
-        SmartAgentDevicePairStartView,
-        SmartAgentDevicePairConfirmView,
-        SmartAgentVoiceSessionView,
-        SmartAgentVoiceInterruptView,
-        SmartAgentVisionCamerasView,
-        SmartAgentVisionCamerasActionView,
-        SmartAgentVisionZonesView,
-        SmartAgentVisionZonesSaveView,
-        SmartAgentMcpStatusView,
-        SmartAgentMcpSettingsView,
-        SmartAgentHaExecuteView,
-        SmartAgentCapabilityDryRunView,
-        SmartAgentAiSceneDeleteFallbackView,
-        SmartAgentAiSceneArchiveView,
-    ):
-        hass.http.register_view(view_cls())
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartAgent from a config entry."""
     hass.data.setdefault(DOMAIN, {})
@@ -5774,20 +5697,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # 注册日志 API 端点
-    hass.http.register_view(SmartAgentLogDatesView())
-    hass.http.register_view(SmartAgentLogContentView())
-    hass.http.register_view(SmartAgentLogInfoView())
-    hass.http.register_view(SmartAgentSceneExportView())
-    # 注册 Phase 1 Gateway 风格 REST 端点（迁移期由 HA 集成承载）
-    hass.http.register_view(SmartAgentDevicesView())
-    _register_v1_views(hass)
-    # 注册极速配对端点（POST 创建；GET 探测由 coordinator 注册的 SmartAgentPairingView 处理）
-    hass.http.register_view(SmartAgentPairCreateView())
-
-    # 注册 MCP Server 端点 (V3 架构 - Phase 8B)
-    from .mcp_server import SmartAgentMCPEndpointView
-    hass.http.register_view(SmartAgentMCPEndpointView(hass))
+    register_host_views(hass, globals())
 
     entry.async_create_background_task(
         hass, coordinator.async_start_listeners(), "smart_agent_listeners"
@@ -5888,49 +5798,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             scene_key=scene, custom_prompt=custom_prompt, is_command=is_command
         )
 
-    hass.services.async_register(DOMAIN, "discover_devices", svc_discover)
-    hass.services.async_register(DOMAIN, "sync_rooms_to_ha", svc_sync_rooms_to_ha, schema=vol.Schema({}))
-    hass.services.async_register(
-        DOMAIN, "batch_add_devices", svc_batch_add,
-        schema=vol.Schema({vol.Required("entities"): cv.string}),
-    )
-    hass.services.async_register(
-        DOMAIN, "add_device", svc_add_device,
-        schema=vol.Schema({vol.Required("entity_id"): cv.string, vol.Required("description"): cv.string}),
-    )
-    hass.services.async_register(
-        DOMAIN, "delete_device", svc_delete_device,
-        schema=vol.Schema({vol.Required("entity_id"): cv.string}),
-    )
-    hass.services.async_register(
-        DOMAIN, "update_device", svc_update_device,
-        schema=vol.Schema({
-            vol.Required("entity_id"): cv.string,
-            vol.Optional("name"): cv.string,
-            vol.Optional("room"): cv.string,
-            vol.Optional("type"): cv.string,
-            vol.Optional("ops"): cv.string,
-        }),
-    )
-    hass.services.async_register(DOMAIN, "add_habit", svc_add_habit, schema=vol.Schema({vol.Required("content"): cv.string}))
-    hass.services.async_register(DOMAIN, "delete_habit", svc_delete_habit, schema=vol.Schema({vol.Required("content"): cv.string}))
-    hass.services.async_register(DOMAIN, "toggle_habit_lock", svc_toggle_habit_lock, schema=vol.Schema({vol.Required("content"): cv.string}))
-    hass.services.async_register(DOMAIN, "add_rule", svc_add_rule, schema=vol.Schema({vol.Required("content"): cv.string}))
-    hass.services.async_register(DOMAIN, "delete_rule", svc_delete_rule, schema=vol.Schema({vol.Required("content"): cv.string}))
-    hass.services.async_register(DOMAIN, "toggle_rule_lock", svc_toggle_rule_lock, schema=vol.Schema({vol.Required("content"): cv.string}))
-    hass.services.async_register(DOMAIN, "manual_inference", svc_manual_inference,
-        schema=vol.Schema({vol.Optional("trigger", default="手动测试触发"): cv.string}))
-    hass.services.async_register(DOMAIN, "clear_overrides", svc_clear_overrides, schema=vol.Schema({}))
-    hass.services.async_register(DOMAIN, "delete_behavior_pattern", svc_delete_behavior_pattern,
-        schema=vol.Schema({vol.Required("id"): vol.Coerce(int)}))
-    hass.services.async_register(DOMAIN, "set_mode", svc_set_mode,
-        schema=vol.Schema({vol.Required("mode"): vol.In([MODE_HOME, MODE_SHOWROOM])}))
-    hass.services.async_register(DOMAIN, "set_showroom_scene", svc_set_showroom_scene,
-        schema=vol.Schema({
-            vol.Optional("scene", default=""): cv.string,
-            vol.Optional("custom_prompt", default=""): cv.string,
-            vol.Optional("is_command", default=False): cv.boolean,
-        }))
 
     # ── Phase 4: AI 场景管理服务 ──────────────────────────────────────────────
     async def _proxy_ai_scene_lifecycle(action: str, scene_id: int) -> None:
@@ -5984,10 +5851,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _proxy_ai_scene_lifecycle("trigger", scene_id)
 
     _ai_scene_schema = vol.Schema({vol.Required("id"): vol.Coerce(int)})
-    hass.services.async_register(DOMAIN, "approve_ai_scene", svc_approve_ai_scene, schema=_ai_scene_schema)
-    hass.services.async_register(DOMAIN, "reject_ai_scene", svc_reject_ai_scene, schema=_ai_scene_schema)
-    hass.services.async_register(DOMAIN, "delete_ai_scene", svc_delete_ai_scene, schema=_ai_scene_schema)
-    hass.services.async_register(DOMAIN, "trigger_ai_scene", svc_trigger_ai_scene, schema=_ai_scene_schema)
 
     # ── 一句话生成场景 ─────────────────────────────────────────────────────────
     async def svc_create_scene_from_text(call: ServiceCall) -> None:
@@ -5997,10 +5860,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
           text (str, 必填)：场景描述，如"下午 2 点到 6 点，工作日，打开客厅灯 80%"
           auto_activate (bool, 可选, 默认 False)：是否跳过审批直接激活
         """
-        result = await coordinator.async_create_scene_from_text(
-            text=call.data["text"],
-            auto_activate=bool(call.data.get("auto_activate", False)),
-        )
+        _addon_client = getattr(coordinator, "_addon_client", None)
+        if _addon_client is None:
+            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: create-from-text")
+            return
+        body = {
+            "text": call.data["text"],
+            "auto_activate": bool(call.data.get("auto_activate", False)),
+        }
+        result = await _addon_client.post_ai_scene_ops("ai-scenes/create-from-text", body)
+        if not isinstance(result, dict):
+            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: create-from-text")
+            return
+        status = int(result.get("__status", 200) or 200)
+        if status >= 400 or result.get("ok") is False:
+            error = result.get("error") or result.get("error_type") or f"http_{status}"
+            coordinator._sys_log("WARN", f"[AI场景] add-on create-from-text failed: {error}")
+            return
         coordinator.hass.bus.async_fire(
             "smart_agent_scene_created",
             {"success": result.get("success"), "scene_id": result.get("scene_id"),
@@ -6012,11 +5888,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         vol.Required("text"): str,
         vol.Optional("auto_activate", default=False): bool,
     })
-    hass.services.async_register(
-        DOMAIN, "create_scene_from_text",
-        svc_create_scene_from_text,
-        schema=_create_scene_schema,
-    )
 
     # ── Layer 2: 事务管理服务 ──────────────────────────────────────────────────
     async def svc_rollback_transaction(call: ServiceCall) -> None:
@@ -6033,33 +5904,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator.async_set_updated_data({})
 
     _txn_schema = vol.Schema({vol.Required("id"): vol.Coerce(int)})
-    hass.services.async_register(DOMAIN, "rollback_transaction", svc_rollback_transaction, schema=_txn_schema)
-    hass.services.async_register(DOMAIN, "refresh_transactions", svc_refresh_transactions,
-                                  schema=vol.Schema({}))
 
     async def svc_set_device_control_mode(call: ServiceCall) -> None:
         entity_id = call.data["entity_id"]
         mode = call.data["mode"]
         await coordinator.async_set_device_control_mode(entity_id, mode)
 
-    hass.services.async_register(DOMAIN, "set_device_control_mode", svc_set_device_control_mode,
-        schema=vol.Schema({
-            vol.Required("entity_id"): cv.string,
-            vol.Required("mode"): vol.In(["ai", "ha", "shared"]),
-        }))
-
     async def svc_batch_set_control_mode(call: ServiceCall) -> None:
         mode = call.data["mode"]
         room = call.data.get("room", "")
         dev_type = call.data.get("type", "")
         await coordinator.async_batch_set_control_mode(mode, room=room, dev_type=dev_type)
-
-    hass.services.async_register(DOMAIN, "batch_set_control_mode", svc_batch_set_control_mode,
-        schema=vol.Schema({
-            vol.Required("mode"): vol.In(["ai", "ha", "shared"]),
-            vol.Optional("room", default=""): cv.string,
-            vol.Optional("type", default=""): cv.string,
-        }))
 
     async def svc_update_showroom_scene_config(call: ServiceCall) -> None:
         scene_key = call.data.get("scene_key", "")
@@ -6070,15 +5925,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             scene_desc=call.data.get("scene_desc") or None,
             hint=call.data.get("hint") or None,
         )
-
-    hass.services.async_register(DOMAIN, "update_showroom_scene_config", svc_update_showroom_scene_config,
-        schema=vol.Schema({
-            vol.Required("scene_key"): cv.string,
-            vol.Optional("label"): cv.string,
-            vol.Optional("virtual_time"): cv.string,
-            vol.Optional("scene_desc"): cv.string,
-            vol.Optional("hint"): cv.string,
-        }))
 
     async def svc_update_config(call: ServiceCall) -> None:
         """前端设置面板保存通用配置，持久化到 config entry options。"""
@@ -6240,7 +6086,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             coordinator.async_set_updated_data(coordinator.get_config_attributes())
             coordinator._sys_log("INFO", "[配置] 系统参数已更新")
 
-    hass.services.async_register(DOMAIN, "update_config", svc_update_config)
 
     async def svc_tts_test(call: ServiceCall) -> None:
         """发送一条测试 TTS 播报，验证 TTS 配置是否正确。"""
@@ -6252,680 +6097,177 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         source = call.data.get("source", "touch")
         await coordinator._run_voice_inference(command, source=source)
 
-    hass.services.async_register(DOMAIN, "tts_test", svc_tts_test, schema=vol.Schema({}))
 
     async def svc_run_pattern_analysis(_call: ServiceCall) -> None:
         """触发行为规律分析与 AI 场景生成（async 处理器，事件循环内直接 await）。"""
-        await coordinator.async_run_pattern_analysis()
+        _addon_client = getattr(coordinator, "_addon_client", None)
+        if _addon_client is None:
+            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: analyze")
+            return
+        result = await _addon_client.post_ai_scene_ops("ai-scenes/analyze", {})
+        if not isinstance(result, dict):
+            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: analyze")
+            return
+        status = int(result.get("__status", 200) or 200)
+        if status >= 400 or result.get("ok") is False:
+            error = result.get("error") or result.get("error_type") or f"http_{status}"
+            coordinator._sys_log("WARN", f"[AI场景] add-on analyze failed: {error}")
+            return
+        coordinator.async_set_updated_data({})
 
-    hass.services.async_register(
-        DOMAIN, "run_pattern_analysis",
-        svc_run_pattern_analysis,
-        schema=vol.Schema({}),
+    register_smart_agent_services(
+        hass,
+        (
+            ServiceRegistration("discover_devices", svc_discover),
+            ServiceRegistration("sync_rooms_to_ha", svc_sync_rooms_to_ha, vol.Schema({})),
+            ServiceRegistration(
+                "batch_add_devices",
+                svc_batch_add,
+                vol.Schema({vol.Required("entities"): cv.string}),
+            ),
+            ServiceRegistration(
+                "add_device",
+                svc_add_device,
+                vol.Schema({
+                    vol.Required("entity_id"): cv.string,
+                    vol.Required("description"): cv.string,
+                }),
+            ),
+            ServiceRegistration(
+                "delete_device",
+                svc_delete_device,
+                vol.Schema({vol.Required("entity_id"): cv.string}),
+            ),
+            ServiceRegistration(
+                "update_device",
+                svc_update_device,
+                vol.Schema({
+                    vol.Required("entity_id"): cv.string,
+                    vol.Optional("name"): cv.string,
+                    vol.Optional("room"): cv.string,
+                    vol.Optional("type"): cv.string,
+                    vol.Optional("ops"): cv.string,
+                }),
+            ),
+            ServiceRegistration(
+                "add_habit",
+                svc_add_habit,
+                vol.Schema({vol.Required("content"): cv.string}),
+            ),
+            ServiceRegistration(
+                "delete_habit",
+                svc_delete_habit,
+                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+            ),
+            ServiceRegistration(
+                "toggle_habit_lock",
+                svc_toggle_habit_lock,
+                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+            ),
+            ServiceRegistration(
+                "add_rule",
+                svc_add_rule,
+                vol.Schema({vol.Required("content"): cv.string}),
+            ),
+            ServiceRegistration(
+                "delete_rule",
+                svc_delete_rule,
+                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+            ),
+            ServiceRegistration(
+                "toggle_rule_lock",
+                svc_toggle_rule_lock,
+                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+            ),
+            ServiceRegistration(
+                "manual_inference",
+                svc_manual_inference,
+                vol.Schema({vol.Optional("trigger", default="鎵嬪姩娴嬭瘯瑙﹀彂"): cv.string}),
+            ),
+            ServiceRegistration("clear_overrides", svc_clear_overrides, vol.Schema({})),
+            ServiceRegistration(
+                "delete_behavior_pattern",
+                svc_delete_behavior_pattern,
+                vol.Schema({vol.Required("id"): vol.Coerce(int)}),
+            ),
+            ServiceRegistration(
+                "set_mode",
+                svc_set_mode,
+                vol.Schema({vol.Required("mode"): vol.In([MODE_HOME, MODE_SHOWROOM])}),
+            ),
+            ServiceRegistration(
+                "set_showroom_scene",
+                svc_set_showroom_scene,
+                vol.Schema({
+                    vol.Optional("scene", default=""): cv.string,
+                    vol.Optional("custom_prompt", default=""): cv.string,
+                    vol.Optional("is_command", default=False): cv.boolean,
+                }),
+            ),
+            ServiceRegistration("approve_ai_scene", svc_approve_ai_scene, _ai_scene_schema),
+            ServiceRegistration("reject_ai_scene", svc_reject_ai_scene, _ai_scene_schema),
+            ServiceRegistration("delete_ai_scene", svc_delete_ai_scene, _ai_scene_schema),
+            ServiceRegistration("trigger_ai_scene", svc_trigger_ai_scene, _ai_scene_schema),
+            ServiceRegistration("create_scene_from_text", svc_create_scene_from_text, _create_scene_schema),
+            ServiceRegistration("rollback_transaction", svc_rollback_transaction, _txn_schema),
+            ServiceRegistration("refresh_transactions", svc_refresh_transactions, vol.Schema({})),
+            ServiceRegistration(
+                "set_device_control_mode",
+                svc_set_device_control_mode,
+                vol.Schema({
+                    vol.Required("entity_id"): cv.string,
+                    vol.Required("mode"): vol.In(["ai", "ha", "shared"]),
+                }),
+            ),
+            ServiceRegistration(
+                "batch_set_control_mode",
+                svc_batch_set_control_mode,
+                vol.Schema({
+                    vol.Required("mode"): vol.In(["ai", "ha", "shared"]),
+                    vol.Optional("room", default=""): cv.string,
+                    vol.Optional("type", default=""): cv.string,
+                }),
+            ),
+            ServiceRegistration(
+                "update_showroom_scene_config",
+                svc_update_showroom_scene_config,
+                vol.Schema({
+                    vol.Required("scene_key"): cv.string,
+                    vol.Optional("label"): cv.string,
+                    vol.Optional("virtual_time"): cv.string,
+                    vol.Optional("scene_desc"): cv.string,
+                    vol.Optional("hint"): cv.string,
+                }),
+            ),
+            ServiceRegistration("update_config", svc_update_config),
+            ServiceRegistration("tts_test", svc_tts_test, vol.Schema({})),
+            ServiceRegistration("run_pattern_analysis", svc_run_pattern_analysis, vol.Schema({})),
+            ServiceRegistration(
+                "verify_license",
+                coordinator.async_svc_verify_license,
+                vol.Schema({vol.Optional("license_key", default=""): cv.string}),
+            ),
+            ServiceRegistration(
+                "voice_command",
+                svc_voice_command,
+                vol.Schema({
+                    vol.Required("command"): cv.string,
+                    vol.Optional("source", default="touch"): cv.string,
+                }),
+            ),
+        ),
     )
-    hass.services.async_register(
-        DOMAIN, "verify_license", coordinator.async_svc_verify_license,
-        schema=vol.Schema({
-            vol.Optional("license_key", default=""): cv.string,
-        })
-    )
-    hass.services.async_register(
-        DOMAIN, "voice_command", svc_voice_command,
-        schema=vol.Schema({
-            vol.Required("command"): cv.string,
-            vol.Optional("source", default="touch"): cv.string,
-        })
-    )
+
 
     # ── WebSocket API：大数据列表通过 WS 按需下发，绕过 sensor 属性 16KB 上限 ──
-
-    def _get_coord(hass: HomeAssistant) -> SmartAgentCoordinator | None:
-        """从 hass.data 取出第一个 coordinator 实例（单实例部署常用）。"""
-        return next(iter(hass.data.get(DOMAIN, {}).values()), None)
-
-    def _require_admin(connection, msg_id: int) -> bool:
-        """校验调用者是否为管理员，非管理员返回 False 并发送 forbidden 错误。
-
-        WS 面板注册时已 require_admin=True，此校验为纵深防御，
-        防止非管理员用户绕过 UI 直接调用 WebSocket 命令。
-        """
-        if not connection.user.is_admin:
-            connection.send_error(msg_id, "forbidden", "Admin access required")
-            return False
-        return True
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_devices"})
-    @websocket_api.async_response
-    async def ws_get_devices(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整设备列表（所有字段，无截断），供设备管理页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        devices = [
-            {
-                "entity_id": eid,
-                "name": info.get("name", eid),
-                "room": info.get("room", ""),
-                "type": info.get("type", ""),
-                "control_mode": info.get("control_mode", "shared"),
-                "ops": info.get("ops", ""),
-                "sensor_type": info.get("sensor_type", ""),
-            }
-            for eid, info in get_device_info_snapshot(coord).items()
-        ]
-        connection.send_result(msg["id"], {"devices": devices})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_habits"})
-    @websocket_api.async_response
-    async def ws_get_habits(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整习惯列表（内容无截断），供个性化画像页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        habits = [
-            {"index": i, "content": c, "locked": lk}
-            for i, (c, lk) in enumerate(get_habits_cache_snapshot(coord))
-        ]
-        connection.send_result(msg["id"], {"habits": habits})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_rules"})
-    @websocket_api.async_response
-    async def ws_get_rules(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整规则列表（含 AI 自动规则，内容无截断），供个性化画像页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        _AI_MARKS = ("[自动修正规则]", "[强化修正规则]")
-        rules = [
-            {"index": i, "content": c, "locked": lk, "is_ai": any(c.startswith(m) for m in _AI_MARKS)}
-            for i, (c, lk) in enumerate(get_rules_snapshot(coord))
-        ]
-        connection.send_result(msg["id"], {"rules": rules})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_ai_scenes"})
-    @websocket_api.async_response
-    async def ws_get_ai_scenes(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整 AI 候选场景列表（含 entities_json），供 AI 场景页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        scenes = get_ai_scenes_cache_snapshot(coord)
-        connection.send_result(msg["id"], {"scenes": scenes})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_energy_stats"})
-    @websocket_api.async_response
-    async def ws_get_energy_stats(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整能耗统计数据，供能耗分析页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        stats = coord._energy_stats if isinstance(coord._energy_stats, list) else []
-        connection.send_result(msg["id"], {"stats": stats})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_transactions"})
-    @websocket_api.async_response
-    async def ws_get_transactions(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整执行记录（最近 50 条），供执行记录页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        txns = get_transactions_cache_snapshot(coord)
-        # 去掉超大 JSON 快照字段，只保留展示所需字段
-        _DROP = {"pre_states_json"}
-        result = [
-            {k: v for k, v in t.items() if k not in _DROP}
-            for t in txns[-50:]
-            if isinstance(t, dict)
-        ]
-        connection.send_result(msg["id"], {"transactions": result})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_decision_stats"})
-    @websocket_api.async_response
-    async def ws_get_decision_stats(hass: HomeAssistant, connection, msg: dict) -> None:
-        """5D-3 AI 决策看板统计 API — 返回今日决策概览和按房间推翻率。
-
-        返回结构：
-          today_inferences: 今日 AI 推理触发次数
-          today_blocked:    今日被意图验证拦截的动作数
-          today_corrections: 今日用户主动修正次数
-          room_overturn_rates: [{room, inferences, corrections, rate}]
-          recent_decisions: 最近 5 条事务摘要
-        """
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-
-        from datetime import date as _date, timedelta as _td
-
-        today_str = _date.today().isoformat()
-        # P2 fix: 近30天截止日期（原代码误用了今天）
-        cutoff_30 = (_date.today() - _td(days=30)).strftime("%Y-%m-%d")
-
-        def _fetch():
-            # P1 fix: 整体 try/except，避免任何 SQL 异常导致 WS 处理函数崩溃
-            try:
-                db = coord._db
-                # 今日 AI 推理次数（events 表 type=AI_Inference）
-                inf_rows = db.query(
-                    "SELECT COUNT(*) AS cnt FROM events WHERE type='AI_Inference' AND time >= ?",
-                    (today_str,),
-                )
-                today_inferences = inf_rows[0]["cnt"] if inf_rows else 0
-
-                # 今日拦截动作数（action_transactions 中 blocked_count 合计）
-                blk_rows = db.query(
-                    "SELECT COALESCE(SUM(blocked_count),0) AS cnt FROM action_transactions WHERE time >= ?",
-                    (today_str,),
-                )
-                today_blocked = blk_rows[0]["cnt"] if blk_rows else 0
-
-                # 今日用户修正次数（corrections 表 time 今日）
-                cor_rows = db.query(
-                    "SELECT COUNT(*) AS cnt FROM corrections WHERE time >= ?",
-                    (today_str,),
-                )
-                today_corrections = cor_rows[0]["cnt"] if cor_rows else 0
-
-                # 按房间统计推翻率（近 30 天）
-                room_inf = db.query(
-                    "SELECT area AS room, COUNT(*) AS cnt FROM events "
-                    "WHERE type='AI_Inference' AND area != '' AND time >= ? "
-                    "GROUP BY area ORDER BY cnt DESC LIMIT 10",
-                    (cutoff_30,),
-                )
-                # P3 fix: 移除 SELECT 中未使用的 c.entity_id（GROUP BY d.area 时返回值不确定）
-                room_cor = db.query(
-                    "SELECT d.area AS room, SUM(c.correction_count) AS corrections "
-                    "FROM corrections c "
-                    "LEFT JOIN devices d ON c.entity_id = d.entity_id "
-                    "WHERE c.time >= ? AND d.area != '' "
-                    "GROUP BY d.area",
-                    (cutoff_30,),
-                )
-                cor_map = {r["room"]: int(r.get("corrections") or 0) for r in room_cor if r.get("room")}
-                room_overturn_rates = []
-                for r in room_inf:
-                    room = r.get("room", "")
-                    infs = int(r.get("cnt") or 0)
-                    cors = cor_map.get(room, 0)
-                    rate = round(cors / infs * 100, 1) if infs > 0 else 0.0
-                    room_overturn_rates.append({"room": room, "inferences": infs, "corrections": cors, "rate": rate})
-
-                return today_inferences, today_blocked, today_corrections, room_overturn_rates
-            except Exception as _exc:
-                _LOGGER.warning("[DecisionStats] DB 查询失败: %s", _exc)
-                return 0, 0, 0, []
-
-        ti, tb, tc, rates = await hass.async_add_executor_job(_fetch)
-
-        addon_diagnostics: dict[str, Any] = {}
-        _addon_client = getattr(coord, "_addon_client", None)
-        if _addon_client is not None:
-            try:
-                addon_diagnostics = _normalize_addon_diagnostics(await _addon_client.get_diagnostics())
-            except Exception as _diag_exc:
-                _LOGGER.debug("[DecisionStats] 获取 Add-on diagnostics 失败: %s", _diag_exc)
-                addon_diagnostics = {
-                    "ok": False,
-                    "error": "addon_diagnostics_fetch_failed",
-                    "error_type": "dependency_unreachable",
-                    "retryable": True,
-                }
-
-        # 最近 5 条事务（from cache）
-        txns = coord._transactions_cache if isinstance(coord._transactions_cache, list) else []
-        _DROP = {"pre_states_json", "actions_json", "results_json"}
-        recent = [
-            {k: v for k, v in t.items() if k not in _DROP}
-            for t in txns[-5:]
-            if isinstance(t, dict)
-        ]
-
-        connection.send_result(msg["id"], {
-            "today_inferences": ti,
-            "today_blocked": tb,
-            "today_corrections": tc,
-            "room_overturn_rates": rates,
-            "recent_decisions": recent,
-            "addon_diagnostics": addon_diagnostics,
-        })
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_behavior_patterns"})
-    @websocket_api.async_response
-    async def ws_get_behavior_patterns(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整行为模式列表，供行为习惯页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        patterns = coord._behavior_patterns_cache if isinstance(coord._behavior_patterns_cache, list) else []
-        connection.send_result(msg["id"], {"patterns": patterns})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_ai_actions"})
-    @websocket_api.async_response
-    async def ws_get_ai_actions(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回近期 AI 操作记录（_last_ai_actions dict），供纠错学习页使用。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        raw = getattr(coord, "_last_ai_actions", {})
-        actions = [{"entity_id": eid, **v} for eid, v in raw.items()]
-        connection.send_result(msg["id"], {"actions": actions})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_sys_log"})
-    @websocket_api.async_response
-    async def ws_get_sys_log(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回完整系统运行日志 HTML（不受 sensor 16KB 限制）。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        html = getattr(coord, "sys_log_html", "") or ""
-        connection.send_result(msg["id"], {"html": html})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_terminal_log"})
-    @websocket_api.async_response
-    async def ws_get_terminal_log(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回决策流水 HTML（绕过 sensor 16KB 限制，支持前端轮询）。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-        html = getattr(coord, "terminal_log_html", "") or ""
-        connection.send_result(msg["id"], {"html": html})
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_learning_stats"})
-    @websocket_api.async_response
-    async def ws_get_learning_stats(hass: HomeAssistant, connection, msg: dict) -> None:
-        """
-        返回 AI 学习数据积累统计，供前端「学习进度仪表盘」使用。
-
-        包含各核心学习表的记录数、设备区域覆盖率、纠正学习趋势等。
-        """
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-
-        def _query_stats():
-            q = coord._db.query
-            # _safe_int: 返回 COUNT/SUM 查询结果中 "c" 列的整数值
-            # 原错误：_safe(sql)[0] 对 dict 使用整数下标 → KeyError: 0（v4.11.1 修复）
-            _safe_int = lambda sql: ((q(sql) or [{}])[0].get("c") or 0)
-
-            # 各表记录数
-            arrival_count    = _safe_int("SELECT COUNT(*) as c FROM arrival_baseline")
-            correction_count = _safe_int("SELECT COUNT(*) as c FROM corrections")
-            cache_count      = _safe_int("SELECT COUNT(*) as c FROM decision_cache")
-            cache_hits       = _safe_int("SELECT SUM(hit_count) as c FROM decision_cache")
-            pattern_count    = _safe_int("SELECT COUNT(*) as c FROM behavior_patterns")
-            reflexion_count  = _safe_int("SELECT COUNT(*) as c FROM reflexion_patterns")
-
-            # 设备区域覆盖率
-            total_devices  = _safe_int("SELECT COUNT(*) as c FROM devices")
-            noroom_devices = _safe_int("SELECT COUNT(*) as c FROM devices WHERE area='' OR area IS NULL")
-
-            # 近 7 天纠正趋势（按天分组）
-            correction_trend = []
-            rows = q(
-                "SELECT DATE(time) as day, COUNT(*) as cnt "
-                "FROM corrections WHERE time >= DATE('now','-7 days') "
-                "GROUP BY DATE(time) ORDER BY day"
-            )
-            if rows:
-                correction_trend = [{"day": r["day"], "count": r["cnt"]} for r in rows]
-
-            # 被纠正最多的 Top-5 设备
-            top_corrected = []
-            rows = q(
-                "SELECT entity_id, SUM(correction_count) as total "
-                "FROM corrections GROUP BY entity_id ORDER BY total DESC LIMIT 5"
-            )
-            if rows:
-                top_corrected = [{"entity_id": r["entity_id"], "count": r["total"]} for r in rows]
-
-            return {
-                "arrival_baseline": arrival_count,
-                "corrections": correction_count,
-                "decision_cache": cache_count,
-                "decision_cache_hits": cache_hits,
-                "behavior_patterns": pattern_count,
-                "reflexion_patterns": reflexion_count,
-                "total_devices": total_devices,
-                "noroom_devices": noroom_devices,
-                "correction_trend": correction_trend,
-                "top_corrected": top_corrected,
-            }
-
-        try:
-            stats = await hass.async_add_executor_job(_query_stats)
-        except Exception as _exc:
-            _LOGGER.warning("[WS] get_learning_stats 查询异常: %s", _exc)
-            connection.send_error(msg["id"], "query_error", str(_exc))
-            return
-        connection.send_result(msg["id"], stats)
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_frigate_cameras"})
-    @websocket_api.async_response
-    async def ws_get_frigate_cameras(hass: HomeAssistant, connection, msg: dict) -> None:
-        """
-        返回 Frigate 摄像头配置列表（合并 DB 绑定 + Frigate 现有摄像头）。
-
-        数据来源优先级：
-          1. Frigate HTTP API（主路径，跨容器网络，无需文件系统权限）
-          2. 文件系统搜索（降级兜底，适用于本地开发/非 Supervisor 部署）
-
-        DB 中有绑定记录的摄像头会附带 room 信息；
-        Frigate 中存在但尚未绑定的摄像头也会列出（room 为空，提示用户补充）。
-        """
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-
-        from .frigate_config import (
-            find_frigate_config_path, read_frigate_config,
-            list_cameras_from_config, get_cameras_from_frigate_api,
-        )
-
-        try:
-            # 查 DB 中的摄像头绑定记录
-            def _db_query():
-                rows = coord._db.query("SELECT * FROM frigate_cameras ORDER BY created_at DESC")
-                return [dict(r) for r in rows] if rows else []
-
-            db_cameras = await hass.async_add_executor_job(_db_query)
-            db_ids = {c["camera_id"] for c in db_cameras}
-
-            # ── 主路径：Frigate HTTP API（HA Core 容器不挂载 /addon_configs/）──
-            yml_cameras, config_path = await get_cameras_from_frigate_api()
-
-            # ── 降级：文件系统搜索（本地开发 / 特殊部署场景）──
-            if not yml_cameras:
-                fs_path = await hass.async_add_executor_job(find_frigate_config_path)
-                if fs_path:
-                    config = await hass.async_add_executor_job(read_frigate_config, fs_path)
-                    yml_cameras = list_cameras_from_config(config)
-                    config_path = fs_path
-
-            # 合并：DB 记录优先，API/文件中未绑定的追加
-            result = list(db_cameras)
-            for yc in yml_cameras:
-                if yc["camera_id"] not in db_ids:
-                    result.append({**yc, "room": "", "enabled": yc.get("enabled", True)})
-
-            connection.send_result(msg["id"], {
-                "cameras": result,
-                "config_path": config_path or "",
-            })
-        except Exception as _exc:
-            _LOGGER.warning("[WS] get_frigate_cameras 异常: %s", _exc)
-            connection.send_error(msg["id"], "query_error", str(_exc))
-
-    # ── Frigate Zone 房间绑定 WS 接口 ──────────────────────────────────
-    @websocket_api.websocket_command({
-        vol.Required("type"): "smart_agent/get_frigate_zones",
-        vol.Required("camera_id"): str,
-    })
-    @websocket_api.async_response
-    async def ws_get_frigate_zones(hass: HomeAssistant, connection, msg: dict) -> None:
-        """
-        返回指定摄像头的所有 zone 及其房间绑定信息。
-
-        先从 Frigate API 读取摄像头配置中的 zones 定义，
-        再与 DB frigate_zones 表合并（已绑定的附带 room 信息）。
-        """
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-
-        camera_id = msg["camera_id"]
-
-        from .frigate_config import get_cameras_from_frigate_api
-
-        try:
-            # 从 Frigate API 获取 zone 定义
-            yml_cameras, _ = await get_cameras_from_frigate_api()
-            cam_config = next((c for c in yml_cameras if c.get("camera_id") == camera_id), None)
-            frigate_zones: list[dict] = cam_config.get("zones", []) if cam_config else []
-
-            # 查 DB 中已绑定的 zone
-            def _db_query():
-                rows = coord._db.query(
-                    "SELECT * FROM frigate_zones WHERE camera_id=?", (camera_id,)
-                )
-                return {r["zone_id"]: r for r in rows} if rows else {}
-
-            db_zones = await hass.async_add_executor_job(_db_query)
-
-            # 合并：DB 记录优先
-            result = []
-            for z in frigate_zones:
-                zid = z["zone_id"]
-                db_rec = db_zones.get(zid)
-                result.append({
-                    "zone_id": zid,
-                    "friendly_name": (db_rec or {}).get("friendly_name") or z.get("friendly_name", zid),
-                    "room": (db_rec or {}).get("room", ""),
-                    "camera_id": camera_id,
-                })
-            # 追加在 Frigate API 中未出现但 DB 有记录的 zone（可能 zone 已删除）
-            seen = {z["zone_id"] for z in frigate_zones}
-            for zid, db_rec in db_zones.items():
-                if zid not in seen:
-                    result.append({
-                        "zone_id": zid,
-                        "friendly_name": db_rec.get("friendly_name", zid),
-                        "room": db_rec.get("room", ""),
-                        "camera_id": camera_id,
-                        "_orphan": True,
-                    })
-
-            connection.send_result(msg["id"], {"zones": result, "camera_id": camera_id})
-        except Exception as _exc:
-            _LOGGER.warning("[WS] get_frigate_zones 异常: %s", _exc)
-            connection.send_error(msg["id"], "query_error", str(_exc))
-
-    @websocket_api.websocket_command({
-        vol.Required("type"): "smart_agent/save_frigate_zone",
-        vol.Required("camera_id"): str,
-        vol.Required("zone_id"): str,
-        vol.Optional("friendly_name", default=""): str,
-        vol.Optional("room", default=""): str,
-    })
-    @websocket_api.async_response
-    async def ws_save_frigate_zone(hass: HomeAssistant, connection, msg: dict) -> None:
-        """保存 Frigate zone 的房间绑定（upsert）。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-
-        camera_id = msg["camera_id"]
-        zone_id = msg["zone_id"]
-        friendly_name = msg.get("friendly_name", "")
-        room = msg.get("room", "")
-
-        from datetime import datetime as _dt_now
-
-        def _db_upsert() -> bool:
-            now_str = _dt_now.now().isoformat()
-            return bool(coord._db.execute(
-                """INSERT INTO frigate_zones (camera_id, zone_id, friendly_name, room, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(camera_id, zone_id) DO UPDATE SET
-                     friendly_name=excluded.friendly_name,
-                     room=excluded.room,
-                     updated_at=excluded.updated_at""",
-                (camera_id, zone_id, friendly_name, room, now_str, now_str),
-            ))
-
-        db_ok = await hass.async_add_executor_job(_db_upsert)
-        if not db_ok:
-            connection.send_error(msg["id"], "db_write_failed", "保存 Frigate zone 失败")
-            return
-        connection.send_result(msg["id"], {"ok": True})
-
-    # ── 传感器管理 WS（Phase 12.1）──────────────────────────────────────────────
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_presence_sensors"})
-    @websocket_api.async_response
-    async def ws_get_presence_sensors(hass: HomeAssistant, connection, msg: dict) -> None:
-        """
-        返回 HA 中所有存在类传感器（binary_sensor.*），附带 SmartAgent DB 信息。
-
-        数据来源：
-          1. HA states → 全量 binary_sensor 实体（不限于已注册到 SA 的设备）
-          2. coordinator.device_info → 补充 name / room / sensor_type
-          3. coordinator._fusion_registry → 补充所属融合域
-          4. coordinator._cfg.options / presence_fusion → 当前融合域配置 JSON
-        """
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-
-        connection.send_result(msg["id"], _build_presence_sensors_payload(hass, coord))
-
-    @websocket_api.websocket_command({
-        vol.Required("type"): "smart_agent/save_sensor_type",
-        vol.Required("entity_id"): str,
-        vol.Required("sensor_type"): str,
-    })
-    @websocket_api.async_response
-    async def ws_save_sensor_type(hass: HomeAssistant, connection, msg: dict) -> None:
-        """保存单个传感器的 sensor_type（pir / mmwave / frigate / ""）到 DB。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
-            return
-
-        result = await _async_save_presence_sensor_type(
-            hass,
-            coord,
-            msg["entity_id"],
-            msg["sensor_type"],
-        )
-        status = int(result.pop("status", 200) or 200)
-        if not result.get("ok"):
-            code = "invalid_input" if status == 400 else "not_found" if status == 404 else "db_write_failed"
-            connection.send_error(msg["id"], code, str(result.get("error") or "保存 sensor_type 失败"))
-            return
-
-        connection.send_result(msg["id"], result)
-
-    # ── 房间拓扑 WS ───────────────────────────────────────────────────────────
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_room_topology"})
-    @websocket_api.async_response
-    async def ws_get_room_topology(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回已保存的房间拓扑关系列表。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_result(msg["id"], {"topology": []})
-            return
-
-        def _query():
-            try:
-                rows = coord._db.query(
-                    "SELECT room_a, room_b, relation FROM room_topology", ()
-                )
-                return rows or []
-            except Exception:
-                return []
-
-        rows = await hass.async_add_executor_job(_query)
-        connection.send_result(msg["id"], {"topology": rows})
-
-    # ── 备份列表 WS ───────────────────────────────────────────────────────────
-
-    @websocket_api.websocket_command({vol.Required("type"): "smart_agent/list_backups"})
-    @websocket_api.async_response
-    async def ws_list_backups(hass: HomeAssistant, connection, msg: dict) -> None:
-        """返回备份文件列表。"""
-        if not _require_admin(connection, msg["id"]):
-            return
-        coord = _get_coord(hass)
-        if coord is None:
-            connection.send_result(msg["id"], {"backups": []})
-            return
-
-        try:
-            backup_mgr = getattr(coord, "_backup_manager", None)
-            if backup_mgr and hasattr(backup_mgr, "list_backups"):
-                backups = await hass.async_add_executor_job(backup_mgr.list_backups)
-            else:
-                backups = []
-            connection.send_result(msg["id"], {"backups": backups})
-        except Exception as e:
-            connection.send_error(msg["id"], "error", str(e))
-
-    # ── 传感器管理 WS END ─────────────────────────────────────────────────────
-
-    websocket_api.async_register_command(hass, ws_get_devices)
-    websocket_api.async_register_command(hass, ws_get_habits)
-    websocket_api.async_register_command(hass, ws_get_rules)
-    websocket_api.async_register_command(hass, ws_get_ai_scenes)
-    websocket_api.async_register_command(hass, ws_get_energy_stats)
-    websocket_api.async_register_command(hass, ws_get_transactions)
-    websocket_api.async_register_command(hass, ws_get_decision_stats)
-    websocket_api.async_register_command(hass, ws_get_behavior_patterns)
-    websocket_api.async_register_command(hass, ws_get_ai_actions)
-    websocket_api.async_register_command(hass, ws_get_sys_log)
-    websocket_api.async_register_command(hass, ws_get_terminal_log)
-    websocket_api.async_register_command(hass, ws_get_frigate_cameras)
-    websocket_api.async_register_command(hass, ws_get_learning_stats)
-    websocket_api.async_register_command(hass, ws_get_frigate_zones)
-    websocket_api.async_register_command(hass, ws_save_frigate_zone)
-    websocket_api.async_register_command(hass, ws_get_presence_sensors)
-    websocket_api.async_register_command(hass, ws_save_sensor_type)
-    websocket_api.async_register_command(hass, ws_get_room_topology)
-    websocket_api.async_register_command(hass, ws_list_backups)
+    register_smart_agent_websocket_commands(
+        hass,
+        build_smart_agent_websocket_commands(
+            _normalize_addon_diagnostics=_normalize_addon_diagnostics,
+            _build_presence_sensors_payload=_build_presence_sensors_payload,
+            _async_save_presence_sensor_type=_async_save_presence_sensor_type,
+        ),
+    )
 
     # ── 选项变更时自动重载集成（API Key / 模型 / 引擎等全部生效）──
     entry.async_on_unload(
@@ -6960,20 +6302,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_shutdown()
     # 只有在 domain 数据为空时才移除服务（多实例场景下其他实例仍在运行）
     if not hass.data.get(DOMAIN):
-        for svc_name in (
-            "discover_devices", "batch_add_devices", "add_device", "delete_device", "update_device",
-            "add_habit", "delete_habit", "toggle_habit_lock",
-            "add_rule", "delete_rule", "toggle_rule_lock",
-            "manual_inference", "clear_overrides", "delete_behavior_pattern",
-            "set_mode", "set_showroom_scene", "update_showroom_scene_config",
-            "set_device_control_mode", "batch_set_control_mode",
-            "approve_ai_scene", "reject_ai_scene", "delete_ai_scene", "trigger_ai_scene",
-            "rollback_transaction", "refresh_transactions",
-            "update_config", "tts_test", "voice_command", "verify_license",
-            "run_pattern_analysis",
-            "sync_rooms_to_ha", "report_correction", "dismiss_ai_action",
-        ):
-            hass.services.async_remove(DOMAIN, svc_name)
+        remove_smart_agent_services(hass)
         try:
             async_remove_panel(hass, "smart-agent")
         except Exception:

@@ -314,6 +314,8 @@ class SmartAgentCoordinator(
         self._glitch_suppressed: dict[str, float] = {}         # 闪断抑制期
         self._behavior_patterns_cache: list[dict] = []
         self._room_topology_cache: dict[str, set[str]] = {}  # P1-2: room → {adjacent rooms}
+        self._room_topology_cache_updated_at: float = 0.0
+        self._room_topology_refresh_pending: bool = False
         self._energy_stats: list[dict] = []
         self._mode = data.get(CONF_MODE, MODE_HOME)
         _saved_scene = data.get(CONF_SHOWROOM_SCENE, "") or ""
@@ -598,6 +600,82 @@ class SmartAgentCoordinator(
         """Check if AI is enabled (switch on)."""
         return self._enabled
 
+    def _presence_string_list(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item) for item in value if str(item)]
+        return [str(value)] if str(value) else []
+
+    def _presence_fusion_scopes_from_core_config(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        presence = config.get("presence") if isinstance(config.get("presence"), dict) else {}
+        policies = presence.get("policies") if isinstance(presence, dict) else []
+        if not isinstance(policies, list):
+            return []
+
+        scopes: list[dict[str, Any]] = []
+        for policy in policies:
+            if not isinstance(policy, dict):
+                continue
+            space_id = str(policy.get("space_id") or policy.get("room") or policy.get("scope_id") or "").strip()
+            if not space_id:
+                continue
+            members = [
+                {
+                    "entity_id": entity_id,
+                    "can_enter_trigger": True,
+                    "can_leave_evidence": True,
+                    "priority": 50,
+                    "confidence": 1,
+                }
+                for entity_id in self._presence_string_list(policy.get("member_evidence_ids") or policy.get("members"))
+            ]
+            strategy = str(policy.get("strategy") or policy.get("occupied_strategy") or "")
+            scopes.append(
+                {
+                    "scope_id": str(policy.get("scope_id") or space_id),
+                    "name": str(policy.get("name") or policy.get("display_name") or space_id),
+                    "strategy": "vacant_and" if strategy == "vacant_and" else "occupied_or",
+                    "rooms": (
+                        self._presence_string_list(policy.get("rooms") or policy.get("space_ids"))
+                        or [space_id]
+                    ),
+                    "members": members,
+                    "enter_hold_secs": int(policy.get("enter_hold_secs") or 3),
+                    "vacant_hold_secs": int(policy.get("vacant_hold_secs") or 60),
+                }
+            )
+        return scopes
+
+    async def _async_presence_fusion_json_from_core(self) -> str | None:
+        """Read Core Config presence policies and export the legacy registry shape."""
+        addon_client = getattr(self, "_addon_client", None)
+        request_json = getattr(addon_client, "request_json", None)
+        if not callable(request_json):
+            return None
+        try:
+            result = await request_json("GET", "/core/config")
+        except Exception as exc:
+            _LOGGER.debug("[FusionRegistry] Core Config presence read failed: %s", exc)
+            return None
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        if status < 200 or status >= 300:
+            return None
+        body = result.get("body")
+        if not isinstance(body, dict):
+            return None
+        config = body.get("config")
+        if not isinstance(config, dict):
+            return None
+        scopes = self._presence_fusion_scopes_from_core_config(config)
+        if not scopes:
+            return None
+        return json.dumps(scopes, ensure_ascii=False)
+
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     async def async_start_listeners(self) -> None:
@@ -617,8 +695,10 @@ class SmartAgentCoordinator(
         try:
             from .presence_fusion import PresenceFusionRegistry
             from .const import CONF_PRESENCE_FUSION, DEFAULT_PRESENCE_FUSION
+            _core_presence_fusion_json = await self._async_presence_fusion_json_from_core()
             _fusion_json = (
-                (self._entry.options or {}).get(CONF_PRESENCE_FUSION)
+                _core_presence_fusion_json
+                or (self._entry.options or {}).get(CONF_PRESENCE_FUSION)
                 or (self._entry.data or {}).get(CONF_PRESENCE_FUSION)
                 or DEFAULT_PRESENCE_FUSION
             )
@@ -626,7 +706,8 @@ class SmartAgentCoordinator(
             if self._fusion_registry.has_scopes:
                 self._sys_log(
                     "INFO",
-                    f"[FusionRegistry] 存在融合域已启用，共 {len(self._fusion_registry.scopes)} 个域: "
+                    f"[FusionRegistry] Presence policies loaded from {'Core Config' if _core_presence_fusion_json else 'legacy presence_fusion'}; "
+                    f"存在融合域已启用，共 {len(self._fusion_registry.scopes)} 个域: "
                     + ", ".join(s.display_name for s in self._fusion_registry.scopes),
                 )
         except Exception as exc:
@@ -1373,13 +1454,19 @@ class SmartAgentCoordinator(
         else:
             path = os.path.join(log_dir, f"{LOG_FILENAME}.{date}")
         real = os.path.realpath(path)
-        if not real.startswith(os.path.realpath(log_dir)):
+        log_root = os.path.realpath(log_dir)
+        if os.path.commonpath([log_root, real]) != log_root:
             return ""
         if not os.path.isfile(path):
             return ""
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+            max_bytes = 256 * 1024
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                if size > max_bytes:
+                    f.seek(size - max_bytes)
+                data = f.read(max_bytes)
+            return data.decode("utf-8", errors="replace")
         except Exception:
             return ""
 
@@ -1400,24 +1487,21 @@ class SmartAgentCoordinator(
             else:
                 path = os.path.join(log_dir, f"{LOG_FILENAME}.{date}")
             info: dict = {"date": date, "size_kb": 0, "lines": 0, "errors": 0, "warns": 0, "today": date == today}
-            if os.path.isfile(path):
-                try:
-                    size = os.path.getsize(path)
-                    info["size_kb"] = round(size / 1024, 1)
-                    with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        for line in f:
-                            info["lines"] += 1
-                            if "[ERROR]" in line:
-                                info["errors"] += 1
-                            elif "[WARNING]" in line or "[WARN]" in line:
-                                info["warns"] += 1
-                except Exception:
-                    pass
+            try:
+                if os.path.isfile(path):
+                    info["size_kb"] = round(os.path.getsize(path) / 1024, 1)
+            except Exception:
+                pass
             result.append(info)
         return result
 
     def get_space_runtime_snapshot(self) -> dict[str, Any]:
         """返回空间运行时快照（只读内存态，不触发 DB 热路径）。"""
+        topology_updated_at = float(getattr(self, "_room_topology_cache_updated_at", 0.0) or 0.0)
+        refresh_topology = getattr(self, "_refresh_room_topology_cache", None)
+        if time.monotonic() - topology_updated_at > 60 and callable(refresh_topology):
+            self._refresh_room_topology_cache()
+
         room_topology: dict[str, list[str]] = {}
         for room, neighbors in (self._room_topology_cache or {}).items():
             room_name = str(room or "").strip()
@@ -1476,4 +1560,148 @@ class SmartAgentCoordinator(
             SPACE_SNAPSHOT_KEY_SHARED_CONTROL_ZONES: shared_control_zones,
             "space_roles": space_roles,
             "device_coverage": device_coverage,
+        }
+
+    def get_presence_snapshot(self) -> dict[str, Any]:
+        """Return the HA-side canonical presence snapshot adapter."""
+
+        def _text(value: Any) -> str:
+            return str(value or "").strip()
+
+        def _as_list(value: Any) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple, set)):
+                result: list[str] = []
+                for item in value:
+                    text = _text(item)
+                    if text and text not in result:
+                        result.append(text)
+                return result
+            text = _text(value)
+            return [text] if text else []
+
+        def _confidence(value: Any) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            return max(0.0, min(1.0, parsed))
+
+        def _state(value: Any) -> str:
+            raw = _text(value).lower()
+            if raw in {"on", "occupied", "present", "detected", "home", "person", "motion"}:
+                return "occupied"
+            if raw in {"off", "vacant", "empty", "away", "clear", "none", "idle"}:
+                return "vacant"
+            return "unknown"
+
+        def _bool_or_default(value: Any, default: bool) -> bool:
+            if isinstance(value, bool):
+                return value
+            return default
+
+        def _merge_room(room: Any, raw: Any) -> None:
+            room_id = _text(room)
+            if not room_id:
+                return
+            row = raw if isinstance(raw, dict) else {"state": raw}
+            state = _state(row.get("state"))
+            existing = rooms.setdefault(
+                room_id,
+                {
+                    "state": "unknown",
+                    "confidence": 0.0,
+                    "reasons": [],
+                    "enter_qualified": False,
+                    "leave_qualified": False,
+                    "localized_spaces": [room_id],
+                    "blocked_actions": [],
+                    "occupied_evidence_ids": [],
+                    "vacant_evidence_ids": [],
+                },
+            )
+            if state != "unknown" or existing.get("state") == "unknown":
+                existing["state"] = state
+            existing["confidence"] = max(float(existing.get("confidence") or 0.0), _confidence(row.get("confidence")))
+            existing["enter_qualified"] = _bool_or_default(row.get("enter_qualified"), state == "occupied")
+            existing["leave_qualified"] = _bool_or_default(row.get("leave_qualified"), state == "vacant")
+            for key in (
+                "reasons",
+                "localized_spaces",
+                "blocked_actions",
+                "occupied_evidence_ids",
+                "vacant_evidence_ids",
+            ):
+                merged = list(existing.get(key) or [])
+                for item in _as_list(row.get(key)):
+                    if item not in merged:
+                        merged.append(item)
+                if key == "localized_spaces" and room_id not in merged:
+                    merged.insert(0, room_id)
+                existing[key] = merged
+
+        rooms: dict[str, dict[str, Any]] = {}
+
+        inference = getattr(self, "_presence_inference", None)
+        if inference is not None:
+            snapshots_fn = getattr(inference, "infer_presence_snapshots", None)
+            if callable(snapshots_fn):
+                try:
+                    snapshots = snapshots_fn()
+                except Exception:
+                    snapshots = None
+                if isinstance(snapshots, dict):
+                    for room, raw in snapshots.items():
+                        _merge_room(room, raw)
+
+            room_fn = getattr(inference, "infer_room_presence_snapshot", None)
+            if callable(room_fn):
+                device_info = getattr(self, "device_info", {}) or {}
+                for info in device_info.values():
+                    if not isinstance(info, dict):
+                        continue
+                    room = _text(info.get("room"))
+                    if not room or room in rooms:
+                        continue
+                    try:
+                        _merge_room(room, room_fn(room))
+                    except Exception:
+                        continue
+
+        fusion = getattr(self, "_fusion_registry", None)
+        if fusion is not None:
+            scopes = getattr(fusion, "scopes", None)
+            if scopes is None:
+                scopes = getattr(fusion, "_scopes", None)
+            scope_rows = scopes.values() if isinstance(scopes, dict) else scopes
+            evaluate_scope = getattr(fusion, "evaluate_scope", None)
+            if scope_rows and callable(evaluate_scope):
+                for scope in scope_rows:
+                    scope_id = _text(getattr(scope, "scope_id", None) or getattr(scope, "id", None))
+                    scope_rooms = getattr(scope, "rooms", None)
+                    if not scope_rooms and isinstance(scope, dict):
+                        scope_id = _text(scope.get("scope_id") or scope.get("id"))
+                        scope_rooms = scope.get("rooms")
+                    if not scope_id:
+                        continue
+                    try:
+                        result = evaluate_scope(scope_id)
+                    except Exception:
+                        continue
+                    raw_state = getattr(result, "state", None)
+                    for room in _as_list(scope_rooms):
+                        _merge_room(
+                            room,
+                            {
+                                "state": raw_state,
+                                "confidence": getattr(result, "confidence", 0.0),
+                                "reasons": [f"fusion:{scope_id}"],
+                            },
+                        )
+
+        return {
+            "version": "1.0",
+            "source": "ha_presence_snapshot_adapter",
+            "rooms": rooms,
         }

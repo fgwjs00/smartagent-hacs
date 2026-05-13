@@ -2102,19 +2102,75 @@ class PatrolMixin:
         self._refresh_room_topology_cache()
 
     def _refresh_room_topology_cache(self) -> None:
-        """P1-2: 从 room_topology 表加载房间邻接关系到内存缓存。"""
+        """P1-2: 从 add-on room topology projection 刷新只读缓存。"""
         topo: dict[str, set[str]] = {}
+        addon_client = getattr(self, "_addon_client", None)
+        loop = getattr(getattr(self, "hass", None), "loop", None)
+        if addon_client is None or loop is None:
+            self._room_topology_cache = topo
+            self._room_topology_cache_updated_at = time.monotonic()
+            return
         try:
-            rows = self._query_events(
-                "SELECT room_a, room_b, relation FROM room_topology"
-            )
-            for r in rows:
-                a, b = r["room_a"], r["room_b"]
-                topo.setdefault(a, set()).add(b)
-                topo.setdefault(b, set()).add(a)  # 双向
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is loop:
+                _LOGGER.debug("[Topology] skip sync refresh on event loop thread")
+                if not getattr(self, "_room_topology_refresh_pending", False):
+                    self._room_topology_refresh_pending = True
+                    task = self.hass.async_create_task(self._async_refresh_room_topology_cache())
+                    if hasattr(task, "add_done_callback"):
+                        task.add_done_callback(
+                            lambda _task: setattr(self, "_room_topology_refresh_pending", False)
+                        )
+                    else:
+                        self._room_topology_refresh_pending = False
+                return
+
+            future = asyncio.run_coroutine_threadsafe(addon_client.get_rooms_topology(), loop)
+            rows_payload = future.result(timeout=5)
+            topo = self._coerce_room_topology_payload(rows_payload)
         except Exception as exc:
             _LOGGER.debug("[Topology] 加载房间拓扑失败: %s", exc)
         self._room_topology_cache = topo
+        self._room_topology_cache_updated_at = time.monotonic()
+
+    async def _async_refresh_room_topology_cache(self) -> None:
+        """Refresh room topology from add-on without blocking the HA event loop."""
+        topo: dict[str, set[str]] = {}
+        addon_client = getattr(self, "_addon_client", None)
+        if addon_client is None:
+            self._room_topology_cache = topo
+            self._room_topology_cache_updated_at = time.monotonic()
+            return
+        try:
+            rows_payload = await addon_client.get_rooms_topology()
+            topo = self._coerce_room_topology_payload(rows_payload)
+        except Exception as exc:
+            _LOGGER.debug("[Topology] 加载房间拓扑失败: %s", exc)
+        self._room_topology_cache = topo
+        self._room_topology_cache_updated_at = time.monotonic()
+
+    @staticmethod
+    def _coerce_room_topology_payload(rows_payload: Any) -> dict[str, set[str]]:
+        topo: dict[str, set[str]] = {}
+        if isinstance(rows_payload, dict):
+            rows = rows_payload.get("topology") or rows_payload.get("relations") or rows_payload.get("data") or []
+        elif isinstance(rows_payload, list):
+            rows = rows_payload
+        else:
+            rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            room_a = str(row.get("room_a") or row.get("source") or row.get("from") or "").strip()
+            room_b = str(row.get("room_b") or row.get("target") or row.get("to") or "").strip()
+            if not room_a or not room_b or room_a == room_b:
+                continue
+            topo.setdefault(room_a, set()).add(room_b)
+            topo.setdefault(room_b, set()).add(room_a)
+        return topo
 
     def _get_behavior_patterns_snapshot(self) -> list[dict]:
         """同步读取 behavior_patterns 表（仅在 executor 线程调用）。"""

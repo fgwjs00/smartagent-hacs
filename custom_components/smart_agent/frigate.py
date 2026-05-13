@@ -20,6 +20,11 @@ from typing import Any, Protocol
 
 from homeassistant.core import callback
 
+try:
+    from core.vision import FrigateProvider as CoreFrigateProvider
+except Exception:  # pragma: no cover - add-on Core is optional inside HA runtime
+    CoreFrigateProvider = None  # type: ignore[assignment]
+
 _LOGGER = logging.getLogger(__name__)
 
 # Frigate MQTT 事件去抖参数
@@ -75,6 +80,27 @@ class FrigateVisionProvider:
         self._owner = owner
 
     def parse_event_payload(self, payload: dict[str, Any]) -> VisionEventSnapshot | None:
+        if CoreFrigateProvider is not None:
+            frame = CoreFrigateProvider().normalize_event(payload)
+            metadata = frame.metadata if isinstance(frame.metadata, dict) else {}
+            label = str(metadata.get("label") or "")
+            if label != "person":
+                return None
+            return VisionEventSnapshot(
+                provider=self.provider_name,
+                camera_id=frame.camera_id or "unknown",
+                event_id=str(metadata.get("event_id") or ""),
+                event_type=str(metadata.get("event_type") or ""),
+                label=label,
+                sub_label=metadata.get("sub_label"),
+                score=float(metadata.get("top_score") or 0),
+                entered_zones=[str(item) for item in metadata.get("entered_zones", []) if isinstance(item, str)],
+                current_zones=[str(item) for item in metadata.get("current_zones", []) if isinstance(item, str)],
+                has_snapshot=bool(metadata.get("has_snapshot", False)),
+                thumbnail=str(metadata.get("thumbnail") or ""),
+                timestamp=time.time(),
+            )
+
         after = payload.get("after") or {}
         if not isinstance(after, dict):
             return None

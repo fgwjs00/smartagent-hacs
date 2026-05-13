@@ -415,17 +415,39 @@ class AddOnClient:
         except Exception as exc:
             return self._build_client_exception_result(exc)
 
-    async def get_log_content(self, date: str) -> dict[str, Any] | None:
+    async def get_log_content(
+        self,
+        date: str,
+        *,
+        level: str | None = None,
+        keyword: str | None = None,
+        max_bytes: int | str | None = None,
+        tail_lines: int | str | None = None,
+        raw: bool = False,
+    ) -> dict[str, Any] | None:
         """按日期读取日志内容（优先 add-on canonical 服务面）。"""
         d = str(date or "").strip()
         if not d:
             return None
+        params: dict[str, str] = {"date": d}
+        if str(level or "").strip() and str(level or "").strip().lower() != "all":
+            params["level"] = str(level or "").strip().lower()
+        if str(keyword or "").strip():
+            params["keyword"] = str(keyword or "").strip()
+        if max_bytes not in (None, ""):
+            params["max_bytes"] = str(max_bytes)
+        if tail_lines not in (None, ""):
+            params["tail_lines"] = str(tail_lines)
+        headers = self._auth_headers
+        if raw:
+            params["raw"] = "true"
+            headers = {**headers, "X-SA-Log-Raw": "1"}
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/logs/content",
-                params={"date": d},
-                headers=self._auth_headers,
+                params=params,
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -553,12 +575,11 @@ class AddOnClient:
 
     async def get_auth_me(self, token: str = "") -> dict[str, Any] | None:
         """读取当前会话用户信息（优先 add-on 服务面）。"""
-        params = {"token": token.strip()} if str(token or "").strip() else None
+        _ = token
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/auth/me",
-                params=params,
                 headers=self._auth_headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
@@ -577,12 +598,11 @@ class AddOnClient:
 
     async def post_auth_logout(self, token: str = "") -> dict[str, Any] | None:
         """退出登录（优先 add-on 服务面）。"""
-        params = {"token": token.strip()} if str(token or "").strip() else None
+        _ = token
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/auth/logout",
-                params=params,
                 json={},
                 headers=self._auth_headers,
                 timeout=_HEALTH_TIMEOUT,

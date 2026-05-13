@@ -15,6 +15,7 @@ DecisionPipeline — 渐进式解耦：统一决策管道 (Phase 9.6 / P2.3)。
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
