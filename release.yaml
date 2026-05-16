@@ -1,12 +1,13 @@
 product: SmartAgent
-release_version: 0.0.21
-display_version: Beta 0.0.21
+release_version: 0.0.22
+display_version: Beta 0.0.22
 channel: beta
-release_date: '2026-05-15'
+release_date: '2026-05-16'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.21 test release for SmartAgent.
-  customer_visible_version: Beta 0.0.21
+  summary: Beta 0.0.22 publishes clean-cut migration hardening, rollback/snapshot
+    tooling, Gateway diagnostics, and add-on smoke verification.
+  customer_visible_version: Beta 0.0.22
