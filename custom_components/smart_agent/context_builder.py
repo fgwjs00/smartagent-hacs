@@ -738,6 +738,12 @@ class ContextBuilder:
             "cloud_fallback": getattr(c, "_cloud_fallback", False),
         }
 
+        # Transport-only: AddOnClient.infer pops this before the HTTP POST
+        # and moves it to the X-SA-Online-Key header.
+        _online_api_key = str(getattr(c, "_online_api_key", "") or "").strip()
+        if _online_api_key:
+            bundle["online_api_key"] = _online_api_key
+
         _LOGGER.info(
             "[ContextBuilder] Bundle 构建完成 | 触发: %s | 房间: %s | 大小: ~%d chars",
             trigger[:50],
