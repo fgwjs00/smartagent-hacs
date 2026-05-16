@@ -1,13 +1,14 @@
 product: SmartAgent
-release_version: 0.0.22
-display_version: Beta 0.0.22
+release_version: 0.0.23
+display_version: Beta 0.0.23
 channel: beta
-release_date: '2026-05-16'
+release_date: '2026-05-17'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.22 publishes clean-cut migration hardening, rollback/snapshot
-    tooling, Gateway diagnostics, and add-on smoke verification.
-  customer_visible_version: Beta 0.0.22
+  summary: Beta 0.0.23 publishes online AI settings ownership, Gateway diagnostics
+    hardening, log export fixes, and add-on inference preference for 8234-managed
+    configuration.
+  customer_visible_version: Beta 0.0.23
