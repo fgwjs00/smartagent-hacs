@@ -3307,23 +3307,85 @@ class SmartAgentEventsWSView(HomeAssistantView):
 
         forward_events = {
             "smart_agent_confirm_required",
+            "smart_agent_decision_bubble",
             "smart_agent_scene_created",
             "smart_agent_pairing_event",
             "smart_agent_voice_command",
+            "smart_agent_listener_event",
+            "state_changed",
         }
+        state_changed_domains = (
+            "sensor.",
+            "binary_sensor.",
+            "light.",
+            "switch.",
+            "climate.",
+            "cover.",
+            "fan.",
+            "media_player.",
+            "scene.",
+            "automation.",
+        )
+
+        def _state_obj_to_jsonable(value):
+            if value is None:
+                return None
+            as_dict = getattr(value, "as_dict", None)
+            if callable(as_dict):
+                return as_dict()
+            if isinstance(value, dict):
+                return value
+            return {}
+
+        def _event_int(value, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
 
         async def _forward(event):
             evt_type = getattr(event, "event_type", "")
             if evt_type not in forward_events:
                 return
+            event_data = dict(getattr(event, "data", {}) or {})
+            if evt_type == "state_changed":
+                old_state = _state_obj_to_jsonable(event_data.get("old_state"))
+                new_state = _state_obj_to_jsonable(event_data.get("new_state"))
+                entity_id = str(
+                    event_data.get("entity_id")
+                    or (new_state or {}).get("entity_id")
+                    or (old_state or {}).get("entity_id")
+                    or ""
+                )
+                if not entity_id.startswith(state_changed_domains):
+                    return
+                event_data = {
+                    "entity_id": entity_id,
+                    "old_state": old_state,
+                    "new_state": new_state,
+                }
+            elif evt_type == "smart_agent_listener_event":
+                event_data = {
+                    "listener_action": str(event_data.get("listener_action") or ""),
+                    "entity_id": str(event_data.get("entity_id") or ""),
+                    "old_state": str(event_data.get("old_state") or ""),
+                    "new_state": str(event_data.get("new_state") or ""),
+                    "filter_reason": str(event_data.get("filter_reason") or ""),
+                    "source_type": str(event_data.get("source_type") or ""),
+                    "ai_enabled": bool(event_data.get("ai_enabled", False)),
+                    "sensors_muted": bool(event_data.get("sensors_muted", False)),
+                    "startup_remaining": _event_int(event_data.get("startup_remaining")),
+                    "startup_cooldown": bool(event_data.get("startup_cooldown", False)),
+                    "mode": str(event_data.get("mode") or ""),
+                }
             payload = {
                 "type": evt_type,
                 "event_type": evt_type,
                 "event": {
                     "event_type": evt_type,
-                    "data": dict(getattr(event, "data", {}) or {}),
+                    "data": event_data,
                 },
-                "data": dict(getattr(event, "data", {}) or {}),
+                "data": event_data,
             }
             try:
                 await ws.send_json(payload)

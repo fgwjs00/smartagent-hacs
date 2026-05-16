@@ -13,6 +13,7 @@ from .const import (
     CONF_ENGINE,
     CONF_LICENSE_KEY,
     CONF_ADDON_AUTH_TOKEN,
+    CONF_ADDON_BASE_URL,
     CONF_OLLAMA_URL,
     CONF_OLLAMA_MODEL,
     CONF_ONLINE_API_KEY,
@@ -64,6 +65,7 @@ from .const import (
     ONLINE_MODELS_ALL,
     LOCAL_MODELS_SUGGESTIONS,
 )
+from .addon_client import derive_addon_gateway_base_url
 
 def _validate_hhmm(value: str) -> str:
     """校验并规范化 HH:MM 格式的营业时间字符串。
@@ -183,6 +185,18 @@ def _build_initial_entry_data(engine_data: dict) -> dict:
     data.setdefault(CONF_SHOWROOM_EXCLUDED_SUBAREAS, DEFAULT_SHOWROOM_EXCLUDED_SUBAREAS)
     data.setdefault(CONF_SHOWROOM_ZONE_MAP, DEFAULT_SHOWROOM_ZONE_MAP)
     return data
+
+
+def _suggest_addon_base_url(hass: HomeAssistant | None) -> str:
+    """Suggest the LAN add-on gateway URL from the HA URL when available."""
+    if hass is None:
+        return ""
+    try:
+        from homeassistant.helpers.network import get_url
+
+        return derive_addon_gateway_base_url(get_url(hass))
+    except Exception:
+        return ""
 
 
 class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -457,12 +471,19 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
 
         cur_provider = _url_to_provider(d.get(CONF_ONLINE_BASE_URL, DEFAULT_ONLINE_BASE_URL))
         cur_mode = d.get(CONF_MODE, MODE_HOME)
+        addon_base_default = (d.get(CONF_ADDON_BASE_URL) or "").strip() or _suggest_addon_base_url(self.hass)
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({
                 # ── 引擎 ──
                 vol.Required(CONF_ENGINE, default=d.get(CONF_ENGINE, DEFAULT_ENGINE)): _ENGINE_SELECTOR,
+
+                # ── Add-on 连接（HA 侧访问网关，优先展示，便于现场排障）──
+                vol.Optional(CONF_ADDON_BASE_URL,
+                             default=addon_base_default): str,
+                vol.Optional(CONF_ADDON_AUTH_TOKEN,
+                             default=d.get(CONF_ADDON_AUTH_TOKEN, "")): _PASSWORD_SELECTOR,
 
                 # ── 本地 Ollama（引擎为 local 时生效）──
                 vol.Optional(CONF_OLLAMA_URL,
@@ -533,10 +554,6 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
                         mode=selector.SelectSelectorMode.LIST,
                     )
                 ),
-
-                # ── Add-on 内部认证（可选，需与 SA_AUTH_TOKEN 环境变量一致）──
-                vol.Optional(CONF_ADDON_AUTH_TOKEN,
-                             default=d.get(CONF_ADDON_AUTH_TOKEN, "")): _PASSWORD_SELECTOR,
 
                 # TODO(license): 上线时取消注释
                 # vol.Optional(CONF_LICENSE_KEY, default=d.get(CONF_LICENSE_KEY, "")): str,

@@ -28,7 +28,7 @@ import logging
 import re
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -37,10 +37,34 @@ _LOGGER = logging.getLogger(__name__)
 # Add-on 默认内部端口（与 smartagent-addon/config.yaml SA_INTERNAL_PORT 保持一致）
 # 不直接使用此常量构造 URL，由 coordinator 通过 CONF_ADDON_PORT 读取后传入
 _DEFAULT_ADDON_PORT = 18099
+_DEFAULT_ADDON_GATEWAY_PORT = 8234
 
 def _build_addon_base_url(port: int) -> str:
     """根据端口构建 Add-on 内部 API 基础 URL。"""
     return f"http://localhost:{port}"
+
+
+def derive_addon_gateway_base_url(ha_url: str, gateway_port: int = _DEFAULT_ADDON_GATEWAY_PORT) -> str:
+    """Derive the add-on gateway URL from a Home Assistant URL.
+
+    HA Core usually cannot reach the add-on through its own localhost. When HA is
+    accessed through a LAN URL, the add-on's mapped gateway port on that same
+    host is the practical default.
+    """
+    raw = (ha_url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    host = parsed.hostname.strip()
+    if host.lower() == "localhost" or host in {"127.0.0.1", "::1"}:
+        return ""
+    netloc = f"[{host}]:{gateway_port}" if ":" in host and not host.startswith("[") else f"{host}:{gateway_port}"
+    return urlunsplit((parsed.scheme, netloc, "", "", ""))
 
 _HEALTH_TIMEOUT = aiohttp.ClientTimeout(total=5)
 # LLM 调用可能需要 60s+，推理超时设宽裕一些

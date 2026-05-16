@@ -121,7 +121,8 @@
           "vision_engine":     "视觉分析引擎",
           "vision_model":      "视觉分析模型",
           "mode":              "运行模式",
-          "addon_auth_token":  "Add-on 内部认证令牌（SA_AUTH_TOKEN）"
+          "addon_auth_token":  "Add-on 内部认证令牌（SA_AUTH_TOKEN）",
+          "addon_base_url":    "Add-on API 地址"
         },
         "data_description": {
           "ollama_url":        "本地 Ollama 服务地址，如 http://127.0.0.1:11434",
@@ -140,7 +141,8 @@
           "vision_engine":     "选择本地模型或云端 API 进行视觉分析",
           "vision_model":      "如 llava:7b (本地) 或 qwen-vl-max (云端)",
           "mode":              "家庭模式：普通住宅使用；展厅模式：销售展厅专用，需商业版授权，选择后进入展厅专属配置",
-          "addon_auth_token":  "需与 SmartAgent Add-on 的 SA_AUTH_TOKEN 环境变量保持一致，留空则不启用认证"
+          "addon_auth_token":  "需与 SmartAgent Add-on 的 SA_AUTH_TOKEN 环境变量保持一致，留空则不启用认证",
+          "addon_base_url":    "HA 集成访问 SmartAgent Add-on 的完整地址，例如 http://192.168.2.9:8234；留空则回退到 localhost 与端口配置"
         }
       },
       "showroom_config": {

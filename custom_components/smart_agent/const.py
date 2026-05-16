@@ -57,6 +57,7 @@ DEFAULT_CIRCADIAN_AUTO_ADJUST = False
 
 CONF_LICENSE_KEY = "license_key"         # SaaS License Key
 CONF_ADDON_AUTH_TOKEN = "addon_auth_token"  # Add-on 内部认证令牌（对应 SA_AUTH_TOKEN 环境变量）
+CONF_ADDON_BASE_URL = "addon_base_url"      # HA 侧访问 Add-on API 的完整地址；留空时使用端口回退
 CONF_ADDON_PORT = "addon_port"              # Add-on 内部 API 端口（对应 SA_INTERNAL_PORT 环境变量）
 DEFAULT_ADDON_PORT = 18099                  # 默认使用高位私有端口，避免与 8099 常用服务冲突
 

@@ -109,6 +109,7 @@ from .const import (
     ENGINE_ONLINE,
     CONF_LOG_RETENTION,
     CONF_ADDON_AUTH_TOKEN,
+    CONF_ADDON_BASE_URL,
     DB_FILENAME,
     DOMAIN,
     LOG_FILENAME,
@@ -283,12 +284,15 @@ class SmartAgentCoordinator(
         self._license_key = (data.get(CONF_LICENSE_KEY) or "").strip()
         # 数据同步（v4.8.78）
         self._init_data_sync()
-        # Add-on 客户端（v4.10.10：新增内部认证令牌支持；端口可通过 CONF_ADDON_PORT 配置）
-        from .addon_client import AddOnClient
+        # Add-on 客户端（显式 URL 优先；留空时按端口回退）
+        from .addon_client import AddOnClient, derive_addon_gateway_base_url
         from .const import CONF_ADDON_PORT, DEFAULT_ADDON_PORT
         _addon_token = (data.get(CONF_ADDON_AUTH_TOKEN) or "").strip()
+        _addon_base_url = (data.get(CONF_ADDON_BASE_URL) or "").strip()
+        if not _addon_base_url:
+            _addon_base_url = derive_addon_gateway_base_url(self._get_ha_url())
         _addon_port = int(data.get(CONF_ADDON_PORT) or DEFAULT_ADDON_PORT)
-        self._addon_client = AddOnClient(port=_addon_port, auth_token=_addon_token)
+        self._addon_client = AddOnClient(base_url=_addon_base_url, port=_addon_port, auth_token=_addon_token)
         # TTS 配置
         self._tts_service: str = (data.get(CONF_TTS_SERVICE) or "").strip()
         self._tts_target: str = (data.get(CONF_TTS_TARGET) or "").strip()

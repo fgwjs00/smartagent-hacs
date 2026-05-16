@@ -626,6 +626,77 @@ class ListenersMixin:
             cmd_source=CMD_SOURCE_SENSOR,
         )
 
+    def _addon_fast_path_snapshot_diagnostics(self, snapshot: dict[str, Any], entity_id: str) -> dict[str, Any]:
+        device_info = snapshot.get("device_info") if isinstance(snapshot.get("device_info"), dict) else {}
+        topology = snapshot.get("room_topology") if isinstance(snapshot.get("room_topology"), dict) else {}
+        capabilities = snapshot.get("device_capability_snapshot")
+        capability_rows = 0
+        if isinstance(capabilities, dict):
+            rows = capabilities.get("devices", capabilities.get("items", capabilities.get("data", capabilities)))
+            capability_rows = len(rows) if isinstance(rows, (dict, list, tuple, set)) else 0
+        elif isinstance(capabilities, (list, tuple, set)):
+            capability_rows = len(capabilities)
+
+        active_space = ""
+        for key in ("active_space_id", "space_id", "trigger_room", "room", "area"):
+            active_space = str(snapshot.get(key) or "").strip()
+            if active_space:
+                break
+        if not active_space:
+            info = device_info.get(entity_id)
+            if isinstance(info, dict):
+                active_space = str(info.get("space_id") or info.get("room") or info.get("area") or "").strip()
+
+        return {
+            "active_space": active_space,
+            "capability_rows": capability_rows,
+            "device_info_count": len(device_info),
+            "topology_count": len(topology),
+        }
+
+    def _emit_addon_fast_path_event(self, payload: dict[str, Any]) -> None:
+        try:
+            self.hass.bus.async_fire("smart_agent_decision_bubble", payload)
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] smart_agent_decision_bubble emit failed: %s", exc)
+
+    def _emit_listener_event(
+        self,
+        *,
+        listener_action: str,
+        entity_id: str,
+        old_state: str = "",
+        new_state: str = "",
+        filter_reason: str = "",
+        source_type: str = "",
+        **extra: Any,
+    ) -> None:
+        try:
+            now_ts = time.time()
+            startup_elapsed = now_ts - float(getattr(self, "_startup_time", now_ts) or now_ts)
+            startup_grace = int(getattr(self, "_startup_grace", 0) or 0)
+            startup_remaining = max(0, int(startup_grace - startup_elapsed))
+            payload: dict[str, Any] = {
+                "listener_action": str(listener_action or "unknown"),
+                "entity_id": str(entity_id or ""),
+                "old_state": str(old_state or ""),
+                "new_state": str(new_state or ""),
+                "filter_reason": str(filter_reason or ""),
+                "source_type": str(source_type or ""),
+                "ai_enabled": bool(self._is_enabled()),
+                "sensors_muted": bool(getattr(self, "_sensors_muted", False)),
+                "startup_remaining": startup_remaining,
+                "startup_cooldown": startup_remaining > 0,
+                "mode": str(getattr(self, "_mode", "") or ""),
+            }
+            payload.update({key: value for key, value in extra.items() if value is not None})
+            self._last_listener_event = payload
+            if filter_reason:
+                self._last_listener_filter_reason = str(filter_reason)
+            self.hass.bus.async_fire("smart_agent_listener_event", payload)
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] smart_agent_listener_event emit failed: %s", exc)
+
     async def _run_addon_fast_path_fail_closed(
         self,
         entity_id: str,
@@ -634,27 +705,101 @@ class ListenersMixin:
     ) -> None:
         should_fail_closed = True
         addon_client = getattr(self, "_addon_client", None)
+        snapshot = self._build_addon_fast_path_snapshot(entity_id)
+        snapshot_diag = self._addon_fast_path_snapshot_diagnostics(snapshot, entity_id)
+        self._sys_log(
+            "INFO",
+            "[Add-on FastPath] request "
+            f"entity={entity_id} old={old_state} new={new_state} "
+            f"active_space={snapshot_diag.get('active_space') or '-'} "
+            f"capability_rows={snapshot_diag.get('capability_rows', 0)} "
+            f"device_info_count={snapshot_diag.get('device_info_count', 0)} "
+            f"topology_count={snapshot_diag.get('topology_count', 0)}",
+        )
         if addon_client is not None:
             try:
                 response = await addon_client.run_decision_fast_path(
                     entity_id=entity_id,
                     new_state=new_state,
                     old_state=old_state,
-                    snapshot=self._build_addon_fast_path_snapshot(entity_id),
+                    snapshot=snapshot,
                 )
             except Exception as exc:
                 response = None
                 _LOGGER.debug("[Listeners] add-on fast-path decision failed: %s", exc)
                 self._sys_log(
                     "ERROR",
-                    f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} reason=exception",
+                    f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} "
+                    f"reason=exception exception_type={type(exc).__name__}",
+                )
+                self._emit_addon_fast_path_event(
+                    {
+                        "source": "addon_fast_path",
+                        "entity_id": entity_id,
+                        "old_state": old_state,
+                        "new_state": new_state,
+                        "status": 0,
+                        "matched": False,
+                        "path_taken": "none",
+                        "reason": "exception",
+                        "exception_type": type(exc).__name__,
+                        "fail_closed": True,
+                        "snapshot": snapshot_diag,
+                    }
                 )
                 return
             else:
                 if isinstance(response, dict):
                     status = int(response.get("__status") or 0)
                     result = response.get("result")
-                    if 200 <= status < 300 and response.get("matched") is True and isinstance(result, dict):
+                    matched = response.get("matched") is True
+                    details = response.get("details") if isinstance(response.get("details"), dict) else {}
+                    path_taken = str(response.get("path_taken") or details.get("path_taken") or "none")
+                    reason = str(response.get("reason") or details.get("reason") or response.get("error") or "")
+                    scene = ""
+                    confidence = None
+                    action_count = 0
+                    actions: list[Any] = []
+                    transaction_id = ""
+                    if isinstance(result, dict):
+                        scene = str(result.get("scene") or result.get("source") or "")
+                        confidence = result.get("confidence")
+                        raw_actions = result.get("actions")
+                        if isinstance(raw_actions, list):
+                            actions = raw_actions
+                            action_count = len(raw_actions)
+                        elif result.get("action"):
+                            action_count = 1
+                        transaction_id = str(result.get("transaction_id") or result.get("txn_id") or "")
+                    self._sys_log(
+                        "INFO",
+                        "[Add-on FastPath] result "
+                        f"status={status} matched={matched} path_taken={path_taken} "
+                        f"reason={reason or '-'} scene={scene or '-'} "
+                        f"confidence={confidence if confidence is not None else '-'} "
+                        f"action_count={action_count} entity={entity_id}",
+                    )
+                    self._emit_addon_fast_path_event(
+                        {
+                            "source": "addon_fast_path",
+                            "entity_id": entity_id,
+                            "old_state": old_state,
+                            "new_state": new_state,
+                            "status": status,
+                            "matched": matched,
+                            "path_taken": path_taken,
+                            "reason": reason,
+                            "scene": scene,
+                            "confidence": confidence,
+                            "action_count": action_count,
+                            "actions": actions,
+                            "transaction_id": transaction_id,
+                            "executed": matched,
+                            "fail_closed": not (200 <= status < 300),
+                            "snapshot": snapshot_diag,
+                        }
+                    )
+                    if 200 <= status < 300 and matched and isinstance(result, dict):
                         self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
                         await self._execute_fast_path_decision_result(
                             result,
@@ -668,16 +813,39 @@ class ListenersMixin:
                             "INFO",
                             f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
                         )
-                    else:
+                    elif status == 409:
+                        self._sys_log(
+                            "WARN",
+                            f"[Add-on FastPath] addon_fast_path_input_incomplete fail-closed | "
+                            f"status={status} reason={reason or 'input_incomplete'} entity={entity_id}",
+                        )
+                        return
+                    elif status > 0:
                         self._sys_log(
                             "INFO",
-                            f"[Add-on FastPath] addon_unreachable fail-closed | status={status} matched={response.get('matched')}",
+                            f"[Add-on FastPath] addon_unreachable fail-closed | "
+                            f"status={status} matched={response.get('matched')} reason={reason or '-'}",
                         )
+                        return
 
         if should_fail_closed:
             self._sys_log(
                 "ERROR",
                 f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} reason=unreachable",
+            )
+            self._emit_addon_fast_path_event(
+                {
+                    "source": "addon_fast_path",
+                    "entity_id": entity_id,
+                    "old_state": old_state,
+                    "new_state": new_state,
+                    "status": 0,
+                    "matched": False,
+                    "path_taken": "none",
+                    "reason": "unreachable",
+                    "fail_closed": True,
+                    "snapshot": snapshot_diag,
+                }
             )
         return
 
@@ -702,11 +870,26 @@ class ListenersMixin:
                     source_type = "自动化/脚本"
 
             self._sys_log("INFO", f"[事件] {entity_id}: {old_s} → {new_s} (来源: {source_type})")
+            self._emit_listener_event(
+                listener_action="received",
+                entity_id=entity_id,
+                old_state=old_s,
+                new_state=new_s,
+                source_type=source_type,
+            )
             domain = entity_id.split(".")[0]
 
             # ── 传感器静默 ──
             if self._sensors_muted and domain in ("binary_sensor", "sensor"):
                 self._sys_log("INFO", f"[传感器静默] {entity_id} {old_s}→{new_s}，静默中跳过")
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="sensors_muted",
+                    source_type=source_type,
+                )
                 return
 
             if domain == "sensor" and old_s and new_s:
@@ -719,6 +902,16 @@ class ListenersMixin:
                     threshold = 1 if is_person_count else 5
                     if delta < threshold:
                         self._sys_log("INFO", f"[过滤] 传感器变化 {delta:.1f} < {threshold}，跳过: {entity_id}")
+                        self._emit_listener_event(
+                            listener_action="filtered",
+                            entity_id=entity_id,
+                            old_state=old_s,
+                            new_state=new_s,
+                            filter_reason="numeric_deadband",
+                            source_type=source_type,
+                            delta=delta,
+                            threshold=threshold,
+                        )
                         return
                 except (ValueError, TypeError):
                     pass
@@ -727,15 +920,39 @@ class ListenersMixin:
             # 否则关闭 AI 仍会执行设备控制动作。
             if not self._is_enabled():
                 self._sys_log("INFO", f"[过滤] AI 已暂停，跳过场景快路/FastBrain: {entity_id}")
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="ai_disabled",
+                    source_type=source_type,
+                )
                 return
             # 启动冷却保护：系统初始化期间也不执行快路
             _startup_elapsed = time.time() - self._startup_time
             if _startup_elapsed < self._startup_grace:
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="startup_cooldown",
+                    source_type=source_type,
+                    startup_remaining=max(0, int(self._startup_grace - _startup_elapsed)),
+                )
                 return
 
             # ── Step 0 + FastBrain: add-on 优先路径（B1 迁移：有 add-on 时直接调用，不先跑本地）──
             from .intent_verifier import CMD_SOURCE_SENSOR
             _pipeline = self._decision_pipeline
+            self._emit_listener_event(
+                listener_action="fast_path_scheduled",
+                entity_id=entity_id,
+                old_state=old_s,
+                new_state=new_s,
+                source_type=source_type,
+            )
             self.hass.async_create_task(
                 self._run_addon_fast_path_fail_closed(
                     entity_id,
@@ -1169,6 +1386,37 @@ class ListenersMixin:
                 self.hass.async_create_task(
                     async_call_service(self.hass, "homeassistant", "update_entity", {"entity_id": entity_id})
                 )
+                if self._learning_mode:
+                    self.hass.async_add_executor_job(
+                        self._record_event,
+                        "Learning",
+                        f"{trigger} [src:{source_type}]",
+                        entity_id,
+                        new_s,
+                        db_source,
+                    )
+                else:
+                    self.hass.async_add_executor_job(
+                        self._record_event,
+                        "DeviceOperation",
+                        trigger,
+                        entity_id,
+                        new_s,
+                        db_source,
+                    )
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="controllable_state_feedback",
+                    source_type=source_type,
+                )
+                self._sys_log(
+                    "INFO",
+                    f"[可控设备回写] {entity_id} {old_s}→{new_s} 已记录为设备操作，不提交 fast-path",
+                )
+                return
             elif domain in location_domains:
                 trigger = self._fmt_trigger("位置", domain, name, entity_id, old_s, new_s)
             else:

@@ -2720,7 +2720,9 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
             context: str = ""          # 供 _record_training_sample 使用
             _bundle: dict | None = None
             _addon_client = getattr(self, "_addon_client", None)
-            if _addon_client is not None:
+            if _addon_client is None:
+                self._sys_log("WARN", "[推理] Add-on 客户端未配置，HA 本地推理 fallback 已关闭（fail-closed）")
+            else:
                 try:
                     if await _addon_client.is_available():
                         from .context_builder import ContextBuilder
@@ -2733,30 +2735,16 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
                         if decision:
                             self._sys_log("INFO", "[推理] Add-on 推理成功，使用受保护引擎")
                         else:
-                            self._sys_log("INFO", "[推理] Add-on 返回空（503/超时/认证失败），降级到本地推理")
+                            self._sys_log("ERROR", "[推理] Add-on 返回空，HA 本地推理 fallback 已关闭（fail-closed）")
                     else:
-                        self._sys_log("INFO", "[推理] Add-on 未在线，使用本地推理")
+                        self._sys_log("ERROR", "[推理] Add-on 未在线，HA 本地推理 fallback 已关闭（fail-closed）")
                 except Exception as _addon_exc:
-                    _LOGGER.info("[推理] Add-on 路径异常，降级到本地推理: %s", _addon_exc)
+                    _LOGGER.warning("[推理] Add-on 路径异常，HA 本地推理 fallback 已关闭（fail-closed）: %s", _addon_exc)
                     decision = None
 
-            # ── 本地推理（Add-on 不可用时的降级路径）──────────────────────
-            # 优先复用已构建的 _bundle（Add-on 超时时 bundle 已有，无需重建）；
-            # 若 Add-on 根本未部署，重新通过 ContextBuilder 构建以保持数据采集逻辑一致性：
-            # 两条路径均经过 ContextBuilder（SYS-02 死区、Phase 8E 折叠、MemoryStore 等）。
             if decision is None:
-                if _bundle is None:
-                    from .context_builder import ContextBuilder
-                    _bundle = await ContextBuilder(self).build(
-                        trigger, one_off_prompt, is_voice=False
-                    )
-                context = _bundle.get("context_text", "")
-                decision = await self._call_ai_engine(
-                    context, trigger, one_off_prompt=one_off_prompt, bundle=_bundle
-                )
-
-            if not decision:
-                await self._async_update_status("运行中", "AI 引擎无响应")
+                await self._async_update_status("运行中", "addon_inference_unavailable")
+                self._sys_log("ERROR", "[推理] addon_inference_unavailable | fail-closed")
                 return
 
             confidence = decision.get("confidence", 0)
@@ -3123,26 +3111,27 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
         context: str = ""          # 供 _record_training_sample 使用（Add-on 成功时也需有值）
         _voice_bundle: dict | None = None
         _addon_client = getattr(self, "_addon_client", None)
-        if _addon_client is not None:
+        if _addon_client is None:
+            _LOGGER.warning("[VoiceInference] Add-on 客户端未配置，HA 本地语音推理 fallback 已关闭（fail-closed）")
+        else:
             try:
                 if await _addon_client.is_available():
                     from .context_builder import ContextBuilder
                     _voice_bundle = await ContextBuilder(self).build(trigger, "", is_voice=True)
                     context = _voice_bundle.get("context_text", "")
                     decision = await _addon_client.infer(_voice_bundle)
+                else:
+                    _LOGGER.warning("[VoiceInference] Add-on 未在线，HA 本地语音推理 fallback 已关闭（fail-closed）")
             except Exception as _ae:
-                _LOGGER.debug("[VoiceInference] Add-on 失败，降级到本地: %s", _ae)
+                _LOGGER.warning("[VoiceInference] Add-on 失败，HA 本地语音推理 fallback 已关闭（fail-closed）: %s", _ae)
 
         if decision is None:
-            # 优先复用已构建的 bundle；若 Add-on 未部署则重新构建
-            if _voice_bundle is None:
-                from .context_builder import ContextBuilder
-                _voice_bundle = await ContextBuilder(self).build(trigger, "", is_voice=True)
-            context = _voice_bundle.get("context_text", "")
-            decision = await self._call_ai_engine(
-                context, trigger, is_voice=True, bundle=_voice_bundle
-            )
-        if not decision: return {"status": "error"}
+            await self._async_update_status("运行中", "addon_voice_inference_unavailable")
+            return {
+                "status": "error",
+                "error": "addon_voice_inference_unavailable",
+                "message": "Add-on 推理不可用，HA 本地语音推理 fallback 已关闭（fail-closed）",
+            }
 
         actions = decision.get("actions", [])
         scene = decision.get("scene", "语音指令")
