@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.25
-display_version: Beta 0.0.25
+release_version: 0.0.26
+display_version: Beta 0.0.26
 channel: beta
 release_date: '2026-05-17'
 public_release_ready: true
@@ -8,7 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.25 publishes canonical space/device reads for the Lighting Planner,
-    legacy AI scene import and deletion ownership, room topology add-on ownership,
-    and log truncation diagnostics.
-  customer_visible_version: Beta 0.0.25
+  summary: Beta 0.0.26 repairs model-only text-created AI scene action generation
+    and adds a full-day log download path with explicit truncation metadata.
+  customer_visible_version: Beta 0.0.26
