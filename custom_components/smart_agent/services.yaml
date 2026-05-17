@@ -6,6 +6,17 @@ sync_rooms_to_ha:
   name: 同步房间到 HA
   description: 将 AI 管家中的房间信息同步到 Home Assistant 的区域注册表中
 
+save_room_topology:
+  name: 保存房间拓扑
+  description: 将房间相邻关系写入 SmartAgent add-on 拓扑投影
+  fields:
+    topology:
+      name: 拓扑关系
+      description: "元素格式：{room_a, room_b, relation}"
+      required: true
+      selector:
+        object:
+
 batch_add_devices:
   name: 批量添加设备
   description: 将指定实体批量添加到 SmartAgent 设备列表

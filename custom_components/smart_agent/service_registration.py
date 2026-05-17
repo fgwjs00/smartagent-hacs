@@ -18,6 +18,7 @@ class ServiceRegistration:
 SERVICE_REGISTRATION_NAMES: tuple[str, ...] = (
     "discover_devices",
     "sync_rooms_to_ha",
+    "save_room_topology",
     "batch_add_devices",
     "add_device",
     "delete_device",

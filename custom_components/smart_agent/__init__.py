@@ -1374,6 +1374,47 @@ async def _addon_probe_list_result(
     return None, None
 
 
+async def _save_rooms_topology_via_addon(
+    addon_client: Any,
+    body: dict[str, Any],
+) -> tuple[dict[str, Any], int] | None:
+    payload = body if isinstance(body, dict) else {}
+    save_rooms_topology = getattr(addon_client, "save_rooms_topology", None)
+    if callable(save_rooms_topology):
+        result = await save_rooms_topology(payload)
+        if isinstance(result, dict):
+            normalized = _json_from_addon_http_result(result)
+            if normalized is not None:
+                return normalized
+            return _json_from_addon_result(result)
+        return None
+
+    request_json = getattr(addon_client, "request_json", None)
+    if callable(request_json):
+        result = await request_json("POST", "/rooms/topology", body=payload)
+        if isinstance(result, dict):
+            normalized = _json_from_addon_http_result(result)
+            if normalized is not None:
+                return normalized
+            return _json_from_addon_result(result)
+    return None
+
+
+async def _refresh_coord_room_topology_cache(coord: Any) -> None:
+    refresh_async = getattr(coord, "_async_refresh_room_topology_cache", None)
+    if callable(refresh_async):
+        result = refresh_async()
+        if hasattr(result, "__await__"):
+            await result
+        return
+
+    refresh_sync = getattr(coord, "_refresh_room_topology_cache", None)
+    if callable(refresh_sync):
+        result = refresh_sync()
+        if hasattr(result, "__await__"):
+            await result
+
+
 async def _resolve_user_from_token(hass: HomeAssistant, token: str):
     token = str(token or "").strip()
     if not token:
@@ -2382,15 +2423,17 @@ class SmartAgentRoomsTopologyView(HomeAssistantView):
             return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
 
         try:
-            proxied = await _addon_client.request_json("POST", "/rooms/topology", body=(body if isinstance(body, dict) else {}))
-            if isinstance(proxied, dict):
-                normalized = _json_from_addon_http_result(proxied)
-                if normalized is not None:
-                    payload, status = normalized
-                    if status in (404, 405):
-                        return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=status)
-                    return self.json(payload, status_code=status)
-                return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
+            normalized = await _save_rooms_topology_via_addon(
+                _addon_client,
+                body if isinstance(body, dict) else {},
+            )
+            if normalized is not None:
+                payload, status = normalized
+                if status in (404, 405):
+                    return self.json(_addon_endpoint_missing_payload("rooms_topology"), status_code=status)
+                if status < 400:
+                    await _refresh_coord_room_topology_cache(coord)
+                return self.json(payload, status_code=status)
             return self.json(_addon_unreachable_payload("rooms_topology"), status_code=502)
         except Exception as exc:
             _LOGGER.debug("[RoomsTopology] add-on topology save proxy failed: %s", exc)
@@ -5874,6 +5917,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """将 SmartAgent 的房间信息同步到 HA Area Registry。"""
         await coordinator.async_sync_rooms_to_ha()
 
+    async def svc_save_room_topology(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
+        body = {"topology": call.data.get("topology") or []}
+        _addon_client = getattr(coordinator, "_addon_client", None)
+        if _addon_client is None:
+            coordinator._sys_log("WARN", "[Topology] add-on topology provider unavailable: save_room_topology")
+            return
+        try:
+            normalized = await _save_rooms_topology_via_addon(_addon_client, body)
+        except Exception as exc:
+            coordinator._sys_log("WARN", f"[Topology] add-on topology save failed: {exc}")
+            return
+        if normalized is None:
+            coordinator._sys_log("WARN", "[Topology] add-on topology provider unavailable: save_room_topology")
+            return
+        payload, status = normalized
+        if status >= 400 or payload.get("ok") is False:
+            error = payload.get("error") or payload.get("error_type") or f"http_{status}"
+            coordinator._sys_log("WARN", f"[Topology] add-on topology save rejected: {error}")
+            return
+        await _refresh_coord_room_topology_cache(coordinator)
+        coordinator.async_set_updated_data({})
+
     async def svc_batch_add(call: ServiceCall) -> None:
         raw = call.data.get("entities", "")
         entity_ids = [e.strip() for e in raw.split(",") if e.strip()]
@@ -6266,6 +6333,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         (
             ServiceRegistration("discover_devices", svc_discover),
             ServiceRegistration("sync_rooms_to_ha", svc_sync_rooms_to_ha, vol.Schema({})),
+            ServiceRegistration(
+                "save_room_topology",
+                svc_save_room_topology,
+                vol.Schema({vol.Required("topology"): list}),
+            ),
             ServiceRegistration(
                 "batch_add_devices",
                 svc_batch_add,

@@ -623,17 +623,33 @@ def build_smart_agent_websocket_commands(
             connection.send_result(msg["id"], {"topology": []})
             return
 
-        def _query():
-            try:
-                rows = coord._db.query(
-                    "SELECT room_a, room_b, relation FROM room_topology", ()
-                )
-                return rows or []
-            except Exception:
-                return []
-
-        rows = await hass.async_add_executor_job(_query)
-        connection.send_result(msg["id"], {"topology": rows})
+        addon_client = getattr(coord, "_addon_client", None)
+        if addon_client is None:
+            connection.send_result(msg["id"], {"topology": []})
+            return
+        try:
+            rows_payload = await addon_client.get_rooms_topology()
+            coerce = getattr(coord, "_coerce_room_topology_payload", None)
+            topology = coerce(rows_payload) if callable(coerce) else {}
+            rows: list[dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
+            for room_a, neighbors in (topology or {}).items():
+                left = str(room_a or "").strip()
+                if not left or not isinstance(neighbors, (set, list, tuple)):
+                    continue
+                for neighbor in neighbors:
+                    right = str(neighbor or "").strip()
+                    if not right or right == left:
+                        continue
+                    edge = tuple(sorted((left, right)))
+                    if edge in seen:
+                        continue
+                    seen.add(edge)
+                    rows.append({"room_a": edge[0], "room_b": edge[1], "relation": "adjacent"})
+            connection.send_result(msg["id"], {"topology": rows})
+        except Exception as exc:
+            _LOGGER.debug("[Topology] add-on topology ws read failed: %s", exc)
+            connection.send_result(msg["id"], {"topology": []})
 
     # ── 备份列表 WS ───────────────────────────────────────────────────────────
 

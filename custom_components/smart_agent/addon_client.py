@@ -999,6 +999,28 @@ class AddOnClient:
             return self._handle_request_exception(exc)
         return None
 
+    async def save_rooms_topology(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Save room topology into the add-on canonical projection."""
+        body = body if isinstance(body, dict) else {}
+        try:
+            session = await self._get_session()
+            async with session.post(
+                f"{self._base}/rooms/topology",
+                json=body,
+                headers=self._auth_headers,
+                timeout=_HEALTH_TIMEOUT,
+            ) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
+                result["__status"] = resp.status
+                return result
+        except Exception as exc:
+            return self._handle_request_exception(exc)
+        return None
+
     async def get_learning_stats(self) -> dict[str, Any] | None:
         """获取学习统计（优先 add-on 服务面）。"""
         try:
