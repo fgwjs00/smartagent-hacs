@@ -2244,7 +2244,14 @@ class SmartAgentPresenceSensorTypeView(HomeAssistantView):
 
         is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
-            return self.json(_addon_endpoint_missing_payload("presence_sensor_type"), status_code=404)
+            result = await _async_save_presence_sensor_type(
+                hass,
+                coord,
+                str(body.get("entity_id") or ""),
+                str(body.get("sensor_type") or ""),
+            )
+            status = int(result.get("status", 200) or 200)
+            return self.json(result, status_code=status)
 
         addon_client = getattr(coord, "_addon_client", None)
         if addon_client is None:
