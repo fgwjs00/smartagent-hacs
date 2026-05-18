@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.28
-display_version: Beta 0.0.28
+release_version: 0.0.29
+display_version: Beta 0.0.29
 channel: beta
 release_date: '2026-05-18'
 public_release_ready: true
@@ -8,7 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.28 fixes online AI scene model generation by reading the light
-    device catalog with GET, reports missing catalogs explicitly, and ships the corrected
-    model-generation UI.
-  customer_visible_version: Beta 0.0.28
+  summary: Beta 0.0.29 restores historical event-stream rows in the log audit view,
+    including event ticket and WebSocket connection audit history.
+  customer_visible_version: Beta 0.0.29

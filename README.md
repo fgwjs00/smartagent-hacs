@@ -1,6 +1,6 @@
 # SmartAgent for Home Assistant
 
-Current release: `Beta 0.0.28`
+Current release: `Beta 0.0.29`
 
 ## 中文说明
 
@@ -10,7 +10,7 @@ SmartAgent 是一套基于 HA OS / Home Assistant 生态构建的 AI 全屋智�
 
 ### 更新
 
-SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.28`。
+SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.29`。
 
 ## English
 
@@ -20,4 +20,4 @@ This repository provides the SmartAgent Home Assistant integration package for H
 
 ### Updates
 
-The SmartAgent Home Assistant integration is updated through HACS. The current public release is `Beta 0.0.28`.
+The SmartAgent Home Assistant integration is updated through HACS. The current public release is `Beta 0.0.29`.
