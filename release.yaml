@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.27
-display_version: Beta 0.0.27
+release_version: 0.0.28
+display_version: Beta 0.0.28
 channel: beta
 release_date: '2026-05-18'
 public_release_ready: true
@@ -8,7 +8,7 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.27 hardens AI scene lifecycle deletion, restores space/device
-    planning data, and keeps explicit-user inference prompts under code-layer safety
-    authority.
-  customer_visible_version: Beta 0.0.27
+  summary: Beta 0.0.28 fixes online AI scene model generation by reading the light
+    device catalog with GET, reports missing catalogs explicitly, and ships the corrected
+    model-generation UI.
+  customer_visible_version: Beta 0.0.28
