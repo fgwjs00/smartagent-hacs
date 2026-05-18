@@ -1667,25 +1667,25 @@ class InferenceMixin:
         if is_showroom:
             if "[展厅] 自定义场景:" in trigger:
                 _cmd_text = trigger.split("[展厅] 自定义场景:")[-1].strip()
-                # 操作员直接指令优先级高于 P1-P4 所有配置规则（包括用户锁定规则）
-                # 仅 P0 安全红线（烟雾报警、燃气、门锁等）不可违反
+                # 操作员直接指令可提高意图优先级，但执行仍由代码层安全规则裁决。
                 # 判断是否为"全局关闭"类指令（关所有灯/除展厅外关所有灯）
                 _is_global_off = any(
                     kw in _cmd_text for kw in ("所有灯", "全部灯", "所有的灯", "全部的灯")
                 ) and any(kw in _cmd_text for kw in ("关", "关闭", "熄"))
                 _global_off_hint = (
-                    "\n🔴【全局关灯指令】必须枚举并关闭所有灯光设备（light domain），包括：\n"
-                    "  - 最近几分钟内刚被打开的灯（不受30分钟不反向规则限制）\n"
-                    "  - 展厅/办公室/餐厅/客厅等所有区域的灯\n"
-                    "  - P1《不反向操作》规则对本指令无效，必须覆盖所有 light 实体\n"
+                    "\n🔴【全局关灯指令】请在已知设备上下文中，为用户意图覆盖范围内的 light 实体生成 turn_off 候选：\n"
+                    "  - 刚被打开的灯可以作为候选，是否允许执行由代码层判断\n"
+                    "  - 不得生成未知 entity_id，不得生成非 light 实体，不得补全上下文没有的设备\n"
+                    "  - 不要声明任何 P0/P1/P2 或锁定规则失效；最终允许或拒绝由代码层裁决\n"
                 ) if _is_global_off else ""
                 mode_hint = (
-                    f"【⚡ 操作员直接指令 — 最高优先级】\n"
+                    f"【⚡ 操作员直接指令 — USER_EXPLICIT】\n"
                     f"指令内容：「{_cmd_text}」\n"
-                    "⚠️ 此指令优先级高于 P1-P4 所有规则，包括用户设置的锁定规则（如《无人关灯》《营业时间规则》等）。\n"
-                    "请立即执行该指令，confidence 填 90 以上。\n"
-                    "不得以《无人在场》《规则冲突》为由返回空 actions 或低置信度。\n"
-                    f"唯一不可违反的是 P0 安全红线（烟雾报警、燃气探测器、门锁等）。{_global_off_hint}"
+                    "请按用户意图输出候选 actions，不要自行宣布任何 P0/P1/P2 或锁定规则失效。\n"
+                    "不要仅因有人/无人、区域、最近手动操作等可由 USER_EXPLICIT 裁决的上下文返回空 actions 或低置信度。\n"
+                    "最终允许或拒绝由代码层 IntentVerifier / PolicyEngine / execution guard 按 USER_EXPLICIT 规则裁决。"
+                    "硬禁止、manual override 接管、实体有效性和 P0 安全红线不会由 prompt 豁免。"
+                    f"{_global_off_hint}"
                 )
             else:
                 from .const import format_biz_time
@@ -1705,8 +1705,9 @@ class InferenceMixin:
 
         # 语音指令特殊提示
         voice_hint = (
-            "\n⚡【语音指令 — 用户直接命令】请立即执行，reply 字段作为语音回答。"
-            "此指令优先级高于 P1-P4 所有规则（包括锁定规则），不得以规则冲突或无人在场为由拒绝执行。\n"
+            "\n⚡【语音指令 — USER_EXPLICIT】请按用户语音意图输出候选 actions，reply 字段作为语音回答。"
+            "不要自行宣布任何 P0/P1/P2 或锁定规则失效；"
+            "最终允许或拒绝由代码层 IntentVerifier / PolicyEngine / execution guard 裁决。\n"
         ) if is_voice else ""
 
         # Phase 13.5: 季节月份感知
@@ -1871,7 +1872,7 @@ class InferenceMixin:
         from .schemas import DECISION_JSON_SCHEMA, validate_decision
 
         async def _do_call(engine_override: str | None = None) -> dict | None:
-            """内部 API 调用，支持云端降级（Phase 9.1 统一 + P1.3 Structured Output）。"""
+            """内部 API 调用；online override 只用于显式启用的备用在线模型。"""
             _engine = engine_override or self.engine
             try:
                 async with aiohttp.ClientSession() as session:
@@ -2036,12 +2037,12 @@ class InferenceMixin:
             else:
                 break
 
-        # 云端降级：本地引擎失败且已配置在线 API 时自动降级
+        # 备用在线模型：仅本地引擎失败、显式启用且已配置在线 API 时才调用
         if out is None and self.engine == "local" and getattr(self, "_cloud_fallback", False) and self._online_api_key:
-            self._sys_log("WARN", "[推理] 本地引擎无响应，尝试云端降级...")
+            self._sys_log("WARN", "[推理] 本地引擎无响应，尝试显式备用在线模型...")
             out = await _do_call("online")
             if out:
-                self._sys_log("INFO", "[推理] 云端降级成功")
+                self._sys_log("INFO", "[推理] 备用在线模型成功")
 
         if out:
             _conf = out.get('confidence', 0)
@@ -2713,9 +2714,8 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
             # ── Add-on 委托推理（v4.10.10：LLM 核心剥离 + 内部认证）──────────
             # 若 smartagent-addon 容器在线，则将完整 InferenceBundle 发给 Add-on，
             # 由受 Cython 保护的 inference_engine 执行 Prompt 构建 + LLM 调用。
-            # Add-on 不可用（未启动/超时/503/401）时自动降级到本地推理（_call_ai_engine）。
-            # _bundle 在两条路径间共享：Add-on 路径构建后若失败，降级路径直接复用，
-            # 避免 ContextBuilder（含 DB 查询 + MemoryStore）被重复执行。
+            # Add-on 不可用（未启动/超时/503/401）时 fail-closed，不再回退到 HA 本地推理。
+            # _bundle 仅供 Add-on 路径使用，失败时用于训练上下文记录，不触发第二套推理。
             decision: dict | None = None
             context: str = ""          # 供 _record_training_sample 使用
             _bundle: dict | None = None
@@ -2799,7 +2799,7 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
             elif _scene_cand:
                 self._sys_log(
                     "INFO",
-                    f"[5B-2] scene_candidate={_scene_cand} 在 HA 中不存在，使用 fallback actions",
+                    f"[5B-2] scene_candidate={_scene_cand} 在 HA 中不存在，保留模型原始 actions",
                 )
 
             # need_confirm：置信度偏低，推送确认事件让用户决策后再执行
@@ -2917,73 +2917,6 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
 
             auto_th = self._SHOWROOM_CONFIDENCE_AUTO if self._mode == MODE_SHOWROOM else self.confidence_auto
             notify_th = self._SHOWROOM_CONFIDENCE_NOTIFY if self._mode == MODE_SHOWROOM else self.confidence_notify
-
-            # ── 全局关灯兜底：补全 AI 漏掉的 light 实体 ────────────────────────
-            # 当 _is_global=True 且 AI 生成了 turn_off 动作时，
-            # 检查 device_info 中所有 light 域设备，将 AI 遗漏的自动补入，
-            # 防止 AI 因"刚操作过"等内部推理跳过某些设备。
-            _has_global_off = _is_global and any(
-                a.get("domain") == "light" and a.get("service") == "turn_off"
-                for a in actions if isinstance(a, dict)
-            )
-            if _has_global_off:
-                _covered = {a.get("entity_id") for a in actions if isinstance(a, dict)}
-                # 如果指令包含"除展厅外"，则展厅灯不补入（AI 应当已排除展厅）
-                _exclude_showroom = any(kw in trigger for kw in ("除展厅", "展厅外", "非展厅"))
-                _supplemented = []
-                for eid, info in self.device_info.items():
-                    if not eid.startswith("light."):
-                        continue
-                    if eid in _covered:
-                        continue
-                    # 跳过当前已关闭的设备（避免无效调用）
-                    _state = self.hass.states.get(eid)
-                    if _state and _state.state == "off":
-                        continue
-                    # 排除展厅灯（若"除展厅外"指令）
-                    if _exclude_showroom:
-                        _dev_room = (info or {}).get("room", "")
-                        if _dev_room and ("展厅" in _dev_room or "showroom" in _dev_room.lower()):
-                            continue
-                    _supplemented.append({
-                        "domain": "light",
-                        "service": "turn_off",
-                        "entity_id": eid,
-                        "params": {},
-                        "reason": "全局关灯补全（AI未枚举）",
-                        "delay_seconds": 0,
-                    })
-                if _supplemented:
-                    self._sys_log("INFO",
-                        f"[全局关灯补全] AI 漏掉 {len(_supplemented)} 盏灯，已自动补入: "
-                        f"{[a['entity_id'] for a in _supplemented[:5]]}"
-                        f"{'...' if len(_supplemented) > 5 else ''}"
-                    )
-                    actions = actions + _supplemented
-                    # 补全动作必须再走一次统一验证链，避免绕过 IntentVerifier
-                    try:
-                        actions, _supp_rejected = _verifier.verify(
-                            actions,
-                            trigger_room,
-                            is_global_cmd=_is_global,
-                            cmd_source=_cmd_source,
-                        )
-                        if _supp_rejected:
-                            _supp_detail = ", ".join(
-                                "{eid}({reason})".format(
-                                    eid=a.get("entity_id", "?"),
-                                    reason=a.get("reject_reason", ""),
-                                )
-                                for a in _supp_rejected
-                            )
-                            self._sys_log(
-                                "INFO",
-                                f"[全局关灯补全-二次验证] 拒绝 {len(_supp_rejected)} 个动作: [{_supp_detail}]",
-                            )
-                    except Exception as _supp_ve:
-                        _LOGGER.error("[IntentVerifier] 全局补全二次验证异常（fail-closed）: %s", _supp_ve)
-                        self._sys_log("ERROR", f"[全局关灯补全-二次验证] 验证异常，已拒绝全部动作: {_supp_ve}")
-                        actions = []
 
             # 动作上限放宽 (P0)
             _MAX_ACTIONS = (len(self.device_info) + 20) if _is_global else 50
@@ -3183,7 +3116,7 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
         elif _v_scene_cand:
             self._sys_log(
                 "INFO",
-                f"[5B-2 Voice] scene_candidate={_v_scene_cand} 不存在，使用 fallback",
+                f"[5B-2 Voice] scene_candidate={_v_scene_cand} 不存在，保留模型原始 actions",
             )
 
         # 1. 意图验证 (语音指令使用 USER_EXPLICIT 来源)

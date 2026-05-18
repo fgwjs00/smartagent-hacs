@@ -174,7 +174,7 @@ def _build_initial_entry_data(engine_data: dict) -> dict:
     data.setdefault(CONF_PRESENCE_FUSION, DEFAULT_PRESENCE_FUSION)
     data.setdefault(CONF_QWEATHER_API_KEY, "")
     data.setdefault(CONF_SEARXNG_URL, "")
-    data.setdefault(CONF_CLOUD_FALLBACK, True)
+    data.setdefault(CONF_CLOUD_FALLBACK, False)
     data.setdefault(CONF_VISION_ENABLED, False)
     data.setdefault(CONF_VISION_ENGINE, ENGINE_ONLINE)
     data.setdefault(CONF_VISION_MODEL, "qwen-vl-max")
@@ -316,7 +316,7 @@ class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._data[CONF_FRIGATE_ENABLED]   = bool(user_input.get(CONF_FRIGATE_ENABLED, False))
             self._data[CONF_QWEATHER_API_KEY]  = (user_input.get(CONF_QWEATHER_API_KEY) or "").strip()
             self._data[CONF_SEARXNG_URL]       = (user_input.get(CONF_SEARXNG_URL) or "").strip()
-            self._data[CONF_CLOUD_FALLBACK]    = bool(user_input.get(CONF_CLOUD_FALLBACK, True))
+            self._data[CONF_CLOUD_FALLBACK]    = bool(user_input.get(CONF_CLOUD_FALLBACK, False))
             self._data[CONF_VISION_ENABLED]    = bool(user_input.get(CONF_VISION_ENABLED, False))
             self._data[CONF_VISION_ENGINE]     = user_input.get(CONF_VISION_ENGINE, ENGINE_ONLINE)
             self._data[CONF_VISION_MODEL]      = (user_input.get(CONF_VISION_MODEL) or "qwen-vl-max").strip()
@@ -373,7 +373,7 @@ class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 # ── 联网与工具（Phase 5）──
                 vol.Optional(CONF_QWEATHER_API_KEY, default=""): str,
                 vol.Optional(CONF_SEARXNG_URL,      default=""): str,
-                vol.Optional(CONF_CLOUD_FALLBACK,   default=True): bool,
+                vol.Optional(CONF_CLOUD_FALLBACK,   default=False): bool,
                 # ── AI 视觉增强（Phase 7E）──
                 vol.Optional(CONF_VISION_ENABLED,   default=False): bool,
                 vol.Optional(CONF_VISION_ENGINE,    default=ENGINE_ONLINE): _VISION_ENGINE_SELECTOR,
@@ -533,7 +533,7 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(CONF_SEARXNG_URL,
                              default=d.get(CONF_SEARXNG_URL, "")): str,
                 vol.Optional(CONF_CLOUD_FALLBACK,
-                             default=d.get(CONF_CLOUD_FALLBACK, True)): bool,
+                             default=d.get(CONF_CLOUD_FALLBACK, False)): bool,
 
                 # ── AI 视觉增强（Phase 7E）──
                 vol.Optional(CONF_VISION_ENABLED,

@@ -76,7 +76,7 @@ DEFAULT_DEPLOY_NAME         = ""
 # Phase 5: 联网工具与知识库 (Tools & Knowledge)
 CONF_QWEATHER_API_KEY = "qweather_api_key"
 CONF_SEARXNG_URL = "searxng_url"
-CONF_CLOUD_FALLBACK = "cloud_fallback"   # 自动云端降级开关
+CONF_CLOUD_FALLBACK = "cloud_fallback"   # 显式备用在线模型开关
 CONF_VISION_ENABLED = "vision_enabled"   # 是否启用 LLMVision 视觉增强
 CONF_VISION_ENGINE = "vision_engine"      # 视觉引擎（local / online）
 CONF_VISION_MODEL = "vision_model"       # 视觉分析使用的模型（如 gemini-1.5-flash）

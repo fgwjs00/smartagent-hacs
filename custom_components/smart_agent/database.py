@@ -1788,6 +1788,37 @@ class DatabaseMixin:
             _LOGGER.warning("[AiScenes] ha_entity_id update failed: id=%s", scene_id)
             return False
         return True
+
+    def _mark_ai_scene_ephemeral(self, scene_id: int) -> bool:
+        """标记 scene.create 临时场景，确保 UI 能提示重启后失效。"""
+        marker = "YAML 写入失败，scene.create 临时场景，重启后失效"
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            rows = self._db.query(
+                "SELECT description FROM ai_scenes WHERE id=?",
+                (scene_id,),
+            )
+            current = ""
+            if rows and isinstance(rows[0], dict):
+                current = str(rows[0].get("description") or "")
+            if marker in current:
+                description = current
+            elif current:
+                description = f"{current}｜{marker}"
+            else:
+                description = marker
+            _ok = self._db.execute(
+                "UPDATE ai_scenes SET description=?, updated=? WHERE id=?",
+                (description, now, scene_id),
+            )
+            if not _ok:
+                _LOGGER.warning("[AiScenes] ephemeral marker update failed: id=%s", scene_id)
+                return False
+            return True
+        except Exception as exc:
+            _LOGGER.warning("[AiScenes] ephemeral marker update failed: id=%s err=%s", scene_id, exc)
+            return False
+
     def _delete_ai_scene_db(self, scene_id: int) -> bool:
         """从数据库删除场景（同步）。"""
         _ok = self._db.execute("DELETE FROM ai_scenes WHERE id=?", (scene_id,))

@@ -219,8 +219,8 @@ export const configMethods = {
             </div>
             <div style="display:flex;align-items:center;justify-content:space-between">
               <div>
-                <div class="label-m">云端降级开关</div>
-                <div class="body-s">本地引擎失效时自动切换云端</div>
+                <div class="label-m">备用在线模型</div>
+                <div class="body-s">仅本地引擎失败且显式开启时调用，默认关闭</div>
               </div>
               <md-switch id="cfg_cloud_fallback" ${cfg.cloud_fallback ? 'selected' : ''}></md-switch>
             </div>
@@ -477,7 +477,7 @@ export const configMethods = {
       vision_engine: $("cfg_vision_engine").value,
       vision_model: $("cfg_vision_model").value,
       searxng_url: $("cfg_searxng_url").value,
-      cloud_fallback: $("cfg_cloud_fallback").checked,
+      cloud_fallback: $("cfg_engine").value === "local" && $("cfg_cloud_fallback").checked,
       cooldown: parseInt($("cfg_cooldown").value),
       log_retention_days: Math.max(3, Math.min(90, parseInt($("cfg_log_retention").value) || 30)),
       license_key: $("cfg_license_key").value,

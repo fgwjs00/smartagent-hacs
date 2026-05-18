@@ -10,7 +10,7 @@ class FastBrainEngine:
     Phase 8A / P4 / P2-ML: System 1 (Reflex Engine 极速快脑)。
 
     三阶段进化决策：
-      阶段 0 (< 50 条已验证样本): behavior_patterns 启发式匹配（旧逻辑，始终保留作兜底）
+      阶段 0 (< 50 条已验证样本): 仅使用已验证的 behavior_patterns / arrival_baseline
       阶段 1 (50~200 条):         本地 DecisionTree(depth=4)，置信度 ≥ 70% 才采纳
       阶段 2 (> 200 条):          本地 DecisionTree(depth=8)，完全个性化
 
@@ -90,7 +90,7 @@ class FastBrainEngine:
           1. FeatureEncoder → 特征编码
           2. 本地 ML 模型预测（若模型存在且置信度 ≥ 70%）
           3. behavior_patterns 习惯匹配（ML 未命中时）
-          4. 启发式三级瀑布兜底（无习惯数据时）
+          4. 无可靠用户数据时返回 None，交给慢脑/上游 fail-closed 链路
           → None → 交给慢脑 LLM
 
         Args:
@@ -121,7 +121,7 @@ class FastBrainEngine:
             if ml_result:
                 return ml_result
 
-            # ── 降级：behavior_patterns + 启发式瀑布 ────────────────────────
+            # ── 已验证用户数据路径：behavior_patterns + arrival_baseline ─────
             return self.predict(features)
         except Exception as exc:
             self._log("WARN", f"[FastBrain] decide() 异常: {exc}")
@@ -158,7 +158,7 @@ class FastBrainEngine:
             scope = room_devices if room_devices else room_lights
             if not scope or entity_id not in scope:
                 self._log("WARN",
-                    f"[FastBrain ML] 预测实体 {entity_id} 不在当前房间可控设备列表中（room_devices={'空' if not room_devices else '存在'}），降级到启发式"
+                    f"[FastBrain ML] 预测实体 {entity_id} 不在当前房间可控设备列表中（room_devices={'空' if not room_devices else '存在'}），跳过快脑"
                 )
                 return None
             _current_state = scope.get(entity_id, "")
@@ -201,7 +201,7 @@ class FastBrainEngine:
                 }],
             }
         except Exception as exc:
-            self._log("WARN", f"[FastBrain] ML 预测异常（降级到启发式）: {exc}")
+            self._log("WARN", f"[FastBrain] ML 预测异常，跳过快脑: {exc}")
             return None
 
     def predict(self, features: dict) -> dict | None:
@@ -459,11 +459,11 @@ class FastBrainEngine:
         return {"lights": selected, "confidence": min(97, 80 + top_confidence // 10)}
 
     def _baseline_select(self, room_lights: dict) -> list[str]:
-        """基于设备使用基线选灯（介于习惯驱动和启发式之间）。
+        """基于到达基线选灯；无可靠到达基线时不生成动作。
 
         优先级：
           1. arrival_baseline（到达场景基线，语义最准确）
-          2. device_baseline（全天使用率，回退兜底）
+          2. 无 arrival_baseline 时返回空列表，避免关键词或全局使用率兜底生成动作
 
         :param room_lights: 房间灯光状态字典 {entity_id: state}
         :return: 应该开启的灯 entity_id 列表，可能为空
@@ -511,60 +511,11 @@ class FastBrainEngine:
                         )
                         return []
 
-        # 5E-1 后续修正（用户明确要求）：无 arrival 数据时，
-        # 不直接返回空（导致全交 LLM），而是用关键词三级瀑布（灯带→主灯→射灯）
-        # 给出一个合理的最小照明方案，避免有人进门却黑灯等 LLM。
-        # LLM 慢脑仍然并发运行，若其判断更佳则会在 200-2000ms 后覆盖此结果。
-        return self._heuristic_select(room_lights)
-
-    def _heuristic_select(self, room_lights: dict) -> list[str]:
-        """
-        关键词三级瀑布选灯（无习惯/基线数据时的最终兜底）。
-
-        优先级（用户明确要求）：
-          Tier 1: 灯带 / 氛围灯 / strip  — 基础环境照明，优先柔和渐入
-          Tier 2: 主灯 / 顶灯 / 普通灯   — 无灯带时的主照明
-          Tier 3: 射灯 / 筒灯             — 再无主灯才使用补光灯
-          兜底:   取列表第一个灯           — 确保不黑灯
-
-        同名称匹配多个词时，先命中的层级优先（Tier 1 > Tier 2 > Tier 3）。
-        entity_id 末段（拼音片段）也纳入关键字检查，兼容国产设备命名习惯。
-        """
-        # 关键字列表同时匹配 name（中英文）和 entity_id 末段（拼音）
-        _STRIP_KW = (
-            "灯带", "strip", "ambient", "氛围", "夜灯", "nightlight",
-            "deng_dai", "rgb", "led_strip",
-        )
-        _MAIN_KW = (
-            "主灯", "顶灯", "吸顶灯", "客厅灯", "ceiling", "main", "overhead",
-            "zhu_deng", "ding_deng",
-        )
-        _SPOT_KW = (
-            "射灯", "筒灯", "格栅", "spotlight", "downlight", "spot",
-            "she_deng", "tong_deng", "ge_zha",
-        )
-
-        tier1, tier2, tier3 = [], [], []
-        for lid in room_lights:
-            info  = self.device_info.get(lid, {})
-            # 拼接 name + entity_id 末段一起检索，提高命中率
-            name  = (info.get("name", "") + " " + lid.split(".")[-1]).lower()
-            if any(kw in name for kw in _STRIP_KW):
-                tier1.append(lid)
-            elif any(kw in name for kw in _MAIN_KW):
-                tier2.append(lid)
-            elif any(kw in name for kw in _SPOT_KW):
-                tier3.append(lid)
-            else:
-                tier2.append(lid)  # 未识别类型归入主灯层
-
-        result = tier1 or tier2 or tier3 or list(room_lights.keys())[:1]
         self._log(
             "INFO",
-            "[FastBrain 关键词选灯] 灯带%d / 主灯%d / 射灯%d → 选中 %s"
-            % (len(tier1), len(tier2), len(tier3), [r.split(".")[-1] for r in result]),
+            "[FastBrain] 无 arrival_baseline/习惯命中，跳过快脑，不做关键词选灯兜底",
         )
-        return result
+        return []
 
     def _get_room_light_context(self, room: str) -> tuple[int, int | None, int]:
         """根据房间名称返回建议的 (亮度%, 色温K | None, 过渡秒数)。

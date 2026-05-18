@@ -17,7 +17,7 @@ AddOnClient — SmartAgent Add-on 内部 API 客户端。
 
 Fail-safe 设计：
   - Add-on 未安装 / 容器未启动时，`is_available()` 返回 False
-  - 调用方检测到不可用时，继续使用 coordinator 内置推理，不中断服务
+  - 调用方检测到不可用时必须 fail-closed，不再回退到 HA 本地推理
   - infer() 超时 90 秒（LLM 调用可能需要较长时间）
   - auth_token 为空时不发送认证头（向后兼容未配置令牌的环境）
 """
@@ -83,7 +83,7 @@ class AddOnClient:
             bundle = await ContextBuilder(coordinator).build(trigger)
             result = await client.infer(bundle)
         else:
-            result = await local_infer(...)  # fallback
+            result = None  # fail-closed upstream
     """
 
     def __init__(
@@ -255,7 +255,7 @@ class AddOnClient:
         - 上次结果为 True：60 秒内复用，不重复健康检查
         - 上次结果为 False：10 秒后重试（快速检测恢复）
 
-        :return: True 表示 Add-on 健康运行，False 表示不可用（降级到本地推理）
+        :return: True 表示 Add-on 健康运行，False 表示不可用（上游应 fail-closed）
         """
         now = time.monotonic()
         ttl = _AVAIL_CACHE_OK if self._avail_cache else _AVAIL_CACHE_FAIL
@@ -387,7 +387,7 @@ class AddOnClient:
                     err = self._redact_sensitive(str(err))
                     retryable = bool(payload.get("retryable", True))
                     _LOGGER.info(
-                        "[AddOnClient] Add-on 推理不可用（HTTP %s, error=%s, retryable=%s），降级到本地推理",
+                        "[AddOnClient] Add-on 推理不可用（HTTP %s, error=%s, retryable=%s），返回 None 由上游 fail-closed",
                         resp.status,
                         err,
                         retryable,
@@ -397,11 +397,11 @@ class AddOnClient:
                 else:
                     _LOGGER.warning("[AddOnClient] 推理请求失败: HTTP %s", resp.status)
         except aiohttp.ClientConnectorError:
-            _LOGGER.debug("[AddOnClient] Add-on 未启动（连接拒绝），将降级到本地推理")
+            _LOGGER.debug("[AddOnClient] Add-on 未启动（连接拒绝），返回 None 由上游 fail-closed")
             self._avail_cache = False          # 让下次立即重新检查
             self._avail_checked_at = 0.0
         except asyncio.TimeoutError:
-            _LOGGER.warning("[AddOnClient] 推理超时（>90s），将降级到本地推理")
+            _LOGGER.warning("[AddOnClient] 推理超时（>90s），返回 None 由上游 fail-closed")
             self._avail_cache = False
             self._avail_checked_at = 0.0
         except Exception as exc:

@@ -1038,6 +1038,9 @@ class DevicesMixin:
             else:
                 # YAML 写入失败时降级为 scene.create（易失但功能可用）
                 await async_create_scene(self.hass, scene_id=ha_scene_id, entities=ha_entities)
+                await self.hass.async_add_executor_job(
+                    self._mark_ai_scene_ephemeral, scene_id
+                )
                 # 降级路径同样记录 ha_entity_id，FastBrain 才能复用此场景
                 _ha_entity_ok = await self.hass.async_add_executor_job(
                     self._update_ai_scene_ha_entity, scene_id, ha_scene_eid

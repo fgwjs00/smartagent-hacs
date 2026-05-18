@@ -587,7 +587,7 @@ class DecisionPipeline:
         流程：
           0.   展厅模式：走展厅占用反射弧（PIR ON → 立即开灯，跳过 LLM）
           0.5. Phase 1 DecisionCache：arrival 类触发优先查历史 LLM 决策缓存
-          1.   FastBrainEngine.decide() - arrival_baseline → device_baseline → 习惯 → 启发式瀑布
+          1.   FastBrainEngine.decide() - arrival_baseline / 习惯命中；无可靠数据则返回 None
           2.   IntentVerifier.verify()  - 双阶段意图验证（过滤不合规动作）
 
         Args:
@@ -821,11 +821,21 @@ class DecisionPipeline:
                     baselines = _get_baseline(trigger_room, min_samples=3)
                     baseline_map = {r["entity_id"]: r["on_ratio"] for r in baselines}
                 except Exception:
-                    pass  # 查询失败时不影响反射弧，默认全开
+                    pass
+
+        if not baseline_map:
+            if hasattr(coord, "_sys_log"):
+                coord._sys_log(
+                    "INFO",
+                    f"[展厅反射] {trigger_room} 无可用 arrival/device baseline，"
+                    "跳过反射弧，移交慢路径，不做全房间开灯兜底",
+                )
+            return None
 
         room_lights_off = []
         skipped_by_baseline = []
-        all_room_lights_off = []  # 未经基线筛选的全量关灯列表，用于冷启动降级
+        missing_baseline = []
+        all_room_lights_off = []  # 未经基线筛选的全量关灯列表，仅用于诊断
         for eid, info in coord.device_info.items():
             if not eid.startswith("light."):
                 continue
@@ -836,19 +846,32 @@ class DecisionPipeline:
                 continue
             all_room_lights_off.append(eid)
             ratio = baseline_map.get(eid)
+            if ratio is None:
+                missing_baseline.append(eid)
+                continue
             if ratio is not None and ratio < _REFLEX_ON_RATIO_THRESHOLD:
                 skipped_by_baseline.append(eid)
                 continue
             room_lights_off.append(eid)
 
-        if skipped_by_baseline and hasattr(coord, "_sys_log"):
+        if (skipped_by_baseline or missing_baseline) and hasattr(coord, "_sys_log"):
             names = [
                 (coord.device_info.get(e) or {}).get("name", e) for e in skipped_by_baseline
+            ]
+            unknown_names = [
+                (coord.device_info.get(e) or {}).get("name", e) for e in missing_baseline
             ]
             coord._sys_log(
                 "INFO",
                 f"[展厅反射] {trigger_room} 基线筛选({_baseline_source})跳过 "
-                f"{len(skipped_by_baseline)} 盏低使用率灯: " + ", ".join(names),
+                f"{len(skipped_by_baseline)} 盏低使用率灯"
+                + (": " + ", ".join(names) if names else "")
+                + (
+                    f"；{len(missing_baseline)} 盏灯缺少基线，按未知设备跳过: "
+                    + ", ".join(unknown_names)
+                    if unknown_names
+                    else ""
+                ),
             )
 
         # ── 用户锁定规则：人数条件性设备过滤 ────────────────────────────────
@@ -889,45 +912,15 @@ class DecisionPipeline:
         # ── 用户规则人数过滤 END ──────────────────────────────────────────────
 
         if not room_lights_off:
-            # 检查是否所有灯都被基线过滤（而非全部已开）
-            if all_room_lights_off and skipped_by_baseline:
-                # 冷启动降级：基线全过滤时不再全开，改用关键词三级瀑布选灯：
-                # 灯带/氛围（基础照明）→ 主灯/顶灯 → 射灯/筒灯 → 首盏可用灯
-                _STRIP_KW = ("灯带", "strip", "ambient", "氛围", "deng_dai", "rgb")
-                _MAIN_KW  = ("主灯", "顶灯", "吸顶灯", "ceiling", "main", "overhead",
-                             "zhu_deng", "ding_deng")
-                _SPOT_KW  = ("射灯", "筒灯", "格栅", "spotlight", "downlight",
-                             "she_deng", "tong_deng", "ge_zha")
-                _t1, _t2, _t3 = [], [], []
-                for _lid in all_room_lights_off:
-                    _n = (
-                        (coord.device_info.get(_lid) or {}).get("name", "")
-                        + " " + _lid.split(".")[-1]
-                    ).lower()
-                    if any(_kw in _n for _kw in _STRIP_KW):
-                        _t1.append(_lid)
-                    elif any(_kw in _n for _kw in _MAIN_KW):
-                        _t2.append(_lid)
-                    elif any(_kw in _n for _kw in _SPOT_KW):
-                        _t3.append(_lid)
-                    else:
-                        _t2.append(_lid)   # 未识别归入主灯层
-                room_lights_off = _t1 or _t2 or _t3 or all_room_lights_off[:1]
-                if hasattr(coord, "_sys_log"):
-                    _tier_tag = "灯带" if _t1 else ("主灯" if _t2 else "射灯")
+            if hasattr(coord, "_sys_log"):
+                if all_room_lights_off and (skipped_by_baseline or missing_baseline):
                     coord._sys_log(
                         "INFO",
-                        f"[展厅反射] {trigger_room} 冷启动关键词选灯（{_tier_tag}层）"
-                        f"→ {len(room_lights_off)} 盏: "
-                        + ", ".join(
-                            (coord.device_info.get(e) or {}).get("name", e)
-                            for e in room_lights_off
-                        ),
+                        f"[展厅反射] {trigger_room} 基线过滤后无可开灯，跳过反射弧，不做关键词选灯兜底",
                     )
-            else:
-                if hasattr(coord, "_sys_log"):
+                else:
                     coord._sys_log("INFO", f"[展厅反射] {trigger_room} 无需开灯（灯已全亮）")
-                return None
+            return None
 
         # Phase 13: 优先使用昼夜节律引擎获取亮度/色温/过渡时长（必须 enabled=True）
         hour = _dt.now().hour

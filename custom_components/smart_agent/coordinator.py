@@ -275,7 +275,7 @@ class SmartAgentCoordinator(
         # Phase 5: 联网工具与知识库
         from .tools import ToolRegistry
         self._tools = ToolRegistry(hass, data)
-        self._cloud_fallback = bool(data.get(CONF_CLOUD_FALLBACK, True))
+        self._cloud_fallback = bool(data.get(CONF_CLOUD_FALLBACK, False))
         self._vision_enabled = bool(data.get(CONF_VISION_ENABLED, False))
         self._vision_engine = data.get(CONF_VISION_ENGINE, ENGINE_ONLINE)
         self._vision_model = (data.get(CONF_VISION_MODEL) or "qwen3.5-omni-flash").strip()
