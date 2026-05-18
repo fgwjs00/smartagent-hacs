@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.29 - 2026-05-18
+## Beta 0.0.30 - 2026-05-18
 
-Beta 0.0.29 restores historical event-stream rows in the log audit view, including event ticket and WebSocket connection audit history.
+Beta 0.0.30 repairs AI scene model-generation prompts for broad lighting requests and preserves text-derived scene schedules.
 
 - Publishes the latest SmartAgent Home Assistant integration package.
-- Aligns the public version with `0.0.29` for Home Assistant update detection.
+- Aligns the public version with `0.0.30` for Home Assistant update detection.
