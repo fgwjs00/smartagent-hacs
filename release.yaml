@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.32
-display_version: Beta 0.0.32
+release_version: 0.0.33
+display_version: Beta 0.0.33
 channel: beta
-release_date: '2026-05-18'
+release_date: '2026-05-19'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.32 repairs AI scene model action normalization and caps log rendering
-    load for field diagnostics.
-  customer_visible_version: Beta 0.0.32
+  summary: Beta 0.0.33 fixes Operations settings projection, topology pending-change
+    copy, controlled backup execution, and transaction detail readability.
+  customer_visible_version: Beta 0.0.33

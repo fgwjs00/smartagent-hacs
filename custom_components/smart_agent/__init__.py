@@ -4454,6 +4454,95 @@ class SmartAgentBackupsActionView(HomeAssistantView):
         act = action.strip().lower()
         is_addon_proxy = _is_addon_proxy_request(request)
         if is_addon_proxy:
+            internal_execute = str(request.headers.get("X-SA-Internal-Execute", "") or "").strip() == "1"
+            if internal_execute and act in {"create", "restore", "delete"}:
+                backup_manager = getattr(coord, "_backup_manager", None)
+                if backup_manager is None:
+                    try:
+                        from .backup import BackupManager
+
+                        backup_manager = BackupManager(coord)
+                        setattr(coord, "_backup_manager", backup_manager)
+                    except Exception as exc:
+                        _LOGGER.debug("[BackupsAction] local backup manager unavailable: %s", exc)
+                        return self.json(_addon_unreachable_payload("backups_action"), status_code=502)
+
+                def _backup_level(value: Any) -> str:
+                    raw = str(value or "").strip().lower()
+                    if raw == "full":
+                        return "full"
+                    if raw in {"basic", "partial"}:
+                        return "standard"
+                    return "standard"
+
+                try:
+                    if act == "create":
+                        result = backup_manager.backup_now(
+                            password=str(body.get("password") or ""),
+                            level=_backup_level(body.get("level")),
+                        )
+                        if hasattr(result, "__await__"):
+                            result = await result
+                    elif act == "restore":
+                        backup_id = str(body.get("backup_id") or body.get("id") or "").strip()
+                        if not backup_id:
+                            return self.json(
+                                _json_error_payload(
+                                    "backup_id_required",
+                                    error_type="bad_request",
+                                    retryable=False,
+                                ),
+                                status_code=400,
+                            )
+                        result = backup_manager.restore_backup(
+                            backup_id=backup_id,
+                            password=str(body.get("password") or ""),
+                        )
+                        if hasattr(result, "__await__"):
+                            result = await result
+                    else:
+                        sanitizer = getattr(backup_manager, "_sanitize_backup_id", None)
+                        backup_id = str(body.get("backup_id") or body.get("id") or "").strip()
+                        if not backup_id:
+                            return self.json(
+                                _json_error_payload(
+                                    "backup_id_required",
+                                    error_type="bad_request",
+                                    retryable=False,
+                                ),
+                                status_code=400,
+                            )
+                        if callable(sanitizer):
+                            backup_id = sanitizer(backup_id)
+                        backup_dir = os.path.join(coord.hass.config.config_dir, "smart_agent_backups")
+                        fpath = os.path.join(backup_dir, f"{backup_id}.enc")
+                        if not os.path.exists(fpath):
+                            return self.json(
+                                _json_error_payload(
+                                    "backup_not_found",
+                                    error_type="not_found",
+                                    retryable=False,
+                                ),
+                                status_code=404,
+                            )
+                        await coord.hass.async_add_executor_job(os.remove, fpath)
+                        result = {"ok": True, "action": "delete", "backup_id": backup_id}
+                except Exception as exc:
+                    _LOGGER.debug("[BackupsAction] local backup action failed: %s", exc)
+                    return self.json(
+                        _json_error_payload(
+                            "backup_action_failed",
+                            error_type="internal_error",
+                            retryable=False,
+                            message=str(exc),
+                        ),
+                        status_code=500,
+                    )
+
+                payload = result if isinstance(result, dict) else {"result": result}
+                payload.setdefault("ok", bool(payload.get("success", True)))
+                payload.setdefault("action", act)
+                return self.json(payload, status_code=200)
             return self.json(_addon_endpoint_missing_payload("backups_action"), status_code=404)
 
         _addon_client = getattr(coord, "_addon_client", None)
