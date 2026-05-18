@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.31
-display_version: Beta 0.0.31
+release_version: 0.0.32
+display_version: Beta 0.0.32
 channel: beta
 release_date: '2026-05-18'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.31 repairs HA-side presence sensor type writes for the 8234 add-on
-    bridge.
-  customer_visible_version: Beta 0.0.31
+  summary: Beta 0.0.32 repairs AI scene model action normalization and caps log rendering
+    load for field diagnostics.
+  customer_visible_version: Beta 0.0.32
