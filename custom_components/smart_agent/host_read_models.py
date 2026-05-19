@@ -84,7 +84,7 @@ def local_device_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dic
         if not isinstance(info, dict):
             continue
         entity_id = str(eid)
-        row = {"entity_id": entity_id, **dict(info)}
+        row = {"entity_id": entity_id, "managed": True, "in_sa": True, **dict(info)}
         try:
             get_area = getattr(coord, "_get_entity_area", None)
             raw_ha_area = get_area(entity_id) if callable(get_area) else ""

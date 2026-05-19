@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.39
-display_version: Beta 0.0.39
+release_version: 0.0.40
+display_version: Beta 0.0.40
 channel: beta
 release_date: '2026-05-20'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.39 修复 8234 设备页与照明策略页在存在纳管实体时隐藏未纳管 HA 运行态实体的问题，设备目录和照明工作台现在保持与总览一致。
-  customer_visible_version: Beta 0.0.39
+  summary: Beta 0.0.40 修复 8234 设备页把 HA 已纳管但 add-on 本地投影缺失的历史设备误标为未纳管的问题，并隐藏 AI 行为总览中已删除/已归档的场景记录。
+  customer_visible_version: Beta 0.0.40
