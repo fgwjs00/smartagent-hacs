@@ -967,7 +967,7 @@ def _extract_bearer_token(request: web.Request) -> str:
     return ""
 
 
-_TRUSTED_ADDON_PROXY_PEERS = {"127.0.0.1", "::1", "localhost"}
+_TRUSTED_ADDON_PROXY_PEERS = {"127.0.0.1", "::1", "localhost", "172.30.33.1"}
 _TRUSTED_ADDON_PROXY_PEER_PREFIXES = ("127.", "172.30.32.")
 _LEGACY_PAIR_TOKEN_CLIENT_NAMES = {
     "SmartAgent 中控屏",
@@ -6021,7 +6021,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_panel)
 
     if _HA_PANEL_DEGRADED_MODE:
-        _LOGGER.warning(
+        _LOGGER.info(
             "SmartAgent panel degraded mode active | panel_register=%s | panel_static=%s | screen_static=%s | /api/v1 chain stays enabled",
             _HA_PANEL_REGISTER_ENABLED,
             _HA_PANEL_STATIC_EXPOSED,
