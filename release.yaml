@@ -8,6 +8,7 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.33 fixes Operations settings projection, topology pending-change
-    copy, controlled backup execution, and transaction detail readability.
+  summary: Beta 0.0.33 fixes Operations settings projection, device unmanage and HA
+    area sync, topology pending-change copy, controlled backup execution, and transaction
+    detail readability.
   customer_visible_version: Beta 0.0.33

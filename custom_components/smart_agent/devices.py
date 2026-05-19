@@ -378,6 +378,17 @@ class DevicesMixin:
             self._sys_log("WARN", f"[设备更新] 写入失败，未更新内存态: {entity_id}")
             return
         self.device_info[entity_id] = info
+        if room:
+            try:
+                sync_result = await self.async_sync_device_room_to_ha(entity_id, info["room"])
+                if isinstance(sync_result, dict) and sync_result.get("ok") is False:
+                    self._sys_log(
+                        "WARN",
+                        f"[设备更新] 同步 HA 区域未完成: {entity_id}: "
+                        f"{sync_result.get('error') or sync_result.get('reason') or sync_result}",
+                    )
+            except Exception as exc:
+                self._sys_log("WARN", f"[设备更新] 同步 HA 区域失败: {entity_id}: {exc}")
         self.async_set_updated_data({})
 
     async def async_dev_add(self, entity_id: str, desc: str) -> None:
