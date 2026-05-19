@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.36
-display_version: Beta 0.0.36
+release_version: 0.0.37
+display_version: Beta 0.0.37
 channel: beta
-release_date: '2026-05-19'
+release_date: '2026-05-20'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.36 增加 SEC-1 代理来源防护和历史配对令牌清理开关，用于测试机验证 add-on 代理来源与 8234 主流程。
-  customer_visible_version: Beta 0.0.36
+  summary: Beta 0.0.37 修复 8234 设备重新纳管时只保留本次添加实体的问题，确保已有纳管设备不会被后续刷新冲掉。
+  customer_visible_version: Beta 0.0.37
