@@ -25,7 +25,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 
-from .const import DOMAIN, MODE_HOME, MODE_SHOWROOM
+from .const import CONF_CLEANUP_LEGACY_PAIR_TOKENS, DOMAIN, MODE_HOME, MODE_SHOWROOM
 from .coordinator import SmartAgentCoordinator
 from .host_read_models import (
     async_save_presence_sensor_type as _async_save_presence_sensor_type,
@@ -967,8 +967,39 @@ def _extract_bearer_token(request: web.Request) -> str:
     return ""
 
 
+_TRUSTED_ADDON_PROXY_PEERS = {"127.0.0.1", "::1", "localhost"}
+_TRUSTED_ADDON_PROXY_PEER_PREFIXES = ("127.", "172.30.32.")
+_LEGACY_PAIR_TOKEN_CLIENT_NAMES = {
+    "SmartAgent 中控屏",
+    "SmartAgent 管理端会话",
+    "SmartAgent 中控屏（极速配对）",
+}
+
+
 def _is_addon_proxy_request(request: web.Request) -> bool:
-    return str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() == "addon"
+    if str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() != "addon":
+        return False
+
+    transport = getattr(request, "transport", None)
+    try:
+        peer = transport.get_extra_info("peername") if transport is not None else None
+    except Exception:
+        peer = None
+    log_debug = getattr(_LOGGER, "debug", lambda *args, **kwargs: None)
+    log_info = getattr(_LOGGER, "info", log_debug)
+    log_warning = getattr(_LOGGER, "warning", log_debug)
+    if not peer:
+        log_warning("[Auth] proxied request peername=%s trusted=False", peer)
+        return False
+
+    peer_host = str(peer[0]) if isinstance(peer, (tuple, list)) and peer else str(peer)
+    trusted_peers = globals().get("_TRUSTED_ADDON_PROXY_PEERS", {"127.0.0.1", "::1", "localhost"})
+    trusted_prefixes = globals().get("_TRUSTED_ADDON_PROXY_PEER_PREFIXES", ("127.", "172.30.32."))
+    trusted = peer_host in trusted_peers or any(peer_host.startswith(prefix) for prefix in trusted_prefixes)
+    log_info("[Auth] proxied request peername=%s trusted=%s", peer, trusted)
+    if not trusted:
+        log_warning("[Auth] rejected forged add-on proxy header from peername=%s", peer)
+    return trusted
 
 
 def _is_addon_internal_execute_request(request: web.Request) -> bool:
@@ -5628,6 +5659,40 @@ def _purge_auth_sessions(hass: HomeAssistant) -> None:
         sessions.pop(tk, None)
 
 
+async def _async_cleanup_legacy_pair_tokens(hass: HomeAssistant) -> int:
+    removed = 0
+    long_lived_type = getattr(auth_models, "TOKEN_TYPE_LONG_LIVED_ACCESS_TOKEN", "long_lived")
+    users = await hass.auth.async_get_users()
+    for user in users:
+        refresh_tokens = getattr(user, "refresh_tokens", {}) or {}
+        for refresh_token in list(refresh_tokens.values()):
+            client_name = str(getattr(refresh_token, "client_name", "") or "")
+            token_type = getattr(refresh_token, "token_type", None)
+            if client_name not in _LEGACY_PAIR_TOKEN_CLIENT_NAMES:
+                continue
+            if token_type != long_lived_type:
+                continue
+            await hass.auth.async_remove_refresh_token(refresh_token)
+            removed += 1
+    hass.data.pop(_PAIR_KEY, None)
+    _LOGGER.info("[Auth] 历史配对长效令牌清理完成，撤销数量=%s", removed)
+    return removed
+
+
+async def _async_cleanup_legacy_pair_tokens_if_enabled(hass: HomeAssistant, entry: ConfigEntry) -> int:
+    options = dict(getattr(entry, "options", {}) or {})
+    if not bool(options.get(CONF_CLEANUP_LEGACY_PAIR_TOKENS, False)):
+        return 0
+
+    removed = await _async_cleanup_legacy_pair_tokens(hass)
+    options[CONF_CLEANUP_LEGACY_PAIR_TOKENS] = False
+    try:
+        hass.config_entries.async_update_entry(entry, options=options)
+    except Exception as exc:
+        _LOGGER.warning("[Auth] 历史配对令牌清理开关自动关闭失败: %s", exc)
+    return removed
+
+
 async def _issue_auth_session(hass: HomeAssistant, user, source_token: str) -> str:
     _purge_auth_sessions(hass)
 
@@ -5975,6 +6040,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartAgent from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+    await _async_cleanup_legacy_pair_tokens_if_enabled(hass, entry)
     coordinator = SmartAgentCoordinator(hass, entry)
     await hass.async_add_executor_job(coordinator._blocking_init)
     await coordinator.async_config_entry_first_refresh()
@@ -6252,6 +6318,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_VISION_MODEL,
             CONF_BRAND_NAME, CONF_BRAND_PRIMARY_COLOR, CONF_BRAND_LOGO_URL, CONF_DEPLOY_NAME,
             CONF_LICENSE_KEY, CONF_LOG_RETENTION,
+            CONF_CLEANUP_LEGACY_PAIR_TOKENS,
             CONF_PRESENCE_FUSION,
             CONF_CIRCADIAN_ENABLED, CONF_CIRCADIAN_WAKE_TIME,
             CONF_CIRCADIAN_SLEEP_TIME, CONF_CIRCADIAN_MAX_BRIGHTNESS,
@@ -6287,6 +6354,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "vision_model": (CONF_VISION_MODEL, str),
             "license_key": (CONF_LICENSE_KEY, str),
             "log_retention_days": (CONF_LOG_RETENTION, int),
+            "cleanup_legacy_pair_tokens": (CONF_CLEANUP_LEGACY_PAIR_TOKENS, bool),
             "mcp_enabled": ("mcp_enabled", bool),
             # 品牌化/白标
             "brand_name": (CONF_BRAND_NAME, str),

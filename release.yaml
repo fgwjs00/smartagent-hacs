@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.35
-display_version: Beta 0.0.35
+release_version: 0.0.36
+display_version: Beta 0.0.36
 channel: beta
 release_date: '2026-05-19'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.35 restores rediscovery and re-add for entity-level device unmanage,
-    while keeping removed entities out of the SmartAgent managed list.
-  customer_visible_version: Beta 0.0.35
+  summary: Beta 0.0.36 增加 SEC-1 代理来源防护和历史配对令牌清理开关，用于测试机验证 add-on 代理来源与 8234 主流程。
+  customer_visible_version: Beta 0.0.36

@@ -1,6 +1,6 @@
 # SmartAgent for Home Assistant
 
-Current release: `Beta 0.0.35`
+当前公开版本：`Beta 0.0.36`
 
 ## 中文说明
 
@@ -10,14 +10,4 @@ SmartAgent 是一套基于 HA OS / Home Assistant 生态构建的 AI 全屋智�
 
 ### 更新
 
-SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.35`。
-
-## English
-
-SmartAgent is an AI whole-home intelligence system built on top of the HA OS / Home Assistant ecosystem. It uses Home Assistant for device integration, entity state, automations, scripts, scenes, and the add-on ecosystem, while SmartAgent provides its own Gateway, Local Core, management console, central control screen, AI decision making, memory learning, and safety execution capabilities.
-
-This repository provides the SmartAgent Home Assistant integration package for HACS installation. It connects the Home Assistant device ecosystem to the SmartAgent product runtime and provides the required HA-side integration entry points.
-
-### Updates
-
-The SmartAgent Home Assistant integration is updated through HACS. The current public release is `Beta 0.0.35`.
+SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.36`。

@@ -14,6 +14,7 @@ from .const import (
     CONF_LICENSE_KEY,
     CONF_ADDON_AUTH_TOKEN,
     CONF_ADDON_BASE_URL,
+    CONF_CLEANUP_LEGACY_PAIR_TOKENS,
     CONF_OLLAMA_URL,
     CONF_OLLAMA_MODEL,
     CONF_ONLINE_API_KEY,
@@ -534,6 +535,8 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
                              default=d.get(CONF_SEARXNG_URL, "")): str,
                 vol.Optional(CONF_CLOUD_FALLBACK,
                              default=d.get(CONF_CLOUD_FALLBACK, False)): bool,
+                vol.Optional(CONF_CLEANUP_LEGACY_PAIR_TOKENS,
+                             default=d.get(CONF_CLEANUP_LEGACY_PAIR_TOKENS, False)): bool,
 
                 # ── AI 视觉增强（Phase 7E）──
                 vol.Optional(CONF_VISION_ENABLED,
