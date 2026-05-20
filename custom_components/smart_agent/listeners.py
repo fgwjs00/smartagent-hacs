@@ -549,9 +549,10 @@ class ListenersMixin:
 
     def _build_addon_fast_path_snapshot(self, entity_id: str) -> dict[str, Any]:
         """Build the plain snapshot consumed by add-on Core fast-path decisions."""
-        device_info = dict(getattr(self, "device_info", {}) or {})
+        raw_device_info = getattr(self, "device_info", {}) or {}
+        device_info = dict(raw_device_info) if isinstance(raw_device_info, dict) else {}
         states: dict[str, str] = {}
-        for eid in set(device_info.keys()) | {str(entity_id or "")}:
+        for eid in device_info.keys():
             if not eid:
                 continue
             state = self.hass.states.get(eid)
@@ -980,6 +981,21 @@ class ListenersMixin:
                     filter_reason="startup_cooldown",
                     source_type=source_type,
                     startup_remaining=max(0, int(self._startup_grace - _startup_elapsed)),
+                )
+                return
+
+            device_info_snapshot = getattr(self, "device_info", {}) or {}
+            if not isinstance(device_info_snapshot, dict):
+                device_info_snapshot = {}
+            if entity_id not in device_info_snapshot:
+                self._sys_log("INFO", f"[过滤] 未纳管实体不进入 fast-path: {entity_id}")
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="unmanaged_entity",
+                    source_type=source_type,
                 )
                 return
 

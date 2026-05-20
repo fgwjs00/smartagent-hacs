@@ -1,12 +1,13 @@
 product: SmartAgent
-release_version: 0.0.45
-display_version: Beta 0.0.45
+release_version: 0.0.46
+display_version: Beta 0.0.46
 channel: beta
-release_date: '2026-05-20'
+release_date: '2026-05-21'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.45 热修发布低置信度 fast-path 需确认路径、事件流上下文展示与 8234 前端优化；自动执行阈值继续保持 90%，命中但低于自动阈值的候选动作只发确认事件，不再静默丢弃或自动执行。
-  customer_visible_version: Beta 0.0.45
+  summary: Beta 0.0.46 热修发布未纳管实体决策边界修复、事件流空 fast-path 降噪与版本徽标同步；未纳管传感器状态变化只进入监听诊断，不再进入
+    add-on fast-path 或世界模型决策快照。
+  customer_visible_version: Beta 0.0.46
