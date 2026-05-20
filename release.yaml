@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.40
-display_version: Beta 0.0.40
+release_version: 0.0.41
+display_version: Beta 0.0.41
 channel: beta
 release_date: '2026-05-20'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.40 修复 8234 设备页把 HA 已纳管但 add-on 本地投影缺失的历史设备误标为未纳管的问题，并隐藏 AI 行为总览中已删除/已归档的场景记录。
-  customer_visible_version: Beta 0.0.40
+  summary: Beta 0.0.41 修复自动执行置信度阈值在 Add-on FastPath 与 HA 标准推理分支中未统一生效的问题；低于自动执行阈值的候选动作改为等待确认，不再自动派发。
+  customer_visible_version: Beta 0.0.41

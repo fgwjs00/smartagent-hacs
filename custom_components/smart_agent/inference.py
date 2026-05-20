@@ -2975,44 +2975,33 @@ User Prompt 的设备列表中，部分设备标注了管辖模式标签：
                 await self._async_update_status(scene, f"已执行 {executed} 个动作")
 
             elif confidence >= notify_th:
-                # ── 模式 2: 渐进式自治 (Confidence 60-90) ──
-                # 核心哲学：先做安全的，存疑的询问用户
-                safe, high, critical = _verifier.split_actions_by_safety(actions)
-                
-                # 1. 执行安全可逆项（灯光、窗帘等）
-                executed_safe = 0
-                if safe:
-                    executed_safe = await self._execute_actions(
-                        safe, trigger_summary=trigger, scene_desc=scene,
-                        confidence=confidence, trigger_room=trigger_room, is_global_cmd=_is_global,
-                        cmd_source=_cmd_source,
-                    )
-                
-                # 2. 对高成本项（空调、安防）进行通报/询问
-                pending_actions = high + critical
-                pending_names = [self.get_device_name(a.get("entity_id", "")) for a in pending_actions]
-                
-                if pending_names:
-                    # 构造询问文本
-                    _safe_count = len(safe) if executed_safe > 0 else 0
-                    prefix = f"已为您处理了{_safe_count}项基础操作。" if _safe_count > 0 else ""
-                    ask_msg = f"{prefix}AI 建议执行{'、'.join(pending_names[:2])}，由于置信度不足，已为您暂缓。您需要执行吗？"
-                    
-                    # 同时发送 TTS 询问和 HA 通知
-                    await self._speak_tts(ask_msg)
-                    self._notify_dedup(ask_msg, "🤖 SmartAgent 存疑询问")
-                    
-                    self._sys_log("INFO", f"[渐进式自治] 执行{len(safe)}个安全项，拦截{len(pending_actions)}个存疑项")
-                    await self._async_update_status(scene, f"执行基础操作，待确认存疑项")
-                else:
-                    # 只有安全项时，即使置信度稍低也直接执行（反正可逆）
-                    if safe:
-                        await self._execute_actions(
-                            safe, trigger_summary=trigger, scene_desc=scene,
-                            confidence=confidence, trigger_room=trigger_room, is_global_cmd=_is_global,
-                            cmd_source=_cmd_source,
-                        )
-                        await self._async_update_status(scene, f"低风险操作已自动执行")
+                pending_names = [self.get_device_name(a.get("entity_id", "")) for a in actions]
+                ask_msg = (
+                    f"AI 建议执行{'、'.join(pending_names[:2]) or scene}，"
+                    f"置信度 {confidence}% 低于自动执行阈值 {auto_th}%，已暂停等待确认。"
+                )
+                self.hass.bus.async_fire(
+                    "smart_agent_confirm_required",
+                    {
+                        "scene": scene,
+                        "intent": _intent,
+                        "intent_label": _intent_label,
+                        "confidence": confidence,
+                        "confidence_auto": auto_th,
+                        "action_count": len(actions),
+                        "actions": [a.get("reason", a.get("entity_id", "?")) for a in actions[:6]],
+                        "trigger": trigger[:120],
+                        "reply": ask_msg,
+                        "txn_id": None,
+                    },
+                )
+                await self._speak_tts(ask_msg)
+                self._notify_dedup(ask_msg, "🤖 SmartAgent 存疑询问")
+                self._sys_log(
+                    "INFO",
+                    f"[阈值拦截] confidence={confidence} < auto_th={auto_th}，等待用户确认，actions={len(actions)}",
+                )
+                await self._async_update_status(scene, f"等待用户确认（{confidence}% < {auto_th}%）")
 
             else:
                 self._sys_log("INFO", f"置信度不足: {confidence}")
