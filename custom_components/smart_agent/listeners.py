@@ -756,14 +756,18 @@ class ListenersMixin:
                     details = response.get("details") if isinstance(response.get("details"), dict) else {}
                     path_taken = str(response.get("path_taken") or details.get("path_taken") or "none")
                     reason = str(response.get("reason") or details.get("reason") or response.get("error") or "")
+                    confirm_required = response.get("confirm_required") is True or details.get("confirm_required") is True
+                    confidence_auto = details.get("confidence_auto")
+                    confidence_notify = details.get("confidence_notify")
                     scene = ""
-                    confidence = None
+                    confidence = details.get("confidence")
                     action_count = 0
                     actions: list[Any] = []
                     transaction_id = ""
                     if isinstance(result, dict):
                         scene = str(result.get("scene") or result.get("source") or "")
-                        confidence = result.get("confidence")
+                        if confidence is None:
+                            confidence = result.get("confidence")
                         raw_actions = result.get("actions")
                         if isinstance(raw_actions, list):
                             actions = raw_actions
@@ -777,7 +781,9 @@ class ListenersMixin:
                         f"status={status} matched={matched} path_taken={path_taken} "
                         f"reason={reason or '-'} scene={scene or '-'} "
                         f"confidence={confidence if confidence is not None else '-'} "
-                        f"action_count={action_count} entity={entity_id}",
+                        f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
+                        f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
+                        f"confirm_required={confirm_required} action_count={action_count} entity={entity_id}",
                     )
                     self._emit_addon_fast_path_event(
                         {
@@ -791,6 +797,9 @@ class ListenersMixin:
                             "reason": reason,
                             "scene": scene,
                             "confidence": confidence,
+                            "confidence_auto": confidence_auto,
+                            "confidence_notify": confidence_notify,
+                            "confirm_required": confirm_required,
                             "action_count": action_count,
                             "actions": actions,
                             "transaction_id": transaction_id,
@@ -799,6 +808,37 @@ class ListenersMixin:
                             "snapshot": snapshot_diag,
                         }
                     )
+                    if 200 <= status < 300 and not matched and confirm_required and isinstance(result, dict):
+                        confirm_payload = {
+                            "source": "addon_fast_path",
+                            "entity_id": entity_id,
+                            "old_state": old_state,
+                            "new_state": new_state,
+                            "scene": scene,
+                            "confidence": confidence,
+                            "confidence_auto": confidence_auto,
+                            "confidence_notify": confidence_notify,
+                            "action_count": action_count,
+                            "actions": actions,
+                            "trigger": f"{entity_id}: {old_state} -> {new_state}",
+                            "reply": "AI 已命中候选动作，但置信度低于自动执行阈值，等待用户确认。",
+                            "reason": reason,
+                            "path_taken": path_taken,
+                            "result": result,
+                            "txn_id": transaction_id or None,
+                        }
+                        try:
+                            self.hass.bus.async_fire("smart_agent_confirm_required", confirm_payload)
+                        except Exception as exc:
+                            _LOGGER.debug("[Listeners] smart_agent_confirm_required emit failed: %s", exc)
+                        self._sys_log(
+                            "INFO",
+                            f"[Add-on FastPath] confirm_required | entity={entity_id} "
+                            f"confidence={confidence if confidence is not None else '-'} "
+                            f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
+                            f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
+                            f"actions={action_count}",
+                        )
                     if 200 <= status < 300 and matched and isinstance(result, dict):
                         self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
                         await self._execute_fast_path_decision_result(
