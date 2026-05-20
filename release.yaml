@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.42
-display_version: Beta 0.0.42
+release_version: 0.0.43
+display_version: Beta 0.0.43
 channel: beta
 release_date: '2026-05-20'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.42 发布 8234 前端交互优化，并修复 AI 行为总览页垃圾桶把场景归档而不是删除的问题；scene delete 现在统一写入
-    deleted，避免误归档保留。
-  customer_visible_version: Beta 0.0.42
+  summary: Beta 0.0.43 发布 8234 前端日志页优化，并修复总览最近事件流只显示事件名、缺少触发源和 AI 决策上下文的问题；事件流现在展示触发实体、状态变化、监听器动作、决策路径、置信度与动作摘要。
+  customer_visible_version: Beta 0.0.43
