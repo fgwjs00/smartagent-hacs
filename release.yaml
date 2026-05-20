@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.43
-display_version: Beta 0.0.43
+release_version: 0.0.44
+display_version: Beta 0.0.44
 channel: beta
 release_date: '2026-05-20'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.43 热修发布 8234 前端优化、设备页 HA 依赖启动期退避、/infer 分段诊断日志和总览事件流上下文展示；设备页在
+  summary: Beta 0.0.44 热修发布 8234 前端优化、设备页 HA 依赖启动期退避、/infer 分段诊断日志和总览事件流上下文展示；设备页在
     HA/API 重启未 ready 时不再形成 /devices 请求风暴，推理超时会返回阶段、超时和耗时细节，便于继续验证 P0。
-  customer_visible_version: Beta 0.0.43
+  customer_visible_version: Beta 0.0.44
