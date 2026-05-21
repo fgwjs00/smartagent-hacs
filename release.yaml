@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.47
-display_version: Beta 0.0.47
+release_version: 0.0.48
+display_version: Beta 0.0.48
 channel: beta
 release_date: '2026-05-21'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.47 发布系统自动维护灯光场景与中控屏本地配对修复；系统会按房间和灯具持续同步全屋/房间全开全关、明亮、柔光、夜光和微光场景，8234
-    配对入口与中控屏扫码/一键连接统一走 Gateway 本地配对窗口。
-  customer_visible_version: Beta 0.0.47
+  summary: Beta 0.0.48 发布 8234 前端时间展示优化与线上模型瞬时重试修复；事务、总览、习惯、纠错、备份、巡检、系统、日志等页面统一本地化时间格式，线上大模型
+    DNS/连接抖动或 429/5xx 短暂失败时会自动补偿重试一次，降低巡检 /infer 503 对 P0 稳定性的影响。
+  customer_visible_version: Beta 0.0.48
