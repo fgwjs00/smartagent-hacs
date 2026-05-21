@@ -249,6 +249,39 @@ class AddOnClient:
         response["__status"] = status
         return response
 
+    async def post_internal_event(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ts: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Post a P1 HA-bridge event into add-on owned storage."""
+        body: dict[str, Any] = {
+            "kind": str(kind or ""),
+            "payload": dict(payload or {}),
+        }
+        if ts:
+            body["ts"] = str(ts)
+        headers = dict(self._auth_headers)
+        headers["X-SA-Internal"] = "ha-bridge"
+        try:
+            session = await self._get_session()
+            async with session.request(
+                "POST",
+                f"{self._base}/api/v1/internal/event",
+                json=body,
+                headers=headers,
+                timeout=_HEALTH_TIMEOUT,
+            ) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    data = {}
+                return self._build_status_result(resp.status, data)
+        except Exception as exc:
+            return self._handle_request_exception(exc)
+
     async def is_available(self) -> bool:
         """检查 Add-on 是否在线（带缓存，避免每次推理都发 HTTP 请求）。
 

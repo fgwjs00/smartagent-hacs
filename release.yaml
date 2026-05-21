@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.52
-display_version: Beta 0.0.52
+release_version: 0.0.53
+display_version: Beta 0.0.53
 channel: beta
 release_date: '2026-05-21'
 public_release_ready: true
@@ -8,7 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.52 热修中控屏语音会话创建：Gateway POST /api/v1/voice/session 改为本地签发 session_id
-    与临时 WS ticket，不再向仅支持 WebSocket GET 的 HA adapter 发起 POST，修复语音按钮返回 405 Method Not
-    Allowed 的问题。
-  customer_visible_version: Beta 0.0.52
+  summary: Beta 0.0.53 发布 P1 HA 写入面冻结低风险切片：HA 侧事件、基线、arrival baseline、behavior decay、decision_cache
+    写入口改为 internal event 推送并由 add-on 落库；同时包含中控屏语音会话 405 热修与语音管道离线回归。
+  customer_visible_version: Beta 0.0.53

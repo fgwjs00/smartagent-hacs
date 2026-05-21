@@ -777,12 +777,21 @@ class DatabaseMixin:
                 and event_type not in ("Override",)):
             self._apply_positive_correction_signal(entity_id)
 
-        _ok = self._db.execute(
-            "INSERT INTO events (time, type, detail, entity, state, source, area, confidence, transaction_id, action_seq) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (timestamp, event_type, detail, entity_id or "", new_state or "", source, area, confidence, transaction_id, action_seq),
-        )
-        if not _ok:
-            _LOGGER.warning("[Events] Write failed: type=%s entity=%s", event_type, entity_id or "")
+        payload = {
+            "time": timestamp,
+            "type": event_type,
+            "detail": detail,
+            "entity_id": entity_id or "",
+            "state": new_state or "",
+            "source": source,
+            "area": area,
+            "confidence": confidence,
+            "transaction_id": transaction_id,
+            "action_seq": action_seq,
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("event", payload, ts=timestamp):
+            _LOGGER.warning("[Events] Internal event enqueue failed: type=%s entity=%s", event_type, entity_id or "")
 
     # ── Phase 7B: 用户修正永久学习 ─────────────────────────────────────────
 
@@ -945,16 +954,18 @@ class DatabaseMixin:
     ) -> None:
         """P1-1: 修正发生时，降低对应 behavior_pattern 的置信度（-15，下限 10）。"""
         expected = "on" if "turn_on" in ai_service else "off"
-        _ok = self._db.execute(
-            "UPDATE behavior_patterns SET confidence = MAX(10, confidence - 15), "
-            "last_updated = ? "
-            "WHERE entity_id = ? AND expected_state = ? "
-            "AND hour_start <= ? AND hour_end >= ?",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-             entity_id, expected, hour, hour),
-        )
-        if not _ok:
-            _LOGGER.warning("[BehaviorPattern] Decay write failed: entity=%s service=%s", entity_id, ai_service)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload = {
+            "action": "decay_on_correction",
+            "time": ts,
+            "entity_id": entity_id,
+            "ai_service": ai_service,
+            "expected_state": expected,
+            "hour": int(hour),
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("behavior", payload, ts=ts):
+            _LOGGER.warning("[BehaviorPattern] Decay enqueue failed: entity=%s service=%s", entity_id, ai_service)
 
     def _upsert_single_correction_lesson(
         self, entity_id: str, ai_service: str, user_state: str,
@@ -1255,50 +1266,18 @@ class DatabaseMixin:
         room = (info.get("room") or "").strip()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hour_bucket = datetime.now().hour
-        on_inc = 1 if is_on else 0
-        try:
-            # v1：全天汇总（保持向后兼容）
-            _ok_daily = self._db_exec("""
-                INSERT INTO device_baseline
-                    (entity_id, room, on_samples, total_samples, on_ratio, avg_brightness, last_updated)
-                VALUES (?, ?, ?, 1, ?, ?, ?)
-                ON CONFLICT(entity_id) DO UPDATE SET
-                    room          = excluded.room,
-                    on_samples    = on_samples  + ?,
-                    total_samples = total_samples + 1,
-                    on_ratio      = CAST(on_samples + ? AS REAL) / (total_samples + 1),
-                    avg_brightness= CASE WHEN ? > 0
-                                    THEN (avg_brightness * total_samples + ?) / (total_samples + 1)
-                                    ELSE avg_brightness END,
-                    last_updated  = ?
-            """, (
-                entity_id, room, on_inc, float(on_inc), brightness, ts,
-                on_inc, on_inc, brightness, brightness, ts,
-            ))
-            if not _ok_daily:
-                _LOGGER.warning("[Baseline] Daily sample write failed: entity=%s", entity_id)
-                return
-
-            # v2：按小时分段（供 MemoryStore._build_baseline_hint_sync 精细查询）
-            _ok_hourly = self._db_exec("""
-                INSERT INTO device_baseline_hourly
-                    (entity_id, hour_bucket, room, usage_ratio, sample_count, last_updated)
-                VALUES (?, ?, ?, ?, 1, ?)
-                ON CONFLICT(entity_id, hour_bucket) DO UPDATE SET
-                    room         = excluded.room,
-                    usage_ratio  = CAST(
-                                       (usage_ratio * sample_count + ?)
-                                       AS REAL) / (sample_count + 1),
-                    sample_count = sample_count + 1,
-                    last_updated = ?
-            """, (
-                entity_id, hour_bucket, room, float(on_inc), ts,
-                float(on_inc), ts,
-            ))
-            if not _ok_hourly:
-                _LOGGER.warning("[Baseline] Hourly sample write failed: entity=%s hour=%s", entity_id, hour_bucket)
-        except Exception as e:
-            _LOGGER.warning("[Baseline] Sample failed for %s: %s", entity_id, e)
+        payload = {
+            "action": "sample",
+            "time": ts,
+            "entity_id": entity_id,
+            "room": room,
+            "is_on": bool(is_on),
+            "brightness": int(brightness or 0),
+            "hour_bucket": hour_bucket,
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("baseline", payload, ts=ts):
+            _LOGGER.warning("[Baseline] Sample enqueue failed: entity=%s hour=%s", entity_id, hour_bucket)
 
     def _apply_correction_to_baseline(self, entity_id: str, direction: str, weight: float = 1.5) -> None:
         """将用户修正直接反映到基线分数，替代生成 P3 规则。
@@ -1313,43 +1292,18 @@ class DatabaseMixin:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.device_info.get(entity_id, {})
         room = (info.get("room") or "").strip()
-        try:
-            if direction == "down":
-                # 增加关闭采样，同时记录 correction_down 计数
-                _ok = self._db_exec("""
-                    INSERT INTO device_baseline
-                        (entity_id, room, on_samples, total_samples, on_ratio, correction_down, last_updated)
-                    VALUES (?, ?, 0, ?, ?, 1, ?)
-                    ON CONFLICT(entity_id) DO UPDATE SET
-                        room            = excluded.room,
-                        total_samples   = total_samples + ?,
-                        on_ratio        = CAST(on_samples AS REAL) / (total_samples + ?),
-                        correction_down = correction_down + 1,
-                        last_updated    = ?
-                """, (entity_id, room, int(weight), 0.0, ts,
-                      int(weight), int(weight), ts))
-                if not _ok:
-                    _LOGGER.warning("[Baseline] Correction down write failed: entity=%s", entity_id)
-            else:
-                # 增加开启采样
-                w = int(weight)
-                _ok = self._db_exec("""
-                    INSERT INTO device_baseline
-                        (entity_id, room, on_samples, total_samples, on_ratio, correction_up, last_updated)
-                    VALUES (?, ?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(entity_id) DO UPDATE SET
-                        room           = excluded.room,
-                        on_samples     = on_samples + ?,
-                        total_samples  = total_samples + ?,
-                        on_ratio       = CAST(on_samples + ? AS REAL) / (total_samples + ?),
-                        correction_up  = correction_up + 1,
-                        last_updated   = ?
-                """, (entity_id, room, w, w, 1.0, ts,
-                      w, w, w, w, ts))
-                if not _ok:
-                    _LOGGER.warning("[Baseline] Correction up write failed: entity=%s", entity_id)
-        except Exception as e:
-            _LOGGER.warning("[Baseline] Correction failed for %s: %s", entity_id, e)
+        w = int(weight)
+        action = "correction_down" if direction == "down" else "correction_up"
+        payload = {
+            "action": action,
+            "time": ts,
+            "entity_id": entity_id,
+            "room": room,
+            "weight": w,
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("baseline", payload, ts=ts):
+            _LOGGER.warning("[Baseline] Correction enqueue failed: entity=%s action=%s", entity_id, action)
 
     def _get_baseline_for_room(self, room: str, min_samples: int = 3) -> list[dict]:
         """查询某房间所有设备的基线数据。
@@ -1420,34 +1374,23 @@ class DatabaseMixin:
 
             # 收集该房间所有灯的当前状态
             updated_count = 0
+            enqueue = getattr(self, "_enqueue_internal_event", None)
             for eid, state_str in light_states.items():
                 if state_str is None:
                     continue
-                is_on = 1 if state_str == "on" else 0
-
-                # UPSERT：累加采样计数，重算 turn_on_ratio
-                try:
-                    _ok = self._db_exec(
-                        """
-                        INSERT INTO arrival_baseline
-                            (entity_id, room, hour_bucket,
-                             on_samples, total_samples, turn_on_ratio, last_updated)
-                        VALUES (?, ?, ?, ?, 1, ?, ?)
-                        ON CONFLICT(entity_id, hour_bucket) DO UPDATE SET
-                            on_samples    = on_samples + excluded.on_samples,
-                            total_samples = total_samples + 1,
-                            turn_on_ratio = CAST(on_samples + excluded.on_samples AS REAL)
-                                            / (total_samples + 1),
-                            last_updated  = excluded.last_updated
-                        """,
-                        (eid, room, hour_bucket, is_on, float(is_on), now_str),
-                    )
-                    if not _ok:
-                        _LOGGER.debug("[ArrivalBaseline] UPSERT 写入失败 %s", eid)
-                        continue
+                payload = {
+                    "action": "arrival_sample",
+                    "time": now_str,
+                    "entity_id": eid,
+                    "room": room,
+                    "presence_entity_id": presence_entity_id,
+                    "is_on": state_str == "on",
+                    "hour_bucket": hour_bucket,
+                }
+                if callable(enqueue) and enqueue("baseline", payload, ts=now_str):
                     updated_count += 1
-                except Exception as exc:
-                    _LOGGER.debug("[ArrivalBaseline] UPSERT 失败 %s: %s", eid, exc)
+                else:
+                    _LOGGER.debug("[ArrivalBaseline] sample enqueue failed %s", eid)
 
             _LOGGER.debug(
                 "[ArrivalBaseline] 快照完成: room=%s hour=%d 设备数=%d 触发传感器=%s",
@@ -2145,80 +2088,20 @@ class DatabaseMixin:
         features: dict | None = None,
     ) -> None:
         """
-        记录一次 AI 推理作为待验证的训练样本（Phase 11.2 增加写入过滤）。
+        P1: training_data 是 HA 独有旧表，add-on 不承接，停止本地写入。
 
-        过滤规则：若为"无人+灯亮+无动作"场景，跳过记录，避免正向样本强化
-        "无人也不关灯"的错误行为（死亡螺旋防护）。
-
-        Args:
-            trigger: 触发文本
-            context: 上下文 JSON 字符串
-            decision: AI 决策字典
-            features: FeatureEncoder.encode() 的输出（数值特征快照），用于本地 ML 训练
+        旧实现会写 `training_data` 供本地轻量模型训练；迁移后该数据面
+        直接弃用，保留方法入口只为调用链兼容。
         """
-        try:
-            # Phase 11.2: 死亡螺旋防护——无人+灯亮+不作为 不写入正向样本
-            if self._is_empty_lights_on_no_action(context, decision):
-                _LOGGER.debug(
-                    "[TrainingData] 跳过记录：检测到无人+灯亮+无动作场景，"
-                    "避免强化错误的不关灯行为"
-                )
-                return
-
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            decision_json = json.dumps(decision, ensure_ascii=False)
-            feature_json = json.dumps(features, ensure_ascii=False) if features else None
-            _ok = self._db.execute(
-                "INSERT INTO training_data "
-                "(time, trigger_text, context_json, decision_json, feature_json) "
-                "VALUES (?,?,?,?,?)",
-                (ts, trigger, context, decision_json, feature_json),
-            )
-            if not _ok:
-                _LOGGER.warning("[TrainingData] Record write failed: trigger=%s", trigger[:60])
-        except Exception as e:
-            _LOGGER.warning("[TrainingData] Record failed: %s", e)
+        _LOGGER.debug("[TrainingData] Deprecated local sample ignored: trigger=%s", trigger[:60])
 
     def _mark_training_negative(self, entity_id: str) -> None:
-        """当用户手动修正某设备时，将最近 30 分钟内涉及该设备的 AI 样本标记为负样本(0)。"""
-        try:
-            # 查找 30 分钟内包含该 entity_id 的 AI 决策
-            cutoff = (datetime.now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-            _ok = self._db.execute(
-                "UPDATE training_data SET label = 0 WHERE time > ? AND decision_json LIKE ?",
-                (cutoff, f"%{entity_id}%"),
-            )
-            if not _ok:
-                _LOGGER.warning("[TrainingData] Mark negative write failed: entity=%s", entity_id)
-        except Exception as e:
-            _LOGGER.warning("[TrainingData] Mark negative failed: %s", e)
+        """P1: training_data 已弃用，不再标记本地负样本。"""
+        _LOGGER.debug("[TrainingData] Deprecated negative mark ignored: entity=%s", entity_id)
 
     def _verify_training_samples(self) -> int:
-        """回查 30-60 分钟前的待验证样本，将其标记为已验证（Verified）。"""
-        try:
-            # 窗口：30 分钟前到 2 小时前
-            now = datetime.now()
-            start = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-            end = (now - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-            ts_now = now.strftime("%Y-%m-%d %H:%M:%S")
-
-            count = self._db.query_scalar(
-                "SELECT COUNT(*) FROM training_data "
-                "WHERE is_verified = 0 AND time BETWEEN ? AND ?",
-                (start, end),
-            ) or 0
-            _ok = self._db.execute(
-                "UPDATE training_data SET is_verified = 1, verified_at = ? "
-                "WHERE is_verified = 0 AND time BETWEEN ? AND ?",
-                (ts_now, start, end),
-            )
-            if not _ok:
-                _LOGGER.warning("[TrainingData] Verification write failed")
-                return 0
-            return count
-        except Exception as e:
-            _LOGGER.warning("[TrainingData] Verification failed: %s", e)
-            return 0
+        """P1: training_data 已弃用，不再回写 verified 标记。"""
+        return 0
 
     def _cleanup_old_memory(self) -> None:
         """Delete stale events/action_results and expired in-memory caches."""
@@ -2888,45 +2771,33 @@ class DatabaseMixin:
         :param intent:          5B-3: AI 意图标识（如 'arrival_lighting'）
         :param scene_candidate: 5B-3: AI 推荐的 HA 场景 entity_id
         """
-        import json as _json
         try:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            actions_json = _json.dumps(actions, ensure_ascii=False)
-            _ok = self._db_exec(
-                """
-                INSERT INTO decision_cache
-                    (trigger_room, hour_bucket, weekday, trigger_type,
-                     actions_json, confidence, scene, intent, scene_candidate,
-                     hit_count, created, last_hit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-                ON CONFLICT(trigger_room, hour_bucket, weekday, trigger_type) DO UPDATE SET
-                    actions_json    = excluded.actions_json,
-                    confidence      = excluded.confidence,
-                    scene           = excluded.scene,
-                    intent          = excluded.intent,
-                    scene_candidate = excluded.scene_candidate,
-                    last_hit        = excluded.last_hit
-                """,
-                # created 字段刻意不在 UPDATE SET 中，以保留首次写入时间
-                (trigger_room, hour_bucket, weekday, trigger_type,
-                 actions_json, confidence, scene, intent, scene_candidate,
-                 now_str, now_str),
-            )
-            if not _ok:
+            payload = {
+                "action": "write_decision",
+                "time": now_str,
+                "trigger_room": trigger_room,
+                "hour_bucket": int(hour_bucket),
+                "weekday": int(weekday),
+                "trigger_type": trigger_type,
+                "actions": actions,
+                "confidence": int(confidence),
+                "scene": scene,
+                "intent": intent,
+                "scene_candidate": scene_candidate,
+            }
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue("cache_invalidate", payload, ts=now_str):
                 _LOGGER.warning(
-                    "[DecisionCache] 写入失败: room=%s h=%d wd=%d type=%s",
+                    "[DecisionCache] 写入事件入队失败: room=%s h=%d wd=%d type=%s",
                     trigger_room,
                     hour_bucket,
                     weekday,
                     trigger_type,
                 )
                 return
-            _LOGGER.debug(
-                "[DecisionCache] 写入: room=%s h=%d wd=%d type=%s acts=%d conf=%d",
-                trigger_room, hour_bucket, weekday, trigger_type, len(actions), confidence,
-            )
         except Exception as exc:
-            _LOGGER.warning("[DecisionCache] 写入失败: %s", exc)
+            _LOGGER.warning("[DecisionCache] 写入事件入队失败: %s", exc)
 
     def _lookup_decision_cache(
         self,
@@ -2973,31 +2844,26 @@ class DatabaseMixin:
             if not actions:
                 return None
 
-            # 仅更新实际命中的那一行（精确匹配 hour_bucket），而非 ±1h 范围内所有行
+            # 仅记录实际命中的那一行（精确匹配 hour_bucket），本地库不再回写命中计数
             matched_hour = row["hour_bucket"]
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _ok = self._db_exec(
-                """
-                UPDATE decision_cache
-                SET hit_count = hit_count + 1, last_hit = ?
-                WHERE trigger_room = ? AND weekday = ? AND trigger_type = ?
-                  AND hour_bucket = ?
-                """,
-                (now_str, trigger_room, weekday, trigger_type, matched_hour),
-            )
-            if not _ok:
+            payload = {
+                "action": "hit",
+                "time": now_str,
+                "trigger_room": trigger_room,
+                "hour_bucket": int(matched_hour),
+                "weekday": int(weekday),
+                "trigger_type": trigger_type,
+            }
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue("cache_invalidate", payload, ts=now_str):
                 _LOGGER.warning(
-                    "[DecisionCache] 命中计数更新失败: room=%s wd=%s type=%s hour=%s",
+                    "[DecisionCache] 命中事件入队失败: room=%s wd=%s type=%s hour=%s",
                     trigger_room,
                     weekday,
                     trigger_type,
                     matched_hour,
                 )
-            _LOGGER.debug(
-                "[DecisionCache] 命中: room=%s h=%d→cached_h=%d type=%s acts=%d hits=%d intent=%s",
-                trigger_room, hour_bucket, matched_hour,
-                trigger_type, len(actions), row["hit_count"] + 1, row["intent"],
-            )
             return {
                 "actions": actions,
                 "confidence": row["confidence"],
@@ -3017,16 +2883,13 @@ class DatabaseMixin:
         :param room: 触发修正的房间名称
         """
         try:
-            _ok = self._db_exec(
-                "DELETE FROM decision_cache WHERE trigger_room = ?",
-                (room,),
-            )
-            if not _ok:
-                _LOGGER.warning("[DecisionCache] 缓存清除写入失败 room=%s", room)
-                return
-            _LOGGER.debug("[DecisionCache] 已清除 room=%s 的所有缓存", room)
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            payload = {"action": "invalidate_room", "time": ts, "trigger_room": room}
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue("cache_invalidate", payload, ts=ts):
+                _LOGGER.warning("[DecisionCache] 缓存清除事件入队失败 room=%s", room)
         except Exception as exc:
-            _LOGGER.warning("[DecisionCache] 缓存清除失败 room=%s: %s", room, exc)
+            _LOGGER.warning("[DecisionCache] 缓存清除事件入队失败 room=%s: %s", room, exc)
 
     def _cleanup_decision_cache(self) -> None:
         """清理冷门（< 3次命中）且超过 48 小时未访问的缓存条目。
@@ -3035,18 +2898,13 @@ class DatabaseMixin:
         保留命中率高的热门缓存，避免频繁让 LLM 重新推理。
         """
         try:
-            from datetime import timedelta
-            cutoff = (datetime.now() - timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
-            _ok = self._db_exec(
-                "DELETE FROM decision_cache WHERE last_hit < ? AND hit_count < 3",
-                (cutoff,),
-            )
-            if not _ok:
-                _LOGGER.warning("[DecisionCache] 过期缓存清理写入失败: cutoff=%s", cutoff)
-                return
-            _LOGGER.debug("[DecisionCache] 过期冷门缓存清理完成（cutoff=%s）", cutoff)
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            payload = {"action": "cleanup_cold", "time": ts, "older_than_hours": 48}
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue("cache_invalidate", payload, ts=ts):
+                _LOGGER.warning("[DecisionCache] 过期缓存清理事件入队失败")
         except Exception as exc:
-            _LOGGER.warning("[DecisionCache] 缓存清理失败: %s", exc)
+            _LOGGER.warning("[DecisionCache] 缓存清理事件入队失败: %s", exc)
 
     def _get_decision_cache_stats(self) -> dict:
         """返回缓存统计信息（供日志/面板展示）。

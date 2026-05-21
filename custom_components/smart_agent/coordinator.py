@@ -293,6 +293,11 @@ class SmartAgentCoordinator(
             _addon_base_url = derive_addon_gateway_base_url(self._get_ha_url())
         _addon_port = int(data.get(CONF_ADDON_PORT) or DEFAULT_ADDON_PORT)
         self._addon_client = AddOnClient(base_url=_addon_base_url, port=_addon_port, auth_token=_addon_token)
+        from .internal_event_bridge import InternalEventBridge
+        self._internal_event_bridge = InternalEventBridge(
+            self._addon_client,
+            log_callback=self._sys_log,
+        )
         # TTS 配置
         self._tts_service: str = (data.get(CONF_TTS_SERVICE) or "").strip()
         self._tts_target: str = (data.get(CONF_TTS_TARGET) or "").strip()
@@ -473,6 +478,37 @@ class SmartAgentCoordinator(
             return get_url(self.hass)
         except Exception:
             return "http://localhost:8123"
+
+    def _enqueue_internal_event(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ts: str | None = None,
+    ) -> bool:
+        """Thread-safe enqueue into the P1 HA-to-add-on storage bridge."""
+        bridge = getattr(self, "_internal_event_bridge", None)
+        if bridge is None:
+            return False
+
+        def _enqueue() -> None:
+            bridge.enqueue(kind, payload, ts=ts)
+
+        try:
+            loop = getattr(self.hass, "loop", None)
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if loop is not None and running_loop is loop:
+                return bool(bridge.enqueue(kind, payload, ts=ts))
+            if loop is not None:
+                loop.call_soon_threadsafe(_enqueue)
+                return True
+            return bool(bridge.enqueue(kind, payload, ts=ts))
+        except Exception as exc:
+            _LOGGER.warning("[P1] internal event enqueue failed: %s", exc)
+            return False
 
     # ── 系统日志 ──────────────────────────────────────────────────────────────
 
@@ -752,6 +788,9 @@ class SmartAgentCoordinator(
         self._sys_log("INFO", f"SmartAgent v{_SA_VERSION} 启动 — 引擎={self.engine}, "
                       f"设备数={len(self.device_info)}, 画像={len(self._habits)}, 规则={len(self._rules)}, "
                       f"视觉分析={_vision_flag}, Frigate={_frigate_flag}")
+        bridge = getattr(self, "_internal_event_bridge", None)
+        if bridge is not None:
+            bridge.start()
         self._refresh_listeners()
         # 智能巡检：动态间隔，自调度
         if self._scan_timer_unsub:
@@ -866,6 +905,9 @@ class SmartAgentCoordinator(
         await self._async_stop_frigate_mqtt()
         # 数据同步任务清理（关闭 HTTP Session）
         await self._stop_data_sync()
+        bridge = getattr(self, "_internal_event_bridge", None)
+        if bridge is not None:
+            await bridge.stop()
         # Add-on 客户端 HTTP Session 清理（v4.8.79）
         if hasattr(self, "_addon_client"):
             await self._addon_client.close()
