@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.46
-display_version: Beta 0.0.46
+release_version: 0.0.47
+display_version: Beta 0.0.47
 channel: beta
 release_date: '2026-05-21'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.46 热修发布未纳管实体决策边界修复、事件流空 fast-path 降噪与版本徽标同步；未纳管传感器状态变化只进入监听诊断，不再进入
-    add-on fast-path 或世界模型决策快照。
-  customer_visible_version: Beta 0.0.46
+  summary: Beta 0.0.47 发布系统自动维护灯光场景与中控屏本地配对修复；系统会按房间和灯具持续同步全屋/房间全开全关、明亮、柔光、夜光和微光场景，8234
+    配对入口与中控屏扫码/一键连接统一走 Gateway 本地配对窗口。
+  customer_visible_version: Beta 0.0.47
