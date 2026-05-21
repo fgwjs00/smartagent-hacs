@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.51
-display_version: Beta 0.0.51
+release_version: 0.0.52
+display_version: Beta 0.0.52
 channel: beta
 release_date: '2026-05-21'
 public_release_ready: true
@@ -8,6 +8,7 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.51 热修中控屏设备与房间清单：中控屏受管设备改为从 Gateway REST /devices 读取，房间从 /rooms?include_local_only=true
-    读取，并携带 gateway_token 授权，修复连接成功后设备和房间为空的问题。
-  customer_visible_version: Beta 0.0.51
+  summary: Beta 0.0.52 热修中控屏语音会话创建：Gateway POST /api/v1/voice/session 改为本地签发 session_id
+    与临时 WS ticket，不再向仅支持 WebSocket GET 的 HA adapter 发起 POST，修复语音按钮返回 405 Method Not
+    Allowed 的问题。
+  customer_visible_version: Beta 0.0.52
