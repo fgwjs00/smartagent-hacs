@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.48 - 2026-05-21
+## Beta 0.0.49 - 2026-05-21
 
-Beta 0.0.48 发布 8234 前端时间展示优化与线上模型瞬时重试修复；事务、总览、习惯、纠错、备份、巡检、系统、日志等页面统一本地化时间格式，线上大模型 DNS/连接抖动或 429/5xx 短暂失败时会自动补偿重试一次，降低巡检 /infer 503 对 P0 稳定性的影响。
+Beta 0.0.49 热修 8234 中控屏连接链路：Gateway 新增 /api/websocket 到 Home Assistant /api/websocket 的兼容 WebSocket 代理，修复中控屏一键连接后报 Gateway WebSocket connection failed、无法连接到 Home Assistant 服务器的问题。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.48`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.49`，用于 Home Assistant 更新检测。
