@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.54
-display_version: Beta 0.0.54
+release_version: 0.0.55
+display_version: Beta 0.0.55
 channel: beta
 release_date: '2026-05-22'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.54 发布中控屏与空间存在交互修复：中控屏真实 AI 场景改为从 Gateway /ai-scenes 加载并通过 gateway
-    触发，房间/设备映射优先采用后端稳定 ID；管理端空间存在与证据页补齐传感器融合候选、新增融合域和空态点击反馈。
-  customer_visible_version: Beta 0.0.54
+  summary: Beta 0.0.55 发布空间存在热修：新增融合域支持无现成房间时按名称创建本地逻辑空间并同步 Core Config，保存失败会留在弹窗内展示错误；同时保留中控屏静态包和固定灯光场景设备读取修复。
+  customer_visible_version: Beta 0.0.55
