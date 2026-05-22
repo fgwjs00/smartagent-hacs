@@ -1,12 +1,13 @@
 product: SmartAgent
-release_version: 0.0.56
-display_version: Beta 0.0.56
+release_version: 0.0.57
+display_version: Beta 0.0.57
 channel: beta
-release_date: '2026-05-22'
+release_date: '2026-05-23'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.56 测试版发布：同步 8234 系统开关到 HA 运行时，修复固定灯光场景内部设备读取的 503 噪声，并包含最新前端修复与发布产物。
-  customer_visible_version: Beta 0.0.56
+  summary: Beta 0.0.57 测试版发布：修复静默学习下传感器 FastPath 仍弹出确认/可能执行的问题，主动习惯询问只在开关开启时生效，并补齐
+    Frigate 视觉感知热启动/热停止。
+  customer_visible_version: Beta 0.0.57

@@ -307,6 +307,7 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
     async def async_turn_on(self, **kwargs) -> None:
         await self._push_to_addon("frigate_enabled", True)
         self.coordinator._frigate_enabled = True
+        await self.coordinator._async_start_frigate_mqtt()
         self._attr_is_on = True
         self._persist(True)
         self.coordinator._sys_log(
@@ -318,6 +319,7 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
     async def async_turn_off(self, **kwargs) -> None:
         await self._push_to_addon("frigate_enabled", False)
         self.coordinator._frigate_enabled = False
+        await self.coordinator._async_stop_frigate_mqtt()
         self._attr_is_on = False
         self._persist(False)
         self.coordinator._sys_log("INFO", "Frigate NVR 视觉感知已关闭")

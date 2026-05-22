@@ -309,6 +309,8 @@ class FrigateMixin:
         """订阅 Frigate MQTT events topic。在 async_start_listeners 中调用。"""
         if not getattr(self, "_frigate_enabled", False):
             return
+        if self._frigate_mqtt_unsub:
+            return
 
         try:
             from homeassistant.components.mqtt import async_subscribe

@@ -758,6 +758,15 @@ class ListenersMixin:
                     path_taken = str(response.get("path_taken") or details.get("path_taken") or "none")
                     reason = str(response.get("reason") or details.get("reason") or response.get("error") or "")
                     confirm_required = response.get("confirm_required") is True or details.get("confirm_required") is True
+                    confirm_suppressed_reason = str(details.get("confirm_suppressed_reason") or "")
+                    execution_suppressed_reason = "learning_mode" if matched and self._learning_mode else ""
+                    if confirm_required:
+                        if self._learning_mode:
+                            confirm_suppressed_reason = "learning_mode"
+                        elif not getattr(self, "_habit_proactive", False):
+                            confirm_suppressed_reason = "habit_proactive_disabled"
+                        if confirm_suppressed_reason:
+                            confirm_required = False
                     confidence_auto = details.get("confidence_auto")
                     confidence_notify = details.get("confidence_notify")
                     scene = ""
@@ -801,10 +810,12 @@ class ListenersMixin:
                             "confidence_auto": confidence_auto,
                             "confidence_notify": confidence_notify,
                             "confirm_required": confirm_required,
+                            "confirm_suppressed_reason": confirm_suppressed_reason,
                             "action_count": action_count,
                             "actions": actions,
                             "transaction_id": transaction_id,
-                            "executed": matched,
+                            "executed": matched and not execution_suppressed_reason,
+                            "execution_suppressed_reason": execution_suppressed_reason,
                             "fail_closed": not (200 <= status < 300),
                             "snapshot": snapshot_diag,
                         }
@@ -841,6 +852,12 @@ class ListenersMixin:
                             f"actions={action_count}",
                         )
                     if 200 <= status < 300 and matched and isinstance(result, dict):
+                        if execution_suppressed_reason:
+                            self._sys_log(
+                                "INFO",
+                                f"[Add-on FastPath] execution suppressed | entity={entity_id} policy=learning_mode reason={execution_suppressed_reason}",
+                            )
+                            return
                         self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
                         await self._execute_fast_path_decision_result(
                             result,
@@ -1000,6 +1017,28 @@ class ListenersMixin:
                 return
 
             # ── Step 0 + FastBrain: add-on 优先路径（B1 迁移：有 add-on 时直接调用，不先跑本地）──
+            if self._learning_mode:
+                name = self.get_device_name(entity_id)
+                trigger = self._fmt_trigger(source_type, domain, name, entity_id, old_s, new_s)
+                self._sys_log("INFO", f"[SilentLearning] {entity_id} {old_s}->{new_s}; record only, skip add-on fast-path")
+                self.hass.async_add_executor_job(
+                    self._record_event,
+                    "Learning",
+                    trigger,
+                    entity_id,
+                    new_s,
+                    "system",
+                )
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="learning_mode",
+                    source_type=source_type,
+                )
+                return
+
             from .intent_verifier import CMD_SOURCE_SENSOR
             _pipeline = self._decision_pipeline
             self._emit_listener_event(

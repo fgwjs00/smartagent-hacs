@@ -738,6 +738,7 @@ class SmartAgentCoordinator(
         if habit_value is None:
             habit_value = payload.get("habit_proactive_ask")
         applied: list[str] = []
+        frigate_runtime_action: str | None = None
         if "learning_mode" in payload:
             new_value = bool(payload.get("learning_mode"))
             if new_value != self._learning_mode:
@@ -752,12 +753,18 @@ class SmartAgentCoordinator(
             new_value = bool(payload.get("frigate_enabled"))
             if new_value != self._frigate_enabled:
                 self._frigate_enabled = new_value
+                frigate_runtime_action = "start" if new_value else "stop"
                 applied.append(f"frigate_enabled={new_value}")
+        if frigate_runtime_action == "start":
+            await self._async_start_frigate_mqtt()
+        elif frigate_runtime_action == "stop":
+            await self._async_stop_frigate_mqtt()
         if applied:
             self._sys_log(
                 "INFO",
                 "[AddonSettings] 已从 add-on 同步策略开关：" + ", ".join(applied),
             )
+            self.async_set_updated_data({})
         return True
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
