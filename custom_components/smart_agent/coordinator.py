@@ -35,6 +35,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import (
     async_track_state_change_event,
+    async_track_time_interval,
     async_track_utc_time_change,
 )
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -716,11 +717,78 @@ class SmartAgentCoordinator(
             return None
         return json.dumps(scopes, ensure_ascii=False)
 
+    async def _async_apply_addon_system_settings(self) -> bool:
+        """Pull canonical system settings from add-on and apply to coordinator state.
+
+        add-on 是真源；HA 仅作消费方。本函数在启动时和收到 settings 变更广播时调用。
+        失败时不抛出，保留现有内存态（来自 config_entry 的初始化值）。
+        """
+        addon_client = getattr(self, "_addon_client", None)
+        if addon_client is None:
+            return False
+        try:
+            payload = await addon_client.get_system_settings()
+        except Exception as exc:
+            _LOGGER.debug("[AddonSettings] get_system_settings 失败: %s", exc)
+            return False
+        if not isinstance(payload, dict):
+            return False
+        # 兼容旧字段名 habit_proactive_ask
+        habit_value = payload.get("habit_proactive")
+        if habit_value is None:
+            habit_value = payload.get("habit_proactive_ask")
+        applied: list[str] = []
+        if "learning_mode" in payload:
+            new_value = bool(payload.get("learning_mode"))
+            if new_value != self._learning_mode:
+                self._learning_mode = new_value
+                applied.append(f"learning_mode={new_value}")
+        if habit_value is not None:
+            new_value = bool(habit_value)
+            if new_value != self._habit_proactive:
+                self._habit_proactive = new_value
+                applied.append(f"habit_proactive={new_value}")
+        if "frigate_enabled" in payload:
+            new_value = bool(payload.get("frigate_enabled"))
+            if new_value != self._frigate_enabled:
+                self._frigate_enabled = new_value
+                applied.append(f"frigate_enabled={new_value}")
+        if applied:
+            self._sys_log(
+                "INFO",
+                "[AddonSettings] 已从 add-on 同步策略开关：" + ", ".join(applied),
+            )
+        return True
+
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     async def async_start_listeners(self) -> None:
         """Register state change listeners for device domains."""
         await self.hass.async_add_executor_job(self._init_file_logger)
+
+        # add-on first：启动时把 add-on settings 当作真源覆写到内存（learning/habit/frigate）
+        try:
+            await self._async_apply_addon_system_settings()
+        except Exception as exc:
+            _LOGGER.debug("[AddonSettings] 启动期同步失败（保留 config_entry 初值）: %s", exc)
+
+        # 周期同步：每 60 秒比对一次 add-on settings，发现变更即时刷内存
+        try:
+            async def _settings_periodic_sync(_now: Any) -> None:
+                try:
+                    await self._async_apply_addon_system_settings()
+                except Exception as exc:
+                    _LOGGER.debug("[AddonSettings] 周期同步失败: %s", exc)
+
+            self._listener_removers.append(
+                async_track_time_interval(
+                    self.hass,
+                    _settings_periodic_sync,
+                    timedelta(seconds=60),
+                )
+            )
+        except Exception as exc:
+            _LOGGER.debug("[AddonSettings] 周期同步注册失败: %s", exc)
 
         # Phase 10.0: 初始化虚拟在场推断引擎（device_info 此时已加载完成）
         try:

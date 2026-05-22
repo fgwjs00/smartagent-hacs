@@ -157,7 +157,27 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         opts[CONF_LEARNING_MODE] = value
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
+    async def _push_to_addon(self, field: str, value: bool) -> bool:
+        """把单个布尔字段反写到 add-on /settings/system；失败时返回 False。"""
+        addon_client = getattr(self.coordinator, "_addon_client", None)
+        if addon_client is None:
+            return False
+        try:
+            result = await addon_client.post_system_settings({field: value})
+        except Exception as exc:
+            self.coordinator._sys_log("WARNING", f"[AddonSettings] {field} 写入 add-on 失败: {exc}")
+            return False
+        if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
+            self.coordinator._sys_log(
+                "WARNING",
+                f"[AddonSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
+            )
+            return False
+        return True
+
     async def async_turn_on(self, **kwargs) -> None:
+        # add-on first：先反写 add-on，让真源更新；HA 内存随后翻转
+        await self._push_to_addon("learning_mode", True)
         self.coordinator._learning_mode = True
         self._attr_is_on = True
         self._persist(True)
@@ -165,6 +185,7 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        await self._push_to_addon("learning_mode", False)
         self.coordinator._learning_mode = False
         self._attr_is_on = False
         self._persist(False)
@@ -202,7 +223,25 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
         opts[CONF_HABIT_PROACTIVE] = value
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
+    async def _push_to_addon(self, field: str, value: bool) -> bool:
+        addon_client = getattr(self.coordinator, "_addon_client", None)
+        if addon_client is None:
+            return False
+        try:
+            result = await addon_client.post_system_settings({field: value})
+        except Exception as exc:
+            self.coordinator._sys_log("WARNING", f"[AddonSettings] {field} 写入 add-on 失败: {exc}")
+            return False
+        if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
+            self.coordinator._sys_log(
+                "WARNING",
+                f"[AddonSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
+            )
+            return False
+        return True
+
     async def async_turn_on(self, **kwargs) -> None:
+        await self._push_to_addon("habit_proactive", True)
         self.coordinator._habit_proactive = True
         self._attr_is_on = True
         self._persist(True)
@@ -210,6 +249,7 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        await self._push_to_addon("habit_proactive", False)
         self.coordinator._habit_proactive = False
         self._attr_is_on = False
         self._persist(False)
@@ -247,7 +287,25 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
         opts[CONF_FRIGATE_ENABLED] = value
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
+    async def _push_to_addon(self, field: str, value: bool) -> bool:
+        addon_client = getattr(self.coordinator, "_addon_client", None)
+        if addon_client is None:
+            return False
+        try:
+            result = await addon_client.post_system_settings({field: value})
+        except Exception as exc:
+            self.coordinator._sys_log("WARNING", f"[AddonSettings] {field} 写入 add-on 失败: {exc}")
+            return False
+        if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
+            self.coordinator._sys_log(
+                "WARNING",
+                f"[AddonSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
+            )
+            return False
+        return True
+
     async def async_turn_on(self, **kwargs) -> None:
+        await self._push_to_addon("frigate_enabled", True)
         self.coordinator._frigate_enabled = True
         self._attr_is_on = True
         self._persist(True)
@@ -258,6 +316,7 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        await self._push_to_addon("frigate_enabled", False)
         self.coordinator._frigate_enabled = False
         self._attr_is_on = False
         self._persist(False)
