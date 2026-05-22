@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.55
-display_version: Beta 0.0.55
+release_version: 0.0.56
+display_version: Beta 0.0.56
 channel: beta
 release_date: '2026-05-22'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.55 发布空间存在热修：新增融合域支持无现成房间时按名称创建本地逻辑空间并同步 Core Config，保存失败会留在弹窗内展示错误；同时保留中控屏静态包和固定灯光场景设备读取修复。
-  customer_visible_version: Beta 0.0.55
+  summary: Beta 0.0.56 测试版发布：同步 8234 系统开关到 HA 运行时，修复固定灯光场景内部设备读取的 503 噪声，并包含最新前端修复与发布产物。
+  customer_visible_version: Beta 0.0.56
