@@ -244,14 +244,12 @@ async def async_save_presence_sensor_type(
     from datetime import datetime as _dt_s
     now_s = _dt_s.now().isoformat()
 
-    def _db_update() -> bool:
-        return bool(coord._db.execute(
-            "UPDATE devices SET sensor_type=?, updated=? WHERE entity_id=?",
-            (s_type, now_s, eid),
-        ))
-
-    db_ok = await hass.async_add_executor_job(_db_update)
-    if not db_ok:
+    enqueue = getattr(coord, "_enqueue_internal_event", None)
+    if not callable(enqueue) or not enqueue(
+        "device",
+        {"action": "update_sensor_type", "entity_id": eid, "sensor_type": s_type, "updated": now_s},
+        ts=now_s,
+    ):
         return {"ok": False, "error": "保存 sensor_type 失败", "status": 500}
 
     coord.device_info[eid]["sensor_type"] = s_type

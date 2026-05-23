@@ -793,7 +793,11 @@ class ListenersMixin:
                         f"confidence={confidence if confidence is not None else '-'} "
                         f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
                         f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
-                        f"confirm_required={confirm_required} action_count={action_count} entity={entity_id}",
+                        f"confirm_required={confirm_required} "
+                        f"confirm_suppressed_reason={confirm_suppressed_reason or '-'} "
+                        f"learning_mode={bool(self._learning_mode)} "
+                        f"habit_proactive={bool(getattr(self, '_habit_proactive', False))} "
+                        f"action_count={action_count} entity={entity_id}",
                     )
                     self._emit_addon_fast_path_event(
                         {
@@ -1005,7 +1009,12 @@ class ListenersMixin:
             if not isinstance(device_info_snapshot, dict):
                 device_info_snapshot = {}
             if entity_id not in device_info_snapshot:
-                self._sys_log("INFO", f"[过滤] 未纳管实体不进入 fast-path: {entity_id}")
+                self._sys_log(
+                    "INFO",
+                    f"[ListenerFilter] managed=false filter_reason=unmanaged_entity "
+                    f"path=state_handler entity={entity_id} old_state={old_s} new_state={new_s} "
+                    f"source_type={source_type}",
+                )
                 self._emit_listener_event(
                     listener_action="filtered",
                     entity_id=entity_id,
@@ -1020,7 +1029,13 @@ class ListenersMixin:
             if self._learning_mode:
                 name = self.get_device_name(entity_id)
                 trigger = self._fmt_trigger(source_type, domain, name, entity_id, old_s, new_s)
-                self._sys_log("INFO", f"[SilentLearning] {entity_id} {old_s}->{new_s}; record only, skip add-on fast-path")
+                self._sys_log(
+                    "INFO",
+                    f"[SilentLearning] managed=true filter_reason=learning_mode "
+                    f"confirm_suppressed_reason=learning_mode execution_policy=record_only "
+                    f"path=state_handler entity={entity_id} old_state={old_s} new_state={new_s} "
+                    f"source_type={source_type}; record only, skip add-on fast-path",
+                )
                 self.hass.async_add_executor_job(
                     self._record_event,
                     "Learning",

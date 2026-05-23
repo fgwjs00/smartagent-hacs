@@ -670,11 +670,26 @@ class DatabaseMixin:
         Returns:
             True=写入成功；False=写入失败
         """
+        if self._p1_blocks_local_write(sql):
+            return False
         return bool(self._db.execute(sql, params))
 
     async def _async_db_exec(self, sql: str, params: tuple = ()) -> bool:
         """Async wrapper: run write SQL in executor and return success flag."""
+        if self._p1_blocks_local_write(sql):
+            return False
         return bool(await self.hass.async_add_executor_job(self._db.execute, sql, params))
+
+    def _p1_blocks_local_write(self, sql: str) -> bool:
+        """P1 hard gate: HA storage is read-only except scene entity registration."""
+        normalized = " ".join(str(sql or "").split())
+        upper = normalized.upper()
+        if not upper.startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE ")):
+            return False
+        if upper.startswith("UPDATE AI_SCENES SET HA_ENTITY_ID"):
+            return False
+        _LOGGER.warning("[P1] Legacy HA local write blocked: %s", normalized[:140])
+        return True
 
     def _query_events(self, sql: str, params: tuple = (), max_rows: int = 10000) -> list[dict]:
         """Run query and return list of dicts (sync, run via executor from async context).
@@ -886,30 +901,28 @@ class DatabaseMixin:
             if rows:
                 existing = rows[0]
                 new_count = existing["correction_count"] + 1
-                _ok = self._db.execute(
-                    "UPDATE corrections SET correction_count = ?, time = ?, "
-                    "hour = ?, weekday = ?, "
-                    "user_state = ?, scene_desc = ?, trigger_text = ? WHERE id = ?",
-                    (new_count, ts, hour, weekday,
-                     user_state, scene_desc, trigger_text, existing["id"]),
-                )
-                if not _ok:
-                    _LOGGER.warning("[Corrections] Update failed: entity=%s service=%s", entity_id, ai_service)
-                    return
                 count = new_count
             else:
-                _ok = self._db.execute(
-                    "INSERT INTO corrections "
-                    "(time, entity_id, ai_service, ai_state, user_state, room, hour, weekday, "
-                    "scene_desc, trigger_text, presence_context) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (ts, entity_id, ai_service, ai_state, user_state, room, hour, weekday,
-                     scene_desc, trigger_text, presence_ctx),
-                )
-                if not _ok:
-                    _LOGGER.warning("[Corrections] Insert failed: entity=%s service=%s", entity_id, ai_service)
-                    return
                 count = 1
+
+            payload = {
+                "action": "record",
+                "time": ts,
+                "entity_id": entity_id,
+                "ai_service": ai_service,
+                "ai_state": ai_state,
+                "user_state": user_state,
+                "room": room,
+                "hour": hour,
+                "weekday": weekday,
+                "scene_desc": scene_desc,
+                "trigger_text": trigger_text,
+                "presence_context": presence_ctx,
+            }
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue("correction", payload, ts=ts):
+                _LOGGER.warning("[Corrections] Internal event enqueue failed: entity=%s service=%s", entity_id, ai_service)
+                return
 
             name = self.get_device_name(entity_id) if hasattr(self, "get_device_name") else entity_id
             self._sys_log("INFO",
@@ -981,19 +994,21 @@ class DatabaseMixin:
         pres_label = {"occupied": "有人时", "empty": "无人时"}.get(presence_ctx, "")
         lesson = f"{pres_label}不要{svc_label}{name}（用户已纠正{count}次→{user_state}）"
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _ok = self._db.execute(
-            "INSERT INTO correction_lessons "
-            "(entity_id, room, presence_context, lesson_text, ai_service, "
-            "user_state, correction_count, confidence, created, updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 0.5, ?, ?) "
-            "ON CONFLICT(entity_id, presence_context, ai_service) DO UPDATE SET "
-            "lesson_text = excluded.lesson_text, correction_count = excluded.correction_count, "
-            "updated = excluded.updated",
-            (entity_id, room, presence_ctx, lesson, ai_service,
-             user_state, count, ts, ts),
-        )
-        if not _ok:
-            _LOGGER.warning("[Corrections] Lesson upsert failed: entity=%s service=%s", entity_id, ai_service)
+        payload = {
+            "action": "upsert_lesson",
+            "time": ts,
+            "entity_id": entity_id,
+            "room": room,
+            "presence_context": presence_ctx,
+            "lesson_text": lesson,
+            "ai_service": ai_service,
+            "user_state": user_state,
+            "correction_count": int(count),
+            "confidence": 0.5,
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("correction", payload, ts=ts):
+            _LOGGER.warning("[Corrections] Lesson enqueue failed: entity=%s service=%s", entity_id, ai_service)
 
     def _apply_positive_correction_signal(self, entity_id: str) -> None:
         """
@@ -1604,15 +1619,35 @@ class DatabaseMixin:
                               expected: str, actual: str, success: int,
                               retry_count: int, latency_ms: int, reason: str,
                               transaction_id: int = 0, action_seq: int = 0) -> None:
-        """同步写入 action_results 表（通过 executor 调用）。"""
+        """Record action verification through add-on owned transaction storage."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _ok = self._db.execute(
-            "INSERT INTO action_results (time,entity_id,domain,service,expected_state,actual_state,verified,success,retry_count,latency_ms,reason,transaction_id,action_seq) "
-            "VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?)",
-            (ts, entity_id, domain, service, expected, actual, success, retry_count, latency_ms, reason, transaction_id, action_seq),
-        )
-        if not _ok:
-            _LOGGER.warning("[ActionResult] Write failed: entity=%s service=%s", entity_id, service)
+        payload = {
+            "action": "action_result",
+            "transaction_id": str(transaction_id or f"action-{int(time.time() * 1000)}-{action_seq}"),
+            "updated_at": ts,
+            "result": {
+                "action_results": [
+                    {
+                        "time": ts,
+                        "entity_id": entity_id,
+                        "domain": domain,
+                        "service": service,
+                        "expected_state": expected,
+                        "actual_state": actual,
+                        "verified": 1,
+                        "success": int(success),
+                        "retry_count": int(retry_count),
+                        "latency_ms": int(latency_ms),
+                        "reason": reason,
+                        "transaction_id": transaction_id,
+                        "action_seq": action_seq,
+                    }
+                ]
+            },
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("transaction_end", payload, ts=ts):
+            _LOGGER.warning("[ActionResult] Internal event enqueue failed: entity=%s service=%s", entity_id, service)
 
     def _get_action_quality_stats(self) -> dict:
         """查询动作执行质量统计（同步，通过 executor 调用）。"""
@@ -1666,58 +1701,36 @@ class DatabaseMixin:
                          trigger_context: str, hour_start: int, hour_end: int,
                          weekday_mask: str, confidence: int, hit_count: int,
                          actions_json: str = "[]") -> None:
-        """插入或更新候选场景（同步，通过 executor 调用）。
-        已存在且状态为 rejected/active 的场景不覆盖，只更新 pending 状态的。
-        """
+        """插入或更新候选场景。P1 后由 add-on 持久化，HA 只发内部事件。"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            rows = self._db.query(
-                "SELECT id, status FROM ai_scenes WHERE name=?", (name,),
-            )
-            if rows:
-                existing = rows[0]
-                if existing["status"] in ("active", "rejected"):
-                    _ok = self._db.execute(
-                        "UPDATE ai_scenes SET hit_count=?, updated=? WHERE name=?",
-                        (hit_count, now, name),
-                    )
-                    if not _ok:
-                        _LOGGER.warning("[AiScenes] Upsert write failed(update-hit): name=%s", name)
-                        return
-                else:
-                    _ok = self._db.execute(
-                        "UPDATE ai_scenes SET description=?, entities_json=?, actions_json=?, "
-                        "trigger_context=?, hour_start=?, hour_end=?, weekday_mask=?, "
-                        "confidence=?, hit_count=?, updated=? WHERE name=?",
-                        (description, entities_json, actions_json, trigger_context, hour_start, hour_end,
-                         weekday_mask, confidence, hit_count, now, name),
-                    )
-                    if not _ok:
-                        _LOGGER.warning("[AiScenes] Upsert write failed(update): name=%s", name)
-                        return
-            else:
-                _ok = self._db.execute(
-                    "INSERT INTO ai_scenes (name,description,entities_json,actions_json,trigger_context,"
-                    "hour_start,hour_end,weekday_mask,confidence,hit_count,status,source,created,updated) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,'pending','auto',?,?)",
-                    (name, description, entities_json, actions_json, trigger_context,
-                     hour_start, hour_end, weekday_mask, confidence, hit_count, now, now),
-                )
-                if not _ok:
-                    _LOGGER.warning("[AiScenes] Upsert write failed(insert): name=%s", name)
-                    return
-        except Exception as e:
-            _LOGGER.warning("[AiScenes] Upsert failed: %s", e)
+        payload = {
+            "action": "upsert",
+            "name": name,
+            "description": description,
+            "entities_json": entities_json,
+            "actions_json": actions_json,
+            "trigger_context": trigger_context,
+            "hour_start": int(hour_start),
+            "hour_end": int(hour_end),
+            "weekday_mask": weekday_mask,
+            "confidence": int(confidence),
+            "hit_count": int(hit_count),
+            "status": "pending",
+            "source": "auto",
+            "created": now,
+            "updated": now,
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("ai_scene", payload, ts=now):
+            _LOGGER.warning("[AiScenes] Upsert enqueue failed: name=%s", name)
 
     def _update_ai_scene_status(self, scene_id: int, status: str) -> bool:
         """更新场景状态（同步）。"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _ok = self._db.execute(
-            "UPDATE ai_scenes SET status=?, updated=? WHERE id=?",
-            (status, now, scene_id),
-        )
-        if not _ok:
-            _LOGGER.warning("[AiScenes] Status update failed: id=%s", scene_id)
+        payload = {"action": "update_status", "id": int(scene_id), "status": status, "updated": now}
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("ai_scene", payload, ts=now):
+            _LOGGER.warning("[AiScenes] Status enqueue failed: id=%s", scene_id)
             return False
         return True
     def _update_ai_scene_ha_entity(self, scene_id: int, ha_entity_id: str) -> bool:
@@ -1750,12 +1763,15 @@ class DatabaseMixin:
                 description = f"{current}｜{marker}"
             else:
                 description = marker
-            _ok = self._db.execute(
-                "UPDATE ai_scenes SET description=?, updated=? WHERE id=?",
-                (description, now, scene_id),
-            )
-            if not _ok:
-                _LOGGER.warning("[AiScenes] ephemeral marker update failed: id=%s", scene_id)
+            payload = {
+                "action": "mark_ephemeral",
+                "id": int(scene_id),
+                "description": description,
+                "updated": now,
+            }
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue("ai_scene", payload, ts=now):
+                _LOGGER.warning("[AiScenes] ephemeral marker enqueue failed: id=%s", scene_id)
                 return False
             return True
         except Exception as exc:
@@ -1764,9 +1780,10 @@ class DatabaseMixin:
 
     def _delete_ai_scene_db(self, scene_id: int) -> bool:
         """从数据库删除场景（同步）。"""
-        _ok = self._db.execute("DELETE FROM ai_scenes WHERE id=?", (scene_id,))
-        if not _ok:
-            _LOGGER.warning("[AiScenes] Delete failed: id=%s", scene_id)
+        payload = {"action": "delete", "id": int(scene_id)}
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("ai_scene", payload):
+            _LOGGER.warning("[AiScenes] Delete enqueue failed: id=%s", scene_id)
             return False
         return True
     # ── Layer 2: 事务管理 CRUD ────────────────────────────────────────────────
@@ -1780,22 +1797,25 @@ class DatabaseMixin:
         pre_states_json: str,
         actions_json: str,
     ) -> int:
-        """写入一条 pending 事务记录，返回自增 id（同步，通过 executor 调用）。"""
-        import json as _json
+        """Create a pending transaction in add-on storage and return a local correlation id."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _ok = self._db.execute(
-            "INSERT INTO action_transactions "
-            "(time,trigger_summary,scene_desc,confidence,action_count,"
-            "pre_states_json,actions_json,status) "
-            "VALUES (?,?,?,?,?,?,?,'pending')",
-            (now, trigger_summary[:200], scene_desc[:200], confidence,
-             action_count, pre_states_json, actions_json),
-        )
-        if not _ok:
-            _LOGGER.warning("[Transaction] Begin failed: trigger=%s", trigger_summary[:60])
+        txn_id = int(time.time() * 1000)
+        payload = {
+            "transaction_id": str(txn_id),
+            "created_at": now,
+            "status": "pending",
+            "trigger_summary": trigger_summary[:200],
+            "scene_desc": scene_desc[:200],
+            "confidence": int(confidence),
+            "action_count": int(action_count),
+            "rollback_json": pre_states_json,
+            "envelope_json": {"actions": actions_json},
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("transaction_start", payload, ts=now):
+            _LOGGER.warning("[Transaction] Begin enqueue failed: trigger=%s", trigger_summary[:60])
             return 0
-        row_id = self._db.query_scalar("SELECT last_insert_rowid()")
-        return row_id or 0
+        return txn_id
 
     def _complete_transaction_db(
         self,
@@ -1818,14 +1838,23 @@ class DatabaseMixin:
             status = "blocked"
         else:
             status = "failed"
-        _ok = self._db.execute(
-            "UPDATE action_transactions SET "
-            "dispatched_count=?,blocked_count=?,failed_count=?,"
-            "status=?,results_json=? WHERE id=?",
-            (dispatched, blocked, failed, status, results_json, txn_id),
-        )
-        if not _ok:
-            _LOGGER.warning("[Transaction] Complete failed: txn_id=%s", txn_id)
+        payload = {
+            "transaction_id": str(txn_id),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+            "final_outcome": status,
+            "blocked_count": int(blocked),
+            "failed_count": int(failed),
+            "result": {
+                "dispatched_count": int(dispatched),
+                "blocked_count": int(blocked),
+                "failed_count": int(failed),
+                "results": results_json,
+            },
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("transaction_end", payload, ts=payload["updated_at"]):
+            _LOGGER.warning("[Transaction] Complete enqueue failed: txn_id=%s", txn_id)
 
     def _rollback_transaction_db(self, txn_id: int) -> dict | None:
         """查询事务的预快照数据，用于回滚（同步）。返回 pre_states dict 或 None。"""
@@ -2104,24 +2133,23 @@ class DatabaseMixin:
         return 0
 
     def _cleanup_old_memory(self) -> None:
-        """Delete stale events/action_results and expired in-memory caches."""
+        """Delete expired in-memory caches; persistent cleanup is owned by add-on after P1."""
         from .const import MEMORY_RETENTION_DAYS
         cutoff = (datetime.now() - timedelta(days=MEMORY_RETENTION_DAYS)).strftime("%Y-%m-%d")
         try:
             txn_cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             td_cutoff_verified = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
             td_cutoff_unverified = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            _ok = self._db.execute_script([
-                ("DELETE FROM events WHERE time < ?", (cutoff,)),
-                ("DELETE FROM action_results WHERE time < ?", (cutoff,)),
-                ("DELETE FROM action_transactions WHERE time < ?", (txn_cutoff,)),
-                ("DELETE FROM training_data WHERE is_verified=1 AND time < ?", (td_cutoff_verified,)),
-                ("DELETE FROM training_data WHERE is_verified=0 AND time < ?", (td_cutoff_unverified,)),
-                ("DELETE FROM training_data WHERE id NOT IN "
-                 "(SELECT id FROM training_data ORDER BY id DESC LIMIT 5000)", ()),
-            ])
-            if not _ok:
-                _LOGGER.warning("[Memory] Cleanup write failed: cutoff=%s", cutoff)
+            payload = {
+                "action": "cleanup_old",
+                "events_cutoff": cutoff,
+                "transactions_cutoff": txn_cutoff,
+                "training_verified_cutoff": td_cutoff_verified,
+                "training_unverified_cutoff": td_cutoff_unverified,
+            }
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue("memory_maintenance", payload):
+                _LOGGER.debug("[Memory] Cleanup enqueue skipped: cutoff=%s", cutoff)
         except Exception as e:
             _LOGGER.warning("[Memory] Cleanup failed: %s", e)
         now_ts = time.time()
@@ -2428,12 +2456,12 @@ class DatabaseMixin:
                     )
                     for row in all_corr
                 ]
-                _ok = self._db.execute_many(
-                    "UPDATE corrections SET decay_score = ? WHERE id = ?",
-                    decay_updates,
-                )
-                if not _ok:
-                    _LOGGER.warning("[MemoryDecay] decay_score 批量更新失败: count=%s", len(decay_updates))
+                enqueue = getattr(self, "_enqueue_internal_event", None)
+                if not callable(enqueue) or not enqueue(
+                    "memory_maintenance",
+                    {"action": "update_correction_decay_scores", "updates": decay_updates},
+                ):
+                    _LOGGER.warning("[MemoryDecay] decay_score enqueue failed: count=%s", len(decay_updates))
                     return report
                 report["corrections_updated"] = len(decay_updates)
 
@@ -2584,9 +2612,12 @@ class DatabaseMixin:
                     (r["entity_id"], r["ai_service"], r["hour"], r["correction_count"], summary, now_str),
                 ))
                 inserted += 1
-            _ok = self._db.execute_script(stmts)
-            if not _ok:
-                _LOGGER.warning("[Reflexion] 周聚合写入失败: statements=%s", len(stmts))
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if not callable(enqueue) or not enqueue(
+                "memory_maintenance",
+                {"action": "aggregate_reflexion_patterns", "statements": stmts},
+            ):
+                _LOGGER.warning("[Reflexion] 周聚合 enqueue 失败: statements=%s", len(stmts))
                 return
             _LOGGER.info("[Reflexion] 周聚合完成，写入 %d 条 anti-pattern", inserted)
 

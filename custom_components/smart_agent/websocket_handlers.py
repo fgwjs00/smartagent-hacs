@@ -540,20 +540,21 @@ def build_smart_agent_websocket_commands(
 
         from datetime import datetime as _dt_now
 
-        def _db_upsert() -> bool:
-            now_str = _dt_now.now().isoformat()
-            return bool(coord._db.execute(
-                """INSERT INTO frigate_zones (camera_id, zone_id, friendly_name, room, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(camera_id, zone_id) DO UPDATE SET
-                     friendly_name=excluded.friendly_name,
-                     room=excluded.room,
-                     updated_at=excluded.updated_at""",
-                (camera_id, zone_id, friendly_name, room, now_str, now_str),
-            ))
-
-        db_ok = await hass.async_add_executor_job(_db_upsert)
-        if not db_ok:
+        now_str = _dt_now.now().isoformat()
+        enqueue = getattr(coord, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue(
+            "frigate_zone",
+            {
+                "action": "upsert",
+                "camera_id": camera_id,
+                "zone_id": zone_id,
+                "friendly_name": friendly_name,
+                "room": room,
+                "created_at": now_str,
+                "updated_at": now_str,
+            },
+            ts=now_str,
+        ):
             connection.send_error(msg["id"], "db_write_failed", "保存 Frigate zone 失败")
             return
         connection.send_result(msg["id"], {"ok": True})
