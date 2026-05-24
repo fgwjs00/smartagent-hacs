@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.59
-display_version: Beta 0.0.59
+release_version: 0.0.60
+display_version: Beta 0.0.60
 channel: beta
 release_date: '2026-05-24'
 public_release_ready: true
@@ -8,6 +8,7 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.59 测试版发布：修复 8234 Gateway/UI 根路径 /favicon.ico 返回 404 的问题，将浏览器默认
-    favicon.ico 探测映射到管理端现有 favicon.svg，避免控制台静态资源报错。
-  customer_visible_version: Beta 0.0.59
+  summary: Beta 0.0.60 测试版发布：在 8234 管理端加入全局“AI 托管中 / 服务已暂停”开关，service_paused 由 /settings/system
+    持久化；暂停时 /infer 在调用大模型前返回 423 service_paused，并阻断主动分析和执行类 mutating 路由，同时保留 /favicon.ico
+    静态资源兼容修复。
+  customer_visible_version: Beta 0.0.60
