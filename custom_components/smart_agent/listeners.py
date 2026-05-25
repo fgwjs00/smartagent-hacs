@@ -27,6 +27,7 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_CMD_SOURCE_SENSOR = "SENSOR"
 
 
 class ListenersMixin:
@@ -382,7 +383,7 @@ class ListenersMixin:
             merged = self._compact_merged_trigger(texts)
         self._sys_log("INFO", f"[合并] 合并 {len(triggers)} 个触发，启动推理: {merged[:80]}")
         try:
-            self.hass.async_create_task(self._run_inference(merged, one_off_prompt=final_one_off))
+            self.hass.async_create_task(self._run_addon_decision(merged, one_off_prompt=final_one_off))
         except Exception as exc:
             self._sys_log("ERROR", f"[合并] 创建推理任务失败: {exc}")
 
@@ -596,8 +597,6 @@ class ListenersMixin:
         entity_id: str,
         source_label: str,
     ) -> None:
-        from .intent_verifier import CMD_SOURCE_SENSOR
-
         actions = result.get("actions", [])
         scene = result.get("scene", source_label)
         confidence = result.get("confidence", 90)
@@ -609,13 +608,6 @@ class ListenersMixin:
 
         if defer_seconds > 0:
             await asyncio.sleep(defer_seconds)
-            recheck = getattr(getattr(self, "_decision_pipeline", None), "_try_departure_cache", None)
-            if callable(recheck) and recheck(entity_id, "off") is None:
-                self._sys_log(
-                    "INFO",
-                    f"[{source_label}] delayed execution cancelled after {defer_seconds}s | room={room}",
-                )
-                return
 
         await self._execute_actions(
             actions if isinstance(actions, list) else [],
@@ -624,7 +616,7 @@ class ListenersMixin:
             confidence=confidence,
             trigger_room=room,
             is_global_cmd=False,
-            cmd_source=CMD_SOURCE_SENSOR,
+            cmd_source=_CMD_SOURCE_SENSOR,
         )
 
     def _addon_fast_path_snapshot_diagnostics(self, snapshot: dict[str, Any], entity_id: str) -> dict[str, Any]:
@@ -978,10 +970,10 @@ class ListenersMixin:
                 except (ValueError, TypeError):
                     pass
 
-            # P0修复：AI 主开关检查必须先于场景快路和 FastBrain，
+            # P0修复：AI 主开关检查必须先于 add-on 快路，
             # 否则关闭 AI 仍会执行设备控制动作。
             if not self._is_enabled():
-                self._sys_log("INFO", f"[过滤] AI 已暂停，跳过场景快路/FastBrain: {entity_id}")
+                self._sys_log("INFO", f"[过滤] AI 已暂停，跳过 add-on 快路: {entity_id}")
                 self._emit_listener_event(
                     listener_action="filtered",
                     entity_id=entity_id,
@@ -1025,7 +1017,7 @@ class ListenersMixin:
                 )
                 return
 
-            # ── Step 0 + FastBrain: add-on 优先路径（B1 迁移：有 add-on 时直接调用，不先跑本地）──
+            # ── Step 0：add-on 优先快路（有 add-on 时直接调用，不先跑本地）──
             if self._learning_mode:
                 name = self.get_device_name(entity_id)
                 trigger = self._fmt_trigger(source_type, domain, name, entity_id, old_s, new_s)
@@ -1054,8 +1046,6 @@ class ListenersMixin:
                 )
                 return
 
-            from .intent_verifier import CMD_SOURCE_SENSOR
-            _pipeline = self._decision_pipeline
             self._emit_listener_event(
                 listener_action="fast_path_scheduled",
                 entity_id=entity_id,
@@ -1071,611 +1061,6 @@ class ListenersMixin:
                 )
             )
             return
-            # Legacy local execution below is intentionally unreachable after Phase B fail-closed.
-
-            # ── Step 0: HA AI 场景优先路径（预设场景优先于 FastBrain 和 LLM）────────
-            _scene_res = _pipeline.run_ha_scene_path(entity_id, new_s)
-            if _scene_res:
-                _s_actions = _scene_res.get("actions", [])
-                _s_scene   = _scene_res.get("scene", "AI场景")
-                _s_conf    = _scene_res.get("confidence", 85)
-                _s_room    = _scene_res.get("trigger_room", "")
-                self._sys_log("INFO", f"[Scene Path] 命中 AI 场景: {_s_scene}，直接执行（跳过 FastBrain/LLM）")
-                self.hass.async_create_task(
-                    self._execute_actions(
-                        _s_actions,
-                        trigger_summary=f"ScenePath[{_s_scene}]",
-                        scene_desc=_s_scene,
-                        confidence=_s_conf,
-                        trigger_room=_s_room,
-                        is_global_cmd=False,
-                        cmd_source=CMD_SOURCE_SENSOR,
-                    )
-                )
-                return
-            # ── Step 0 结束 ─────────────────────────────────────────────────
-
-            # ── 极速快脑 (FastBrain) 同步拦截 (Phase 9.6: DecisionPipeline 统一管道) ──
-            # DecisionPipeline 内部完整执行：特征编码 → FastBrain 决策 → 双阶段意图验证
-            # 展厅模式和静默学习模式在 DecisionPipeline.run_fast_path() 内部自动跳过
-            _fb_res = _pipeline.run_fast_path(entity_id, new_s, old_s)
-            if _fb_res:
-                _actions = _fb_res.get("actions", [])
-                _scene = _fb_res.get("scene", "FastBrain")
-                _conf = _fb_res.get("confidence", 90)
-                _room = _fb_res.get("trigger_room") or self.device_info.get(entity_id, {}).get("room", "")
-                _defer_sec = _fb_res.get("defer_seconds", 0)
-
-                if _defer_sec > 0:
-                    # DepartureCache 离开确认延迟：等待 defer_seconds 后重验证，
-                    # 若用户在等待期间返回（任意传感器变 on），自动取消。
-                    _depart_eid = entity_id
-                    _depart_pipeline = _pipeline
-
-                    async def _deferred_departure(
-                        _eid=_depart_eid,
-                        _acts=_actions,
-                        _sc=_scene,
-                        _cf=_conf,
-                        _rm=_room,
-                        _ds=_defer_sec,
-                        _pl=_depart_pipeline,
-                    ) -> None:
-                        await asyncio.sleep(_ds)
-                        # 重验证：若用户已返回 _try_departure_cache 会因传感器变 on 返回 None
-                        _recheck = _pl._try_departure_cache(_eid, "off")
-                        if _recheck is None:
-                            self._sys_log(
-                                "INFO",
-                                f"[DepartureCache] ⚡ 延迟 {_ds}s 后重验证未通过"
-                                f"（用户已返回或状态变更），取消 room={_rm} 的离开动作",
-                            )
-                            return
-                        self._sys_log(
-                            "INFO",
-                            f"[DepartureCache] ✅ 延迟 {_ds}s 确认无人，执行 {len(_acts)} 个动作"
-                            f" room={_rm}",
-                        )
-                        await self._execute_actions(
-                            _acts,
-                            trigger_summary=f"DepartureCache[delayed_{_ds}s]",
-                            scene_desc=_sc,
-                            confidence=_cf,
-                            trigger_room=_rm,
-                            is_global_cmd=False,
-                            cmd_source=CMD_SOURCE_SENSOR,
-                        )
-
-                    self.hass.async_create_task(_deferred_departure())
-                else:
-                    self._sys_log("INFO", f"[极速快脑+验证] 命中规则: {_scene}，立即执行 {len(_actions)} 个动作")
-                    self.hass.async_create_task(
-                        self._execute_actions(
-                            _actions,
-                            trigger_summary=f"FastBrain[{_scene}]",
-                            scene_desc=_scene,
-                            confidence=_conf,
-                            trigger_room=_room,
-                            is_global_cmd=False,
-                            cmd_source=CMD_SOURCE_SENSOR,
-                        )
-                    )
-                # 极速快脑 + 意图验证通过后，放弃抛给慢脑
-                return
-            # ── 极速快脑 (FastBrain) 拦截结束 ──────────────────────────
-
-            # ── 存在传感器高频去抖 ──────────────────────────────────────────
-            if domain == "binary_sensor":
-                check_str = (self.device_info.get(entity_id, {}).get("name", "") + entity_id).lower()
-                if any(kw in check_str for kw in self._PRESENCE_KW):
-                    if self._learning_mode:
-                        name = self.get_device_name(entity_id)
-                        trigger = self._fmt_trigger("物理", "binary_sensor", name, entity_id, old_s, new_s)
-                        self._sys_log("INFO", f"[静默学习] {entity_id} {old_s}→{new_s}，仅记录")
-                        self.hass.async_add_executor_job(
-                            self._record_event, "Learning", trigger, entity_id, new_s
-                        )
-                        return
-                    if new_s == "on":
-                        _suppressed, _remain = self._is_presence_flap_suppressed(entity_id)
-                        if _suppressed:
-                            self._sys_log(
-                                "INFO",
-                                f"[存在去抖] {entity_id} 处于抖动抑制期，跳过有人触发（剩余{_remain}s）",
-                            )
-                            return
-                        self._record_presence_flap(entity_id)
-                        _suppressed_after, _remain_after = self._is_presence_flap_suppressed(entity_id)
-                        if _suppressed_after:
-                            self._sys_log(
-                                "INFO",
-                                f"[存在去抖] {entity_id} 抖动风暴触发抑制，跳过有人触发（剩余{_remain_after}s）",
-                            )
-                            return
-                        cancel = self._presence_off_timers.pop(entity_id, None)
-                        if cancel:
-                            try:
-                                cancel()
-                                self._sys_log("INFO", f"[存在去抖] {entity_id} 重新检测到人，取消离开确认")
-                            except Exception as exc:
-                                _LOGGER.debug("[Listeners] 取消离开确认计时器失败: %s", exc)
-                        self._presence_on_start[entity_id] = time.time()
-                        last_on = self._presence_last_on.get(entity_id, 0)
-                        since = time.time() - last_on
-                        if since < self._PRESENCE_ON_COOLDOWN:
-                            self._sys_log("INFO", f"[存在去抖] {entity_id} 持续有人抑制（距上次 {int(since)}s < {self._PRESENCE_ON_COOLDOWN}s）")
-                            return
-                        _eid_on = entity_id
-                        _old_s_on = old_s
-                        @callback
-                        def _confirm_present(_now, eid=_eid_on, o=_old_s_on) -> None:
-                            cur = self.hass.states.get(eid)
-                            if not cur or cur.state != "on":
-                                self._sys_log("INFO", f"[存在去抖] {eid} on 持续不足 {self._PRESENCE_ON_MIN_HOLD}s 即离开（闪烁），跳过触发")
-                                self._presence_on_start.pop(eid, None)
-                                return
-                            _suppressed_now, _remain_now = self._is_presence_flap_suppressed(eid)
-                            if _suppressed_now:
-                                self._sys_log(
-                                    "INFO",
-                                    f"[存在去抖] {eid} 确认在场时仍处于抖动抑制期，取消有人触发（剩余{_remain_now}s）",
-                                )
-                                self._presence_on_start.pop(eid, None)
-                                return
-                            _presence_snap = self._build_presence_snapshot_for_entity(
-                                eid,
-                                reasons=["presence_on_confirm"],
-                            )
-                            if _presence_snap.get("state") == "unknown":
-                                self._sys_log(
-                                    "INFO",
-                                    f"[PresenceSnapshot] {eid} 状态未知，跳过有人触发，避免误开灯"
-                                    f" | snapshot={_presence_snap}",
-                                )
-                                self._presence_on_start.pop(eid, None)
-                                return
-                            if not _presence_snap.get("enter_qualified", False):
-                                self._sys_log(
-                                    "INFO",
-                                    f"[PresenceSnapshot] {eid} enter 未通过，跳过有人触发"
-                                    f" | snapshot={_presence_snap}",
-                                )
-                                self._presence_on_start.pop(eid, None)
-                                return
-                            self._presence_last_on[eid] = time.time()
-                            self._presence_on_start.pop(eid, None)
-                            name = self.get_device_name(eid)
-                            trig = self._fmt_trigger("物理", "binary_sensor", name, eid, o, "on")
-                            self._sys_log("INFO", f"[存在去抖] {eid} 持续有人 {self._PRESENCE_ON_MIN_HOLD}s，确认在场，触发推理")
-                            try:
-                                self._schedule_inference(eid, trig, new_state="on")
-                            except Exception as exc:
-                                self._sys_log("ERROR", f"[存在去抖] 调度推理失败: {exc}")
-
-                            # Phase 7G 备用路径：存在传感器确认有人时主动拉取摄像头帧做行为分析。
-                            # _confirm_present 是 @callback，不能直接 await；用 async_create_task 调度。
-                            if (getattr(self, "_vision_enabled", False)
-                                    and getattr(self, "_frigate_enabled", False)
-                                    and hasattr(self, "_async_analyze_on_presence")):
-                                self.hass.async_create_task(
-                                    self._async_analyze_on_presence(eid)
-                                )
-
-                            # Phase 0: 5 分钟后快照灯光状态，写入 arrival_baseline
-                            _arrival_room = self.device_info.get(eid, {}).get("room", "")
-                            if _arrival_room and hasattr(self, "_record_arrival_snapshot"):
-                                _snap_eid = eid
-
-                                @callback
-                                def _do_arrival_snapshot(_now2, _r=_arrival_room, _s=_snap_eid) -> None:
-                                    _STARTUP_SNAPSHOT_GUARD = 120
-                                    if time.time() - getattr(self, "_startup_time", 0) < _STARTUP_SNAPSHOT_GUARD:
-                                        self._sys_log("INFO", "[ArrivalBaseline] 启动恢复窗口内，跳过到达快照")
-                                        return
-                                    # 确认传感器仍在 on（人还在）才采样，避免误记「离开后状态」
-                                    _cur2 = self.hass.states.get(_s)
-                                    if _cur2 and _cur2.state == "on":
-                                        # 在事件循环中预先捕获灯光状态，再派发到 executor，
-                                        # 避免 executor 线程直接访问 HA 状态机（线程安全）
-                                        _light_states: dict[str, str | None] = {}
-                                        for _lid, _linfo in self.device_info.items():
-                                            if not _lid.startswith("light."):
-                                                continue
-                                            if _linfo.get("room") != _r:
-                                                continue
-                                            _ls = self.hass.states.get(_lid)
-                                            _light_states[_lid] = _ls.state if _ls else None
-                                        self.hass.async_add_executor_job(
-                                            self._record_arrival_snapshot,
-                                            _r, _s, _light_states,
-                                        )
-                                        self._sys_log(
-                                            "INFO",
-                                            f"[ArrivalBaseline] 到达快照: room={_r} sensor={_s}"
-                                            f" lights={len(_light_states)}",
-                                        )
-
-                                async_call_later(self.hass, 300, _do_arrival_snapshot)
-
-                        async_call_later(self.hass, self._PRESENCE_ON_MIN_HOLD, _confirm_present)
-                        self._sys_log("INFO", f"[存在去抖] {entity_id} 检测到人，{self._PRESENCE_ON_MIN_HOLD}s 后确认仍在场则触发")
-                        return
-
-                    elif new_s == "off":
-                        _suppressed, _remain = self._is_presence_flap_suppressed(entity_id)
-                        if _suppressed:
-                            self._sys_log(
-                                "INFO",
-                                f"[存在去抖] {entity_id} 处于抖动抑制期，跳过离开确认（剩余{_remain}s）",
-                            )
-                            return
-                        self._record_presence_flap(entity_id)
-                        _suppressed_after, _remain_after = self._is_presence_flap_suppressed(entity_id)
-                        if _suppressed_after:
-                            self._sys_log(
-                                "INFO",
-                                f"[存在去抖] {entity_id} 抖动风暴触发抑制，跳过离开确认（剩余{_remain_after}s）",
-                            )
-                            return
-                        if old_s in ("unavailable", "unknown", None, ""):
-                            self._sys_log("INFO", f"[存在去抖] {entity_id} 从 {old_s} 恢复为 off（重启噪声），跳过离开确认")
-                            return
-                        on_start = self._presence_on_start.pop(entity_id, 0)
-                        if on_start and (time.time() - on_start) < self._PRESENCE_ON_MIN_HOLD:
-                            self._sys_log("INFO", f"[存在去抖] {entity_id} on→off 仅 {time.time() - on_start:.1f}s（<{self._PRESENCE_ON_MIN_HOLD}s 闪烁），跳过离开确认")
-                            return
-                        old_cancel = self._presence_off_timers.pop(entity_id, None)
-                        if old_cancel:
-                            try:
-                                old_cancel()
-                            except Exception as exc:
-                                _LOGGER.debug("[Listeners] 取消离开确认计时器失败 (off): %s", exc)
-                        _eid = entity_id
-                        _old_s = old_s
-                        @callback
-                        def _confirm_left(_now, eid=_eid, o=_old_s) -> None:
-                            self._presence_off_timers.pop(eid, None)
-                            cur = self.hass.states.get(eid)
-                            if not cur or cur.state != "off":
-                                self._sys_log("INFO", f"[存在去抖] {eid} 已重新检测到人，取消离开触发")
-                                return
-                            self._presence_last_on.pop(eid, None)
-                            dev_name = self.get_device_name(eid)
-                            trig = self._fmt_trigger("物理", "binary_sensor", dev_name, eid, o, "off")
-                            
-                            # Phase 10.1: PIR 传感器特殊处理
-                            # PIR 无法检测静止存在，其 off 信号不可信（人可能还在但没动）。
-                            # 策略：PIR off 不主动触发 AI 推理（关灯），仅更新 PresenceInference 置信度。
-                            info = self.device_info.get(eid, {})
-                            if info.get("sensor_type") == "pir":
-                                self._sys_log("INFO", f"[存在去抖] {eid} (PIR) 持续无人，仅记录状态，不触发关灯推理")
-                                return
-
-                            _presence_snap = self._build_presence_snapshot_for_entity(
-                                eid,
-                                reasons=["presence_off_confirm"],
-                            )
-                            if not _presence_snap.get("leave_qualified", False):
-                                self._sys_log(
-                                    "INFO",
-                                    f"[PresenceSnapshot] {eid} leave 未通过，抑制离开推理"
-                                    f" | snapshot={_presence_snap}",
-                                )
-                                return
-
-                            self._sys_log("INFO", f"[存在去抖] {eid} 持续无人 {self._PRESENCE_OFF_DELAY}s，确认离开，触发推理")
-                            # 5A-2: presence-off 事件驱动解锁 —— 清除该房间所有用户保护锁
-                            _dev_room = (self.device_info.get(eid) or {}).get("room", "")
-                            if _dev_room and hasattr(self, "_user_overrides"):
-                                _now_ts = time.time()
-                                with self._user_overrides_lock:
-                                    _cleared = [
-                                        _k for _k, _v in list(self._user_overrides.items())
-                                        if (self.device_info.get(_k) or {}).get("room") == _dev_room
-                                        and _now_ts - _v.get("time", 0) > 60
-                                    ]
-                                    for _k in _cleared:
-                                        self._user_overrides.pop(_k, None)
-                                if _cleared:
-                                    self._sys_log("INFO",
-                                        f"[5A-2 柔性保护] 房间「{_dev_room}」已无人，"
-                                        f"清除 {len(_cleared)} 个超过 60s 的用户保护锁: {_cleared}")
-                            _dev_room_l = _dev_room.lower() if _dev_room else ""
-                            _is_bedroom = any(k in _dev_room_l for k in ("卧室", "bedroom", "master", "guest"))
-                            if _is_bedroom:
-                                _leave_map = getattr(self, "_bedroom_last_leave_ts", None)
-                                if not isinstance(_leave_map, dict):
-                                    _leave_map = {}
-                                    self._bedroom_last_leave_ts = _leave_map
-                                _leave_map[_dev_room] = time.time()
-                                self._sys_log("INFO", f"[SleepGuard] 记录卧室离开时间戳: room={_dev_room}")
-                            try:
-                                self._schedule_inference(eid, trig, new_state="off")
-                            except Exception as exc:
-                                self._sys_log("ERROR", f"[存在去抖] 调度推理失败: {exc}")
-                        # Frigate 摄像头生成的 binary_sensor（如 *_person_occupancy / cam_* occupancy）
-                        # 因视角死角或遮挡会短暂误报无人，使用更长的离开确认时间：
-                        #   - 普通 mmWave/PIR 传感器：30s（原值）
-                        #   - Frigate 摄像头传感器：90s（减少误触关灯）
-                        #   - Frigate 摄像头 + 房间近期由展厅反射弧开灯：180s（顾客短暂转身/走动不关灯）
-                        _eid_lower_off = entity_id.lower()
-                        _is_cam_off = (
-                            "person_occupancy" in _eid_lower_off
-                            or ("cam" in _eid_lower_off and "occupancy" in _eid_lower_off)
-                        )
-                        if _is_cam_off:
-                            _room_off = (self.device_info.get(entity_id) or {}).get("room", "")
-                            _reflex_ts = getattr(self, "_reflex_room_open_time", {}).get(_room_off, 0)
-                            _reflex_recent = (time.time() - _reflex_ts) < 300  # 反射弧5分钟内开过灯
-                            _off_delay = 180 if _reflex_recent else 90
-                        else:
-                            _off_delay = self._PRESENCE_OFF_DELAY
-                        handle = async_call_later(self.hass, _off_delay, _confirm_left)
-                        self._presence_off_timers[entity_id] = handle
-                        self._sys_log("INFO", f"[存在去抖] {entity_id} 离开待确认，{_off_delay}s 后无人则触发")
-                        return
-            # ── 存在传感器去抖 END ─────────────────────────────────────────
-
-            # ── 灯光/开关「同态跳变」过滤（on→on / off→off 仅属性变化，无需推理）──────
-            # 场景激活时，所有已开启灯光会连续触发 on→on（亮度/色温变化），
-            # 这类事件对 AI 决策无价值，是主要的 AI 算力浪费来源（日志显示 2908 次）。
-            if domain in ("light", "switch") and old_s == new_s and old_s in ("on", "off"):
-                self._sys_log("INFO", f"[过滤] {entity_id} 同态跳变（{old_s}→{new_s}，仅属性变化），跳过推理")
-                return
-            # ── 同态过滤 END ──────────────────────────────────────────────────────
-
-            if not self._should_trigger(entity_id, old_s, new_s):
-                return
-            name = self.get_device_name(entity_id)
-            controllable_domains = ("light", "switch", "fan", "cover", "climate", "media_player")
-            location_domains = ("device_tracker", "person")
-            
-            # 记录到数据库时的来源标记 (BUG 1 修复)
-            db_source = "system"
-
-            if domain in controllable_domains:
-                # ── 优先级系统：标准化来源分类 ──
-                std_source = self._classify_source(entity_id, source_type)
-                from .const import (
-                    SOURCE_AUTOMATION, SOURCE_EMERGENCY,
-                    SOURCE_PHYSICAL, SOURCE_DASHBOARD, SOURCE_VOICE,
-                    PRIORITY_LABELS, SOURCE_LABELS,
-                )
-                
-                # 识别用户手动操作
-                if std_source in (SOURCE_PHYSICAL, SOURCE_DASHBOARD, SOURCE_VOICE):
-                    db_source = "user"
-
-                # P0 紧急事件检测（安全传感器激活）
-                if std_source == SOURCE_EMERGENCY:
-                    self._record_device_operation(entity_id, std_source, new_s, new.attributes if new else {})
-                    self._trigger_emergency(entity_id, f"安全传感器 {entity_id} 触发告警 → {new_s}")
-
-                if source_type == "自动化/脚本":
-                    pri_rec = self._record_device_operation(entity_id, SOURCE_AUTOMATION, new_s)
-                    self._sys_log("INFO", f"[自动化操作] {entity_id} → {new_s}（来源: 自动化/脚本，{pri_rec['priority_label']}）")
-                    if entity_id in self._automation_managed_devices:
-                        auto_names = self._automation_managed_devices[entity_id]
-                        self._sys_log("INFO", f"[自动化避让] {entity_id} 由自动化操控（{', '.join(auto_names)}），跳过 AI 推理")
-                        self.hass.async_add_executor_job(
-                            self._record_event, "AutomationSkip", f"{entity_id} -> {new_s} (自动化)", entity_id, new_s
-                        )
-                        return
-                elif source_type == "物理/自动" and new_s in self._OFF_STATES and self._is_occupancy_active(entity_id):
-                    # 设备自动关闭（如定时器断电/Zigbee 联动关闭）→ 降级为 P2，不触发用户保护
-                    pri_rec = self._record_device_operation(entity_id, SOURCE_AUTOMATION, new_s)
-                    db_source = "system" # 修正：非用户操作，重置 db_source
-                    self._sys_log("INFO", f"[设备自动关闭] {entity_id} → {new_s}（区域有人，判定为设备端自动关闭，{pri_rec['priority_label']}）")
-                elif old_s == "unknown" and new_s in ("on", "open") and (
-                    time.time() - self._startup_time < 120
-                ):
-                    # Phase 11.9: unknown→on 在启动恢复窗口（120s）内视为设备状态恢复，非用户操作。
-                    # 根因：Lemesh/Zigbee 设备在 HA 重启后 60-80s 才恢复在线，此时启动冷却已结束，
-                    # 设备恢复到上次状态（on）被误判为用户操作，导致记录 P1 保护 + corrections 污染。
-                    pri_rec = self._record_device_operation(entity_id, SOURCE_AUTOMATION, new_s)
-                    db_source = "system"
-                    self._sys_log("INFO",
-                        f"[状态恢复] {entity_id} unknown→{new_s}"
-                        f"（启动恢复窗口 {int(time.time() - self._startup_time)}s，"
-                        f"非用户操作，{pri_rec['priority_label']}）")
-                else:
-                    # 用户真实操作 → P1
-                    pri_rec = self._record_device_operation(entity_id, std_source, new_s)
-                    with self._user_overrides_lock:
-                        self._user_overrides[entity_id] = {"state": new_s, "time": time.time()}
-                    with self._user_manual_actions_lock:
-                        self._user_manual_actions[entity_id] = {"state": new_s, "time": time.time()}
-                    # Phase 10.0: 更新虚拟在场推断的设备操作痕迹（用户操作即在场证明）
-                    if hasattr(self, "_presence_inference") and self._presence_inference is not None:
-                        self._presence_inference.update_device_trace(entity_id, new_s, source=std_source)
-                    self._sys_log("INFO",
-                        f"[用户操作] 记录保护: {entity_id} → {new_s}"
-                        f" (来源: {pri_rec['source_label']}，{pri_rec['priority_label']}，"
-                        f"保护 {int(pri_rec['guard_until'] - time.time())}s)")
-                trigger = self._fmt_trigger(source_type, domain, name, entity_id, old_s, new_s)
-                self.hass.async_create_task(
-                    async_call_service(self.hass, "homeassistant", "update_entity", {"entity_id": entity_id})
-                )
-                if self._learning_mode:
-                    self.hass.async_add_executor_job(
-                        self._record_event,
-                        "Learning",
-                        f"{trigger} [src:{source_type}]",
-                        entity_id,
-                        new_s,
-                        db_source,
-                    )
-                else:
-                    self.hass.async_add_executor_job(
-                        self._record_event,
-                        "DeviceOperation",
-                        trigger,
-                        entity_id,
-                        new_s,
-                        db_source,
-                    )
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="controllable_state_feedback",
-                    source_type=source_type,
-                )
-                self._sys_log(
-                    "INFO",
-                    f"[可控设备回写] {entity_id} {old_s}→{new_s} 已记录为设备操作，不提交 fast-path",
-                )
-                return
-            elif domain in location_domains:
-                trigger = self._fmt_trigger("位置", domain, name, entity_id, old_s, new_s)
-            else:
-                # P0 紧急事件检测（binary_sensor 域的安全传感器）
-                if domain == "binary_sensor" and new_s == "on":
-                    eid_lower = entity_id.lower()
-                    dev_name = self.device_info.get(entity_id, {}).get("name", "").lower()
-                    from .const import SOURCE_EMERGENCY
-                    _emg_kw = ("smoke", "gas", "leak", "flood", "alarm", "security", "fire", "co2",
-                               "烟雾", "烟感", "燃气", "漏水", "水浸", "告警", "警报", "火灾", "安防")
-                    if any(kw in eid_lower or kw in dev_name for kw in _emg_kw):
-                        self._trigger_emergency(entity_id, f"安全传感器 {name}({entity_id}) 触发 → {new_s}")
-
-                # Frigate person_count 生成语义化触发文本（仅在 Frigate 已启用时）
-                eid_lower = entity_id.lower()
-                if getattr(self, "_frigate_enabled", False) and any(kw in eid_lower for kw in self._PERSON_COUNT_KW):
-                    try:
-                        cnt_new = int(float(new_s))
-                        cnt_old = int(float(old_s)) if old_s else 0
-                    except (ValueError, TypeError):
-                        cnt_new, cnt_old = 0, 0
-
-                    # ── Frigate 人数传感器防抖 ────────────────────────────────
-                    # 取消已有的待确认计时器（新的变化覆盖旧的）
-                    old_cancel = self._frigate_count_timers.pop(entity_id, None)
-                    if old_cancel:
-                        try:
-                            old_cancel()
-                        except Exception as exc:
-                            _LOGGER.debug("[Listeners] 取消 Frigate 防抖计时器失败: %s", exc)
-
-                    # 冷却检查：相同值在 _FRIGATE_COUNT_COOLDOWN 内不重复触发
-                    last_ts, last_cnt = self._frigate_count_last_trigger.get(entity_id, (0, -1))
-                    if cnt_new == last_cnt and (time.time() - last_ts) < self._FRIGATE_COUNT_COOLDOWN:
-                        self._sys_log(
-                            "INFO",
-                            f"[Frigate防抖] {entity_id} 值 {cnt_new} 与上次相同，"
-                            f"冷却中（{int(time.time() - last_ts)}s < {self._FRIGATE_COUNT_COOLDOWN}s），跳过"
-                        )
-                        return
-
-                    # 按变化方向选择确认延迟时长
-                    if cnt_new > cnt_old:
-                        hold = self._FRIGATE_COUNT_ON_HOLD
-                        direction_log = f"人数增加 {cnt_old}→{cnt_new}"
-                    elif cnt_new == 0:
-                        hold = self._FRIGATE_COUNT_OFF_HOLD
-                        direction_log = f"人数归零 {cnt_old}→0"
-                    else:
-                        hold = self._FRIGATE_COUNT_CHANGE_HOLD
-                        direction_log = f"人数减少 {cnt_old}→{cnt_new}"
-
-                    _eid = entity_id
-                    _cnt_new = cnt_new
-                    _cnt_old = cnt_old
-                    _name = name
-
-                    @callback
-                    def _confirm_frigate_count(_now,
-                                               eid=_eid,
-                                               expected=_cnt_new,
-                                               c_old=_cnt_old,
-                                               dev_nm=_name) -> None:
-                        """确认 Frigate 人数值稳定后才触发推理。"""
-                        self._frigate_count_timers.pop(eid, None)
-                        cur_state = self.hass.states.get(eid)
-                        if not cur_state:
-                            return
-                        try:
-                            cur_cnt = int(float(cur_state.state))
-                        except (ValueError, TypeError):
-                            return
-                        if cur_cnt != expected:
-                            self._sys_log(
-                                "INFO",
-                                f"[Frigate防抖] {eid} 确认时人数已变为 {cur_cnt}（期望 {expected}），丢弃，等待新事件"
-                            )
-                            return
-
-                        # 二次冷却：确认时再检查一次（防止并发计时器残留）
-                        ts_now = time.time()
-                        last_t, last_c = self._frigate_count_last_trigger.get(eid, (0, -1))
-                        if cur_cnt == last_c and (ts_now - last_t) < self._FRIGATE_COUNT_COOLDOWN:
-                            self._sys_log("INFO", f"[Frigate防抖] {eid} 确认时仍在冷却中，跳过")
-                            return
-
-                        self._frigate_count_last_trigger[eid] = (ts_now, cur_cnt)
-                        dev_room = self.device_info.get(eid, {}).get("room", "") or dev_nm
-                        if cur_cnt > c_old:
-                            trig = (
-                                f"[视觉检测] Frigate 摄像头「{dev_room}」检测到人员进入"
-                                f"（当前人数: {cur_cnt}，变化: {c_old}→{cur_cnt}）"
-                            )
-                        elif cur_cnt == 0:
-                            trig = (
-                                f"[视觉检测] Frigate 摄像头「{dev_room}」区域已无人"
-                                f"（变化: {c_old}→0）"
-                            )
-                        else:
-                            trig = (
-                                f"[视觉检测] Frigate 摄像头「{dev_room}」人数变化"
-                                f"（{c_old}→{cur_cnt}人）"
-                            )
-                        event_type_label = "Learning" if self._learning_mode else "Trigger"
-                        self._sys_log("INFO", f"[Frigate防抖] {eid} 稳定确认，{event_type_label}: {trig}")
-                        self.hass.async_add_executor_job(
-                            self._record_event, event_type_label, trig, eid, str(cur_cnt)
-                        )
-                        if not self._learning_mode:
-                            try:
-                                self._schedule_inference(eid, trig, new_state=str(cur_cnt))
-                            except Exception as exc:
-                                self._sys_log("ERROR", f"[Frigate防抖] 调度推理失败: {exc}")
-
-                    handle = async_call_later(self.hass, hold, _confirm_frigate_count)
-                    self._frigate_count_timers[entity_id] = handle
-                    self._sys_log(
-                        "INFO",
-                        f"[Frigate防抖] {entity_id} {direction_log}，等待 {hold}s 稳定确认"
-                    )
-                    return  # 不直接触发，由防抖回调决定是否触发
-                    # ── Frigate 防抖 END ──────────────────────────────────────
-                else:
-                    trigger = self._fmt_trigger("物理", domain, name, entity_id, old_s, new_s)
-
-            if self._learning_mode:
-                # 静默学习：保留全部来源（用户手动、HA 自动化/脚本、物理传感器）
-                # HA 自动化代表用户设定的偏好，物理传感器代表真实使用模式，均有训练价值；
-                # 同时当传感器故障时，历史自动化触发记录可作为设备状态推断的兜底依据。
-                # 在 detail 中嵌入来源标记，未来分析可据此区分并加权。
-                _src_tag = f" [src:{source_type}]" if source_type != "物理/自动" else ""
-                _learning_detail = f"{trigger}{_src_tag}"
-                self._sys_log(
-                    "INFO",
-                    f"[静默学习] {entity_id} {old_s}→{new_s}，记录（来源: {source_type}）"
-                )
-                self.hass.async_add_executor_job(
-                    self._record_event, "Learning", _learning_detail, entity_id, new_s, db_source
-                )
-                return
-            self._sys_log("INFO", f"[触发] 调度推理: {trigger}")
-            self.hass.async_add_executor_job(
-                self._record_event, "Trigger", trigger, entity_id, new_s, db_source
-            )
-            try:
-                self._schedule_inference(entity_id, trigger, new_state=new_s)
-            except Exception as exc:
-                self._sys_log("ERROR", f"[触发] 调度推理异常: {exc}")
-                _LOGGER.exception("_schedule_inference failed")
         return _state_changed
 
     def _refresh_listeners(self) -> None:

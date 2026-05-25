@@ -365,10 +365,7 @@ class ActionsMixin:
         # 允许的例外：巡检、位置变化、Frigate视觉触发（通常涉及多区域）
         # USER_EXPLICIT（用户主动指令/一次性场景/语音）豁免区域隔离，与 IntentVerifier 保持一致
         _SKIP_ISOLATION = ("巡检", "位置变化", "视觉检测")
-        try:
-            from .intent_verifier import CMD_SOURCE_USER_EXPLICIT as _USER_EXPLICIT
-        except Exception:
-            _USER_EXPLICIT = "user_explicit"
+        _USER_EXPLICIT = "USER_EXPLICIT"
         _is_user_explicit = (cmd_source == _USER_EXPLICIT)
         should_isolate = bool(
             trigger_room

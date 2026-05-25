@@ -41,20 +41,16 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .actions import ActionsMixin
-from .data_sync import DataSyncMixin
 from .database import DatabaseMixin
-from .decision_pipeline import DecisionPipeline
 from .devices import DevicesMixin
 from .frigate import FrigateMixin
 from .ha_adapter import async_call_service
-from .inference import InferenceMixin
 from .license import LicenseMixin
 from .listeners import ListenersMixin
-from .patrol import PatrolMixin
-from .protection import ProtectionMixin
 from .api import SmartAgentPairingView, SmartAgentAuthPageView, SmartAgentPairConfirmView
 
 from .const import (
+    ACTION_PARAM_KEYS_COMMON,
     CONF_AI_ENABLED,
     CONF_COOLDOWN,
     CONF_ENGINE,
@@ -108,6 +104,9 @@ from .const import (
     parse_biz_time,
     format_biz_time,
     ENGINE_ONLINE,
+    ESCALATION_COUNT,
+    ESCALATION_GUARD_SEC,
+    ESCALATION_WINDOW_MIN,
     CONF_LOG_RETENTION,
     CONF_ADDON_AUTH_TOKEN,
     CONF_ADDON_BASE_URL,
@@ -122,8 +121,18 @@ from .const import (
     MODE_SHOWROOM,
     NOTIFY_DEDUP_SECONDS,
     OVERRIDE_WINDOW_SECONDS,
+    PRIORITY_AI_LEARNED,
+    PRIORITY_GUARD_WINDOWS,
+    PRIORITY_LABELS,
     PATTERN_FILENAME,
     SHOWROOM_SCENES,
+    SOURCE_AUTOMATION,
+    SOURCE_DASHBOARD,
+    SOURCE_EMERGENCY,
+    SOURCE_LABELS,
+    SOURCE_PHYSICAL,
+    SOURCE_PRIORITY_MAP,
+    SOURCE_VOICE,
     STARTUP_GRACE_SECONDS,
     TARGET_DOMAINS,
     TERMINAL_LOGS_MAX,
@@ -135,16 +144,31 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_PRIORITY_MAP_HARD_LIMIT = 500
+_USER_OP_HISTORY_HARD_LIMIT = 500
+_EMERGENCY_KEYWORDS = frozenset((
+    "smoke", "gas", "leak", "flood", "alarm", "security", "fire", "co2",
+    "烟雾", "烟感", "燃气", "漏水", "水浸", "告警", "警报", "火灾", "安防",
+))
+_EMERGENCY_EXCLUDE = frozenset((
+    "gas_meter", "gas_consumption", "gas_cost",
+    "alarm_clock", "alarm_volume",
+    "security_camera", "security_mode",
+    "fire_tv", "fireplace",
+))
+_EMERGENCY_THRESHOLDS: dict[str, float] = {
+    "temperature": 55.0,
+    "carbon_monoxide": 50.0,
+    "carbon_dioxide": 5000.0,
+    "gas": 20.0,
+    "pm25": 500.0,
+}
 
 
 class SmartAgentCoordinator(
     DatabaseMixin,
-    DataSyncMixin,
-    ProtectionMixin,
     ActionsMixin,
-    InferenceMixin,
     ListenersMixin,
-    PatrolMixin,
     DevicesMixin,
     FrigateMixin,
     LicenseMixin,
@@ -158,26 +182,12 @@ class SmartAgentCoordinator(
                           _db_exec / _async_db_exec / _query_events / _async_query
                           _record_event / _cleanup_old_memory
                           _record_action_result / _get_action_quality_stats
-        ProtectionMixin → _refresh_ha_resources / _extract_entity_ids_from_config
-                          _get_room_occupancy_map / _build_occupancy_section
-                          _guess_scene_room / _occupancy_guard_check / _is_occupancy_active
         ActionsMixin    → _normalize_action / _fuzzy_match_entity / _find_associated_script
                           _execute_actions / _do_call_service / _verify_pending_actions
-        InferenceMixin  → _detect_scene / _build_context / _call_ai_engine / _run_inference
-                          _get_habits_text / _get_rules_text / _annotate_time
-                          _habit_display / _rule_display / _find_habit_idx / _find_rule_idx
-                          _load_pattern_summary / _save_pattern_summary
-                          _get_history_context / _get_realtime_habits / _get_recent_overrides
-                          _effective_showroom_scenes (property) / _speak_tts
         ListenersMixin  → _should_trigger / _effective_cooldown
                           _schedule_inference / _flush_triggers
                           _get_time_brightness / _find_room_lights
                           _make_state_handler / _refresh_listeners
-        PatrolMixin     → _get_scan_interval / _schedule_next_scan / _run_periodic_scan
-                          _analyze_patterns / _get_arrival_prediction
-                          _run_habit_proactive_check / _habit_notify
-                          async_confirm_habit / async_cancel_habit
-                          _refresh_behavior_patterns_cache / _get_behavior_patterns_snapshot
         DevicesMixin    → get_device_name / _get_entity_area
                           _async_discover_devices / async_batch_add_devices
                           async_svc_add/delete/update_device / async_dev_add/delete
@@ -189,6 +199,11 @@ class SmartAgentCoordinator(
                           _schedule_frigate_inference / _build_frigate_trigger
                           get_frigate_zone_summary / get_recent_frigate_events
     """
+
+    _OFF_STATES = frozenset(("off", "closed", "idle", "standby", "locked"))
+    _AUTOMATION_EXEC_WINDOW = 30
+    _USER_OVERRIDE_PROTECTION = 120
+    _USER_MANUAL_WINDOW = 1800
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize and load config from entry (data + options)."""
@@ -283,8 +298,6 @@ class SmartAgentCoordinator(
         # License
         self._init_license()
         self._license_key = (data.get(CONF_LICENSE_KEY) or "").strip()
-        # 数据同步（v4.8.78）
-        self._init_data_sync()
         # Add-on 客户端（显式 URL 优先；留空时按端口回退）
         from .addon_client import AddOnClient, derive_addon_gateway_base_url
         from .const import CONF_ADDON_PORT, DEFAULT_ADDON_PORT
@@ -444,7 +457,6 @@ class SmartAgentCoordinator(
 
         self._memory_retention_days = MEMORY_RETENTION_DAYS
         self._action_quality_cache: dict = {}
-        self._decision_pipeline = DecisionPipeline(self)
 
         # Phase 4: AI 场景缓存（_blocking_init 中加载）
         self._ai_scenes_cache: list[dict] = []
@@ -630,6 +642,270 @@ class SmartAgentCoordinator(
             self._sys_log("INFO", f"[TTS] 播报: {text[:60]}")
         except Exception as exc:
             self._sys_log("WARN", f"[TTS] 播报失败: {exc}")
+
+    def _init_priority_system(self) -> None:
+        self._device_priority_map: dict[str, dict] = {}
+        self._user_op_history: dict[str, list[float]] = {}
+        self._global_suppress_until: float = 0.0
+        self._global_suppress_reason: str = ""
+
+    @staticmethod
+    def _extract_entity_ids_from_config(config_items: list | dict | None, out: set[str]) -> None:
+        if config_items is None:
+            return
+        if isinstance(config_items, dict):
+            config_items = [config_items]
+        if not isinstance(config_items, list):
+            return
+        for item in config_items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("entity_id", "device_id", "target"):
+                val = item.get(key)
+                if isinstance(val, str) and "." in val:
+                    out.add(val)
+                elif isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, str) and "." in v:
+                            out.add(v)
+                elif isinstance(val, dict):
+                    for v in val.values():
+                        if isinstance(v, str) and "." in v:
+                            out.add(v)
+                        elif isinstance(v, list):
+                            for vv in v:
+                                if isinstance(vv, str) and "." in vv:
+                                    out.add(vv)
+            for sub_key in ("then", "else", "sequence", "action", "actions"):
+                sub = item.get(sub_key)
+                if sub:
+                    SmartAgentCoordinator._extract_entity_ids_from_config(sub, out)
+
+    def _refresh_ha_resources(self) -> None:
+        scripts, scenes, autos = [], [], []
+        managed_sensors: set[str] = set()
+        managed_devices: dict[str, set[str]] = {}
+        for state in self.hass.states.async_all("script"):
+            scripts.append({"entity_id": state.entity_id, "name": state.attributes.get("friendly_name", state.entity_id)})
+        for state in self.hass.states.async_all("scene"):
+            scenes.append({"entity_id": state.entity_id, "name": state.attributes.get("friendly_name", state.entity_id)})
+        for state in self.hass.states.async_all("automation"):
+            autos.append({
+                "entity_id": state.entity_id,
+                "name": state.attributes.get("friendly_name", state.entity_id),
+                "state": state.state,
+            })
+
+        try:
+            auto_configs = self.hass.data.get("automation.config", {}) or {}
+            for auto_state in self.hass.states.async_all("automation"):
+                if auto_state.state != "on":
+                    continue
+                auto_id = auto_state.attributes.get("id", "")
+                auto_name = auto_state.attributes.get("friendly_name", auto_state.entity_id)
+                cfg = auto_configs.get(auto_id, {}) if auto_id else {}
+                trigger_eids: set[str] = set()
+                action_eids: set[str] = set()
+                self._extract_entity_ids_from_config(cfg.get("trigger", cfg.get("triggers", [])), trigger_eids)
+                self._extract_entity_ids_from_config(cfg.get("action", cfg.get("actions", [])), action_eids)
+                self._extract_entity_ids_from_config(cfg.get("condition", cfg.get("conditions", [])), trigger_eids)
+                for eid in trigger_eids:
+                    if eid.startswith(("binary_sensor.", "sensor.")):
+                        managed_sensors.add(eid)
+                for eid in action_eids:
+                    domain = eid.split(".", 1)[0]
+                    if domain in ("light", "switch", "fan", "cover", "climate", "media_player", "script", "scene"):
+                        managed_devices.setdefault(eid, set()).add(auto_name)
+        except Exception as exc:
+            self._sys_log("WARN", f"[资源] 自动化配置解析出错（不影响核心功能）: {exc}")
+
+        self._ha_scripts = scripts
+        self._ha_scenes = scenes
+        self._ha_automations = autos
+        self._automation_managed_sensors = managed_sensors
+        self._automation_managed_devices = managed_devices
+        self._sys_log("INFO", f"[资源] HA资源刷新: 脚本={len(scripts)} 场景={len(scenes)} 自动化={len(autos)}")
+
+    def _get_room_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
+        occ: dict[str, list[tuple[str, str]]] = {}
+        for entity_id, info in self.device_info.items():
+            if not entity_id.startswith(("binary_sensor.", "sensor.", "person.", "device_tracker.")):
+                continue
+            name = str(info.get("name") or entity_id).lower()
+            eid_lower = entity_id.lower()
+            if entity_id.startswith(("binary_sensor.", "sensor.")) and not any(
+                kw in eid_lower or kw in name for kw in self._PRESENCE_KW
+            ):
+                continue
+            room = str(info.get("room") or info.get("area") or "").strip()
+            if not room:
+                continue
+            state = self.hass.states.get(entity_id)
+            occ.setdefault(room, []).append((entity_id, state.state if state else "unknown"))
+        return occ
+
+    def _get_room_person_counts(self) -> dict[str, int]:
+        return {}
+
+    def _build_locked_people_rules(self) -> list[dict]:
+        return []
+
+    def _is_occupancy_active(self, entity_id: str) -> bool:
+        room = str(self.device_info.get(entity_id, {}).get("room") or "").strip()
+        if not room:
+            return False
+        return any(state == "on" for _, state in self._get_room_occupancy_map().get(room, []))
+
+    def _classify_source(self, entity_id: str, source_type: str, context: dict | None = None) -> str:
+        eid_lower = entity_id.lower()
+        name = self.device_info.get(entity_id, {}).get("name", "").lower()
+        if any(kw in eid_lower or kw in name for kw in _EMERGENCY_KEYWORDS):
+            if not any(ex in eid_lower for ex in _EMERGENCY_EXCLUDE):
+                return SOURCE_EMERGENCY
+        state_obj = self.hass.states.get(entity_id)
+        if state_obj and entity_id.startswith("sensor."):
+            dev_class = (state_obj.attributes.get("device_class") or "").lower()
+            threshold = _EMERGENCY_THRESHOLDS.get(dev_class)
+            if threshold is not None:
+                try:
+                    if float(state_obj.state) >= threshold:
+                        return SOURCE_EMERGENCY
+                except (ValueError, TypeError):
+                    pass
+        if source_type == "自动化/脚本":
+            return SOURCE_AUTOMATION
+        if source_type == "用户界面":
+            return SOURCE_DASHBOARD
+        if source_type == "语音":
+            return SOURCE_VOICE
+        return SOURCE_PHYSICAL
+
+    def _record_device_operation(self, entity_id: str, source: str, new_state: str, params: dict | None = None) -> dict:
+        now = time.time()
+        priority = SOURCE_PRIORITY_MAP.get(source, PRIORITY_AI_LEARNED)
+        guard_until = now + PRIORITY_GUARD_WINDOWS.get(priority, 120)
+        if priority == 1:
+            history = self._user_op_history.setdefault(entity_id, [])
+            cutoff = now - ESCALATION_WINDOW_MIN * 60
+            history[:] = [t for t in history if t > cutoff]
+            history.append(now)
+            if len(history) >= ESCALATION_COUNT:
+                guard_until = now + ESCALATION_GUARD_SEC
+                self._sys_log("WARN", f"[优先级] {entity_id} 连续用户操作，保护升级至 {ESCALATION_GUARD_SEC // 60} 分钟")
+        record = {
+            "priority": priority,
+            "source": source,
+            "source_label": SOURCE_LABELS.get(source, source),
+            "priority_label": PRIORITY_LABELS.get(priority, f"P{priority}"),
+            "time": now,
+            "state": new_state,
+            "params": {k: v for k, v in (params or {}).items() if k in ACTION_PARAM_KEYS_COMMON},
+            "guard_until": guard_until,
+        }
+        self._device_priority_map[entity_id] = record
+        self._enforce_priority_storage_limits()
+        return record
+
+    def _is_reverse_op(self, current_state: str, service: str) -> bool:
+        is_off = current_state in self._OFF_STATES
+        ai_turning_on = "turn_on" in service or "open" in service
+        ai_turning_off = "turn_off" in service or "close" in service
+        return (is_off and ai_turning_on) or (not is_off and ai_turning_off)
+
+    def _arbitrate(
+        self,
+        entity_id: str,
+        ai_source: str,
+        ai_service: str,
+        ai_params: dict | None = None,
+    ) -> tuple[bool, str]:
+        now = time.time()
+        if now < self._global_suppress_until:
+            remaining = int(self._global_suppress_until - now)
+            return False, f"[P0 全局抑制] {self._global_suppress_reason}（剩余 {remaining}s）"
+        existing = self._device_priority_map.get(entity_id)
+        if not existing or now > existing.get("guard_until", 0):
+            return True, ""
+        ai_priority = SOURCE_PRIORITY_MAP.get(ai_source, PRIORITY_AI_LEARNED)
+        if ai_priority < int(existing.get("priority", PRIORITY_AI_LEARNED)):
+            return True, ""
+        if self._is_reverse_op(str(existing.get("state") or ""), ai_service):
+            remaining = int(existing["guard_until"] - now)
+            return False, (
+                f"[优先级仲裁] AI 尝试反向操作 {entity_id}"
+                f"（当前由 {existing.get('source_label', 'unknown')} 控制，保护剩余 {remaining}s）"
+            )
+        return True, ""
+
+    def _build_priority_prompt_section(self) -> str:
+        active = self._get_priority_summary()
+        if not active:
+            return ""
+        lines = ["【设备操作优先级保护】"]
+        for item in active[:15]:
+            lines.append(
+                f"- {item['name']}({item['entity_id']})："
+                f"当前由「{item['source_label']}」控制 → {item['state']}，"
+                f"{item['priority_label']}保护中（剩余 {item['remaining_sec']}s）"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _enforce_priority_storage_limits(self) -> None:
+        if len(self._device_priority_map) > _PRIORITY_MAP_HARD_LIMIT:
+            ordered = sorted(self._device_priority_map.items(), key=lambda kv: kv[1].get("guard_until", 0))
+            for eid, _ in ordered[: len(self._device_priority_map) - _PRIORITY_MAP_HARD_LIMIT]:
+                self._device_priority_map.pop(eid, None)
+        if len(self._user_op_history) > _USER_OP_HISTORY_HARD_LIMIT:
+            ordered = sorted(self._user_op_history.items(), key=lambda kv: max(kv[1]) if kv[1] else 0)
+            for eid, _ in ordered[: len(self._user_op_history) - _USER_OP_HISTORY_HARD_LIMIT]:
+                self._user_op_history.pop(eid, None)
+
+    def _cleanup_expired_priorities(self) -> None:
+        now = time.time()
+        for eid in [eid for eid, rec in self._device_priority_map.items() if now > rec.get("guard_until", 0)]:
+            del self._device_priority_map[eid]
+        cutoff = now - ESCALATION_WINDOW_MIN * 60
+        for eid, history in list(self._user_op_history.items()):
+            history[:] = [t for t in history if t > cutoff]
+            if not history:
+                del self._user_op_history[eid]
+
+    def _get_priority_summary(self) -> list[dict]:
+        now = time.time()
+        result = []
+        for eid, rec in self._device_priority_map.items():
+            if now > rec.get("guard_until", 0):
+                continue
+            result.append({
+                "entity_id": eid,
+                "name": self.device_info.get(eid, {}).get("name", eid),
+                "priority": rec["priority"],
+                "priority_label": rec["priority_label"],
+                "source_label": rec["source_label"],
+                "state": rec["state"],
+                "remaining_sec": int(rec["guard_until"] - now),
+            })
+        result.sort(key=lambda x: (x["priority"], -x["remaining_sec"]))
+        return result
+
+    def _trigger_emergency(self, entity_id: str, reason: str, suppress_seconds: int = 300) -> None:
+        now = time.time()
+        self._global_suppress_until = now + suppress_seconds
+        self._global_suppress_reason = reason
+        self._record_device_operation(entity_id, SOURCE_EMERGENCY, "alert")
+        self._sys_log("ERROR", f"[P0紧急] {reason}，全局 AI 抑制 {suppress_seconds}s | 触发: {entity_id}")
+
+    def _refresh_behavior_patterns_cache(self) -> None:
+        self._behavior_patterns_cache = []
+
+    def _get_behavior_patterns_snapshot(self) -> list[dict]:
+        return list(self._behavior_patterns_cache)
+
+    async def async_confirm_habit(self) -> None:
+        self._sys_log("INFO", "[习惯建议] HA 本地确认入口已下架，请在 8234/add-on 侧处理")
+
+    async def async_cancel_habit(self) -> None:
+        self._sys_log("INFO", "[习惯建议] HA 本地取消入口已下架，请在 8234/add-on 侧处理")
 
     async def _async_update_data(self) -> dict[str, Any]:
         """DataUpdateCoordinator: return current UI state."""
@@ -848,9 +1124,6 @@ class SmartAgentCoordinator(
                 enabled=_opts.get(CONF_CIRCADIAN_ENABLED, DEFAULT_CIRCADIAN_ENABLED),
             )
             self._circadian_auto_adjust = _opts.get(CONF_CIRCADIAN_AUTO_ADJUST, DEFAULT_CIRCADIAN_AUTO_ADJUST)
-            # 注入到快脑引擎（如果已初始化）
-            if hasattr(self, "_fast_brain") and self._fast_brain:
-                self._fast_brain._circadian_engine = self._circadian_engine
             _c_flag = "✓" if self._circadian_engine.enabled else "✗(disabled)"
             self._sys_log("INFO", f"[Circadian] 昼夜节律引擎已初始化 {_c_flag}")
         except Exception as exc:
@@ -867,36 +1140,11 @@ class SmartAgentCoordinator(
         if bridge is not None:
             bridge.start()
         self._refresh_listeners()
-        # 智能巡检：动态间隔，自调度
-        if self._scan_timer_unsub:
-            try:
-                self._scan_timer_unsub()
-            except Exception:
-                pass
-        self._scan_timer_unsub = None
-        self._schedule_next_scan()
-        # 习惯主动询问
-        if self._habit_check_timer_unsub:
-            try:
-                self._habit_check_timer_unsub()
-            except Exception:
-                pass
-        self._habit_check_timer_unsub = None
-        self._schedule_next_habit_check()
-        # 每天凌晨 3:00 行为规律分析（UTC 19:00 = 北京时间 03:00）
-        self._listener_removers.append(
-            async_track_utc_time_change(self.hass, self._on_daily_pattern_analysis, hour=19, minute=0, second=0)
-        )
-        # 启动时执行一次分析（确保 pattern_summary 有值），走统一分析入口（含 _analysis_lock）
-        self.hass.async_create_task(self.async_run_pattern_analysis())
         # Phase 11.9: 启动时立即刷新行为戒律（强制使用最新措辞，无需等待凌晨3点）
-        self.hass.async_add_executor_job(self._startup_lessons_refresh)
         # Frigate MQTT 深度集成（Phase 7A）
         await self._async_start_frigate_mqtt()
         # License 首次验证（不阻塞启动，异步后台执行）
         self.hass.async_create_task(self._async_license_startup_check())
-        # 数据同步（心跳 + 训练数据回传，v4.8.78）
-        await self._start_data_sync()
 
         async def _startup_state_refresh() -> None:
             await asyncio.sleep(10)
@@ -978,8 +1226,6 @@ class SmartAgentCoordinator(
                 pass
         # Frigate MQTT 清理
         await self._async_stop_frigate_mqtt()
-        # 数据同步任务清理（关闭 HTTP Session）
-        await self._stop_data_sync()
         bridge = getattr(self, "_internal_event_bridge", None)
         if bridge is not None:
             await bridge.stop()
@@ -998,25 +1244,91 @@ class SmartAgentCoordinator(
     # ── 对外服务接口 ──────────────────────────────────────────────────────────
 
     async def async_manual_inference(self, trigger: str = "手动测试触发") -> None:
-        """Manually trigger an AI inference (bypasses listeners & cooldown)."""
+        """Manually trigger add-on owned AI decision."""
         self._sys_log("INFO", f"[手动] 手动触发推理: {trigger}")
-        await self._run_inference(trigger)
+        await self._run_addon_decision(trigger, source="manual")
+
+    async def _run_addon_decision(
+        self,
+        trigger: str,
+        *,
+        one_off_prompt: str = "",
+        source: str = "listener",
+    ) -> dict[str, Any]:
+        addon_client = getattr(self, "_addon_client", None)
+        if addon_client is None:
+            self._sys_log("WARN", "[决策] add-on decision provider unavailable")
+            return {"status": "error", "message": "add-on decision provider unavailable"}
+        bundle = {
+            "trigger": str(trigger or ""),
+            "context_text": str(one_off_prompt or trigger or ""),
+            "source": f"ha_bridge_{source}",
+            "mode": self._mode,
+            "engine": self.engine,
+            "confidence_auto": self.confidence_auto,
+            "confidence_notify": self.confidence_notify,
+        }
+        try:
+            result = await addon_client.run_decision(trigger=str(trigger or ""), bundle=bundle)
+        except Exception as exc:
+            self._sys_log("WARN", f"[决策] add-on decision provider 调用失败: {exc}")
+            return {"status": "error", "message": str(exc)}
+        if not isinstance(result, dict):
+            self._sys_log("WARN", "[决策] add-on decision provider 无响应")
+            return {"status": "error", "message": "add-on decision provider unavailable"}
+        status = int(result.get("__status", 200) or 200)
+        if status >= 400 or result.get("ok") is False:
+            error = result.get("error") or result.get("error_type") or f"http_{status}"
+            self._sys_log("WARN", f"[决策] add-on decision provider 返回失败: {error}")
+            return {"status": "error", "message": str(error), **result}
+
+        actions = result.get("actions") if isinstance(result.get("actions"), list) else []
+        scene = str(result.get("scene") or "")
+        try:
+            confidence = int(float(result.get("confidence") or 0))
+        except (TypeError, ValueError):
+            confidence = 0
+        if actions:
+            executed = await self._execute_actions(
+                [item for item in actions if isinstance(item, dict)],
+                trigger_summary=str(trigger or ""),
+                scene_desc=scene,
+                confidence=confidence,
+            )
+            result["executed_count"] = executed
+            self._sys_log("INFO", f"[决策] add-on 返回 {len(actions)} 个动作，已执行 {executed} 个")
+        else:
+            self._sys_log("INFO", f"[决策] add-on 未返回可执行动作: {result.get('reason') or 'no_actions'}")
+        nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+        result.setdefault("reply", nested.get("reply") or ("已处理" if actions else "未命中可执行动作"))
+        result.setdefault("status", "ok")
+        return result
+
+    async def _run_voice_inference(self, text: str, source: str = "touch") -> dict:
+        """Handle voice text through add-on owned decision provider."""
+        return await self._run_addon_decision(text, source=f"voice_{source}")
 
     async def async_run_pattern_analysis(self) -> None:
-        """手动触发行为规律分析 + Phase 4 候选 AI 场景生成（无需等到凌晨 3:00）。
-
-        使用 _analysis_lock 防止手动触发与每日定时触发重叠执行。
-        """
+        """Delegate behavior analysis to the add-on owned AI-scene provider."""
         if self._analysis_lock.locked():
             self._sys_log("INFO", "[手动] 行为分析已在进行中，跳过重复触发")
             return
         async with self._analysis_lock:
-            self._sys_log("INFO", "[手动] 触发行为规律分析与 AI 场景生成...")
+            addon_client = getattr(self, "_addon_client", None)
+            if addon_client is None:
+                self._sys_log("WARN", "[AI场景] add-on ops provider unavailable: analyze")
+                return
+            self._sys_log("INFO", "[手动] 触发 add-on 行为规律分析与 AI 场景生成...")
             await self._async_update_status("分析中", "正在分析历史行为规律...")
-            await self.hass.async_add_executor_job(self._analyze_patterns)
-            count = len([s for s in self._ai_scenes_cache if s.get("status") == "pending"])
-            self._sys_log("INFO", f"[手动] 行为分析完成，待确认候选场景: {count} 个")
-            await self._async_update_status("运行中", f"行为分析完成，发现 {count} 个候选场景")
+            result = await addon_client.post_ai_scene_ops("ai-scenes/analyze", {})
+            status = int(result.get("__status", 200) or 200) if isinstance(result, dict) else 503
+            if status >= 400 or not isinstance(result, dict) or result.get("ok") is False:
+                error = result.get("error") if isinstance(result, dict) else "provider_unavailable"
+                self._sys_log("WARN", f"[AI场景] add-on analyze failed: {error}")
+                await self._async_update_status("运行中", "行为分析请求失败")
+                return
+            self._sys_log("INFO", "[手动] add-on 行为分析请求已完成")
+            await self._async_update_status("运行中", "行为分析完成")
 
     async def async_set_mode(self, mode: str) -> None:
         """Switch between home and showroom mode, and persist to config entry.
@@ -1466,16 +1778,19 @@ class SmartAgentCoordinator(
             user_state = now_value or "unknown"
         
         # 记录修正
-        self.hass.async_add_executor_job(
-            self._record_correction,
-            entity_id,
-            last_ai.get("service", ""),
-            last_ai.get("state", ""),
-            user_state,
-            self.device_info.get(entity_id, {}).get("room", ""),
-            last_ai.get("scene", ""),
-            last_ai.get("trigger", ""),
-        )
+        correction_payload = {
+            "action": "record",
+            "entity_id": entity_id,
+            "ai_service": last_ai.get("service", ""),
+            "ai_state": last_ai.get("state", ""),
+            "user_state": user_state,
+            "room": self.device_info.get(entity_id, {}).get("room", ""),
+            "scene": last_ai.get("scene", ""),
+            "trigger": last_ai.get("trigger", ""),
+            "reason": reason,
+        }
+        if not self._enqueue_internal_event("correction", correction_payload):
+            self._sys_log("WARN", f"[Correction] add-on correction enqueue failed: {entity_id}")
         
         # 更新 UI 状态让前端感知
         name = self.get_device_name(entity_id)

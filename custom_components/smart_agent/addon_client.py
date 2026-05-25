@@ -249,6 +249,26 @@ class AddOnClient:
         response["__status"] = status
         return response
 
+    async def run_decision(
+        self,
+        *,
+        trigger: str,
+        bundle: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Run the add-on owned full decision path and return executable actions."""
+        payload: dict[str, Any] = {"trigger": str(trigger or "")}
+        if bundle is not None:
+            payload["bundle"] = dict(bundle)
+
+        result = await self.request_json("POST", "/decision/run", body=payload)
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        body = result.get("body")
+        response = body if isinstance(body, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
     async def post_internal_event(
         self,
         kind: str,
