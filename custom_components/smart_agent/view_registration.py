@@ -4,88 +4,27 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .mcp_server import SmartAgentMCPEndpointView
-
-
 HOST_VIEW_CLASS_NAMES: tuple[str, ...] = (
-    "SmartAgentLogDatesView",
-    "SmartAgentLogContentView",
-    "SmartAgentLogInfoView",
-    "SmartAgentSceneExportView",
-    "SmartAgentDevicesView",
 )
 
 
 V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
-    "SmartAgentDevicesDiscoverView",
-    "SmartAgentDevicesBatchAddView",
-    "SmartAgentDeviceDetailView",
-    "SmartAgentDeviceControlView",
-    "SmartAgentPresenceSensorsView",
-    "SmartAgentPresenceSensorTypeView",
-    "SmartAgentRoomsView",
-    "SmartAgentRoomsSyncView",
-    "SmartAgentRoomsTopologyView",
-    "SmartAgentAiScenesView",
-    "SmartAgentAiSceneActionView",
-    "SmartAgentAiSceneTriggerView",
-    "SmartAgentSystemStatusView",
-    "SmartAgentDashboardSummaryView",
-    "SmartAgentDiagnosticsView",
-    "SmartAgentSystemSettingsView",
     "SmartAgentAuthLoginView",
     "SmartAgentAuthMeView",
     "SmartAgentAuthLogoutView",
-    "SmartAgentSystemBrandView",
     "SmartAgentEventsWSView",
-    "SmartAgentMemoryProfilesView",
-    "SmartAgentMemoryHabitsView",
-    "SmartAgentLearningStatsView",
-    "SmartAgentProfileActionView",
-    "SmartAgentHabitActionView",
-    "SmartAgentCorrectionsView",
-    "SmartAgentCorrectionActionView",
-    "SmartAgentTransactionsView",
-    "SmartAgentTransactionDetailView",
-    "SmartAgentDecisionTraceView",
-    "SmartAgentTransactionRollbackView",
-    "SmartAgentEnergyView",
-    "SmartAgentLicenseStatusView",
-    "SmartAgentLicenseVerifyView",
-    "SmartAgentBackupsView",
-    "SmartAgentBackupsActionView",
-    "SmartAgentAiSceneOpsView",
-    "SmartAgentPatrolTriggerView",
-    "SmartAgentModeView",
-    "SmartAgentShowroomSceneView",
-    "SmartAgentShowroomSceneConfigView",
+    "SmartAgentHaExecuteView",
     "SmartAgentDevicePairStartView",
     "SmartAgentDevicePairConfirmView",
-    "SmartAgentVoiceSessionView",
-    "SmartAgentVoiceInterruptView",
-    "SmartAgentVisionCamerasView",
-    "SmartAgentVisionCamerasActionView",
-    "SmartAgentVisionZonesView",
-    "SmartAgentVisionZonesSaveView",
-    "SmartAgentMcpStatusView",
-    "SmartAgentMcpSettingsView",
-    "SmartAgentHaExecuteView",
-    "SmartAgentCapabilityDryRunView",
-    "SmartAgentAiSceneDeleteFallbackView",
-    "SmartAgentAiSceneArchiveView",
 )
 
 POST_V1_HOST_VIEW_CLASS_NAMES: tuple[str, ...] = (
-    "SmartAgentPairCreateView",
 )
 
 HASS_BOUND_VIEW_CLASS_NAMES: tuple[str, ...] = (
-    "SmartAgentMCPEndpointView",
 )
 
-_HASS_BOUND_VIEW_CLASSES: Mapping[str, Any] = {
-    "SmartAgentMCPEndpointView": SmartAgentMCPEndpointView,
-}
+_HASS_BOUND_VIEW_CLASSES: Mapping[str, Any] = {}
 
 
 def register_v1_views(hass: Any, view_namespace: Mapping[str, Any]) -> None:
