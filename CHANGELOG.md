@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.67 - 2026-05-26
+## Beta 0.0.68 - 2026-05-26
 
-Beta 0.0.67 测试版发布：完成核心合同语义收敛 C1-C4 与管理台 9 主域重组，补齐 CrossZoneGuard、Operations voice/events 读模型、Context Builder 2.0、Memory 四层 facade，并同步 P3/P4 薄 Host 迁移合同。
+Beta 0.0.68 测试版发布：收口管理台产品语义与页面质量，设备列表默认只展示纳管实体，未纳管扫描过滤非真实设备，统一中文状态/诊断文案，并优化导航字号、照明规划控制区与前端合同覆盖。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.67`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.68`，用于 Home Assistant 更新检测。

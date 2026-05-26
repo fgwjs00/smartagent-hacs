@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.67
-display_version: Beta 0.0.67
+release_version: 0.0.68
+display_version: Beta 0.0.68
 channel: beta
 release_date: '2026-05-26'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.67 测试版发布：完成核心合同语义收敛 C1-C4 与管理台 9 主域重组，补齐 CrossZoneGuard、Operations
-    voice/events 读模型、Context Builder 2.0、Memory 四层 facade，并同步 P3/P4 薄 Host 迁移合同。
-  customer_visible_version: Beta 0.0.67
+  summary: Beta 0.0.68 测试版发布：收口管理台产品语义与页面质量，设备列表默认只展示纳管实体，未纳管扫描过滤非真实设备，统一中文状态/诊断文案，并优化导航字号、照明规划控制区与前端合同覆盖。
+  customer_visible_version: Beta 0.0.68
