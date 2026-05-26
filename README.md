@@ -1,6 +1,6 @@
 # SmartAgent for Home Assistant
 
-当前公开版本：`Beta 0.0.65`
+当前公开版本：`Beta 0.0.67`
 
 ## 中文说明
 
@@ -10,4 +10,4 @@ SmartAgent 是一套基于 HA OS / Home Assistant 生态构建的 AI 全屋智�
 
 ### 更新
 
-SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.65`。
+SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.67`。
