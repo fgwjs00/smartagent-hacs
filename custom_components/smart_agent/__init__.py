@@ -1131,6 +1131,127 @@ class SmartAgentRoomDetailView(HomeAssistantView):
         return self.json(result, status_code=200)
 
 
+class SmartAgentBackupsView(HomeAssistantView):
+    """Operations Bridge read model: HA-owned backup inventory for the add-on."""
+
+    url = "/api/v1/backups"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:backups"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        coord = _get_first_coordinator(request.app["hass"])
+        backup_mgr = getattr(coord, "_backup_manager", None) if coord is not None else None
+        list_backups = getattr(backup_mgr, "list_backups", None)
+        if not callable(list_backups):
+            return self.json({"backups": [], "source": "ha_host_local"}, status_code=200)
+
+        try:
+            result = list_backups()
+            if hasattr(result, "__await__"):
+                result = await result
+        except Exception as exc:
+            _LOGGER.exception("[BackupsBridge] list backups failed: %s", exc)
+            return self.json(
+                _json_error_payload(
+                    "backups_inventory_unavailable",
+                    "dependency_unreachable",
+                    True,
+                    scope="backups",
+                    source="ha_host_local",
+                    exception_type=exc.__class__.__name__,
+                ),
+                status_code=502,
+            )
+
+        rows = result if isinstance(result, list) else []
+        return self.json({"backups": rows, "source": "ha_host_local"}, status_code=200)
+
+
+class SmartAgentLicenseStatusView(HomeAssistantView):
+    """Operations Bridge read model: HA-owned license state for the add-on."""
+
+    url = "/api/v1/license/status"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:license:status"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        coord = _get_first_coordinator(request.app["hass"])
+        get_status = getattr(coord, "get_license_status", None) if coord is not None else None
+        if not callable(get_status):
+            return self.json(
+                {
+                    "has_key": False,
+                    "valid": False,
+                    "tier": "free",
+                    "source": "ha_host_local",
+                },
+                status_code=200,
+            )
+
+        try:
+            payload = get_status()
+        except Exception as exc:
+            _LOGGER.exception("[LicenseBridge] status read failed: %s", exc)
+            return self.json(
+                _json_error_payload(
+                    "license_status_unavailable",
+                    "dependency_unreachable",
+                    True,
+                    scope="license_status",
+                    source="ha_host_local",
+                    exception_type=exc.__class__.__name__,
+                ),
+                status_code=502,
+            )
+
+        data = dict(payload) if isinstance(payload, dict) else {}
+        data.setdefault("source", "ha_host_local")
+        return self.json(data, status_code=200)
+
+
+class SmartAgentMcpStatusView(HomeAssistantView):
+    """Operations Bridge read model: HA-owned MCP status for the add-on."""
+
+    url = "/api/v1/mcp/status"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:mcp:status"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        coord = _get_first_coordinator(request.app["hass"])
+        tools: list[dict[str, Any]] = []
+        try:
+            from .mcp_tools import get_mcp_tools
+
+            loaded_tools = get_mcp_tools()
+            if isinstance(loaded_tools, list):
+                tools = [dict(item) for item in loaded_tools if isinstance(item, dict)]
+        except Exception as exc:
+            _LOGGER.debug("[McpBridge] tool inventory read failed: %s", exc)
+
+        return self.json(
+            {
+                "enabled": bool(getattr(coord, "_mcp_enabled", True)) if coord is not None else False,
+                "protocol": "mcp",
+                "endpoint": "/api/v1/mcp",
+                "tools": tools,
+                "source": "ha_host_local",
+            },
+            status_code=200,
+        )
+
+
 class SmartAgentDevicePairStartView(HomeAssistantView):
     """设备配对开始接口（复用极速配对逻辑）。"""
 
