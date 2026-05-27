@@ -1017,7 +1017,7 @@ class SmartAgentHaExecuteView(HomeAssistantView):
 
 
 class SmartAgentRoomsView(HomeAssistantView):
-    """HA Area Registry 读写边界：物理空间身份以 HA Area 为事实来源。"""
+    """Area Registry Bridge（主计划 P4.2 例外）：只做 HA Area 读写，不承载房间业务语义。"""
 
     url = "/api/v1/rooms"
     extra_urls: list[str] = []
@@ -1059,7 +1059,7 @@ class SmartAgentRoomsView(HomeAssistantView):
 
 
 class SmartAgentRoomsSyncView(HomeAssistantView):
-    """HA Area Registry 写入边界：供 add-on 桥接同步空间。"""
+    """Area Registry Bridge（主计划 P4.2 例外）：供 add-on 同步 HA Area，不承载业务字段。"""
 
     url = "/api/v1/rooms/sync"
     extra_urls: list[str] = []
@@ -1107,7 +1107,7 @@ class SmartAgentRoomsSyncView(HomeAssistantView):
 
 
 class SmartAgentRoomDetailView(HomeAssistantView):
-    """HA Area Registry 删除边界：删除成功后由 add-on 清理本地附加信息。"""
+    """Area Registry Bridge（主计划 P4.2 例外）：只删除 HA Area，业务清理由 add-on 承接。"""
 
     url = "/api/v1/rooms/{room_id}"
     extra_urls: list[str] = []
