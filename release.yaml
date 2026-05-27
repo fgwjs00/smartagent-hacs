@@ -1,12 +1,13 @@
 product: SmartAgent
-release_version: 0.0.68
-display_version: Beta 0.0.68
+release_version: 0.0.69
+display_version: Beta 0.0.69
 channel: beta
-release_date: '2026-05-26'
+release_date: '2026-05-27'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.68 测试版发布：收口管理台产品语义与页面质量，设备列表默认只展示纳管实体，未纳管扫描过滤非真实设备，统一中文状态/诊断文案，并优化导航字号、照明规划控制区与前端合同覆盖。
-  customer_visible_version: Beta 0.0.68
+  summary: Beta 0.0.69 测试版发布：补齐 HA Area Registry Bridge 发布治理口径，明确 rooms 端点作为 HA Area
+    读写桥的 P4.2 例外，恢复 P4 行数门禁并同步迁移台账与公开发布仓。
+  customer_visible_version: Beta 0.0.69
