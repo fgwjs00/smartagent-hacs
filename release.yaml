@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.69
-display_version: Beta 0.0.69
+release_version: 0.0.70
+display_version: Beta 0.0.70
 channel: beta
 release_date: '2026-05-27'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.69 测试版发布：补齐 HA Area Registry Bridge 发布治理口径，明确 rooms 端点作为 HA Area
-    读写桥的 P4.2 例外，恢复 P4 行数门禁并同步迁移台账与公开发布仓。
-  customer_visible_version: Beta 0.0.69
+  summary: Beta 0.0.70 测试版发布：修复日志事件流上游缺失时的重连循环，新增 add-on 本地事件流回退与 Syslog 本地轮询状态；同步收口空间拓扑、运维桥接状态和总览设备
+    helper 过滤。
+  customer_visible_version: Beta 0.0.70
