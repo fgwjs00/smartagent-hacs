@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.70 - 2026-05-27
+## Beta 0.0.71 - 2026-05-28
 
-Beta 0.0.70 测试版发布：修复日志事件流上游缺失时的重连循环，新增 add-on 本地事件流回退与 Syslog 本地轮询状态；同步收口空间拓扑、运维桥接状态和总览设备 helper 过滤。
+Beta 0.0.71 测试版发布：发布 SmartAgent 管理端 UI/UX 全栈重塑 Stage A+B+C，落地新的 AppShell、SidebarRail、Topbar、反馈中心、总览/空间/决策追踪与运维状态视觉体系。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.70`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.71`，用于 Home Assistant 更新检测。
