@@ -147,10 +147,11 @@ def local_ha_area_room_rows(hass: HomeAssistant | None) -> list[dict[str, Any]]:
             continue
         seen.add(name)
         rows.append({
-            "id": name,
+            "id": area_id or name,
             "name": name,
             "device_count": 0,
             "area_id": area_id,
+            "source": "ha_area_registry",
         })
     return rows
 
@@ -159,12 +160,16 @@ def local_room_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dict[
     rooms: dict[str, dict[str, Any]] = {}
     room_aliases: dict[str, str] = {}
     for area_row in local_ha_area_room_rows(hass):
+        area_key = str(area_row.get("id") or area_row.get("area_id") or area_row.get("name") or "").strip()
         name = str(area_row["name"])
-        rooms[name] = dict(area_row)
-        room_aliases[name] = name
+        if not area_key:
+            area_key = name
+        rooms[area_key] = dict(area_row)
+        room_aliases[name] = area_key
+        room_aliases[area_key] = area_key
         area_id = str(area_row.get("area_id") or "").strip()
         if area_id:
-            room_aliases[area_id] = name
+            room_aliases[area_id] = area_key
 
     for info in get_device_info_snapshot(coord).values():
         if not isinstance(info, dict):

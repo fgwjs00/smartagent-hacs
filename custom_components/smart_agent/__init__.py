@@ -35,6 +35,8 @@ from .host_read_models import (
 )
 from .ha_adapter import (
     async_call_service,
+    async_delete_ha_area,
+    async_ensure_ha_area,
     async_execute_command_envelope,
     get_ai_scenes_cache_snapshot,
     get_room_topology_cache_snapshot,
@@ -432,10 +434,6 @@ def _addon_result_list_body(result: dict[str, Any] | None) -> list[dict[str, Any
     if isinstance(raw_body, dict) and isinstance(raw_body.get("data"), list):
         return [x for x in raw_body.get("data", []) if isinstance(x, dict)]
     return None
-
-
-
-
 
 
 def _ha_local_log_error_payload(
@@ -1016,6 +1014,121 @@ class SmartAgentHaExecuteView(HomeAssistantView):
         payload = dict(result)
         payload["execution_path"] = "ha_execute_adapter"
         return self.json(payload, status_code=status_code)
+
+
+class SmartAgentRoomsView(HomeAssistantView):
+    """HA Area Registry 读写边界：物理空间身份以 HA Area 为事实来源。"""
+
+    url = "/api/v1/rooms"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:rooms"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        coord = _get_first_coordinator(request.app["hass"])
+        return self.json(_local_room_rows(coord, request.app["hass"]))
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False, scope="rooms_create"),
+                status_code=400,
+            )
+        if not isinstance(body, dict):
+            return self.json(
+                _json_error_payload("invalid_body", "bad_request", False, scope="rooms_create"),
+                status_code=400,
+            )
+
+        name = str(body.get("name") or body.get("room") or body.get("id") or "").strip()
+        area_id = str(body.get("area_id") or body.get("id") or "").strip()
+        result = await async_ensure_ha_area(request.app["hass"], name=name, area_id=area_id)
+        if not bool(result.get("ok")):
+            error_type = str(result.get("error_type") or "internal_error")
+            status_code = 400 if error_type == "bad_request" else 500
+            return self.json(dict(result, scope="rooms_create"), status_code=status_code)
+        return self.json(result, status_code=200)
+
+
+class SmartAgentRoomsSyncView(HomeAssistantView):
+    """HA Area Registry 写入边界：供 add-on 桥接同步空间。"""
+
+    url = "/api/v1/rooms/sync"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:rooms:sync"
+    requires_auth = True
+
+    async def post(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        coord = _get_first_coordinator(request.app["hass"])
+        sync_rooms = getattr(coord, "async_sync_rooms_to_ha", None) if coord is not None else None
+        if not callable(sync_rooms):
+            return self.json(
+                _json_error_payload(
+                    "addon_unreachable",
+                    "dependency_unreachable",
+                    True,
+                    scope="rooms_sync",
+                    source="ha_host_local",
+                ),
+                status_code=502,
+            )
+
+        try:
+            result = await sync_rooms()
+        except Exception as exc:
+            _LOGGER.exception("[RoomsSync] HA area registry sync failed: %s", exc)
+            return self.json(
+                _json_error_payload(
+                    "addon_unreachable",
+                    "dependency_unreachable",
+                    True,
+                    scope="rooms_sync",
+                    source="ha_host_local",
+                    exception_type=exc.__class__.__name__,
+                ),
+                status_code=502,
+            )
+
+        payload = dict(result) if isinstance(result, dict) else {}
+        errors = int(payload.get("errors", 0) or 0)
+        payload.setdefault("ok", errors == 0)
+        return self.json(payload, status_code=200 if payload.get("ok") else 500)
+
+
+class SmartAgentRoomDetailView(HomeAssistantView):
+    """HA Area Registry 删除边界：删除成功后由 add-on 清理本地附加信息。"""
+
+    url = "/api/v1/rooms/{room_id}"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:rooms:detail"
+    requires_auth = True
+
+    async def delete(self, request: web.Request, room_id: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        result = await async_delete_ha_area(request.app["hass"], room_id)
+        if not bool(result.get("ok")):
+            error_type = str(result.get("error_type") or "internal_error")
+            if error_type == "bad_request":
+                status_code = 400
+            elif error_type == "not_found":
+                status_code = 404
+            else:
+                status_code = 500
+            return self.json(dict(result, scope="rooms_delete"), status_code=status_code)
+        return self.json(result, status_code=200)
 
 
 class SmartAgentDevicePairStartView(HomeAssistantView):

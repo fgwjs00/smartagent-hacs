@@ -60,6 +60,92 @@ def async_get_area_registry(hass: HomeAssistant) -> Any:
     return ar.async_get(hass)
 
 
+def _area_entry_to_row(area: Any) -> dict[str, Any]:
+    area_id = str(
+        getattr(area, "id", "")
+        or getattr(area, "area_id", "")
+        or getattr(area, "slug", "")
+        or ""
+    ).strip()
+    name = str(getattr(area, "name", "") or area_id).strip()
+    return {
+        "id": area_id or name,
+        "name": name or area_id,
+        "area_id": area_id,
+        "device_count": 0,
+        "source": "ha_area_registry",
+    }
+
+
+def _find_area(area_reg: Any, area_id_or_name: str) -> Any | None:
+    target = str(area_id_or_name or "").strip()
+    if not target:
+        return None
+    getter = getattr(area_reg, "async_get_area", None)
+    if callable(getter):
+        try:
+            area = getter(target)
+            if area is not None:
+                return area
+        except Exception:
+            pass
+    raw_areas = getattr(area_reg, "areas", None)
+    area_items = raw_areas.values() if isinstance(raw_areas, dict) else ()
+    folded = target.casefold()
+    for area in area_items:
+        area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()
+        name = str(getattr(area, "name", "") or "").strip()
+        if target in {area_id, name} or folded in {area_id.casefold(), name.casefold()}:
+            return area
+    return None
+
+
+async def async_ensure_ha_area(
+    hass: Any,
+    *,
+    name: str,
+    area_id: str | None = None,
+) -> dict[str, Any]:
+    """Create or reuse a HA Area and return its normalized row."""
+    area_name = str(name or "").strip()
+    requested_id = str(area_id or "").strip()
+    if not area_name and not requested_id:
+        return {"ok": False, "error": "area_name_required", "error_type": "bad_request", "retryable": False}
+
+    area_reg = async_get_area_registry(hass)
+    existing = _find_area(area_reg, requested_id or area_name)
+    if existing is None and area_name:
+        existing = _find_area(area_reg, area_name)
+    if existing is None:
+        existing = area_reg.async_get_or_create(area_name or requested_id)
+    row = _area_entry_to_row(existing)
+    row["ok"] = True
+    return row
+
+
+async def async_delete_ha_area(hass: Any, area_id_or_name: str) -> dict[str, Any]:
+    """Delete a HA Area by id or name and return a normalized result."""
+    target = str(area_id_or_name or "").strip()
+    if not target:
+        return {"ok": False, "error": "area_id_required", "error_type": "bad_request", "retryable": False}
+
+    area_reg = async_get_area_registry(hass)
+    area = _find_area(area_reg, target)
+    if area is None:
+        return {
+            "ok": False,
+            "error": "area_not_found",
+            "error_type": "not_found",
+            "retryable": False,
+            "area_id": target,
+        }
+
+    row = _area_entry_to_row(area)
+    area_id = str(row.get("area_id") or row.get("id") or target)
+    area_reg.async_delete(area_id)
+    return {"ok": True, "deleted": True, **row}
+
+
 def get_device_info_snapshot(coord: Any) -> dict[str, Any]:
     """最小只读读取面：返回 coord.device_info 的安全 dict 视图。
 
