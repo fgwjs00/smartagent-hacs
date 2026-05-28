@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.71
-display_version: Beta 0.0.71
+release_version: 0.0.72
+display_version: Beta 0.0.72
 channel: beta
 release_date: '2026-05-28'
 public_release_ready: true
@@ -8,5 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.71 测试版发布：发布 SmartAgent 管理端 UI/UX 全栈重塑 Stage A+B+C，落地新的 AppShell、SidebarRail、Topbar、反馈中心、总览/空间/决策追踪与运维状态视觉体系。
-  customer_visible_version: Beta 0.0.71
+  summary: Beta 0.0.72 测试版发布：回滚 0.0.71 管理端 UI/UX 重塑，恢复 0.0.70 稳定前端体验；保留日志事件流回退、空间拓扑收口、运维桥接状态和总览设备
+    helper 过滤修复。
+  customer_visible_version: Beta 0.0.72
