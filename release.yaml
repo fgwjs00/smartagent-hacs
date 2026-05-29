@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.72
-display_version: Beta 0.0.72
+release_version: 0.0.73
+display_version: Beta 0.0.73
 channel: beta
-release_date: '2026-05-28'
+release_date: '2026-05-29'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.72 测试版发布：回滚 0.0.71 管理端 UI/UX 重塑，恢复 0.0.70 稳定前端体验；保留日志事件流回退、空间拓扑收口、运维桥接状态和总览设备
-    helper 过滤修复。
-  customer_visible_version: Beta 0.0.72
+  summary: Beta 0.0.73 测试版发布：统一空间读源到 HA Area rooms bridge，修复空间/照明集合漂移、传感器融合 404 降级和运维桥接状态误报；同步最近
+    AI 行为域页面收口。
+  customer_visible_version: Beta 0.0.73
