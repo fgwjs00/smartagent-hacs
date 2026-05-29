@@ -472,7 +472,6 @@ class SmartAgentCoordinator(
         except Exception:
             pass
         self._init_memory_db()
-        self._pattern_summary = self._load_pattern_summary()
         self._load_config()
         # Phase 4: 加载 AI 场景缓存
         self._ai_scenes_cache = self._query_ai_scenes()

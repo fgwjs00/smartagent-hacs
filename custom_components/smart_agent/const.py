@@ -227,6 +227,8 @@ ONLINE_VISION_MODELS: list[str] = [
 LOCAL_MODELS_SUGGESTIONS: list[str] = [
     "qwen3-smarthome",        # 定制微调模型（推荐首选）
     "qwen3.5:9b",             # 8845HS 旗舰机推荐：高精度本地推理
+    "qwen3.5:8b",             # 8B 本地模型
+    "qwen3.5:4b",             # 4B 本地模型
     "qwen3:8b",               # 备选 8B 模型
     "qwen3:4b",               # 轻量：8250U / N305 VM 适用
     "qwen3:1.7b",             # 极轻量：N305 本地兜底

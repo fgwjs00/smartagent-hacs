@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.73
-display_version: Beta 0.0.73
+release_version: 0.0.74
+display_version: Beta 0.0.74
 channel: beta
 release_date: '2026-05-29'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.73 测试版发布：统一空间读源到 HA Area rooms bridge，修复空间/照明集合漂移、传感器融合 404 降级和运维桥接状态误报；同步最近
-    AI 行为域页面收口。
-  customer_visible_version: Beta 0.0.73
+  summary: Beta 0.0.74 测试版发布：收口 HA 薄宿主实体与配置入口，移除旧按钮/选择器/文本实体注册，保留 8234 作为模型和运行参数配置源；补齐
+    Qwen3.5 4B/8B 本地模型候选，并锁定空间与 HA Area 新增、删除、同步的一致语义。
+  customer_visible_version: Beta 0.0.74

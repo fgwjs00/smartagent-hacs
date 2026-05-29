@@ -34,10 +34,6 @@ async def async_setup_entry(
     async_add_entities([
         SmartAgentPausedSwitch(coordinator, entry.entry_id),
         SmartAgentSensorMuteSwitch(coordinator, entry.entry_id),
-        SmartAgentLearningModeSwitch(coordinator, entry.entry_id),
-        SmartAgentHabitProactiveSwitch(coordinator, entry.entry_id),
-        SmartAgentFrigateSwitch(coordinator, entry.entry_id),
-        SmartAgentVisionSwitch(coordinator, entry.entry_id),
     ])
 
 

@@ -23,6 +23,7 @@ from homeassistant.auth import models as auth_models
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import entity_registry
 from homeassistant.helpers import config_validation as cv
 
 from .const import CONF_CLEANUP_LEGACY_PAIR_TOKENS, DOMAIN, MODE_HOME, MODE_SHOWROOM
@@ -1555,13 +1556,88 @@ class SmartAgentDevicePairConfirmView(HomeAssistantView):
 PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.SWITCH,
-    Platform.NUMBER,
-    Platform.SELECT,
-    Platform.BUTTON,
-    Platform.TEXT,
     Platform.CONVERSATION,
     Platform.UPDATE,  # Phase 9.7: 版本自动检查实体
 ]
+
+
+LEGACY_ENTITY_IDS: tuple[str, ...] = (
+    "button.smart_agent_discover",
+    "button.smart_agent_dev_add",
+    "button.smart_agent_dev_delete",
+    "button.smart_agent_habit_add",
+    "button.smart_agent_habit_delete",
+    "button.smart_agent_habit_lock",
+    "button.smart_agent_rule_add",
+    "button.smart_agent_rule_delete",
+    "button.smart_agent_rule_lock",
+    "button.smart_agent_confirm_habit",
+    "button.smart_agent_cancel_habit",
+    "number.smart_agent_confidence_auto",
+    "number.smart_agent_confidence_notify",
+    "select.smart_agent_engine",
+    "select.smart_agent_dev_select",
+    "select.smart_agent_habit_select",
+    "select.smart_agent_rule_select",
+    "text.smart_agent_status",
+    "text.smart_agent_last_action",
+    "text.smart_agent_dev_entity",
+    "text.smart_agent_dev_desc",
+    "text.smart_agent_habit_input",
+    "text.smart_agent_rule_input",
+    "sensor.smart_agent_config",
+    "switch.smart_agent_learning_mode",
+    "switch.smart_agent_habit_proactive",
+    "switch.smart_agent_frigate_enabled",
+    "switch.smart_agent_vision_enabled",
+)
+
+LEGACY_ENTITY_KEY_DOMAINS: dict[str, tuple[str, ...]] = {
+    "discover": ("button",),
+    "dev_add": ("button",),
+    "dev_delete": ("button",),
+    "habit_add": ("button",),
+    "habit_delete": ("button",),
+    "habit_lock": ("button",),
+    "rule_add": ("button",),
+    "rule_delete": ("button",),
+    "rule_lock": ("button",),
+    "confirm_habit": ("button",),
+    "cancel_habit": ("button",),
+    "confidence_auto": ("number",),
+    "confidence_notify": ("number",),
+    "engine": ("select",),
+    "dev_select": ("select",),
+    "habit_select": ("select",),
+    "rule_select": ("select",),
+    "status": ("text",),
+    "last_action": ("text",),
+    "dev_entity": ("text",),
+    "dev_desc": ("text",),
+    "habit_input": ("text",),
+    "rule_input": ("text",),
+    "config": ("sensor",),
+    "learning_mode": ("switch",),
+    "habit_proactive": ("switch",),
+    "frigate_enabled": ("switch",),
+    "vision_enabled": ("switch",),
+}
+LEGACY_ENTITY_KEYS: tuple[str, ...] = tuple(LEGACY_ENTITY_KEY_DOMAINS)
+
+
+async def _async_remove_legacy_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    entity_reg = entity_registry.async_get(hass)
+    for entity_id in LEGACY_ENTITY_IDS:
+        if entity_reg.async_get(entity_id):
+            entity_reg.async_remove(entity_id)
+    for registry_entry in entity_registry.async_entries_for_config_entry(entity_reg, entry.entry_id):
+        entity_id = str(getattr(registry_entry, "entity_id", "") or "")
+        domain = str(getattr(registry_entry, "domain", "") or entity_id.split(".", 1)[0])
+        unique_id = str(getattr(registry_entry, "unique_id", "") or "")
+        for key, domains in LEGACY_ENTITY_KEY_DOMAINS.items():
+            if domain in domains and unique_id.endswith(f"_{key}"):
+                entity_reg.async_remove(entity_id)
+                break
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -1634,6 +1710,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartAgent from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     await _async_cleanup_legacy_pair_tokens_if_enabled(hass, entry)
+    await _async_remove_legacy_entities(hass, entry)
     coordinator = SmartAgentCoordinator(hass, entry)
     await hass.async_add_executor_job(coordinator._blocking_init)
     await coordinator.async_config_entry_first_refresh()
