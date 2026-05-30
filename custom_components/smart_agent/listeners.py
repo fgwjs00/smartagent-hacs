@@ -899,6 +899,17 @@ class ListenersMixin:
                         return
                     if 200 <= status < 300:
                         should_fail_closed = False
+                        if reason == "local_fast_brain_disabled" or response.get("fast_path_disabled") is True:
+                            self._sys_log(
+                                "INFO",
+                                f"[Add-on FastPath] disabled; scheduling slow inference | entity={entity_id}",
+                            )
+                            self._schedule_inference(
+                                entity_id,
+                                f"{entity_id}: {old_state} -> {new_state}",
+                                new_state,
+                            )
+                            return
                         self._sys_log(
                             "INFO",
                             f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",

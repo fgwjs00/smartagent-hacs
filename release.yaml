@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.76
-display_version: Beta 0.0.76
+release_version: 0.0.77
+display_version: Beta 0.0.77
 channel: beta
 release_date: '2026-05-30'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.76 测试版发布：修复空间管理页空间模型编辑事件未送达导致点击编辑无反应的问题；继续包含 0.0.75 的世界模型同源、存在传感器回退与
-    HA Listener 策略真源漂移修复。
-  customer_visible_version: Beta 0.0.76
+  summary: Beta 0.0.77 测试版发布：修复关闭本地快脑后慢脑未接管、照明规划空间下拉显示 ID、Presence 候选预览 422 阻断；继续包含
+    0.0.76 的空间编辑事件修复。
+  customer_visible_version: Beta 0.0.77
