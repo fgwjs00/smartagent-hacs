@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.81
-display_version: Beta 0.0.81
+release_version: 0.0.82
+display_version: Beta 0.0.82
 channel: beta
 release_date: '2026-05-31'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.81 测试版发布：补齐慢脑在线/本地推理链路的超时预算、在线请求审计日志、前端保存反馈与事件 WebSocket 断连语义，便于现场确认是否真实发起在线大模型请求并避免
-    60 秒提前中断。
-  customer_visible_version: Beta 0.0.81
+  summary: Beta 0.0.82 测试版发布：补发空间模型编辑抽屉交互、设备编辑核心配置校验提示与线上大模型请求日志可观测修复，确保 HA Add-on
+    Store/HACS 能识别升级。
+  customer_visible_version: Beta 0.0.82
