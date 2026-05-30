@@ -18,7 +18,7 @@ AddOnClient — SmartAgent Add-on 内部 API 客户端。
 Fail-safe 设计：
   - Add-on 未安装 / 容器未启动时，`is_available()` 返回 False
   - 调用方检测到不可用时必须 fail-closed，不再回退到 HA 本地推理
-  - infer() 超时 90 秒（LLM 调用可能需要较长时间）
+  - infer() 使用较长超时（LLM 调用可能需要较长时间）
   - auth_token 为空时不发送认证头（向后兼容未配置令牌的环境）
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ def derive_addon_gateway_base_url(ha_url: str, gateway_port: int = _DEFAULT_ADDO
 
 _HEALTH_TIMEOUT = aiohttp.ClientTimeout(total=5)
 # LLM 调用可能需要 60s+，推理超时设宽裕一些
-_INFER_TIMEOUT = aiohttp.ClientTimeout(total=90)
+_INFER_TIMEOUT = aiohttp.ClientTimeout(total=140)
 # 可用性检查缓存有效期（秒）：成功=60s，失败=10s（快速重试）
 _AVAIL_CACHE_OK = 60.0
 _AVAIL_CACHE_FAIL = 10.0
@@ -260,7 +260,7 @@ class AddOnClient:
         if bundle is not None:
             payload["bundle"] = dict(bundle)
 
-        result = await self.request_json("POST", "/decision/run", body=payload)
+        result = await self.request_json("POST", "/decision/run", body=payload, timeout=_INFER_TIMEOUT)
         if not isinstance(result, dict):
             return None
         status = int(result.get("status_code") or 0)
@@ -454,7 +454,10 @@ class AddOnClient:
             self._avail_cache = False          # 让下次立即重新检查
             self._avail_checked_at = 0.0
         except asyncio.TimeoutError:
-            _LOGGER.warning("[AddOnClient] 推理超时（>90s），返回 None 由上游 fail-closed")
+            _LOGGER.warning(
+                "[AddOnClient] 推理超时（>%ss），返回 None 由上游 fail-closed",
+                int(_INFER_TIMEOUT.total or 0),
+            )
             self._avail_cache = False
             self._avail_checked_at = 0.0
         except Exception as exc:
