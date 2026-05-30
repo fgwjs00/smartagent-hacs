@@ -1014,6 +1014,70 @@ class SmartAgentCoordinator(
             habit_value = payload.get("habit_proactive_ask")
         applied: list[str] = []
         frigate_runtime_action: str | None = None
+        if "engine" in payload:
+            new_value = "online" if str(payload.get("engine") or "").strip().lower() == "online" else "local"
+            if new_value != self.engine:
+                self.engine = new_value
+                applied.append(f"engine={new_value}")
+        if "ollama_url" in payload:
+            new_value = str(payload.get("ollama_url") or "").strip() or "http://127.0.0.1:11434"
+            if new_value != self.ollama_url:
+                self.ollama_url = new_value
+                applied.append("ollama_url=updated")
+        if "ollama_model" in payload:
+            new_value = str(payload.get("ollama_model") or "").strip()
+            if new_value and new_value != self.ollama_model:
+                self.ollama_model = new_value
+                applied.append(f"ollama_model={new_value}")
+        if "online_base_url" in payload:
+            new_value = str(payload.get("online_base_url") or "").strip()
+            if new_value and new_value != self.online_base_url:
+                self.online_base_url = new_value
+                applied.append("online_base_url=updated")
+        if "online_model" in payload:
+            new_value = str(payload.get("online_model") or "").strip()
+            if new_value and new_value != self.online_model:
+                self.online_model = new_value
+                applied.append(f"online_model={new_value}")
+        if "online_api_key" in payload:
+            new_value = str(payload.get("online_api_key") or "").strip()
+            if new_value and set(new_value) != {"*"} and new_value != self._online_api_key:
+                self._online_api_key = new_value
+                applied.append("online_api_key=updated")
+        if "cloud_fallback" in payload:
+            new_value = bool(payload.get("cloud_fallback"))
+            if new_value != self._cloud_fallback:
+                self._cloud_fallback = new_value
+                applied.append(f"cloud_fallback={new_value}")
+        if "confidence_auto" in payload:
+            try:
+                new_value = int(float(payload.get("confidence_auto")))
+            except (TypeError, ValueError):
+                new_value = self.confidence_auto
+            if new_value != self.confidence_auto:
+                self.confidence_auto = new_value
+                applied.append(f"confidence_auto={new_value}")
+        if "confidence_notify" in payload:
+            try:
+                new_value = int(float(payload.get("confidence_notify")))
+            except (TypeError, ValueError):
+                new_value = self.confidence_notify
+            if new_value != self.confidence_notify:
+                self.confidence_notify = new_value
+                applied.append(f"confidence_notify={new_value}")
+        if "cooldown" in payload:
+            try:
+                new_value = int(float(payload.get("cooldown")))
+            except (TypeError, ValueError):
+                new_value = self.cooldown
+            if new_value != self.cooldown:
+                self.cooldown = new_value
+                applied.append(f"cooldown={new_value}")
+        if "mode" in payload:
+            new_value = "showroom" if str(payload.get("mode") or "").strip().lower() == "showroom" else "home"
+            if new_value != self._mode:
+                self._mode = new_value
+                applied.append(f"mode={new_value}")
         if "learning_mode" in payload:
             new_value = bool(payload.get("learning_mode"))
             if new_value != self._learning_mode:

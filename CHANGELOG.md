@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.79 - 2026-05-30
+## Beta 0.0.80 - 2026-05-30
 
-Beta 0.0.79 测试版发布：修复 Presence 传感器融合类型表将未纳管 HA 候选传感器直接展示的问题；候选仍通过发现候选/应用选择纳管，融合配置表与融合域成员选择仅显示已纳管传感器。
+Beta 0.0.80 测试版发布：修复本地快脑关闭后慢脑仍沿用 HA 侧旧 engine/local Ollama 配置的问题；/decision/run 现在优先采用 8234/add-on 系统设置，HA 同步慢脑运行字段，确保慢脑按在线或本地配置真实接管。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.79`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.80`，用于 Home Assistant 更新检测。

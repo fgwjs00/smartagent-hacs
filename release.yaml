@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.79
-display_version: Beta 0.0.79
+release_version: 0.0.80
+display_version: Beta 0.0.80
 channel: beta
 release_date: '2026-05-30'
 public_release_ready: true
@@ -8,5 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.79 测试版发布：修复 Presence 传感器融合类型表将未纳管 HA 候选传感器直接展示的问题；候选仍通过发现候选/应用选择纳管，融合配置表与融合域成员选择仅显示已纳管传感器。
-  customer_visible_version: Beta 0.0.79
+  summary: Beta 0.0.80 测试版发布：修复本地快脑关闭后慢脑仍沿用 HA 侧旧 engine/local Ollama 配置的问题；/decision/run
+    现在优先采用 8234/add-on 系统设置，HA 同步慢脑运行字段，确保慢脑按在线或本地配置真实接管。
+  customer_visible_version: Beta 0.0.80
