@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.75
-display_version: Beta 0.0.75
+release_version: 0.0.76
+display_version: Beta 0.0.76
 channel: beta
 release_date: '2026-05-30'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.75 测试版发布：统一空间与设备世界模型读源，修复照明规划、空间管理、存在传感器与 HA Listener 策略状态漂移；8234/add-on
-    设置继续作为运行策略真实源，HA 薄宿主不再用旧 learning_mode/vision 内存状态拦截传感器 fast-path。
-  customer_visible_version: Beta 0.0.75
+  summary: Beta 0.0.76 测试版发布：修复空间管理页空间模型编辑事件未送达导致点击编辑无反应的问题；继续包含 0.0.75 的世界模型同源、存在传感器回退与
+    HA Listener 策略真源漂移修复。
+  customer_visible_version: Beta 0.0.76
