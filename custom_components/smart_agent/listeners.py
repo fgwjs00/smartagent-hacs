@@ -239,7 +239,15 @@ class ListenersMixin:
     # ── 触发调度与合并 ────────────────────────────────────────────────────────
 
     @callback
-    def _schedule_inference(self, entity_id: str, trigger: str, new_state: str = "", one_off_prompt: str = "") -> None:
+    def _schedule_inference(
+        self,
+        entity_id: str,
+        trigger: str,
+        new_state: str = "",
+        one_off_prompt: str = "",
+        *,
+        _policy_synced: bool = False,
+    ) -> None:
 
         # ── 门控检查（所有路径统一入口，包括 Frigate MQTT / 巡检 / HA 状态变化）──────
         # 1. AI 是否已暂停
@@ -253,6 +261,16 @@ class ListenersMixin:
             self._sys_log("INFO", f"启动冷却中({_remaining}s 后就绪)，忽略触发: {entity_id}")
             return
         # 3. 静默学习模式（只记录不推理）
+        if not _policy_synced:
+            self.hass.async_create_task(
+                self._schedule_inference_after_addon_policy_sync(
+                    entity_id,
+                    trigger,
+                    new_state,
+                    one_off_prompt,
+                )
+            )
+            return
         if self._learning_mode:
             # 仅记录真实 HA 实体（entity_id 必须含"."，排除"展厅系统"等虚拟调度实体）
             _is_real_entity = "." in entity_id and not entity_id.startswith(".")
@@ -297,6 +315,25 @@ class ListenersMixin:
         self._sys_log("INFO", f"[调度] 推理已加入队列，{window}s 后执行{'（紧急）' if is_urgent else ''}")
         if self._merge_timer_unsub is None:
             self._merge_timer_unsub = async_call_later(self.hass, window, self._flush_triggers)
+
+    async def _schedule_inference_after_addon_policy_sync(
+        self,
+        entity_id: str,
+        trigger: str,
+        new_state: str = "",
+        one_off_prompt: str = "",
+    ) -> None:
+        try:
+            await self._async_apply_addon_system_settings()
+        except Exception as exc:
+            _LOGGER.debug("[AddonSettings] pre-inference policy sync failed: %s", exc)
+        self._schedule_inference(
+            entity_id,
+            trigger,
+            new_state,
+            one_off_prompt,
+            _policy_synced=True,
+        )
 
     @callback
     def _flush_triggers(self, _: datetime) -> None:
@@ -751,14 +788,13 @@ class ListenersMixin:
                     reason = str(response.get("reason") or details.get("reason") or response.get("error") or "")
                     confirm_required = response.get("confirm_required") is True or details.get("confirm_required") is True
                     confirm_suppressed_reason = str(details.get("confirm_suppressed_reason") or "")
-                    execution_suppressed_reason = "learning_mode" if matched and self._learning_mode else ""
-                    if confirm_required:
-                        if self._learning_mode:
-                            confirm_suppressed_reason = "learning_mode"
-                        elif not getattr(self, "_habit_proactive", False):
-                            confirm_suppressed_reason = "habit_proactive_disabled"
-                        if confirm_suppressed_reason:
-                            confirm_required = False
+                    addon_learning_mode = details.get("learning_mode")
+                    addon_habit_proactive = details.get("habit_proactive")
+                    execution_suppressed_reason = (
+                        "learning_mode" if matched and addon_learning_mode is True else ""
+                    )
+                    if confirm_required and confirm_suppressed_reason:
+                        confirm_required = False
                     confidence_auto = details.get("confidence_auto")
                     confidence_notify = details.get("confidence_notify")
                     scene = ""
@@ -787,8 +823,8 @@ class ListenersMixin:
                         f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
                         f"confirm_required={confirm_required} "
                         f"confirm_suppressed_reason={confirm_suppressed_reason or '-'} "
-                        f"learning_mode={bool(self._learning_mode)} "
-                        f"habit_proactive={bool(getattr(self, '_habit_proactive', False))} "
+                        f"learning_mode={addon_learning_mode if addon_learning_mode is not None else '-'} "
+                        f"habit_proactive={addon_habit_proactive if addon_habit_proactive is not None else '-'} "
                         f"action_count={action_count} entity={entity_id}",
                     )
                     self._emit_addon_fast_path_event(
@@ -1013,35 +1049,6 @@ class ListenersMixin:
                     old_state=old_s,
                     new_state=new_s,
                     filter_reason="unmanaged_entity",
-                    source_type=source_type,
-                )
-                return
-
-            # ── Step 0：add-on 优先快路（有 add-on 时直接调用，不先跑本地）──
-            if self._learning_mode:
-                name = self.get_device_name(entity_id)
-                trigger = self._fmt_trigger(source_type, domain, name, entity_id, old_s, new_s)
-                self._sys_log(
-                    "INFO",
-                    f"[SilentLearning] managed=true filter_reason=learning_mode "
-                    f"confirm_suppressed_reason=learning_mode execution_policy=record_only "
-                    f"path=state_handler entity={entity_id} old_state={old_s} new_state={new_s} "
-                    f"source_type={source_type}; record only, skip add-on fast-path",
-                )
-                self.hass.async_add_executor_job(
-                    self._record_event,
-                    "Learning",
-                    trigger,
-                    entity_id,
-                    new_s,
-                    "system",
-                )
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="learning_mode",
                     source_type=source_type,
                 )
                 return

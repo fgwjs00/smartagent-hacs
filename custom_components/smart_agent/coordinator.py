@@ -1024,6 +1024,11 @@ class SmartAgentCoordinator(
             if new_value != self._habit_proactive:
                 self._habit_proactive = new_value
                 applied.append(f"habit_proactive={new_value}")
+        if "vision_enabled" in payload:
+            new_value = bool(payload.get("vision_enabled"))
+            if new_value != self._vision_enabled:
+                self._vision_enabled = new_value
+                applied.append(f"vision_enabled={new_value}")
         if "frigate_enabled" in payload:
             new_value = bool(payload.get("frigate_enabled"))
             if new_value != self._frigate_enabled:

@@ -14,29 +14,85 @@ from .ha_adapter import (
     list_binary_sensor_states,
 )
 
+
+def _presence_sensor_keywords(coord: SmartAgentCoordinator) -> tuple[str, ...]:
+    defaults = (
+        "occupancy", "presence", "motion", "pir", "ren_ti", "cun_zai", "you_ren",
+        "radar", "mmwave", "frigate", "vision", "camera", "person_occupancy", "object_count",
+        "contact", "door", "window", "opening", "men_chuang",
+    )
+    raw_keywords = getattr(coord, "_PRESENCE_KW", defaults)
+    if not isinstance(raw_keywords, (list, tuple, set)):
+        raw_keywords = defaults
+    merged = [*defaults, *(str(item) for item in raw_keywords)]
+    result: list[str] = []
+    for item in merged:
+        token = str(item or "").strip().lower()
+        if token and token not in result:
+            result.append(token)
+    return tuple(result)
+
+
+def _presence_sensor_domain(entity_id: str, info: dict[str, Any] | None = None) -> str:
+    info = info if isinstance(info, dict) else {}
+    domain = str(info.get("domain") or info.get("type") or "").strip()
+    if not domain and "." in entity_id:
+        domain = entity_id.split(".", 1)[0]
+    return domain
+
+
+def _presence_sensor_text(entity_id: str, info: dict[str, Any] | None = None) -> str:
+    info = info if isinstance(info, dict) else {}
+    parts: list[str] = [entity_id]
+    for key in ("name", "friendly_name", "domain", "type", "sensor_type", "device_class"):
+        value = info.get(key)
+        if value:
+            parts.append(str(value))
+    roles = info.get("roles") or info.get("role") or ()
+    if isinstance(roles, str):
+        roles = [roles]
+    if isinstance(roles, (list, tuple, set)):
+        parts.extend(str(item) for item in roles if item)
+    return " ".join(parts).lower()
+
+
+def _is_presence_sensor_snapshot(
+    entity_id: str,
+    info: dict[str, Any] | None,
+    keywords: tuple[str, ...],
+) -> bool:
+    domain = _presence_sensor_domain(entity_id, info)
+    if domain not in {"binary_sensor", "sensor", "camera"}:
+        return False
+    text = _presence_sensor_text(entity_id, info)
+    return any(token in text for token in keywords)
+
+
 def build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordinator) -> dict[str, Any]:
     """Build the presence sensor editor payload shared by HTTP and HA WS UIs."""
     import json as _json
 
-    presence_kw = getattr(coord, "_PRESENCE_KW", (
+    _legacy_presence_kw = (
         "occupancy", "presence", "motion", "人体", "存在", "有人", "移动",
         "ren_ti", "cun_zai", "radar", "mmwave", "雷达",
         "person_occupancy", "object_count",
-    ))
+    )
 
-    sensors: list[dict[str, Any]] = []
+    presence_kw = (*_legacy_presence_kw, *_presence_sensor_keywords(coord))
+
+    sensors_by_id: dict[str, dict[str, Any]] = {}
     fusion_registry = getattr(coord, "_fusion_registry", None)
     device_info = get_device_info_snapshot(coord)
 
     for row in list_binary_sensor_states(hass):
         eid = str(row.get("entity_id", "") or "")
         attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+        info = device_info.get(eid) if isinstance(device_info.get(eid), dict) else {}
+        match_info = {**attrs, **info}
         friendly = attrs.get("friendly_name", eid)
-        check_str = (friendly + eid).lower()
-        if not any(str(kw).lower() in check_str for kw in presence_kw):
+        if not _is_presence_sensor_snapshot(eid, match_info, presence_kw):
             continue
 
-        info = device_info.get(eid) or {}
         fusion_scope = None
         if fusion_registry is not None:
             scope = fusion_registry.get_scope_for_entity(eid)
@@ -45,7 +101,7 @@ def build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordin
 
         state_obj = async_get_state(hass, eid)
         runtime_state = getattr(state_obj, "state", None) if state_obj is not None else None
-        sensors.append({
+        sensors_by_id[eid] = {
             "entity_id": eid,
             "name": info.get("name") or friendly,
             "room": info.get("room", ""),
@@ -53,7 +109,31 @@ def build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordin
             "sensor_type": info.get("sensor_type", ""),
             "in_sa": eid in device_info,
             "fusion_scope": fusion_scope,
-        })
+        }
+
+    for eid, raw_info in sorted(device_info.items(), key=lambda item: str(item[0])):
+        entity_id = str(eid or "").strip()
+        if not entity_id or entity_id in sensors_by_id:
+            continue
+        info = raw_info if isinstance(raw_info, dict) else {}
+        if not _is_presence_sensor_snapshot(entity_id, info, presence_kw):
+            continue
+        fusion_scope = None
+        if fusion_registry is not None:
+            scope = fusion_registry.get_scope_for_entity(entity_id)
+            if scope is not None:
+                fusion_scope = scope.display_name
+        state_obj = async_get_state(hass, entity_id)
+        runtime_state = getattr(state_obj, "state", None) if state_obj is not None else None
+        sensors_by_id[entity_id] = {
+            "entity_id": entity_id,
+            "name": info.get("name") or info.get("friendly_name") or entity_id,
+            "room": info.get("room", ""),
+            "state": str(runtime_state if runtime_state is not None else (info.get("state", "") or "")),
+            "sensor_type": info.get("sensor_type", ""),
+            "in_sa": True,
+            "fusion_scope": fusion_scope,
+        }
 
     entry = getattr(coord, "_entry", None)
     fusion_raw = ((entry.options or {}).get("presence_fusion", "[]") if entry else "[]") or "[]"
@@ -71,7 +151,7 @@ def build_presence_sensors_payload(hass: HomeAssistant, coord: SmartAgentCoordin
     })
 
     return {
-        "sensors": sensors,
+        "sensors": list(sensors_by_id.values()),
         "fusion_config": fusion_config,
         "rooms": rooms,
     }
