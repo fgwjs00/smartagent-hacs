@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.74 - 2026-05-29
+## Beta 0.0.75 - 2026-05-30
 
-Beta 0.0.74 测试版发布：收口 HA 薄宿主实体与配置入口，移除旧按钮/选择器/文本实体注册，保留 8234 作为模型和运行参数配置源；补齐 Qwen3.5 4B/8B 本地模型候选，并锁定空间与 HA Area 新增、删除、同步的一致语义。
+Beta 0.0.75 测试版发布：统一空间与设备世界模型读源，修复照明规划、空间管理、存在传感器与 HA Listener 策略状态漂移；8234/add-on 设置继续作为运行策略真实源，HA 薄宿主不再用旧 learning_mode/vision 内存状态拦截传感器 fast-path。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.74`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.75`，用于 Home Assistant 更新检测。
