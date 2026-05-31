@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.82
-display_version: Beta 0.0.82
+release_version: 0.0.83
+display_version: Beta 0.0.83
 channel: beta
 release_date: '2026-05-31'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.82 测试版发布：补发空间模型编辑抽屉交互、设备编辑核心配置校验提示与线上大模型请求日志可观测修复，确保 HA Add-on
-    Store/HACS 能识别升级。
-  customer_visible_version: Beta 0.0.82
+  summary: Beta 0.0.83 测试版发布：补发设备编辑前的核心配置空间引用规整，避免旧空间拓扑关系 source/target 残留导致设备编辑被
+    422 校验阻断，确保 HA Add-on Store/HACS 能识别升级。
+  customer_visible_version: Beta 0.0.83
