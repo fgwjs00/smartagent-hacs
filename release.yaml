@@ -1,13 +1,12 @@
 product: SmartAgent
-release_version: 0.0.87
-display_version: Beta 0.0.87
+release_version: 0.0.88
+display_version: Beta 0.0.88
 channel: beta
-release_date: '2026-05-31'
+release_date: '2026-06-01'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.87 测试版发布：收敛设备编辑与传感器融合的空间写入边界，阻断设备字段、融合域覆盖房间、showroom/zone 与 relation
-    端点反向生成空间事实。
-  customer_visible_version: Beta 0.0.87
+  summary: Beta 0.0.88 测试版发布：修复设备编辑时 HA 区域镜像失败会阻断 SmartAgent 本地设备投影更新的问题；HA Area 同步失败改为返回告警，本地真源仍成功保存。
+  customer_visible_version: Beta 0.0.88
