@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.88
-display_version: Beta 0.0.88
+release_version: 0.0.89
+display_version: Beta 0.0.89
 channel: beta
 release_date: '2026-06-01'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.88 测试版发布：修复设备编辑时 HA 区域镜像失败会阻断 SmartAgent 本地设备投影更新的问题；HA Area 同步失败改为返回告警，本地真源仍成功保存。
-  customer_visible_version: Beta 0.0.88
+  summary: Beta 0.0.89 测试版发布：新增 AI 决策时间线阶段一与首页最近 AI 决策卡，先基于现有事务账本展示有动作决策，为后续无动作决策落库预留展示骨架。
+  customer_visible_version: Beta 0.0.89
