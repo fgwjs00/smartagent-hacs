@@ -526,14 +526,8 @@ class DevicesMixin:
 
         area_id = area_cache.get(target_room)
         if not area_id:
-            try:
-                area = area_reg.async_get_or_create(target_room)
-                area_id = area.id
-                result["created_areas"] = 1
-            except Exception as exc:
-                self._sys_log("ERROR", f"[同步] 创建设备区域 {target_room} 失败: {exc}")
-                result.update({"ok": False, "error": "area_create_failed", "errors": 1})
-                return result
+            result.update({"ok": False, "error": "area_not_found", "error_type": "not_found", "errors": 1})
+            return result
 
         result["area_id"] = area_id
         try:

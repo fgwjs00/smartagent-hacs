@@ -257,8 +257,12 @@ def local_room_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dict[
         room = str(info.get("room") or info.get("area") or "").strip()
         if not room:
             continue
-        room_key = room_aliases.get(room, room)
-        row = rooms.setdefault(room_key, {"id": room_key, "name": room_key, "device_count": 0})
+        room_key = room_aliases.get(room)
+        if not room_key:
+            continue
+        row = rooms.get(room_key)
+        if row is None:
+            continue
         row["device_count"] = int(row.get("device_count", 0)) + 1
     return sorted(rooms.values(), key=lambda row: str(row.get("name", "")))
 

@@ -1153,6 +1153,87 @@ class SmartAgentRoomDetailView(HomeAssistantView):
         return self.json(result, status_code=200)
 
 
+class SmartAgentDeviceDetailView(HomeAssistantView):
+    """Area Registry Bridge：仅把 add-on 设备房间选择镜像到 HA 实体 Area。"""
+
+    url = "/api/v1/devices/{entity_id}"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:devices:detail"
+    requires_auth = True
+
+    async def patch(self, request: web.Request, entity_id: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False, scope="device_area_sync"),
+                status_code=400,
+            )
+        if not isinstance(body, dict):
+            return self.json(
+                _json_error_payload("invalid_body", "bad_request", False, scope="device_area_sync"),
+                status_code=400,
+            )
+
+        room = str(body.get("room") or body.get("area") or body.get("space") or "").strip()
+        if not room:
+            return self.json(
+                {
+                    "ok": True,
+                    "entity_id": str(entity_id or "").strip(),
+                    "skipped": True,
+                    "reason": "room_not_provided",
+                    "source": "ha_area_registry_mirror",
+                },
+                status_code=200,
+            )
+
+        coord = _get_first_coordinator(request.app["hass"])
+        sync_room = getattr(coord, "async_sync_device_room_to_ha", None) if coord is not None else None
+        if not callable(sync_room):
+            return self.json(
+                _json_error_payload(
+                    "addon_unreachable",
+                    "dependency_unreachable",
+                    True,
+                    scope="device_area_sync",
+                    source="ha_host_local",
+                    entity_id=str(entity_id or "").strip(),
+                    room=room,
+                ),
+                status_code=502,
+            )
+
+        try:
+            result = await sync_room(str(entity_id or "").strip(), room)
+        except Exception as exc:
+            _LOGGER.exception("[DeviceAreaSync] HA area registry sync failed: %s", exc)
+            return self.json(
+                _json_error_payload(
+                    "addon_unreachable",
+                    "dependency_unreachable",
+                    True,
+                    scope="device_area_sync",
+                    source="ha_host_local",
+                    entity_id=str(entity_id or "").strip(),
+                    room=room,
+                    exception_type=exc.__class__.__name__,
+                ),
+                status_code=502,
+            )
+
+        payload = dict(result) if isinstance(result, dict) else {}
+        errors = int(payload.get("errors", 0) or 0)
+        payload.setdefault("ok", errors == 0)
+        payload.setdefault("entity_id", str(entity_id or "").strip())
+        payload.setdefault("room", room)
+        payload.setdefault("source", "ha_area_registry_mirror")
+        return self.json(payload, status_code=200)
+
+
 class SmartAgentBackupsView(HomeAssistantView):
     """Operations Bridge read model: HA-owned backup inventory for the add-on."""
 
