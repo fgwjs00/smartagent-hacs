@@ -271,15 +271,34 @@ def _ha_log_line_matches_level(line: str, level: str) -> bool:
     return True
 
 
+def _ha_log_query_flag(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _ha_log_content_window(content: str, query: Any) -> tuple[str, dict[str, Any]]:
     q = query if hasattr(query, "get") else {}
+    full_day = (
+        _ha_log_query_flag(q.get("full_day"))
+        or _ha_log_query_flag(q.get("all_day"))
+        or str(q.get("scope") or "").strip().lower() in {"day", "full_day", "all_day"}
+    )
     level = str(q.get("level") or "all").strip().lower()
     if level not in {"all", "error", "warning", "info"}:
         level = "all"
     keyword = str(q.get("keyword") or "").strip()
     keyword_lower = keyword.lower()
-    max_bytes = _ha_log_window_int(q.get("max_bytes"), default=128 * 1024, minimum=1, maximum=512 * 1024)
-    tail_lines = _ha_log_window_int(q.get("tail_lines"), default=800, minimum=1, maximum=3000)
+    max_bytes = _ha_log_window_int(
+        q.get("max_bytes"),
+        default=16 * 1024 * 1024 if full_day else 128 * 1024,
+        minimum=1,
+        maximum=16 * 1024 * 1024 if full_day else 512 * 1024,
+    )
+    tail_lines = _ha_log_window_int(
+        q.get("tail_lines"),
+        default=200000 if full_day else 800,
+        minimum=1,
+        maximum=200000 if full_day else 3000,
+    )
 
     lines = str(content or "").splitlines()
     filtered_lines = [
@@ -301,6 +320,7 @@ def _ha_log_content_window(content: str, query: Any) -> tuple[str, dict[str, Any
     active = (
         level != "all"
         or bool(keyword)
+        or full_day
         or "max_bytes" in q
         or "tail_lines" in q
     )
@@ -310,6 +330,7 @@ def _ha_log_content_window(content: str, query: Any) -> tuple[str, dict[str, Any
         "keyword": keyword,
         "max_bytes": max_bytes,
         "tail_lines": tail_lines,
+        "full_day": full_day,
         "filtered": level != "all" or bool(keyword),
         "total_lines": len(lines),
         "matched_lines": len(filtered_lines),
