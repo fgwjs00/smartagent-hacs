@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.89
-display_version: Beta 0.0.89
+release_version: 0.0.90
+display_version: Beta 0.0.90
 channel: beta
 release_date: '2026-06-01'
 public_release_ready: true
@@ -8,5 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.89 测试版发布：新增 AI 决策时间线阶段一与首页最近 AI 决策卡，先基于现有事务账本展示有动作决策，为后续无动作决策落库预留展示骨架。
-  customer_visible_version: Beta 0.0.89
+  summary: Beta 0.0.90 测试版发布：整合多代理修复与世界模型上下文证据链，完成领域决策 high 架构债 A1/A2/A6/A7 修复验证，并刷新公开版本号以触发
+    HACS 与 HA Add-on Store 更新检测。
+  customer_visible_version: Beta 0.0.90
