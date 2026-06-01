@@ -40,6 +40,17 @@ DOMAIN_LABELS = {
     "fan": ("风扇", "turn_on/turn_off/set_percentage"),
 }
 
+_ROLLBACK_OFF_STATES = {"", "off", "unavailable", "unknown", "none"}
+
+
+def _rollback_service_for_snapshot_state(domain: str, state: Any) -> str:
+    state_norm = str(state or "").strip().lower()
+    if domain == "cover":
+        return "open_cover" if state_norm == "open" else "close_cover"
+    if domain == "climate":
+        return "turn_off" if state_norm in _ROLLBACK_OFF_STATES else "turn_on"
+    return "turn_on" if state_norm in {"on", "open"} else "turn_off"
+
 
 class DevicesMixin:
     """Mixin: 设备管理 — 发现/CRUD/区域/管辖域/习惯/规则。"""
@@ -105,27 +116,33 @@ class DevicesMixin:
         elif room:
             coverage_spaces = [room]
 
-        raw_shared = info.get(DEVICE_CAP_KEY_SHARED_FIXTURE)
         explicit_truthy = {True, 1, "1", "true", "yes", "on", "explicit"}
-        shared_fixture = raw_shared in explicit_truthy
+        explicit_falsey = {False, 0, "0", "false", "no", "off"}
+
+        def _explicit_bool(value: Any) -> bool | None:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int) and value in (0, 1):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in explicit_truthy:
+                    return True
+                if normalized in explicit_falsey:
+                    return False
+            return None
+
+        raw_shared = info.get(DEVICE_CAP_KEY_SHARED_FIXTURE)
+        shared_fixture = _explicit_bool(raw_shared) is True
 
         disturbance_level = str(info.get("disturbance_level") or "").lower()
         domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
         sensor_type = str(info.get("sensor_type") or "").lower()
 
-        raw_sleep_safe = info.get(DEVICE_CAP_KEY_SLEEP_SAFE)
-        if isinstance(raw_sleep_safe, bool):
-            sleep_safe = raw_sleep_safe
-        else:
-            sleep_safe = False
+        sleep_safe = _explicit_bool(info.get(DEVICE_CAP_KEY_SLEEP_SAFE))
 
-        raw_risk_level = str(info.get(DEVICE_CAP_KEY_RISK_LEVEL) or "").lower()
-        if raw_risk_level in {"low", "medium", "high", "critical"}:
-            risk_level = raw_risk_level
-        elif disturbance_level in {"high", "critical"} or domain in {"climate", "cover", "media_player"}:
-            risk_level = "high"
-        else:
-            risk_level = "medium"
+        raw_risk_level = str(info.get(DEVICE_CAP_KEY_RISK_LEVEL) or "").strip().lower()
+        risk_level = raw_risk_level if raw_risk_level in {"safe", "low", "medium", "high", "critical"} else None
 
         raw_energy_level = str(info.get(DEVICE_CAP_KEY_ENERGY_LEVEL) or "").lower()
         if raw_energy_level in {"low", "medium", "high"}:
@@ -149,13 +166,7 @@ class DevicesMixin:
         else:
             can_confirm_leave = sensor_type in {"mmwave", "frigate"}
 
-        raw_can_block_turn_off = info.get(DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF)
-        if isinstance(raw_can_block_turn_off, bool):
-            can_block_turn_off = raw_can_block_turn_off
-        else:
-            can_block_turn_off = domain == "light" and (
-                shared_fixture or str(info.get("role") or "").lower() in {"core", "display", "safety"}
-            )
+        can_block_turn_off = _explicit_bool(info.get(DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF))
 
         raw_can_localize_zone = info.get(DEVICE_CAP_KEY_CAN_LOCALIZE_ZONE)
         if isinstance(raw_can_localize_zone, bool):
@@ -219,14 +230,17 @@ class DevicesMixin:
             "coverage_space_ids": list(coverage_spaces),
             DEVICE_CAP_KEY_SHARED_FIXTURE: bool(shared_fixture),
             "shared_space_ids": list(coverage_spaces) if shared_fixture else [],
-            DEVICE_CAP_KEY_SLEEP_SAFE: bool(sleep_safe),
-            DEVICE_CAP_KEY_RISK_LEVEL: risk_level,
             DEVICE_CAP_KEY_ENERGY_LEVEL: energy_level,
             DEVICE_CAP_KEY_CAN_TRIGGER_ENTER: bool(can_trigger_enter),
             DEVICE_CAP_KEY_CAN_CONFIRM_LEAVE: bool(can_confirm_leave),
-            DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF: bool(can_block_turn_off),
             DEVICE_CAP_KEY_CAN_LOCALIZE_ZONE: bool(can_localize_zone),
         }
+        if sleep_safe is not None:
+            capability[DEVICE_CAP_KEY_SLEEP_SAFE] = bool(sleep_safe)
+        if risk_level is not None:
+            capability[DEVICE_CAP_KEY_RISK_LEVEL] = risk_level
+        if can_block_turn_off is not None:
+            capability[DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF] = bool(can_block_turn_off)
         return capability
 
     def get_device_capability_snapshot(self) -> dict[str, dict[str, Any]]:
@@ -625,6 +639,9 @@ class DevicesMixin:
         if locked:
             return
         rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[habits] selected DB row missing; skip delete: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("DELETE FROM habits WHERE id=?", (rows[0]["id"],))
             if not _ok:
@@ -640,6 +657,9 @@ class DevicesMixin:
         c, locked = self._habits[idx]
         new_locked = 0 if locked else 1
         rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[habits] selected DB row missing; skip lock toggle: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("UPDATE habits SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
             if not _ok:
@@ -659,6 +679,9 @@ class DevicesMixin:
                 await self._async_update_status("画像管理", "⛔ 锁定条目不可修改")
                 return
             rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+            if not rows:
+                self._sys_log("WARN", f"[habits] selected DB row missing; skip edit: idx={idx}")
+                return
             if rows:
                 _ok = await self._async_db_exec("UPDATE habits SET content=? WHERE id=?", (text, rows[0]["id"]))
                 if not _ok:
@@ -684,6 +707,9 @@ class DevicesMixin:
             await self._async_update_status("画像管理", "⛔ 锁定条目不可删除")
             return
         rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[habits] selected DB row missing; skip delete: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("DELETE FROM habits WHERE id=?", (rows[0]["id"],))
             if not _ok:
@@ -701,6 +727,9 @@ class DevicesMixin:
         content, locked = self._habits[idx]
         new_locked = 0 if locked else 1
         rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[habits] selected DB row missing; skip lock toggle: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("UPDATE habits SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
             if not _ok:
@@ -728,6 +757,9 @@ class DevicesMixin:
         if locked:
             return
         rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[rules] selected DB row missing; skip delete: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("DELETE FROM rules WHERE id=?", (rows[0]["id"],))
             if not _ok:
@@ -743,6 +775,9 @@ class DevicesMixin:
         c, locked = self._rules[idx]
         new_locked = 0 if locked else 1
         rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[rules] selected DB row missing; skip lock toggle: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("UPDATE rules SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
             if not _ok:
@@ -762,6 +797,9 @@ class DevicesMixin:
                 await self._async_update_status("规则管理", "⛔ 铁律不可修改")
                 return
             rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+            if not rows:
+                self._sys_log("WARN", f"[rules] selected DB row missing; skip edit: idx={idx}")
+                return
             if rows:
                 _ok = await self._async_db_exec("UPDATE rules SET content=? WHERE id=?", (text, rows[0]["id"]))
                 if not _ok:
@@ -787,6 +825,9 @@ class DevicesMixin:
             await self._async_update_status("规则管理", "⛔ 铁律不可删除")
             return
         rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[rules] selected DB row missing; skip delete: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("DELETE FROM rules WHERE id=?", (rows[0]["id"],))
             if not _ok:
@@ -804,6 +845,9 @@ class DevicesMixin:
         content, locked = self._rules[idx]
         new_locked = 0 if locked else 1
         rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
+        if not rows:
+            self._sys_log("WARN", f"[rules] selected DB row missing; skip lock toggle: idx={idx}")
+            return
         if rows:
             _ok = await self._async_db_exec("UPDATE rules SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
             if not _ok:
@@ -1403,88 +1447,50 @@ class DevicesMixin:
     # ── Layer 2: 事务回滚 ──────────────────────────────────────────────────────
 
     async def async_rollback_transaction(self, txn_id: int) -> None:
-        """将指定事务中已执行的设备恢复到执行前的状态快照。"""
-        import json as _json
-        record = await self.hass.async_add_executor_job(
-            self._rollback_transaction_db, txn_id
-        )
-        if not record:
-            self._sys_log("WARN", f"[事务] 回滚失败：找不到事务 id={txn_id}")
+        """Delegate rollback to the add-on canonical transaction source."""
+        addon_client = getattr(self, "_addon_client", None)
+        rollback = getattr(addon_client, "rollback_transaction", None)
+        if not callable(rollback):
+            self._sys_log("WARN", f"[Transaction] rollback unavailable: add-on client missing, id={txn_id}")
             return
-        if record.get("status") not in ("success", "partial", "failed"):
-            self._sys_log("WARN", f"[事务] 事务 id={txn_id} 状态为 {record.get('status')}，不支持回滚")
-            return
+
         try:
-            pre_states: dict = _json.loads(record.get("pre_states_json", "{}"))
-        except Exception:
-            self._sys_log("WARN", f"[事务] 事务 id={txn_id} 预状态数据解析失败")
-            return
-        if not pre_states:
-            self._sys_log("WARN", f"[事务] 事务 id={txn_id} 无预状态快照，无法回滚")
+            result = await rollback(int(txn_id))
+        except Exception as exc:
+            self._sys_log("WARN", f"[Transaction] add-on rollback failed id={txn_id}: {exc}")
             return
 
-        rollback_actions = []
-        for eid, state in pre_states.items():
-            domain = eid.split(".")[0]
-            if domain not in ("light", "switch", "fan", "cover", "climate"):
-                continue
-            if state in ("on", "open", "heat", "cool"):
-                service = "turn_on" if domain != "cover" else "open_cover"
-            else:
-                service = "turn_off" if domain != "cover" else "close_cover"
-            rollback_actions.append({
-                "domain": domain, "service": service,
-                "entity_id": eid, "params": {},
-                "reason": f"[回滚] 事务 {txn_id} 恢复到执行前状态",
-            })
-
-        if not rollback_actions:
-            self._sys_log("INFO", f"[事务] 事务 id={txn_id} 无可回滚的设备动作")
+        if not isinstance(result, dict) or not result:
+            self._sys_log("WARN", f"[Transaction] add-on rollback returned empty result id={txn_id}")
             return
 
-        MAX_ROLLBACK = 50
-        if len(rollback_actions) > MAX_ROLLBACK:
-            self._sys_log("WARN", f"[事务] 回滚设备数 {len(rollback_actions)} 超过上限 {MAX_ROLLBACK}，已截断")
-            rollback_actions = rollback_actions[:MAX_ROLLBACK]
+        try:
+            status = int(result.get("__status") or result.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        ok = bool(result.get("ok")) or (200 <= status < 300 and not result.get("error"))
+        if not ok:
+            error = (result.get("error") or result.get("error_type") or (f"http_{status}" if status else "unknown_error"))
+            self._sys_log("WARN", f"[Transaction] add-on rollback failed id={txn_id}: {error}")
+            return
 
-        self._sys_log("INFO", f"[事务] 开始回滚事务 id={txn_id}，恢复 {len(rollback_actions)} 个设备")
-        from .ha_adapter import async_execute_command_envelope
-
-        result = await async_execute_command_envelope(self.hass, {
-            "request_id": f"legacy-rollback:{txn_id}",
-            "commands": [
-                {
-                    "entity_id": act["entity_id"],
-                    "domain": act["domain"],
-                    "service": act["service"],
-                    "data": {},
-                }
-                for act in rollback_actions
-            ],
-            "execution_policy": {"stop_on_first_error": False},
-            "safety": {
-                "risk_level": "safe",
-                "requires_confirmation": False,
-                "reason": f"[回滚] 事务 {txn_id} 恢复到执行前状态",
-            },
-        })
-        for item in result.get("results", []) if isinstance(result, dict) else []:
-            eid = item.get("entity_id", "")
-            service = item.get("service", "")
-            if item.get("ok"):
-                self._sys_log("INFO", f"[回滚] {eid} → {service}")
-            else:
-                error = item.get("error") or item.get("status") or "unknown_error"
-                self._sys_log("WARN", f"[回滚] {eid} 回滚失败: {error}")
-        if isinstance(result, dict) and not result.get("ok"):
-            self._sys_log("WARN", f"[事务] 事务 id={txn_id} 回滚存在失败项: {result.get('error') or result.get('error_type')}")
-
-        # 刷新事务缓存
-        self._transactions_cache = await self.hass.async_add_executor_job(
-            self._query_recent_transactions, 30
-        )
+        refresh = getattr(addon_client, "get_transactions", None)
+        if callable(refresh):
+            try:
+                transactions = await refresh()
+                if isinstance(transactions, list):
+                    self._transactions_cache = transactions
+                elif isinstance(transactions, dict):
+                    for key in ("transactions", "items", "data"):
+                        value = transactions.get(key)
+                        if isinstance(value, list):
+                            self._transactions_cache = [item for item in value if isinstance(item, dict)]
+                            break
+            except Exception as exc:
+                self._sys_log("WARN", f"[Transaction] add-on transaction refresh failed after rollback id={txn_id}: {exc}")
         self.async_set_updated_data({})
-        self._sys_log("INFO", f"[事务] 事务 id={txn_id} 回滚完成")
+        self._sys_log("INFO", f"[Transaction] rollback delegated to add-on id={txn_id}")
+        return
 
     async def _try_delete_ha_scene(self, scene_id: int) -> None:
         """尝试删除对应的 HA 场景实体 scene.ai_<id>，同时从 YAML 文件中移除（静默失败）。"""

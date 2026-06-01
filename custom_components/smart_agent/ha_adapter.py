@@ -380,8 +380,29 @@ def _json_error(
 
 def _envelope_safety_error(envelope: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     safety = envelope.get("safety") if isinstance(envelope, dict) else None
-    safety = safety if isinstance(safety, dict) else {}
-    risk_level = str(safety.get("risk_level") or "safe").strip().lower()
+
+    def _invalid_safety(reason: str) -> tuple[str, dict[str, Any]]:
+        return (
+            "invalid_safety_envelope",
+            {
+                "risk_level": "unknown",
+                "requires_confirmation": False,
+                "reason": reason,
+            },
+        )
+
+    if not isinstance(envelope, dict) or "safety" not in envelope:
+        return _invalid_safety("missing_safety")
+    if not isinstance(safety, dict):
+        return _invalid_safety("invalid_safety")
+    if "risk_level" not in safety:
+        return _invalid_safety("missing_risk_level")
+    raw_risk_level = safety.get("risk_level")
+    if not isinstance(raw_risk_level, str):
+        return _invalid_safety("invalid_risk_level")
+    risk_level = raw_risk_level.strip().lower()
+    if not risk_level:
+        return _invalid_safety("invalid_risk_level")
     requires_confirmation = bool(safety.get("requires_confirmation", False))
     reason = str(safety.get("reason") or "")
 

@@ -13,7 +13,6 @@ from typing import Any
 
 from homeassistant.helpers.event import async_call_later
 from homeassistant.exceptions import ServiceNotFound
-import voluptuous as vol
 
 from .const import (
     ACTION_PARAM_KEYS_COLOR,
@@ -445,8 +444,11 @@ class ActionsMixin:
 
         # ── 1. 执行前：快照目标设备当前状态 ─────────────────────────────────
         pre_states: dict[str, str] = {}
+        normalized_actions: list[tuple[dict, dict]] = []
         for raw in actions:
-            eid = raw.get("entity_id", "")
+            action = self._normalize_action(raw)
+            normalized_actions.append((raw, action))
+            eid = action.get("entity_id", "")
             if eid and isinstance(eid, str) and "." in eid:
                 st = self.hass.states.get(eid)
                 if st:
@@ -507,12 +509,32 @@ class ActionsMixin:
         _is_bulk = len(actions) > 5
         _pacing_delay = 0.2 if _is_bulk else 0.0
 
-        for idx, raw_action in enumerate(actions):
+        async def _refresh_transaction_from_results() -> None:
+            dispatched_now = sum(1 for item in results if item.get("status") == "ok")
+            blocked_now = sum(
+                1
+                for item in results
+                if str(item.get("status") or "").startswith("blocked")
+                and item.get("status") != "blocked_or_error"
+            )
+            failed_now = sum(1 for item in results if item.get("status") == "blocked_or_error")
+            await self.hass.async_add_executor_job(
+                self._complete_transaction_db,
+                txn_id,
+                dispatched_now,
+                blocked_now,
+                failed_now,
+                _json.dumps(results, ensure_ascii=False),
+            )
+            self._transactions_cache = await self.hass.async_add_executor_job(
+                self._query_recent_transactions, 30
+            )
+
+        for idx, (raw_action, action) in enumerate(normalized_actions):
             action_seq = idx + 1
             if idx > 0 and _pacing_delay > 0:
                 await asyncio.sleep(_pacing_delay)
 
-            action = self._normalize_action(raw_action)
             domain = action.get("domain")
             service = action.get("service")
             entity_id = action.get("entity_id")
@@ -777,23 +799,43 @@ class ActionsMixin:
             if delay > 0:
                 # 在闭包中捕获 scene_desc/trigger_summary，保证延迟执行时仍用正确的上下文
                 # 避免并发推理时 self._current_scene_desc 被其他房间的推理覆盖
+                result_entry = {
+                    "entity_id": entity_id,
+                    "service": service,
+                    "status": "scheduled",
+                    "delay": delay,
+                }
+                results.append(result_entry)
+
+                async def _run_delayed(
+                    d: str, s: str, eid: str, p: dict, r: str,
+                    sc: str, trig: str, txid: int, aseq: int,
+                    result: dict,
+                ) -> None:
+                    try:
+                        ok = await self._do_call_service(d, s, eid, p, r, sc, trig, txid, aseq)
+                    except Exception as exc:
+                        _LOGGER.debug("[Actions] 延迟动作执行失败 %s.%s(%s): %s", d, s, eid, exc)
+                        ok = False
+                    result["status"] = "ok" if ok else "blocked_or_error"
+                    await _refresh_transaction_from_results()
+
                 def _delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
-                    sc: str, trig: str, txid: int, aseq: int, _: datetime,
+                    sc: str, trig: str, txid: int, aseq: int, result: dict, _: datetime,
                 ) -> None:
                     self.hass.async_create_task(
-                        self._do_call_service(d, s, eid, p, r, sc, trig, txid, aseq)
+                        _run_delayed(d, s, eid, p, r, sc, trig, txid, aseq, result)
                     )
 
                 handle = async_call_later(
                     self.hass, delay,
                     lambda dt, d=domain, s=service, e=entity_id, p=params, r=reason,
-                           sc=scene_desc, trig=trigger_summary, txid=txn_id, aseq=action_seq:
-                        _delayed(d, s, e, p, r, sc, trig, txid, aseq, dt),
+                           sc=scene_desc, trig=trigger_summary, txid=txn_id, aseq=action_seq,
+                           result=result_entry:
+                        _delayed(d, s, e, p, r, sc, trig, txid, aseq, result, dt),
                 )
                 self._active_timers[entity_id] = handle
-                executed += 1  # 延迟动作视为已调度
-                results.append({"entity_id": entity_id, "service": service, "status": "delayed", "delay": delay})
             else:
                 ok = await self._do_call_service(
                     domain, service, entity_id, params, reason, scene_desc, trigger_summary, txn_id, action_seq
@@ -929,10 +971,17 @@ class ActionsMixin:
         # 若 AI 仍输出旧格式，自动转换以避免 schema 报错
         if "color_temp" in safe_params and "color_temp_kelvin" not in safe_params:
             mired_val = safe_params.pop("color_temp")
-            if mired_val and mired_val > 0:
-                safe_params["color_temp_kelvin"] = round(1_000_000 / mired_val)
-                self._sys_log("INFO", f"[动作] {entity_id} color_temp({mired_val}mireds)"
-                              f" → color_temp_kelvin({safe_params['color_temp_kelvin']}K) 自动转换")
+            try:
+                mired_num = float(mired_val)
+            except (TypeError, ValueError):
+                self._sys_log("ERROR", f"[动作] {entity_id} color_temp({mired_val}) 非法，拒绝执行")
+                return False
+            if mired_num <= 0:
+                self._sys_log("ERROR", f"[动作] {entity_id} color_temp({mired_val}) 非法，拒绝执行")
+                return False
+            safe_params["color_temp_kelvin"] = round(1_000_000 / mired_num)
+            self._sys_log("INFO", f"[动作] {entity_id} color_temp({mired_val}mireds)"
+                          f" → color_temp_kelvin({safe_params['color_temp_kelvin']}K) 自动转换")
         from .ha_adapter import async_execute_command_envelope
 
         async def _execute_enveloped_service(call_params: dict[str, Any] | None = None) -> None:
@@ -964,6 +1013,10 @@ class ActionsMixin:
                 error = str(result.get("error") or result.get("error_type") or "")
             raise RuntimeError(error or "command_envelope_failed")
 
+        def _is_param_rejection(exc: Exception | str) -> bool:
+            text = str(exc).lower()
+            return "extra keys" in text or "not allowed" in text or "unexpected" in text
+
         try:
             await _execute_enveloped_service(safe_params)
             if domain in ("scene", "script") and service == "turn_on":
@@ -973,7 +1026,7 @@ class ActionsMixin:
             # 部分设备不支持某些扩展参数，尝试智能降级：
             # 优先仅剔除色温参数保留亮度，若仍失败再去除全部扩展参数
             extra_keys = [k for k in safe_params]
-            if extra_keys and ("extra keys" in err_str or "not allowed" in err_str or "unexpected" in err_str):
+            if extra_keys and _is_param_rejection(err_str):
                 color_keys_present = [k for k in extra_keys if k in ACTION_PARAM_KEYS_COLOR]
                 non_color_params = {k: v for k, v in safe_params.items() if k not in ACTION_PARAM_KEYS_COLOR}
                 if color_keys_present and non_color_params:
@@ -982,21 +1035,21 @@ class ActionsMixin:
                                   f"保留亮度重试: {non_color_params}")
                     try:
                         await _execute_enveloped_service(non_color_params)
-                    except vol.Invalid:
+                    except ServiceNotFound:
+                        raise
+                    except Exception as retry_err:
+                        if not _is_param_rejection(retry_err):
+                            self._sys_log("ERROR", f"[动作] {entity_id} 保留亮度重试失败: {retry_err}")
+                            return False
                         # 再退一步：去除全部扩展参数
                         self._sys_log("WARN", f"[动作] {entity_id} 亮度参数也失败，去除全部扩展参数重试")
                         try:
                             await _execute_enveloped_service({})
                         except ServiceNotFound:
                             raise
-                        except Exception as retry_err:
-                            self._sys_log("ERROR", f"[动作] {entity_id} 服务调用重试失败: {retry_err}")
+                        except Exception as bare_retry_err:
+                            self._sys_log("ERROR", f"[动作] {entity_id} 服务调用重试失败: {bare_retry_err}")
                             return False
-                    except ServiceNotFound:
-                        raise
-                    except Exception as retry_err:
-                        self._sys_log("ERROR", f"[动作] {entity_id} 保留亮度重试失败: {retry_err}")
-                        return False
                 else:
                     # 没有可保留的参数，直接裸调用
                     self._sys_log("WARN", f"[动作] {entity_id} 不支持参数 {extra_keys}，去除后重试")

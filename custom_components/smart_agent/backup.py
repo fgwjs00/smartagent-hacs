@@ -55,6 +55,14 @@ BACKUP_LEVEL_STANDARD = "standard"
 BACKUP_LEVEL_FULL = "full"
 
 
+def _restore_text(value: Any, default: Any = "", limit: int = 0) -> str:
+    raw = default if value is None else value
+    if raw is None:
+        raw = ""
+    text = str(raw)
+    return text[:limit] if limit > 0 else text
+
+
 class BackupManager:
     """
     SmartAgent 端到端加密云备份管理器。
@@ -235,6 +243,15 @@ class BackupManager:
             restored_keys = await self._hass.async_add_executor_job(
                 self._restore_data, payload
             )
+
+            # 成功语义以 DB 确认为前提：_restore_data 返回 None 表示事务回滚/失败，
+            # 不得报告恢复成功（否则用户会以为数据已恢复，实际什么都没写入）。
+            if restored_keys is None:
+                _fail_msg = "[Backup] 恢复失败：恢复事务已回滚，数据库未变更"
+                _LOGGER.error(_fail_msg)
+                if hasattr(self._coord, "_sys_log"):
+                    self._coord._sys_log("ERROR", _fail_msg)
+                return {"success": False, "message": "恢复失败：恢复事务已回滚，数据库保持原状", "restored_keys": []}
 
             _res_msg = f"[Backup] 恢复完成，恢复数据类别: {restored_keys}"
             _LOGGER.info(_res_msg)
@@ -499,7 +516,7 @@ class BackupManager:
 
         return payload
 
-    def _restore_data(self, payload: dict) -> list[str]:
+    def _restore_data(self, payload: dict) -> list[str] | None:
         """
         将解密后的备份数据恢复到本地（同步，在 executor 中运行）。
 
@@ -547,12 +564,12 @@ class BackupManager:
                                     "VALUES (?,?,?,?,?,?,?)",
                                     (
                                         eid,
-                                        info.get("name", eid)[:100],
-                                        info.get("room", info.get("area", ""))[:50],
-                                        info.get("type", "")[:30],
-                                        info.get("ops", "")[:200],
-                                        info.get("control_mode", "shared")[:20],
-                                        info.get("sensor_type", "")[:30],
+                                        _restore_text(info.get("name"), eid, 100),
+                                        _restore_text(info.get("room") or info.get("area"), "", 50),
+                                        _restore_text(info.get("type"), "", 30),
+                                        _restore_text(info.get("ops"), "", 200),
+                                        _restore_text(info.get("control_mode"), "shared", 20),
+                                        _restore_text(info.get("sensor_type"), "", 30),
                                     ),
                                 )
                             restored.append("device_info")
@@ -634,14 +651,24 @@ class BackupManager:
                         # ── 6. 事件日志（full 备份才有）──────────────────────────
                         if "events" in payload and isinstance(payload["events"], list):
                             # 不清空 events 表，只补充备份中有而本地没有的旧事件
-                            existing_times: set[str] = set()
-                            for row in conn.execute("SELECT time FROM events"):
-                                existing_times.add(row[0] if isinstance(row, tuple) else row["time"])
+                            existing_events: set[tuple[str, str, str, str, str]] = set()
+                            for row in conn.execute("SELECT time, type, detail, entity, state FROM events"):
+                                if isinstance(row, tuple):
+                                    existing_events.add(tuple("" if v is None else str(v) for v in row))
+                                else:
+                                    existing_events.add(tuple(
+                                        "" if row[field] is None else str(row[field])
+                                        for field in ("time", "type", "detail", "entity", "state")
+                                    ))
                             inserted = 0
                             for r in payload["events"]:
                                 if not isinstance(r, dict):
                                     continue
-                                if r.get("time") in existing_times:
+                                event_key = tuple(
+                                    "" if r.get(field) is None else str(r.get(field))
+                                    for field in ("time", "type", "detail", "entity", "state")
+                                )
+                                if event_key in existing_events:
                                     continue
                                 conn.execute(
                                     "INSERT OR IGNORE INTO events (time, type, detail, entity, state) "
@@ -651,6 +678,7 @@ class BackupManager:
                                         r.get("detail"), r.get("entity"), r.get("state"),
                                     ),
                                 )
+                                existing_events.add(event_key)
                                 inserted += 1
                             if inserted:
                                 restored.append("events")
@@ -665,12 +693,14 @@ class BackupManager:
                         except Exception:
                             pass
                         _LOGGER.error("[Backup] 恢复事务失败，已完整回滚，数据库保持一致: %s", exc)
-                        return []
+                        # 返回 None 作为失败哨兵，区别于"成功但 0 类别"的空列表，
+                        # 避免调用方把回滚（什么都没写入）误报为恢复成功。
+                        return None
                 # 不关闭连接——DatabaseService 持久化连接由 async_shutdown 管理
 
             except Exception as exc:
                 _LOGGER.error("[Backup] 无法访问 DatabaseService: %s", exc)
-                return []
+                return None
 
         # 将 DB 中已恢复的数据同步回 coordinator 内存（不在事务内，失败不影响已写入的 DB）
         if restored and hasattr(coord, "_load_config"):

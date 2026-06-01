@@ -4,6 +4,7 @@ from __future__ import annotations
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -172,8 +173,9 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         return True
 
     async def async_turn_on(self, **kwargs) -> None:
-        # add-on first：先反写 add-on，让真源更新；HA 内存随后翻转
-        await self._push_to_addon("learning_mode", True)
+        # add-on first：先反写 add-on（真源）；写失败则 fail-closed，不翻转内存态/不持久化/不记成功。
+        if not await self._push_to_addon("learning_mode", True):
+            raise HomeAssistantError("写入 add-on 失败，静默学习模式未开启")
         self.coordinator._learning_mode = True
         self._attr_is_on = True
         self._persist(True)
@@ -181,7 +183,8 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._push_to_addon("learning_mode", False)
+        if not await self._push_to_addon("learning_mode", False):
+            raise HomeAssistantError("写入 add-on 失败，静默学习模式未关闭")
         self.coordinator._learning_mode = False
         self._attr_is_on = False
         self._persist(False)
@@ -237,7 +240,8 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
         return True
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._push_to_addon("habit_proactive", True)
+        if not await self._push_to_addon("habit_proactive", True):
+            raise HomeAssistantError("写入 add-on 失败，习惯主动询问未开启")
         self.coordinator._habit_proactive = True
         self._attr_is_on = True
         self._persist(True)
@@ -245,7 +249,8 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._push_to_addon("habit_proactive", False)
+        if not await self._push_to_addon("habit_proactive", False):
+            raise HomeAssistantError("写入 add-on 失败，习惯主动询问未关闭")
         self.coordinator._habit_proactive = False
         self._attr_is_on = False
         self._persist(False)
@@ -301,7 +306,8 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
         return True
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self._push_to_addon("frigate_enabled", True)
+        if not await self._push_to_addon("frigate_enabled", True):
+            raise HomeAssistantError("写入 add-on 失败，Frigate 视觉感知未启用")
         self.coordinator._frigate_enabled = True
         await self.coordinator._async_start_frigate_mqtt()
         self._attr_is_on = True
@@ -313,7 +319,8 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self._push_to_addon("frigate_enabled", False)
+        if not await self._push_to_addon("frigate_enabled", False):
+            raise HomeAssistantError("写入 add-on 失败，Frigate 视觉感知未关闭")
         self.coordinator._frigate_enabled = False
         await self.coordinator._async_stop_frigate_mqtt()
         self._attr_is_on = False

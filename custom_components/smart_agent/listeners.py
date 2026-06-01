@@ -611,6 +611,49 @@ class ListenersMixin:
             "mode": str(getattr(self, "_mode", "") or ""),
         }
 
+        occ_getter = getattr(self, "_get_room_occupancy_map", None)
+        if callable(occ_getter):
+            try:
+                occ_map = occ_getter()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] _get_room_occupancy_map failed for add-on snapshot: %s", exc)
+                occ_map = None
+            if isinstance(occ_map, dict):
+                snapshot["occ_map"] = occ_map
+
+        rules_getter = getattr(self, "_build_locked_people_rules", None)
+        if callable(rules_getter):
+            try:
+                locked_people_rules = rules_getter()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] _build_locked_people_rules failed for add-on snapshot: %s", exc)
+                locked_people_rules = None
+            if isinstance(locked_people_rules, list):
+                snapshot["locked_people_rules"] = locked_people_rules
+
+        manual_getter = getattr(self, "_get_recent_manual_actions_snapshot", None)
+        manual_actions: Any = None
+        if callable(manual_getter):
+            try:
+                manual_actions = manual_getter()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] _get_recent_manual_actions_snapshot failed for add-on snapshot: %s", exc)
+                manual_actions = None
+        elif isinstance(getattr(self, "_user_manual_actions", None), dict):
+            lock = getattr(self, "_user_manual_actions_lock", None)
+            if lock is not None:
+                try:
+                    with lock:
+                        manual_actions = dict(getattr(self, "_user_manual_actions", {}) or {})
+                except Exception as exc:
+                    _LOGGER.debug("[Listeners] _user_manual_actions snapshot failed: %s", exc)
+                    manual_actions = None
+            else:
+                manual_actions = dict(getattr(self, "_user_manual_actions", {}) or {})
+        if isinstance(manual_actions, dict):
+            snapshot["user_manual_actions"] = manual_actions
+        snapshot["now_ts"] = time.time()
+
         for key, getter_name in (
             ("space_snapshot", "get_space_runtime_snapshot"),
             ("presence_snapshot", "get_presence_snapshot"),
@@ -891,11 +934,26 @@ class ListenersMixin:
                             )
                             return
                         self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
-                        await self._execute_fast_path_decision_result(
-                            result,
-                            entity_id=entity_id,
-                            source_label="AddonFastPath",
+                        previous_batch_trigger_controllable = getattr(
+                            self,
+                            "_batch_trigger_controllable",
+                            set(),
                         )
+                        domain = entity_id.split(".")[0]
+                        if domain in ("light", "switch", "fan", "cover", "climate", "media_player"):
+                            self._batch_trigger_controllable = {entity_id}
+                            self._sys_log(
+                                "INFO",
+                                f"[自触发保护] FastPath 可控设备触发: {entity_id}，AI 不可反向操作该设备",
+                            )
+                        try:
+                            await self._execute_fast_path_decision_result(
+                                result,
+                                entity_id=entity_id,
+                                source_label="AddonFastPath",
+                            )
+                        finally:
+                            self._batch_trigger_controllable = previous_batch_trigger_controllable
                         return
                     if 200 <= status < 300:
                         should_fail_closed = False
@@ -1044,6 +1102,33 @@ class ListenersMixin:
                 )
                 return
 
+            if new_s in ("unavailable", "unknown"):
+                self._sys_log("INFO", f"[过滤] 设备状态变为 {new_s}，跳过 add-on 快路: {entity_id}")
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="state_unavailable_unknown",
+                    source_type=source_type,
+                )
+                return
+
+            if old_s in ("unavailable", "unknown") and new_s not in ("on", "open", "home", "playing"):
+                self._sys_log(
+                    "INFO",
+                    f"[过滤] 设备从 {old_s} 恢复为非激活状态 {new_s}，跳过 add-on 快路: {entity_id}",
+                )
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="state_recovery_inactive",
+                    source_type=source_type,
+                )
+                return
+
             device_info_snapshot = getattr(self, "device_info", {}) or {}
             if not isinstance(device_info_snapshot, dict):
                 device_info_snapshot = {}
@@ -1063,6 +1148,29 @@ class ListenersMixin:
                     source_type=source_type,
                 )
                 return
+
+            last_ai_actions = getattr(self, "_last_ai_actions", {})
+            last_ai = last_ai_actions.get(entity_id) if isinstance(last_ai_actions, dict) else None
+            if isinstance(last_ai, dict) and str(last_ai.get("state") or "") == new_s:
+                try:
+                    ai_action_age = time.time() - float(last_ai.get("time") or 0)
+                except (TypeError, ValueError):
+                    ai_action_age = self._AI_ACTION_SKIP_WINDOW + 1
+                if 0 <= ai_action_age < self._AI_ACTION_SKIP_WINDOW:
+                    self._sys_log(
+                        "INFO",
+                        f"[过滤] AI 操作后 {int(ai_action_age)}s 内同向变化，跳过 add-on 快路: {entity_id} -> {new_s}",
+                    )
+                    self._emit_listener_event(
+                        listener_action="filtered",
+                        entity_id=entity_id,
+                        old_state=old_s,
+                        new_state=new_s,
+                        filter_reason="ai_self_action",
+                        source_type=source_type,
+                        ai_action_age=int(ai_action_age),
+                    )
+                    return
 
             self._emit_listener_event(
                 listener_action="fast_path_scheduled",

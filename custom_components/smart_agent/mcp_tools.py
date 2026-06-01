@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time as _time
+from typing import Any
 
 from homeassistant.core import HomeAssistant
 
@@ -21,6 +22,46 @@ _INJECT_PATTERNS = [
     re.compile(r"jailbreak",            re.IGNORECASE),
     re.compile(r"DAN\s+mode",           re.IGNORECASE),
 ]
+
+
+def _mcp_args(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _mcp_string(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _mcp_bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, minimum), maximum)
+
+
+async def _get_addon_transactions(coordinator: Any, *, limit: int | None = None) -> list[dict[str, Any]] | None:
+    client = getattr(coordinator, "_addon_client", None)
+    if client is None or not hasattr(client, "get_transactions"):
+        return None
+    try:
+        payload = await client.get_transactions()
+    except Exception as exc:
+        _LOGGER.debug("[MCP Tools] add-on transactions fetch failed: %s", exc)
+        return None
+    rows: Any
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get("transactions") or payload.get("items") or payload.get("data")
+    else:
+        rows = None
+    if not isinstance(rows, list):
+        return None
+    normalized = [dict(row) for row in rows if isinstance(row, dict)]
+    if limit is not None:
+        normalized = normalized[-limit:]
+    return normalized
 
 
 def get_mcp_tools() -> list[dict]:
@@ -141,7 +182,7 @@ def get_mcp_tools() -> list[dict]:
 async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) -> dict:
     """Execute the requested MCP tool based on params."""
     tool_name = params.get("name")
-    tool_args = params.get("arguments", {})
+    tool_args = _mcp_args(params.get("arguments", {}))
     
     coordinator = None
     for coord in hass.data.get(DOMAIN, {}).values():
@@ -179,8 +220,8 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
                 "isError": True,
             }
 
-        eid = tool_args.get("entity_id", "")
-        cmd = tool_args.get("command_text", "")
+        eid = _mcp_string(tool_args.get("entity_id", ""))
+        cmd = _mcp_string(tool_args.get("command_text", ""))
 
         # ── 输入验证：防止 prompt injection 和资源耗尽 ──────────────────────
         # 1. entity_id 格式校验（domain.name，仅允许小写字母/数字/下划线/点）
@@ -214,19 +255,21 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
         return {"content": [{"type": "text", "text": f"指令已安全提交: {trigger_str[:100]}"}]}
 
     elif tool_name == "smart_recent_decisions":
-        limit = min(max(int(tool_args.get("limit") or 5), 1), 20)
-        try:
-            rows = await hass.async_add_executor_job(
+        limit = _mcp_bounded_int(tool_args.get("limit"), default=5, minimum=1, maximum=20)
+        rows = await _get_addon_transactions(coordinator, limit=limit)
+        if rows is None:
+            try:
+                rows = await hass.async_add_executor_job(
                 coordinator._db.query,
                 """SELECT time, trigger_summary, scene_desc, confidence,
                           action_count, dispatched_count, blocked_count, status, actions_json
                    FROM action_transactions
                    ORDER BY id DESC LIMIT ?""",
                 (limit,),
-            )
-        except Exception as exc:
-            _LOGGER.warning("[MCP Tools] 查询 action_transactions 失败: %s", exc)
-            return {"content": [{"type": "text", "text": f"查询失败: {exc}"}], "isError": True}
+                )
+            except Exception as exc:
+                _LOGGER.warning("[MCP Tools] query action_transactions failed: %s", exc)
+                return {"content": [{"type": "text", "text": f"query failed: {exc}"}], "isError": True}
 
         if not rows:
             return {"content": [{"type": "text", "text": "暂无决策记录。AI 尚未执行过任何推理。"}]}
@@ -246,7 +289,8 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
             # 解析 actions_json 取前 3 条摘要
             action_summary = ""
             try:
-                acts = json.loads(actions_raw or "[]")
+                raw_actions = r.get("actions")
+                acts = raw_actions if isinstance(raw_actions, list) else json.loads(actions_raw or "[]")
                 if acts:
                     parts = []
                     for a in acts[:3]:
@@ -283,8 +327,39 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
     elif tool_name == "smart_decision_stats":
-        days = min(max(int(tool_args.get("days") or 7), 1), 30)
+        days = _mcp_bounded_int(tool_args.get("days"), default=7, minimum=1, maximum=30)
         date_param = (f"-{days} days",)
+        addon_txns = await _get_addon_transactions(coordinator)
+        if addon_txns is not None:
+            total = len(addon_txns)
+            executed = sum(1 for row in addon_txns if int(row.get("dispatched_count") or 0) > 0)
+            blocked_only = sum(
+                1
+                for row in addon_txns
+                if int(row.get("blocked_count") or 0) > 0 and int(row.get("dispatched_count") or 0) == 0
+            )
+            confidences = [
+                float(row.get("confidence"))
+                for row in addon_txns
+                if row.get("confidence") is not None
+            ]
+            avg_conf = sum(confidences) / len(confidences) if confidences else None
+            t_actions = sum(int(row.get("action_count") or 0) for row in addon_txns)
+            t_disp = sum(int(row.get("dispatched_count") or 0) for row in addon_txns)
+            t_blocked = sum(int(row.get("blocked_count") or 0) for row in addon_txns)
+            exec_rate = f"{executed / total * 100:.0f}%" if total else "N/A"
+            block_rate = f"{t_blocked / t_actions * 100:.0f}%" if t_actions else "N/A"
+            conf_str = f"{avg_conf:.0f}%" if avg_conf is not None else "N/A"
+            text = (
+                f"过去 {days} 天 AI 决策质量统计\n\n"
+                f"总推理次数：{total}\n"
+                f"有动作执行：{executed} 次（执行率 {exec_rate}）\n"
+                f"纯拦截（无执行）：{blocked_only} 次\n"
+                f"平均置信度：{conf_str}\n"
+                f"动作总数：{t_actions}，已执行 {t_disp}，被拦截 {t_blocked}（动作拦截率 {block_rate}）\n"
+                "数据源：add-on transactions"
+            )
+            return {"content": [{"type": "text", "text": text}]}
         try:
             # 三个独立查询并发执行，节省串行等待时间
             txn_rows, corr_rows, cache_rows = await asyncio.gather(
@@ -551,11 +626,21 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
     elif tool_name == "smart_health_check":
+        addon_txns = await _get_addon_transactions(coordinator)
+        base_query = coordinator._db.query
+
+        def _health_query(sql, params=()):
+            if addon_txns is not None and "action_results" in sql:
+                return []
+            if addon_txns is not None and "action_transactions" in sql:
+                return [{"cnt": len(addon_txns)}]
+            return base_query(sql, params)
+        _health_query.__self__ = coordinator._db
         # 并发查询四张表，避免串行等待
         try:
             cache_rows, fail_rows, lesson_rows, txn30_rows = await asyncio.gather(
                 hass.async_add_executor_job(
-                    coordinator._db.query,
+                    _health_query,
                     """SELECT trigger_type,
                               COUNT(*) AS entries,
                               SUM(hit_count) AS hits,
@@ -565,7 +650,7 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
                     (),
                 ),
                 hass.async_add_executor_job(
-                    coordinator._db.query,
+                    _health_query,
                     """SELECT entity_id, COUNT(*) AS fail_cnt, MAX(time) AS last_fail
                        FROM action_results
                        WHERE success = 0 AND time >= datetime('now', '-7 days')
@@ -575,7 +660,7 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
                     (),
                 ),
                 hass.async_add_executor_job(
-                    coordinator._db.query,
+                    _health_query,
                     """SELECT COUNT(*) AS total,
                               SUM(is_conflicted) AS conflicted,
                               COUNT(DISTINCT room) AS rooms
@@ -583,7 +668,7 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
                     (),
                 ),
                 hass.async_add_executor_job(
-                    coordinator._db.query,
+                    _health_query,
                     "SELECT COUNT(*) AS cnt FROM action_transactions WHERE time >= datetime('now', '-30 days')",
                     (),
                 ),
@@ -650,10 +735,16 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
                 pass
 
             # 从 SmartAgent DB 补充
-            _fz_rows = coordinator._db.query("SELECT zone_id FROM frigate_zones")
+            _fz_rows = await hass.async_add_executor_job(
+                coordinator._db.query,
+                "SELECT zone_id FROM frigate_zones",
+            )
             for _fz in (_fz_rows or []):
                 _known_zones.add(str(_fz.get("zone_id", "")).lower())
-            _fc_rows = coordinator._db.query("SELECT camera_id FROM frigate_cameras")
+            _fc_rows = await hass.async_add_executor_job(
+                coordinator._db.query,
+                "SELECT camera_id FROM frigate_cameras",
+            )
             for _fc in (_fc_rows or []):
                 _known_zones.add(str(_fc.get("camera_id", "")).lower())
 

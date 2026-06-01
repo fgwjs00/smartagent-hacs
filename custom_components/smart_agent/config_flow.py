@@ -1,4 +1,4 @@
-"""Config flow for SmartAgent: engine → connect → options."""
+"""Config flow for SmartAgent: engine -> connect, with add-on connection options."""
 from __future__ import annotations
 
 import voluptuous as vol
@@ -11,7 +11,6 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_COOLDOWN,
     CONF_ENGINE,
-    CONF_LICENSE_KEY,
     CONF_ADDON_AUTH_TOKEN,
     CONF_ADDON_BASE_URL,
     CONF_CLEANUP_LEGACY_PAIR_TOKENS,
@@ -51,9 +50,6 @@ from .const import (
     CONF_PRESENCE_FUSION,
     DEFAULT_PRESENCE_FUSION,
     MODE_HOME,
-    MODE_SHOWROOM,
-    parse_biz_time,
-    format_biz_time,
     DEFAULT_ENGINE,
     DEFAULT_OLLAMA_URL,
     DEFAULT_OLLAMA_MODEL,
@@ -67,27 +63,6 @@ from .const import (
     LOCAL_MODELS_SUGGESTIONS,
 )
 from .addon_client import derive_addon_gateway_base_url
-
-def _validate_hhmm(value: str) -> str:
-    """校验并规范化 HH:MM 格式的营业时间字符串。
-
-    :param value: 用户输入的时间字符串（如 "8:50"、"08:50"、"19:00"）
-    :return: 规范化的 "HH:MM" 字符串
-    :raises vol.Invalid: 格式非法或数值超出范围
-    """
-    v = str(value).strip()
-    if ":" not in v:
-        raise vol.Invalid("时间格式应为 HH:MM，如 08:50 或 19:00")
-    parts = v.split(":", 1)
-    try:
-        h, m = int(parts[0]), int(parts[1])
-    except ValueError:
-        raise vol.Invalid("时间格式应为 HH:MM，如 08:50 或 19:00")
-    if not (0 <= h <= 23):
-        raise vol.Invalid("小时必须在 0-23 之间")
-    if not (0 <= m <= 59):
-        raise vol.Invalid("分钟必须在 0-59 之间")
-    return f"{h:02d}:{m:02d}"
 
 
 # 供应商下拉选项
@@ -142,18 +117,6 @@ _PASSWORD_SELECTOR = selector.TextSelector(
     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
 )
 
-# 视觉引擎选择
-_VISION_ENGINE_SELECTOR = selector.SelectSelector(
-    selector.SelectSelectorConfig(
-        options=[
-            {"value": ENGINE_LOCAL,  "label": "本地 (Ollama/Llava)"},
-            {"value": ENGINE_ONLINE, "label": "云端 (Qwen-VL/Gemini)"},
-        ],
-        mode=selector.SelectSelectorMode.DROPDOWN,
-    )
-)
-
-
 def _url_to_provider(url: str) -> str:
     """将已保存的 base_url 反向映射回供应商 key，用于回显。"""
     for prov, purl in ONLINE_PROVIDER_URLS.items():
@@ -201,7 +164,7 @@ def _suggest_addon_base_url(hass: HomeAssistant | None) -> str:
 
 
 class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """多步配置流：engine → connect → options。"""
+    """First-install flow for choosing the engine and its connection settings."""
 
     VERSION = 1
 
@@ -299,100 +262,6 @@ class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }),
             errors=errors,
         )
-    # ──────────────────────────────────────────────────────────
-    # Step 3: 置信度与冷却
-    # ──────────────────────────────────────────────────────────
-    async def async_step_options(self, user_input: dict | None = None) -> FlowResult:
-        """Step 3: 自动执行阈值、通知阈值、设备冷却时间，以及 TTS / Frigate 可选配置。"""
-        errors: dict = {}
-        if user_input is not None:
-            self._data[CONF_CONFIDENCE_AUTO]   = int(user_input[CONF_CONFIDENCE_AUTO])
-            self._data[CONF_CONFIDENCE_NOTIFY] = int(user_input[CONF_CONFIDENCE_NOTIFY])
-            self._data[CONF_COOLDOWN]          = int(user_input[CONF_COOLDOWN])
-            self._data[CONF_TTS_SERVICE]       = (user_input.get(CONF_TTS_SERVICE) or "").strip()
-            self._data[CONF_TTS_TARGET]        = (user_input.get(CONF_TTS_TARGET) or "").strip()
-            self._data[CONF_TTS_LEVEL]         = int(user_input.get(CONF_TTS_LEVEL, TTS_LEVEL_OFF))
-            self._data[CONF_FRIGATE_ENABLED]   = bool(user_input.get(CONF_FRIGATE_ENABLED, False))
-            self._data[CONF_QWEATHER_API_KEY]  = (user_input.get(CONF_QWEATHER_API_KEY) or "").strip()
-            self._data[CONF_SEARXNG_URL]       = (user_input.get(CONF_SEARXNG_URL) or "").strip()
-            self._data[CONF_CLOUD_FALLBACK]    = bool(user_input.get(CONF_CLOUD_FALLBACK, False))
-            self._data[CONF_VISION_ENABLED]    = bool(user_input.get(CONF_VISION_ENABLED, False))
-            self._data[CONF_VISION_ENGINE]     = user_input.get(CONF_VISION_ENGINE, ENGINE_ONLINE)
-            self._data[CONF_VISION_MODEL]      = (user_input.get(CONF_VISION_MODEL) or "qwen-vl-max").strip()
-            
-            try:
-                biz_start_str = _validate_hhmm(user_input.get(CONF_SHOWROOM_BIZ_START, DEFAULT_SHOWROOM_BIZ_START))
-                biz_end_str   = _validate_hhmm(user_input.get(CONF_SHOWROOM_BIZ_END, DEFAULT_SHOWROOM_BIZ_END))
-            except vol.Invalid as e:
-                errors["base"] = "biz_time_invalid"
-                biz_start_str, biz_end_str = DEFAULT_SHOWROOM_BIZ_START, DEFAULT_SHOWROOM_BIZ_END
-
-            if not errors and parse_biz_time(biz_start_str) >= parse_biz_time(biz_end_str):
-                errors["base"] = "biz_time_invalid"
-
-            if not errors:
-                self._data[CONF_SHOWROOM_BIZ_START] = biz_start_str
-                self._data[CONF_SHOWROOM_BIZ_END]   = biz_end_str
-
-                # P2修复：以下字段在 schema 中定义但初始安装时未写入 _data，
-                # 导致首次安装后缺失，需在此补全
-                self._data[CONF_PRESENCE_FUSION]           = (user_input.get(CONF_PRESENCE_FUSION) or "").strip()
-                self._data[CONF_SHOWROOM_AREA_NAME]        = (user_input.get(CONF_SHOWROOM_AREA_NAME) or DEFAULT_SHOWROOM_AREA_NAME).strip()
-                self._data[CONF_SHOWROOM_EXCLUDED_SUBAREAS] = (user_input.get(CONF_SHOWROOM_EXCLUDED_SUBAREAS) or DEFAULT_SHOWROOM_EXCLUDED_SUBAREAS).strip()
-
-                # TODO(license): 上线时取消注释
-                # self._data[CONF_LICENSE_KEY] = (user_input.get(CONF_LICENSE_KEY) or "").strip()
-                return self.async_create_entry(title="AI SmartAgent", data=self._data)
-
-        return self.async_show_form(
-            step_id="options",
-            data_schema=vol.Schema({
-                # ── 置信度与冷却 ──
-                vol.Required(CONF_CONFIDENCE_AUTO,   default=DEFAULT_CONFIDENCE_AUTO):   vol.All(int, vol.Range(min=50, max=100)),
-                vol.Required(CONF_CONFIDENCE_NOTIFY, default=DEFAULT_CONFIDENCE_NOTIFY): vol.All(int, vol.Range(min=30, max=100)),
-                vol.Required(CONF_COOLDOWN,          default=DEFAULT_COOLDOWN):          vol.All(int, vol.Range(min=10, max=300)),
-                # ── TTS 语音播报（可选）──
-                vol.Optional(CONF_TTS_SERVICE,  default=""): str,
-                vol.Optional(CONF_TTS_TARGET,   default=""): str,
-                vol.Optional(CONF_TTS_LEVEL,    default=TTS_LEVEL_OFF): vol.All(int, vol.Range(min=0, max=3)),
-                # ── Frigate NVR 视觉感知（可选）──
-                vol.Optional(CONF_FRIGATE_ENABLED, default=False): bool,
-                # ── 存在传感器融合域（Phase 12.0，可选）──
-                # 解决「一镜多区 / 大开间多传感器」误判：茶桌 zone 无人 ≠ 整个客餐厅无人。
-                # 支持两种 members 写法：
-                # 1) 旧版字符串数组：
-                #    "members": ["binary_sensor.a", "binary_sensor.b"]
-                # 2) 新版对象数组（能力驱动，推荐）：
-                #    "members": [
-                #      {"entity_id":"binary_sensor.cam_living","can_enter_trigger":true,"can_leave_evidence":true},
-                #      {"entity_id":"binary_sensor.mmwave_living","can_enter_trigger":false,"can_leave_evidence":true}
-                #    ]
-                # 额外支持 enter_hold_secs / vacant_hold_secs 做进入/离开迟滞。
-                vol.Optional(CONF_PRESENCE_FUSION, default=""): str,
-                # ── 联网与工具（Phase 5）──
-                vol.Optional(CONF_QWEATHER_API_KEY, default=""): str,
-                vol.Optional(CONF_SEARXNG_URL,      default=""): str,
-                vol.Optional(CONF_CLOUD_FALLBACK,   default=False): bool,
-                # ── AI 视觉增强（Phase 7E）──
-                vol.Optional(CONF_VISION_ENABLED,   default=False): bool,
-                vol.Optional(CONF_VISION_ENGINE,    default=ENGINE_ONLINE): _VISION_ENGINE_SELECTOR,
-                vol.Optional(CONF_VISION_MODEL,     default="qwen-vl-max"): str,
-
-                # ── 展厅营业时间与区域配置 ──
-                vol.Required(CONF_SHOWROOM_BIZ_START,
-                             default=DEFAULT_SHOWROOM_BIZ_START): _validate_hhmm,
-                vol.Required(CONF_SHOWROOM_BIZ_END,
-                             default=DEFAULT_SHOWROOM_BIZ_END): _validate_hhmm,
-                vol.Optional(CONF_SHOWROOM_AREA_NAME,
-                             default=DEFAULT_SHOWROOM_AREA_NAME): str,
-                vol.Optional(CONF_SHOWROOM_EXCLUDED_SUBAREAS,
-                             default=DEFAULT_SHOWROOM_EXCLUDED_SUBAREAS): str,
-
-                # TODO(license): 上线时取消注释
-                # vol.Optional(CONF_LICENSE_KEY, default=""): str,
-            }),
-        )
-
     @staticmethod
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,

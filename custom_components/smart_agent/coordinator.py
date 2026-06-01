@@ -726,6 +726,53 @@ class SmartAgentCoordinator(
         self._sys_log("INFO", f"[资源] HA资源刷新: 脚本={len(scripts)} 场景={len(scenes)} 自动化={len(autos)}")
 
     def _get_room_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
+        getter = getattr(self, "get_presence_snapshot", None)
+        if callable(getter):
+            try:
+                presence_snapshot = getter()
+            except Exception:
+                presence_snapshot = None
+            rooms = presence_snapshot.get("rooms") if isinstance(presence_snapshot, dict) else None
+            canonical: dict[str, list[tuple[str, str]]] = {}
+            if isinstance(rooms, dict):
+                room_items = rooms.items()
+            elif isinstance(rooms, list):
+                room_items = (
+                    (
+                        str(item.get("room") or item.get("space") or item.get("space_id") or ""),
+                        item,
+                    )
+                    for item in rooms
+                    if isinstance(item, dict)
+                )
+            else:
+                room_items = ()
+            for raw_room, payload in room_items:
+                if not isinstance(payload, dict):
+                    continue
+                room = str(raw_room or payload.get("room") or payload.get("space") or payload.get("space_id") or "").strip()
+                if not room:
+                    continue
+                state = str(payload.get("state") or "").strip().lower()
+                if state in {"occupied", "present", "on", "home", "motion", "person"}:
+                    mapped_state = "on"
+                    evidence_ids = payload.get("occupied_evidence_ids") or payload.get("evidence_ids") or ()
+                elif state in {"vacant", "clear", "off", "away", "none", "idle", "empty"}:
+                    mapped_state = "off"
+                    evidence_ids = payload.get("vacant_evidence_ids") or payload.get("evidence_ids") or ()
+                else:
+                    mapped_state = "unknown"
+                    evidence_ids = payload.get("evidence_ids") or payload.get("occupied_evidence_ids") or payload.get("vacant_evidence_ids") or ()
+                if isinstance(evidence_ids, str):
+                    evidence = [evidence_ids]
+                else:
+                    evidence = [str(eid or "") for eid in evidence_ids or () if str(eid or "").strip()]
+                if not evidence:
+                    evidence = [f"presence.{room}"]
+                canonical[room] = [(eid, mapped_state) for eid in evidence]
+            if canonical:
+                return canonical
+
         occ: dict[str, list[tuple[str, str]]] = {}
         for entity_id, info in self.device_info.items():
             if not entity_id.startswith(("binary_sensor.", "sensor.", "person.", "device_tracker.")):
@@ -1316,6 +1363,199 @@ class SmartAgentCoordinator(
         self._sys_log("INFO", f"[手动] 手动触发推理: {trigger}")
         await self._run_addon_decision(trigger, source="manual")
 
+    def _parse_addon_decision_trigger(self, trigger: str) -> dict[str, str]:
+        """Parse HA listener trigger text into structured entity transition fields."""
+        text = str(trigger or "").strip()
+        parsed = {"trigger_entity_id": "", "old_state": "", "new_state": ""}
+
+        def _state(value: str) -> str:
+            token = str(value or "").strip().lower()
+            return {
+                "有人": "on",
+                "无人": "off",
+                "开": "on",
+                "打开": "on",
+                "开启": "on",
+                "关": "off",
+                "关闭": "off",
+            }.get(token, token)
+
+        match = re.search(
+            r"(?P<entity>[a-zA-Z_]+\.[\w\d_]+)\s*[:：]\s*(?P<old>[^\s]+)\s*(?:->|→)\s*(?P<new>[^\s]+)",
+            text,
+        )
+        if match:
+            parsed["trigger_entity_id"] = match.group("entity")
+            parsed["old_state"] = _state(match.group("old"))
+            parsed["new_state"] = _state(match.group("new"))
+            return parsed
+
+        entity_match = re.search(r"[（(](?P<entity>[a-zA-Z_]+\.[^)）]+)[)）]", text)
+        if entity_match:
+            parsed["trigger_entity_id"] = entity_match.group("entity")
+        cn_match = re.search(
+            r"(?P<old>有人|无人|开启|关闭|打开|关|开|on|off)\s*(?:->|→)\s*"
+            r"(?P<new>有人|无人|开启|关闭|打开|关|开|on|off)",
+            text,
+        )
+        if cn_match:
+            parsed["old_state"] = _state(cn_match.group("old"))
+            parsed["new_state"] = _state(cn_match.group("new"))
+        return parsed
+
+    @staticmethod
+    def _is_addon_presence_clear(parsed: dict[str, str]) -> bool:
+        entity_id = str(parsed.get("trigger_entity_id") or "").lower()
+        if not entity_id.startswith("binary_sensor."):
+            return False
+        markers = ("occupancy", "presence", "motion", "ren_ti", "人体", "有人")
+        return (
+            any(marker in entity_id for marker in markers)
+            and parsed.get("old_state") == "on"
+            and parsed.get("new_state") == "off"
+        )
+
+    @staticmethod
+    def _render_addon_decision_device_table(
+        device_info: dict[str, Any],
+        states: dict[str, str],
+        *,
+        trigger_room: str = "",
+        max_rows: int = 48,
+    ) -> str:
+        rows: list[str] = []
+        for entity_id, raw_info in sorted(device_info.items()):
+            if not entity_id:
+                continue
+            info = raw_info if isinstance(raw_info, dict) else {}
+            room = str(info.get("room") or info.get("area") or "").strip()
+            domain = entity_id.split(".", 1)[0]
+            if trigger_room and room and room != trigger_room and domain not in {"light", "switch", "binary_sensor", "sensor"}:
+                continue
+            name = str(info.get("name") or entity_id).strip()
+            control_mode = str(info.get("control_mode") or "").strip()
+            state = str(states.get(entity_id) or "").strip()
+            rows.append(
+                f"- [{room or '未分配'}] {name} ({entity_id}) state={state or 'unknown'}"
+                f"{f' control_mode={control_mode}' if control_mode else ''}"
+            )
+            if len(rows) >= max_rows:
+                break
+        return "【设备状态表】\n" + "\n".join(rows) if rows else ""
+
+    @staticmethod
+    def _render_addon_decision_occupancy_section(
+        presence_snapshot: dict[str, Any],
+        *,
+        trigger_room: str = "",
+    ) -> str:
+        if not isinstance(presence_snapshot, dict):
+            return ""
+        rooms = presence_snapshot.get("rooms")
+        if not isinstance(rooms, dict):
+            return ""
+        rows: list[str] = []
+        for room, raw in sorted(rooms.items(), key=lambda item: str(item[0])):
+            if trigger_room and str(room) != trigger_room:
+                continue
+            value = raw if isinstance(raw, dict) else {}
+            state = value.get("state") or value.get("presence_state") or value.get("status") or ""
+            confidence = value.get("confidence")
+            rows.append(f"- {room}: state={state or 'unknown'} confidence={confidence if confidence is not None else 'unknown'}")
+        return "【占用快照】\n" + "\n".join(rows) + "\n" if rows else ""
+
+    def _build_addon_slow_decision_bundle(
+        self,
+        trigger: str,
+        *,
+        one_off_prompt: str = "",
+        source: str = "listener",
+    ) -> dict[str, Any]:
+        """Build the rich bundle used by add-on slow decisions."""
+        parsed = self._parse_addon_decision_trigger(trigger)
+        entity_id = parsed.get("trigger_entity_id", "")
+        snapshot: dict[str, Any] = {}
+        if entity_id:
+            snapshot_builder = getattr(self, "_build_addon_fast_path_snapshot", None)
+            if callable(snapshot_builder):
+                try:
+                    snapshot = snapshot_builder(entity_id)
+                except Exception as exc:
+                    _LOGGER.debug("[决策] 慢脑快照构建失败: %s", exc)
+                    snapshot = {}
+
+        raw_device_info = snapshot.get("device_info") if isinstance(snapshot.get("device_info"), dict) else getattr(self, "device_info", {})
+        device_info = dict(raw_device_info or {}) if isinstance(raw_device_info, dict) else {}
+        raw_states = snapshot.get("states") if isinstance(snapshot.get("states"), dict) else {}
+        states = dict(raw_states or {}) if isinstance(raw_states, dict) else {}
+        trigger_info = device_info.get(entity_id, {}) if entity_id else {}
+        if not isinstance(trigger_info, dict):
+            trigger_info = {}
+        trigger_room = str(
+            trigger_info.get("room")
+            or trigger_info.get("area")
+            or snapshot.get("trigger_room")
+            or ""
+        ).strip()
+        if not trigger_room and entity_id:
+            area_lookup = getattr(self, "_get_entity_area", None)
+            if callable(area_lookup):
+                try:
+                    trigger_room = str(area_lookup(entity_id) or "").strip()
+                except Exception:
+                    trigger_room = ""
+
+        presence_snapshot = snapshot.get("presence_snapshot") if isinstance(snapshot.get("presence_snapshot"), dict) else {}
+        device_table = self._render_addon_decision_device_table(
+            device_info,
+            states,
+            trigger_room=trigger_room,
+        )
+        occupancy_section = self._render_addon_decision_occupancy_section(
+            presence_snapshot,
+            trigger_room=trigger_room,
+        )
+
+        context_parts = [
+            str(one_off_prompt or "").strip(),
+            f"触发事件：{trigger}",
+        ]
+        if entity_id:
+            context_parts.append(f"触发实体：{entity_id}")
+        if trigger_room:
+            context_parts.append(f"触发空间：{trigger_room}")
+        if parsed.get("old_state") or parsed.get("new_state"):
+            context_parts.append(f"状态变化：{parsed.get('old_state') or '?'} -> {parsed.get('new_state') or '?'}")
+        if self._is_addon_presence_clear(parsed):
+            context_parts.append(
+                "触发约束：占用清除。binary_sensor on->off 只表示近期未检测到活动，"
+                "不等于确认无人，不等于确认有人离开；没有 leave_qualified 或多源确认时，"
+                "不要生成“有人离开，准备关闭灯光”的场景。"
+            )
+
+        bundle = {
+            "trigger": str(trigger or ""),
+            "context_text": "\n".join(part for part in context_parts if part),
+            "source": f"ha_bridge_{source}",
+            "mode": self._mode,
+            "engine": self.engine,
+            "confidence_auto": self.confidence_auto,
+            "confidence_notify": self.confidence_notify,
+            "trigger_entity_id": entity_id,
+            "old_state": parsed.get("old_state", ""),
+            "new_state": parsed.get("new_state", ""),
+            "trigger_room": trigger_room,
+            "device_info": device_info,
+            "states": states,
+            "presence_snapshot": presence_snapshot,
+            "space_snapshot": snapshot.get("space_snapshot") if isinstance(snapshot.get("space_snapshot"), dict) else {},
+            "device_capability_snapshot": snapshot.get("device_capability_snapshot") if isinstance(snapshot.get("device_capability_snapshot"), dict) else {},
+            "room_topology": snapshot.get("room_topology") if isinstance(snapshot.get("room_topology"), dict) else {},
+            "device_table": device_table,
+            "occupancy_section": occupancy_section,
+        }
+        return bundle
+
     async def _run_addon_decision(
         self,
         trigger: str,
@@ -1327,15 +1567,19 @@ class SmartAgentCoordinator(
         if addon_client is None:
             self._sys_log("WARN", "[决策] add-on decision provider unavailable")
             return {"status": "error", "message": "add-on decision provider unavailable"}
-        bundle = {
-            "trigger": str(trigger or ""),
-            "context_text": str(one_off_prompt or trigger or ""),
-            "source": f"ha_bridge_{source}",
-            "mode": self._mode,
-            "engine": self.engine,
-            "confidence_auto": self.confidence_auto,
-            "confidence_notify": self.confidence_notify,
-        }
+        bundle = self._build_addon_slow_decision_bundle(
+            trigger,
+            one_off_prompt=one_off_prompt,
+            source=source,
+        )
+        self._sys_log(
+            "INFO",
+            "[决策] 慢脑上下文 "
+            f"entity={bundle.get('trigger_entity_id') or '-'} "
+            f"room={bundle.get('trigger_room') or '-'} "
+            f"state={bundle.get('old_state') or '?'}->{bundle.get('new_state') or '?'} "
+            f"devices={len(bundle.get('device_info') or {})}",
+        )
         try:
             result = await addon_client.run_decision(trigger=str(trigger or ""), bundle=bundle)
         except Exception as exc:
@@ -1719,16 +1963,23 @@ class SmartAgentCoordinator(
         """HA 服务：为中控屏授权配对码。"""
         from homeassistant.auth import models as auth_models
 
-        # P1安全修复：配对服务会生成长效 Owner 令牌，必须限制管理员才能调用
+        # P1安全修复：配对服务会生成长效 Owner 令牌，必须限制管理员才能调用。
+        # fail-closed：无 user_id（自动化/脚本/内部 context 触发）或非管理员一律拒绝，
+        # 不得因 user_id 缺失而跳过鉴权铸造 Owner 级长效令牌。
         _uid = call.context.user_id
-        if _uid is not None:
-            _caller = await self.hass.auth.async_get_user(_uid)
-            if _caller is None or not _caller.is_admin:
-                _LOGGER.warning(
-                    "[配对] authorize_pairing 被非管理员调用拒绝（user=%s）",
-                    _caller.name if _caller else _uid,
-                )
-                return
+        if _uid is None:
+            _LOGGER.warning(
+                "[配对] authorize_pairing 缺少 user_id（自动化/脚本/内部调用）已拒绝，"
+                "该服务仅允许管理员手动调用"
+            )
+            return
+        _caller = await self.hass.auth.async_get_user(_uid)
+        if _caller is None or not _caller.is_admin:
+            _LOGGER.warning(
+                "[配对] authorize_pairing 被非管理员调用拒绝（user=%s）",
+                _caller.name if _caller else _uid,
+            )
+            return
 
         code = str(call.data.get("code", "")).strip()
 
@@ -1857,14 +2108,26 @@ class SmartAgentCoordinator(
             "trigger": last_ai.get("trigger", ""),
             "reason": reason,
         }
+        name = self.get_device_name(entity_id)
+        # fail-closed：入队是该纠错的唯一持久路径。写失败时不得输出"已记录"成功语义，
+        # 也不得 pop 源记录（否则无法重试），让用户/后续重试有机会重新提交。
         if not self._enqueue_internal_event("correction", correction_payload):
             self._sys_log("WARN", f"[Correction] add-on correction enqueue failed: {entity_id}")
-        
+            self.last_correction_text = f"记录失败: {name}（add-on 不可达，请稍后重试）"
+            self.async_set_updated_data({})
+
+            async def _clear_fail():
+                await asyncio.sleep(5)
+                self.last_correction_text = ""
+                self.async_set_updated_data({})
+
+            self.hass.async_create_task(_clear_fail())
+            return
+
         # 更新 UI 状态让前端感知
-        name = self.get_device_name(entity_id)
         self.last_correction_text = f"已记录: {name} (AI建议{last_ai.get('state')} -> 用户改为{user_state})"
         self._sys_log("WARN", f"[修正学习] 🎯 用户显式纠正了 AI 对 {name} 的操作")
-        
+
         # 清除记录，防止重复触发
         self._last_ai_actions.pop(entity_id, None)
         
@@ -1999,13 +2262,75 @@ class SmartAgentCoordinator(
             result.append(info)
         return result
 
+    async def _async_refresh_room_topology_cache(self) -> None:
+        """Refresh room topology from add-on without exposing failures to callers."""
+        addon_client = getattr(self, "_addon_client", None)
+        get_topology = getattr(addon_client, "get_rooms_topology", None)
+        if not callable(get_topology):
+            return
+
+        try:
+            payload = await get_topology()
+        except Exception:
+            return
+
+        def _text(value: Any) -> str:
+            return str(value or "").strip()
+
+        topology: dict[str, set[str]] = {}
+
+        def _add_edge(left: Any, right: Any) -> None:
+            room_a = _text(left)
+            room_b = _text(right)
+            if not room_a or not room_b or room_a == room_b:
+                return
+            topology.setdefault(room_a, set()).add(room_b)
+            topology.setdefault(room_b, set()).add(room_a)
+
+        def _is_error_payload(value: dict[str, Any]) -> bool:
+            if value.get("ok") is False:
+                return True
+            try:
+                return int(value.get("__status", 200) or 200) >= 400
+            except (TypeError, ValueError):
+                return True
+
+        rows: Any = payload
+        if isinstance(payload, dict) and _is_error_payload(payload):
+            return
+        if isinstance(payload, dict) and isinstance(payload.get("topology"), (dict, list, tuple, set)):
+            rows = payload.get("topology")
+        elif isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list, tuple, set)):
+            rows = payload.get("data")
+
+        if isinstance(rows, dict):
+            if _is_error_payload(rows):
+                return
+            for room, raw_neighbors in rows.items():
+                if str(room).startswith("__") or room in {"ok", "error", "error_type", "retryable"}:
+                    continue
+                if isinstance(raw_neighbors, (list, tuple, set)):
+                    for neighbor in raw_neighbors:
+                        _add_edge(room, neighbor)
+                else:
+                    _add_edge(room, raw_neighbors)
+        elif isinstance(rows, (list, tuple, set)):
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                room_a = item.get("room_a") or item.get("room") or item.get("from") or item.get("source")
+                room_b = item.get("room_b") or item.get("neighbor") or item.get("to") or item.get("target")
+                _add_edge(room_a, room_b)
+        elif rows is None:
+            return
+        else:
+            return
+
+        self._room_topology_cache = topology
+        self._room_topology_cache_updated_at = time.monotonic()
+
     def get_space_runtime_snapshot(self) -> dict[str, Any]:
         """返回空间运行时快照（只读内存态，不触发 DB 热路径）。"""
-        topology_updated_at = float(getattr(self, "_room_topology_cache_updated_at", 0.0) or 0.0)
-        refresh_topology = getattr(self, "_refresh_room_topology_cache", None)
-        if time.monotonic() - topology_updated_at > 60 and callable(refresh_topology):
-            self._refresh_room_topology_cache()
-
         room_topology: dict[str, list[str]] = {}
         for room, neighbors in (self._room_topology_cache or {}).items():
             room_name = str(room or "").strip()

@@ -140,7 +140,21 @@ def build_smart_agent_websocket_commands(
         if coord is None:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
-        txns = get_transactions_cache_snapshot(coord)
+        txns = None
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is not None:
+            try:
+                addon_payload = await _addon_client.get_transactions()
+                if isinstance(addon_payload, list):
+                    txns = [row for row in addon_payload if isinstance(row, dict)]
+                elif isinstance(addon_payload, dict):
+                    rows = addon_payload.get("transactions") or addon_payload.get("items") or addon_payload.get("data")
+                    if isinstance(rows, list):
+                        txns = [row for row in rows if isinstance(row, dict)]
+            except Exception as exc:
+                _LOGGER.debug("[WebSocket] add-on transactions fetch failed: %s", exc)
+        if txns is None:
+            txns = get_transactions_cache_snapshot(coord)
         # 去掉超大 JSON 快照字段，只保留展示所需字段
         _DROP = {"pre_states_json"}
         result = [
@@ -649,8 +663,9 @@ def build_smart_agent_websocket_commands(
                     rows.append({"room_a": edge[0], "room_b": edge[1], "relation": "adjacent"})
             connection.send_result(msg["id"], {"topology": rows})
         except Exception as exc:
+            # add-on 读取失败不得伪造空成功，前端会误判为"无拓扑"。返回结构化错误供前端区分。
             _LOGGER.debug("[Topology] add-on topology ws read failed: %s", exc)
-            connection.send_result(msg["id"], {"topology": []})
+            connection.send_error(msg["id"], "addon_unreachable", "读取 add-on 房间拓扑失败")
 
     # ── 备份列表 WS ───────────────────────────────────────────────────────────
 

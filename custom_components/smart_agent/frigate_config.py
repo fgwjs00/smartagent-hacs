@@ -24,6 +24,7 @@ import glob
 import hashlib
 import logging
 import os
+import re
 from typing import Any, Optional
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ _CONFIG_SEARCH_PATTERNS = [
     "/config/frigate.yaml",
     "/config/frigate.yml",
 ]
+_ADDON_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 def find_frigate_config_path() -> Optional[str]:
@@ -75,11 +77,20 @@ def extract_addon_slug(config_path: str) -> Optional[str]:
     Returns:
         Add-on slug 字符串，无法提取时返回 None。
     """
-    parts = config_path.split(os.sep)
-    for part in parts:
-        if "frigate" in part.lower() and part != "config.yaml" and part != "config.yml":
-            return part
-    return None
+    normalized = str(config_path or "").strip().replace("\\", "/")
+    if not normalized:
+        return None
+    parts = [part for part in normalized.split("/") if part]
+    try:
+        addon_configs_idx = parts.index("addon_configs")
+    except ValueError:
+        return None
+    if addon_configs_idx + 2 >= len(parts):
+        return None
+    slug = parts[addon_configs_idx + 1]
+    if not _ADDON_SLUG_RE.fullmatch(slug):
+        return None
+    return slug
 
 
 def generate_camera_id(friendly_name: str) -> str:
@@ -149,14 +160,26 @@ def write_frigate_config(path: str, config: dict) -> bool:
         # 确保父目录存在
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(
-                config, f,
-                allow_unicode=True,
-                default_flow_style=False,
-                sort_keys=False,
-                indent=2,
-            )
+        # 原子写：先写临时文件再 rename，避免 dump 中途失败截断/损坏原配置。
+        # dump 失败时原文件保持不变（临时文件被清理）。
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                yaml.dump(
+                    config, f,
+                    allow_unicode=True,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    indent=2,
+                )
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
         _LOGGER.info("[FrigateConfig] 配置已写入: %s", path)
         return True
     except Exception as exc:

@@ -132,7 +132,8 @@ class AddOnClient:
         """脱敏日志中的令牌与常见密钥片段。"""
         out = text
         if self._auth_token and self._auth_token in out:
-            out = out.replace(self._auth_token, self._auth_token[:4] + "***" + self._auth_token[-4:])
+            token_mask = "***" if len(self._auth_token) <= 16 else self._auth_token[:4] + "***" + self._auth_token[-4:]
+            out = out.replace(self._auth_token, token_mask)
         out = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1***", out)
         out = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[\w\-]{8,}", r"\1***", out)
         return out
@@ -490,9 +491,9 @@ class AddOnClient:
                 if resp.status in (404, 405):
                     return self._build_status_result(resp.status, data)
                 return self._build_status_result(resp.status, data)
-        except (aiohttp.ClientConnectorError, asyncio.TimeoutError):
-            return None
         except Exception as exc:
+            if self._is_fallback_exception(exc):
+                return None
             return self._build_client_exception_result(exc)
 
     async def get_log_content(
@@ -785,6 +786,11 @@ class AddOnClient:
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                return self._build_status_result(resp.status, data)
         except Exception:
             pass
         return {}

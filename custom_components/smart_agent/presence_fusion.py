@@ -225,10 +225,10 @@ class PresenceFusionRegistry:
         if not leave_states:
             leave_states = [s for _, s in states]
 
-        if all(s == "off" for s in leave_states):
-            return "off"
         if any(s == "on" for _, s in states):
             return "on"
+        if all(s == "off" for s in leave_states):
+            return "off"
         return "unknown"
 
     def _apply_hysteresis(self, scope: PresenceFusionScope, raw_state: str) -> str:

@@ -563,6 +563,8 @@ async def _resolve_user_from_token(hass: HomeAssistant, token: str):
     token = str(token or "").strip()
     if not token:
         return None
+    if _is_auth_token_revoked(hass, token):
+        return None
     try:
         refresh_token = await hass.auth.async_validate_access_token(token)
     except Exception:
@@ -580,14 +582,14 @@ async def _resolve_user_from_token(hass: HomeAssistant, token: str):
         return None
 
 
-async def _resolve_request_user(request: web.Request):
+async def _resolve_request_user(request: web.Request, *, allow_query_token: bool = False):
     """解析请求用户：优先 HA 会话，其次会话 token，再回退 HA token。"""
     user = request.get("hass_user")
     if user is not None:
         return user
 
     token = _extract_bearer_token(request)
-    if not token:
+    if not token and allow_query_token:
         token = str(request.query.get("token", "") or "").strip()
     if not token:
         return None
@@ -813,15 +815,18 @@ class SmartAgentAuthLogoutView(HomeAssistantView):
         if session_token:
             sessions = _get_auth_sessions(hass)
             if session_token in sessions:
-                sessions.pop(session_token, None)
+                session_info = sessions.pop(session_token, None)
+                await _async_revoke_auth_session_token(hass, session_token, session_info)
                 return self.json({"ok": True})
 
-        user = await _resolve_request_user(request)
+        user = await _resolve_request_user(request, allow_query_token=True)
         if user is None:
             return self.json(
                 _json_error_payload("unauthorized", "auth_failed", False),
                 status_code=401,
             )
+        if session_token:
+            _mark_auth_token_revoked(hass, session_token)
         return self.json({"ok": True})
 
 
@@ -1428,6 +1433,7 @@ class SmartAgentDevicePairStartView(HomeAssistantView):
 # 极速配对临时存储 key（存于 hass.data）
 _PAIR_KEY = "smart_agent_pairing_token"
 _AUTH_SESSION_KEY = "smart_agent_auth_sessions"
+_AUTH_REVOKED_TOKEN_KEY = "smart_agent_revoked_auth_tokens"
 _AUTH_SESSION_TTL = 24 * 3600
 
 
@@ -1446,6 +1452,75 @@ def _purge_auth_sessions(hass: HomeAssistant) -> None:
     expired = [tk for tk, info in sessions.items() if float((info or {}).get("expires_at", 0) or 0) <= now_ts]
     for tk in expired:
         sessions.pop(tk, None)
+
+
+def _get_revoked_auth_tokens(hass: HomeAssistant) -> dict[str, float]:
+    tokens = hass.data.get(_AUTH_REVOKED_TOKEN_KEY)
+    if isinstance(tokens, dict):
+        return tokens
+    tokens = {}
+    hass.data[_AUTH_REVOKED_TOKEN_KEY] = tokens
+    return tokens
+
+
+def _purge_revoked_auth_tokens(hass: HomeAssistant) -> None:
+    tokens = _get_revoked_auth_tokens(hass)
+    now_ts = time.time()
+    expired = [tk for tk, expires_at in tokens.items() if float(expires_at or 0) <= now_ts]
+    for tk in expired:
+        tokens.pop(tk, None)
+
+
+def _mark_auth_token_revoked(hass: HomeAssistant, token: str, *, expires_at: float | None = None) -> None:
+    token = str(token or "").strip()
+    if not token:
+        return
+    _purge_revoked_auth_tokens(hass)
+    expiry = float(expires_at or 0)
+    if expiry <= time.time():
+        expiry = time.time() + _AUTH_SESSION_TTL
+    _get_revoked_auth_tokens(hass)[token] = expiry
+
+
+def _is_auth_token_revoked(hass: HomeAssistant, token: str) -> bool:
+    token = str(token or "").strip()
+    if not token:
+        return False
+    _purge_revoked_auth_tokens(hass)
+    return token in _get_revoked_auth_tokens(hass)
+
+
+async def _async_revoke_auth_session_token(
+    hass: HomeAssistant,
+    session_token: str,
+    session_info: dict[str, Any] | None,
+) -> None:
+    info = session_info if isinstance(session_info, dict) else {}
+    _mark_auth_token_revoked(hass, session_token, expires_at=float(info.get("expires_at", 0) or 0))
+
+    refresh_token_id = str(info.get("refresh_token_id", "") or "")
+    user_id = str(info.get("user_id", "") or "")
+    if not refresh_token_id or not user_id:
+        return
+
+    try:
+        user = await hass.auth.async_get_user(user_id)
+    except Exception as exc:
+        _LOGGER.debug("[Auth] logout refresh token lookup failed: %s", exc)
+        return
+    refresh_tokens = getattr(user, "refresh_tokens", {}) or {}
+    refresh_token = refresh_tokens.get(refresh_token_id)
+    if refresh_token is None:
+        refresh_token = next(
+            (token for token in refresh_tokens.values() if getattr(token, "id", None) == refresh_token_id),
+            None,
+        )
+    if refresh_token is None:
+        return
+    try:
+        await hass.auth.async_remove_refresh_token(refresh_token)
+    except Exception as exc:
+        _LOGGER.debug("[Auth] logout refresh token revoke failed: %s", exc)
 
 
 async def _async_cleanup_legacy_pair_tokens(hass: HomeAssistant) -> int:
@@ -1518,6 +1593,8 @@ async def _issue_auth_session(hass: HomeAssistant, user, source_token: str) -> s
 
 async def _resolve_user_by_auth_session(hass: HomeAssistant, session_token: str):
     _purge_auth_sessions(hass)
+    if _is_auth_token_revoked(hass, session_token):
+        return None
     sessions = _get_auth_sessions(hass)
     info = sessions.get(str(session_token or ""))
     if not isinstance(info, dict):
@@ -2311,12 +2388,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ServiceRegistration(
                 "delete_habit",
                 svc_delete_habit,
-                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+                vol.Schema({vol.Required("content"): cv.string}),
             ),
             ServiceRegistration(
                 "toggle_habit_lock",
                 svc_toggle_habit_lock,
-                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+                vol.Schema({vol.Required("content"): cv.string}),
             ),
             ServiceRegistration(
                 "add_rule",
@@ -2326,17 +2403,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ServiceRegistration(
                 "delete_rule",
                 svc_delete_rule,
-                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+                vol.Schema({vol.Required("content"): cv.string}),
             ),
             ServiceRegistration(
                 "toggle_rule_lock",
                 svc_toggle_rule_lock,
-                vol.Schema({vol.Required("index"): vol.Coerce(int)}),
+                vol.Schema({vol.Required("content"): cv.string}),
             ),
             ServiceRegistration(
                 "manual_inference",
                 svc_manual_inference,
-                vol.Schema({vol.Optional("trigger", default="鎵嬪姩娴嬭瘯瑙﹀彂"): cv.string}),
+                vol.Schema({vol.Optional("trigger", default="手动测试触发"): cv.string}),
             ),
             ServiceRegistration("clear_overrides", svc_clear_overrides, vol.Schema({})),
             ServiceRegistration(

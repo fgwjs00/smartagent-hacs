@@ -33,6 +33,7 @@ _MQTT_DEBOUNCE_UPDATE = 8     # update 事件冷却（同一 event_id 内的后�
 _MQTT_DEBOUNCE_END = 2        # end 事件延迟（确认人员确实离开）
 _MQTT_EVENT_CACHE_SIZE = 50   # 最近 N 个事件缓存
 _MQTT_ZONE_COOLDOWN = 30      # 同一 zone 的触发冷却（秒）
+_CRITICAL_FRIGATE_EVENT_TTL = 300  # 关键门禁视觉事件最长保留时间（秒）
 
 # 行为识别参数（Phase 7G）
 _ACTIVITY_ANALYSIS_COOLDOWN = 300   # 同一摄像头行为分析冷却时间（秒）—— 5 分钟
@@ -144,11 +145,63 @@ class FrigateMixin:
         self._frigate_zone_last_trigger: dict[str, float] = {}
         self._frigate_mqtt_debounce_timers: dict[str, Any] = {}
         self._frigate_zone_occupancy: dict[str, dict[str, int]] = {}
-        self._frigate_visual_descriptions: dict[str, str] = {}  # event_id -> description（临时，仅供触发文本拼接）
+        self._frigate_event_counted_zones: dict[str, set[str]] = {}
+        self._frigate_visual_descriptions: OrderedDict[str, str] = OrderedDict()  # event_id -> description（临时，仅供触发文本拼接）
         self._vision_provider: VisionProvider = FrigateVisionProvider(self)
         # Phase 7G：行为识别 — 每个摄像头维护最新行为标签（持续有效，不依赖具体事件 ID）
         self._frigate_camera_activity: dict[str, dict] = {}      # camera_id -> {label, desc, ts}
         self._frigate_activity_last_analyzed: dict[str, float] = {}  # camera_id -> 上次分析时间戳
+
+    @staticmethod
+    def _frigate_event_zone_key(camera: str, event_id: str) -> str:
+        return f"{camera}:{event_id}" if event_id else ""
+
+    def _remember_frigate_visual_description(self, event_id: str, description: str) -> None:
+        """Store one-shot visual text for the MQTT trigger and bound the cache."""
+        if not event_id or not description:
+            return
+        cache = self._frigate_visual_descriptions
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict(cache)
+            self._frigate_visual_descriptions = cache
+        cache[event_id] = description
+        cache.move_to_end(event_id)
+        while len(cache) > _MQTT_EVENT_CACHE_SIZE:
+            cache.popitem(last=False)
+
+    def _pop_frigate_visual_description(self, event_id: str) -> str:
+        if not event_id:
+            return ""
+        return self._frigate_visual_descriptions.pop(event_id, "")
+
+    def _discard_frigate_visual_description(self, event_id: str) -> None:
+        if event_id:
+            self._frigate_visual_descriptions.pop(event_id, None)
+
+    def _expire_critical_frigate_event(self, now: float | None = None, *, notify: bool = True) -> bool:
+        event = getattr(self, "_critical_frigate_event", None)
+        if not event:
+            return False
+        if now is None:
+            now = time.time()
+        try:
+            event_time = float(event.get("time") or 0)
+        except Exception:
+            event_time = 0
+        if event_time and now - event_time <= _CRITICAL_FRIGATE_EVENT_TTL:
+            return False
+        self._critical_frigate_event = None
+        if notify:
+            try:
+                self.async_set_updated_data({})
+            except Exception:
+                pass
+        return True
+
+    def get_critical_frigate_event(self) -> dict | None:
+        """Return the current critical event after enforcing TTL expiry."""
+        self._expire_critical_frigate_event(notify=False)
+        return getattr(self, "_critical_frigate_event", None)
 
     async def _async_get_frigate_snapshot_base64(self, event_id: str) -> str | None:
         """Fetch snapshot from Frigate and convert to base64."""
@@ -233,7 +286,7 @@ class FrigateMixin:
 
         if event_id:
             trigger_text = f"{valid_label} — {desc}" if desc else valid_label
-            self._frigate_visual_descriptions[event_id] = f"【行为识别】{trigger_text}"
+            self._remember_frigate_visual_description(event_id, f"【行为识别】{trigger_text}")
 
         self._sys_log("INFO",
             f"[行为识别/{trigger_source}] camera={camera} 识别结果：{valid_label}（{desc}）"
@@ -395,6 +448,8 @@ class FrigateMixin:
         entered_zones = snap.entered_zones
         current_zones = snap.current_zones
         has_snapshot = snap.has_snapshot
+        now = time.time()
+        self._expire_critical_frigate_event(now)
 
         # 缓存事件（限制大小，FIFO 淘汰）
         self._frigate_events_cache[event_id] = {
@@ -406,13 +461,13 @@ class FrigateMixin:
             "entered_zones": entered_zones,
             "current_zones": current_zones,
             "has_snapshot": has_snapshot,
-            "time": time.time(),
+            "time": now,
             "thumbnail": snap.thumbnail,
         }
         if len(self._frigate_events_cache) > _MQTT_EVENT_CACHE_SIZE:
             self._frigate_events_cache.popitem(last=False)
 
-        # 更新 zone 占用统计（end 事件时 current_zones 为空，需传 entered_zones）
+        # 更新 zone 占用统计（按 event_id 记住实际计入的 zone，避免 end 误扣其他追踪目标）
         occ_zones = entered_zones if event_type == "end" else current_zones
         self._update_zone_occupancy(camera, event_type, occ_zones, event_id)
 
@@ -430,7 +485,7 @@ class FrigateMixin:
                 "camera": camera,
                 "camera_name": self._get_frigate_camera_name(camera),
                 "snapshot": f"/api/frigate/notifications/{event_id}/snapshot.jpg",
-                "time": time.time(),
+                "time": now,
                 "label": label,
                 "sub_label": sub_label,
                 "score": top_score,
@@ -443,8 +498,6 @@ class FrigateMixin:
             self._critical_frigate_event = None
             self.async_set_updated_data({})
         # ──────────────────────────────────────────────────
-
-        now = time.time()
 
         if event_type == "new":
             # 新检测事件 — 延迟 N 秒触发（等待 zone 数据填充稳定）
@@ -504,23 +557,52 @@ class FrigateMixin:
         维护每个 zone 的实时占用状态（camera → zone → person count）。
 
         Args:
-            zones: new 事件传 current_zones，end 事件传 entered_zones（离开的区域）。
+            zones: new/update 事件传 current_zones，end 事件传 entered_zones（离开的区域）。
         """
         cam_zones = self._frigate_zone_occupancy.setdefault(camera, {})
+        if not hasattr(self, "_frigate_event_counted_zones"):
+            self._frigate_event_counted_zones = {}
+        normalized_zones = list(dict.fromkeys(str(zone) for zone in zones if zone))
+        target_zones = set(normalized_zones)
+        event_key = self._frigate_event_zone_key(camera, event_id)
+        previous_zones = (
+            set(self._frigate_event_counted_zones.get(event_key, set()))
+            if event_key else set()
+        )
+
+        changed_zones: set[str] = set()
 
         if event_type == "end":
-            for zone in zones:
+            zones_to_decrement = previous_zones or target_zones
+            for zone in zones_to_decrement:
                 cam_zones[zone] = max(0, cam_zones.get(zone, 0) - 1)
-        elif event_type == "new":
-            for zone in zones:
-                cam_zones[zone] = cam_zones.get(zone, 0) + 1
+            if event_key:
+                self._frigate_event_counted_zones.pop(event_key, None)
+            changed_zones = zones_to_decrement
+        elif event_type in ("new", "update"):
+            if event_key:
+                zones_to_decrement = previous_zones - target_zones
+                zones_to_increment = target_zones - previous_zones
+                for zone in zones_to_decrement:
+                    cam_zones[zone] = max(0, cam_zones.get(zone, 0) - 1)
+                for zone in zones_to_increment:
+                    cam_zones[zone] = cam_zones.get(zone, 0) + 1
+                if target_zones:
+                    self._frigate_event_counted_zones[event_key] = target_zones
+                else:
+                    self._frigate_event_counted_zones.pop(event_key, None)
+                changed_zones = zones_to_decrement | zones_to_increment | target_zones
+            elif event_type == "new":
+                for zone in target_zones:
+                    cam_zones[zone] = cam_zones.get(zone, 0) + 1
+                changed_zones = target_zones
 
         # 更新后打印各区域当前人数，方便日志追踪
-        if zones and hasattr(self, "_sys_log"):
+        if changed_zones and hasattr(self, "_sys_log"):
             cam_name = self._get_frigate_camera_name(camera)
             zone_counts = ", ".join(
                 f"{self._get_frigate_zone_name(camera, z)}={cam_zones.get(z, 0)}人"
-                for z in zones
+                for z in sorted(changed_zones)
             )
             total = sum(cam_zones.values())
             self._sys_log(
@@ -553,6 +635,7 @@ class FrigateMixin:
         if (now - last_trigger) < _MQTT_ZONE_COOLDOWN and event_type != "end":
             self._sys_log("INFO",
                 f"[Frigate/MQTT] zone 冷却中({int(now - last_trigger)}s < {_MQTT_ZONE_COOLDOWN}s)，跳过: {zones_key}")
+            self._discard_frigate_visual_description(event_id)
             return
 
         @_ha_callback
@@ -608,6 +691,7 @@ class FrigateMixin:
         else:
             trigger_room = self._get_frigate_camera_room(camera)
         room_prefix = f"[{trigger_room}] " if trigger_room else ""
+        desc = self._pop_frigate_visual_description(event_id)
 
         if event_type == "end":
             zone_names_end = [self._get_frigate_zone_name(camera, z) for z in entered_zones] if entered_zones else []
@@ -640,8 +724,7 @@ class FrigateMixin:
 
         # 附加视觉增强描述（Phase 7E）
         visual_desc = ""
-        if event_id in self._frigate_visual_descriptions:
-            desc = self._frigate_visual_descriptions.pop(event_id)
+        if desc:
             visual_desc = f"【视觉分析】：{desc}"
 
         return (

@@ -462,7 +462,21 @@ class DatabaseMixin:
     ) -> None:
         if not txn_id:
             return
-        if failed == 0 and (dispatched > 0 or blocked == 0):
+        has_scheduled = False
+        try:
+            decoded_results = json.loads(results_json or "[]")
+            if isinstance(decoded_results, list):
+                has_scheduled = any(
+                    str((item or {}).get("status") or "") in {"scheduled", "delayed"}
+                    for item in decoded_results
+                    if isinstance(item, dict)
+                )
+        except Exception:
+            has_scheduled = False
+
+        if has_scheduled:
+            status = "scheduled"
+        elif failed == 0 and (dispatched > 0 or blocked == 0):
             status = "success"
         elif dispatched > 0 and failed > 0:
             status = "partial"
@@ -519,7 +533,7 @@ class DatabaseMixin:
         """Return a small HA-local energy projection from stored event rows."""
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         try:
-            rows = self._db.query(
+            rows = self._query_events(
                 "SELECT entity AS entity_id, state, time FROM events WHERE time >= ? "
                 "AND (entity LIKE 'light.%' OR entity LIKE 'switch.%' OR entity LIKE 'climate.%' "
                 "OR entity LIKE 'cover.%' OR entity LIKE 'fan.%') ORDER BY entity, time",

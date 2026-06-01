@@ -48,6 +48,13 @@ def _trim_attrs(attrs: dict, drop_order: list[str]) -> dict:
     return attrs
 
 
+def _critical_frigate_event(coordinator: SmartAgentCoordinator) -> dict | None:
+    getter = getattr(coordinator, "get_critical_frigate_event", None)
+    if callable(getter):
+        return getter()
+    return getattr(coordinator, "_critical_frigate_event", None)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -86,7 +93,7 @@ class SmartAgentStatusSensor(CoordinatorEntity, SensorEntity):
                 {"entity_id": k, "state": v.get("state"), "time": v.get("time"), "scene": (v.get("scene") or "")[:60]}
                 for k, v in list(getattr(coordinator, "_last_ai_actions", {}).items())[:10]
             ],
-            "critical_frigate_event": getattr(coordinator, "_critical_frigate_event", None),
+            "critical_frigate_event": _critical_frigate_event(coordinator),
             "frigate_events": getattr(coordinator, "get_recent_frigate_events", lambda: [])()[:5],
             "voice_status": getattr(coordinator, "_voice_status", "idle"),
             "last_stt": (getattr(coordinator, "_last_stt_text", "") or "")[:100],
@@ -105,7 +112,7 @@ class SmartAgentStatusSensor(CoordinatorEntity, SensorEntity):
                 {"entity_id": k, "state": v.get("state"), "time": v.get("time"), "scene": (v.get("scene") or "")[:60]}
                 for k, v in list(getattr(self.coordinator, "_last_ai_actions", {}).items())[:10]
             ],
-            "critical_frigate_event": getattr(self.coordinator, "_critical_frigate_event", None),
+            "critical_frigate_event": _critical_frigate_event(self.coordinator),
             "frigate_events": getattr(self.coordinator, "get_recent_frigate_events", lambda: [])()[:5],
             "voice_status": getattr(self.coordinator, "_voice_status", "idle"),
             "last_stt": (getattr(self.coordinator, "_last_stt_text", "") or "")[:100],
