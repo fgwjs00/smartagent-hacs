@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.92 - 2026-06-02
+## Beta 0.0.93 - 2026-06-02
 
-Beta 0.0.92 测试版发布：修复 AI 决策页证据追踪入口误显示问题，仅在真实 trace 可用或详情已拉取时展示追踪链接，并刷新公开版本号以触发 HACS 与 HA Add-on Store 更新检测。
+Beta 0.0.93 测试版发布：优化在线 LLM 延迟，关闭 Qwen3 在线思维链并限制输出长度；修复设备编辑空间同步，确保 HA Area 与 SmartAgent 本地设备投影一致。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.92`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.93`，用于 Home Assistant 更新检测。
