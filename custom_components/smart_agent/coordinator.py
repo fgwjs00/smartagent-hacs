@@ -1533,10 +1533,17 @@ class SmartAgentCoordinator(
                 "不要生成“有人离开，准备关闭灯光”的场景。"
             )
 
+        _now = datetime.now()
+        _weekdays = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+        time_str = _now.strftime("%H:%M")
+        day_str = f"{_now.strftime('%Y-%m-%d')} {_weekdays[_now.weekday()]}"
+
         bundle = {
             "trigger": str(trigger or ""),
             "context_text": "\n".join(part for part in context_parts if part),
             "source": f"ha_bridge_{source}",
+            "time_str": time_str,
+            "day_str": day_str,
             "mode": self._mode,
             "engine": self.engine,
             "confidence_auto": self.confidence_auto,
@@ -1580,6 +1587,20 @@ class SmartAgentCoordinator(
             f"state={bundle.get('old_state') or '?'}->{bundle.get('new_state') or '?'} "
             f"devices={len(bundle.get('device_info') or {})}",
         )
+        # ── 空设备表防裸推：无已同步设备时直接判无动作，避免模型在零设备上凭空幻觉 ──
+        if not str(bundle.get("device_table") or "").strip():
+            self._sys_log(
+                "WARN",
+                "[决策] 设备表为空（无已同步设备），跳过在线慢脑以防模型幻觉编造设备",
+            )
+            return {
+                "status": "ok",
+                "matched": False,
+                "actions": [],
+                "scene": "无已同步设备，跳过决策",
+                "confidence": 0,
+                "reason": "empty_device_table_no_action",
+            }
         try:
             result = await addon_client.run_decision(trigger=str(trigger or ""), bundle=bundle)
         except Exception as exc:

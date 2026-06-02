@@ -210,8 +210,9 @@ class ActionsMixin:
                 entity_id = matched
                 domain = entity_id.split(".")[0]
             else:
-                self._sys_log("ERROR", f"[动作修正] AI 返回无效 entity_id「{entity_id}」且无法匹配到已知设备，将跳过")
-                entity_id = ""  # 置空使守卫生效，真正跳过
+                # 保留原始（疑似幻觉）entity_id，交由执行层防幻觉硬闸显式拒绝并记入 rejected，
+                # 以便 AI 决策页能呈现“为什么没动”，而不是在此静默置空丢弃。
+                self._sys_log("ERROR", f"[动作修正] AI 返回无效 entity_id「{entity_id}」且无法匹配到已知设备，交由执行层硬闸拒绝")
 
         # brightness_pct=0 的 turn_on 等同于关灯，规范化为 turn_off 以统一走守卫逻辑
         # AI 有时用此手段绕过 P1 "禁止 turn_off 展厅灯" 的限制，必须在此拦截
@@ -245,7 +246,10 @@ class ActionsMixin:
             # 按 . 和 _ 拆分，取 长度≥2 的片段
             sub = [s for s in part.replace(".", "_").split("_") if len(s) >= 2]
             keywords.extend(sub if sub else [part])
-        keywords = list(dict.fromkeys(keywords))  # 去重保序
+        # 剔除 domain 结构前缀（如 light/switch/scene）：每个该域实体 eid 都含此前缀，
+        # 若保留它会让任意幻觉实体（如 light.玄关）凭域名前缀命中真实设备并被错误“修正”。
+        _domain_token = (domain_hint or "").strip().lower()
+        keywords = [kw for kw in dict.fromkeys(keywords) if kw and kw != _domain_token]
         best_match = ""
         best_score = 0
         for eid, info in self.device_info.items():
@@ -540,6 +544,12 @@ class ActionsMixin:
             entity_id = action.get("entity_id")
             params = action.get("params", {})
             reason = action.get("reason", "")
+            raw_target = raw_action.get("target") if isinstance(raw_action, dict) else None
+            raw_entity_id = (
+                raw_action.get("entity_id")
+                or raw_action.get("entity")
+                or (raw_target.get("entity_id") if isinstance(raw_target, dict) else None)
+            )
             try:
                 delay = max(0, int(action.get("delay_seconds", 0)))
             except (ValueError, TypeError):
@@ -552,6 +562,35 @@ class ActionsMixin:
                 continue
             if service in self._BLOCKED_SERVICES:
                 self._sys_log("WARN", f"[安全] 拒绝 AI 执行危险服务: {domain}.{service}({entity_id})")
+                continue
+            if (
+                isinstance(raw_entity_id, str)
+                and "." in raw_entity_id
+                and domain not in ("script", "scene")
+                and self.hass.states.get(raw_entity_id) is None
+            ):
+                self._sys_log("WARN", f"[安全] 拒绝原始动作中不存在的实体（防幻觉）: {domain}.{service}({raw_entity_id})")
+                blocked_count += 1
+                results.append({
+                    "entity_id": raw_entity_id,
+                    "service": service,
+                    "status": "blocked_nonexistent",
+                    "msg": "原始动作实体不存在或未注册到 HA，疑似模型幻觉",
+                })
+                continue
+            # ─── 防幻觉硬闸 (P0 代码级强制)：非 script/scene 动作的实体必须在 HA 真实存在 ───
+            # 设备表为空或上下文不足时，模型可能凭空捏造 entity_id（如 light.玄关）。
+            # light.turn_on 指向不存在实体时 HA 通常静默不报错，故必须在执行前显式拦截，
+            # 否则幻觉动作会被记成 AI_Action 并触发后续事件链。
+            if domain not in ("script", "scene") and self.hass.states.get(entity_id) is None:
+                self._sys_log("WARN", f"[安全] 拒绝操作不存在的实体（防幻觉）: {domain}.{service}({entity_id})")
+                blocked_count += 1
+                results.append({
+                    "entity_id": entity_id,
+                    "service": service,
+                    "status": "blocked_nonexistent",
+                    "msg": "实体不存在或未注册到 HA，疑似模型幻觉",
+                })
                 continue
             # ─── 设备管辖域 (Action Router) ───────────────────────────────────
             if domain not in ("script", "scene"):
