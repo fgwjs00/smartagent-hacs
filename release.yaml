@@ -1,13 +1,12 @@
 product: SmartAgent
-release_version: 0.0.93
-display_version: Beta 0.0.93
+release_version: 0.0.94
+display_version: Beta 0.0.94
 channel: beta
-release_date: '2026-06-02'
+release_date: '2026-06-03'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.93 测试版发布：优化在线 LLM 延迟，关闭 Qwen3 在线思维链并限制输出长度；修复设备编辑空间同步，确保 HA Area
-    与 SmartAgent 本地设备投影一致。
-  customer_visible_version: Beta 0.0.93
+  summary: Beta 0.0.94 测试版发布：收紧在线大模型默认 Prompt 预算，减少传感器触发后的慢脑等待；完善 AI 决策证据页可视化，并修复照明预演、备份真实执行门禁和巡检读模型展示。
+  customer_visible_version: Beta 0.0.94
