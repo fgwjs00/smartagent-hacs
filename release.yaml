@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.94
-display_version: Beta 0.0.94
+release_version: 0.0.95
+display_version: Beta 0.0.95
 channel: beta
-release_date: '2026-06-03'
+release_date: '2026-06-04'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.94 测试版发布：收紧在线大模型默认 Prompt 预算，减少传感器触发后的慢脑等待；完善 AI 决策证据页可视化，并修复照明预演、备份真实执行门禁和巡检读模型展示。
-  customer_visible_version: Beta 0.0.94
+  summary: Beta 0.0.95 测试版发布：发布照明预演决策解释中文化与内部码显示修复，确保新管理端 UI 资产进入 add-on release workspace。
+  customer_visible_version: Beta 0.0.95
