@@ -727,6 +727,68 @@ class ListenersMixin:
             "topology_count": len(topology),
         }
 
+    def _should_slow_infer_after_fast_path_no_match(self, entity_id: str, new_state: str) -> bool:
+        """Only presence arrival misses should fall through to slow inference."""
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        state = str(new_state or "").strip().lower()
+        if state not in {"on", "open", "home", "playing", "occupied", "present"}:
+            return False
+        if domain != "binary_sensor":
+            return False
+        info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+        sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
+        if sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}:
+            return True
+        eid_lower = entity_id.lower()
+        name_lower = str((info or {}).get("name") or "").lower()
+        return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
+
+    def _schedule_arrival_baseline_sample(self, entity_id: str, old_state: str, new_state: str) -> None:
+        """Sample room lights shortly after a presence arrival."""
+        old_value = str(old_state or "").strip().lower()
+        new_value = str(new_state or "").strip().lower()
+        if old_value not in {"off", "closed", "not_home", "away", "idle", "clear", "empty", "vacant", "0", ""}:
+            return
+        if not self._should_slow_infer_after_fast_path_no_match(entity_id, new_value):
+            return
+        device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+        info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
+        room = str((info or {}).get("room") or (info or {}).get("area") or "").strip()
+        if not room:
+            area_getter = getattr(self, "_get_entity_area", None)
+            if callable(area_getter):
+                try:
+                    room = str(area_getter(entity_id) or "").strip()
+                except Exception:
+                    room = ""
+        if not room:
+            return
+
+        def _sample(_now: Any = None) -> None:
+            try:
+                states = getattr(self.hass, "states", None)
+                state_obj = states.get(entity_id) if states is not None and hasattr(states, "get") else None
+                if state_obj is not None and str(getattr(state_obj, "state", "") or "").strip().lower() not in {
+                    "on",
+                    "open",
+                    "home",
+                    "playing",
+                    "occupied",
+                    "present",
+                }:
+                    return
+                recorder = getattr(self, "_record_arrival_snapshot", None)
+                if callable(recorder):
+                    recorder(room, entity_id)
+            except Exception as exc:
+                _LOGGER.debug("[ArrivalBaseline] delayed sample failed for %s: %s", entity_id, exc)
+
+        try:
+            delay = max(1, int(getattr(self, "_PRESENCE_ON_MIN_HOLD", 1) or 1))
+            async_call_later(self.hass, delay, _sample)
+        except Exception as exc:
+            _LOGGER.debug("[ArrivalBaseline] sample scheduling failed for %s: %s", entity_id, exc)
+
     def _emit_addon_fast_path_event(self, payload: dict[str, Any]) -> None:
         try:
             self.hass.bus.async_fire("smart_agent_decision_bubble", payload)
@@ -968,6 +1030,18 @@ class ListenersMixin:
                                 new_state,
                             )
                             return
+                        if reason == "no_match" and self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                            self._sys_log(
+                                "INFO",
+                                f"[Add-on FastPath] no_match; scheduling slow inference | entity={entity_id} "
+                                f"active_space={snapshot_diag.get('active_space') or '-'}",
+                            )
+                            self._schedule_inference(
+                                entity_id,
+                                f"{entity_id}: {old_state} -> {new_state}",
+                                new_state,
+                            )
+                            return
                         self._sys_log(
                             "INFO",
                             f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
@@ -1172,6 +1246,7 @@ class ListenersMixin:
                     )
                     return
 
+            self._schedule_arrival_baseline_sample(entity_id, old_s, new_s)
             self._emit_listener_event(
                 listener_action="fast_path_scheduled",
                 entity_id=entity_id,

@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.97
-display_version: Beta 0.0.97
+release_version: 0.0.98
+display_version: Beta 0.0.98
 channel: beta
-release_date: '2026-06-04'
+release_date: '2026-06-06'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.97 测试版发布：恢复 switch 开关设备在设备页的快捷开关操作按钮，并携带最新管理端 UI 资源。
-  customer_visible_version: Beta 0.0.97
+  summary: Beta 0.0.98 测试版发布：修复 FastPath 学习/习惯闭环、人员到达未命中慢脑回退，并携带照明预演 AI 上下文修复。
+  customer_visible_version: Beta 0.0.98

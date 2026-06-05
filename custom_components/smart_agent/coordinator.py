@@ -1563,6 +1563,38 @@ class SmartAgentCoordinator(
         }
         return bundle
 
+    def _enqueue_decision_cache_write(
+        self,
+        *,
+        bundle: dict[str, Any],
+        result: dict[str, Any],
+        actions: list[dict[str, Any]],
+        confidence: int,
+        scene: str,
+    ) -> None:
+        trigger_room = str(bundle.get("trigger_room") or result.get("trigger_room") or "").strip()
+        if not trigger_room or not actions:
+            return
+        new_state = str(bundle.get("new_state") or "").strip().lower()
+        trigger_type = "departure" if new_state in {"off", "closed", "not_home", "away", "idle", "clear"} else "arrival"
+        now = datetime.now()
+        payload = {
+            "action": "write_decision",
+            "trigger_room": trigger_room,
+            "room": trigger_room,
+            "hour_bucket": now.hour,
+            "weekday": int(now.strftime("%w")),
+            "trigger_type": trigger_type,
+            "actions": actions,
+            "confidence": confidence,
+            "scene": scene,
+            "intent": str(result.get("intent") or ""),
+            "scene_candidate": str(result.get("scene_candidate") or result.get("scene") or ""),
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("cache_invalidate", payload):
+            _LOGGER.debug("[DecisionCache] write_decision enqueue skipped room=%s", trigger_room)
+
     async def _run_addon_decision(
         self,
         trigger: str,
@@ -1616,20 +1648,29 @@ class SmartAgentCoordinator(
             return {"status": "error", "message": str(error), **result}
 
         actions = result.get("actions") if isinstance(result.get("actions"), list) else []
+        valid_actions = [item for item in actions if isinstance(item, dict)]
         scene = str(result.get("scene") or "")
         try:
             confidence = int(float(result.get("confidence") or 0))
         except (TypeError, ValueError):
             confidence = 0
-        if actions:
+        if valid_actions:
             executed = await self._execute_actions(
-                [item for item in actions if isinstance(item, dict)],
+                valid_actions,
                 trigger_summary=str(trigger or ""),
                 scene_desc=scene,
                 confidence=confidence,
             )
             result["executed_count"] = executed
-            self._sys_log("INFO", f"[决策] add-on 返回 {len(actions)} 个动作，已执行 {executed} 个")
+            if executed == len(valid_actions):
+                self._enqueue_decision_cache_write(
+                    bundle=bundle,
+                    result=result,
+                    actions=valid_actions,
+                    confidence=confidence,
+                    scene=scene,
+                )
+            self._sys_log("INFO", f"[决策] add-on 返回 {len(valid_actions)} 个动作，已执行 {executed} 个")
         else:
             self._sys_log("INFO", f"[决策] add-on 未返回可执行动作: {result.get('reason') or 'no_actions'}")
         nested = result.get("result") if isinstance(result.get("result"), dict) else {}
