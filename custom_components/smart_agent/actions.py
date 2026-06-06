@@ -118,6 +118,66 @@ class ActionsMixin:
         self._sys_log("INFO", f"[SleepGuard] 夜间卧室二次进入低扰动锁定: {entity_id} -> {out}")
         return service, out
 
+    def _action_entity_room(self, entity_id: str) -> str:
+        info = {}
+        try:
+            info = self.device_info.get(entity_id, {}) or {}
+        except Exception:
+            info = {}
+        room = str(info.get("room") or "").strip() if isinstance(info, dict) else ""
+        if not room and hasattr(self, "_get_entity_area"):
+            try:
+                room = str(self._get_entity_area(entity_id) or "").strip()
+            except Exception:
+                room = ""
+        return room
+
+    def _room_occupancy_entries(self, room: str) -> list[tuple[str, str]]:
+        if not room or not hasattr(self, "_get_room_occupancy_map"):
+            return []
+        try:
+            occ_map = self._get_room_occupancy_map()
+        except Exception:
+            return []
+        if not isinstance(occ_map, dict):
+            return []
+        entries = occ_map.get(room) or []
+        normalized: list[tuple[str, str]] = []
+        for item in entries:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            normalized.append((str(item[0]), str(item[1]).lower()))
+        return normalized
+
+    def _occupancy_guard_check(self, entity_id: str, service: str) -> tuple[bool, str]:
+        if service != "turn_on":
+            return False, ""
+        room = self._action_entity_room(entity_id)
+        sensors = self._room_occupancy_entries(room)
+        if not room or not sensors:
+            return False, ""
+        occupied = any(state == "on" for _, state in sensors)
+        uncertain = any(state in ("unknown", "unavailable") for _, state in sensors)
+        if occupied or uncertain:
+            return False, ""
+        sensor_str = ", ".join(f"{eid}={state}" for eid, state in sensors[:3])
+        return True, f"{room} no occupied sensor evidence ({sensor_str})"
+
+    def _turnoff_presence_guard(self, entity_id: str, service: str) -> tuple[bool, str]:
+        if service != "turn_off":
+            return False, ""
+        room = self._action_entity_room(entity_id)
+        sensors = self._room_occupancy_entries(room)
+        if not room or not sensors:
+            return False, ""
+        occupied = [(eid, state) for eid, state in sensors if state == "on"]
+        uncertain = [(eid, state) for eid, state in sensors if state in ("unknown", "unavailable")]
+        if not occupied and not uncertain:
+            return False, ""
+        blocked = occupied or uncertain
+        sensor_str = ", ".join(f"{eid}={state}" for eid, state in blocked[:3])
+        return True, f"{room} presence not clear ({sensor_str})"
+
     def _get_action_device_capability(self, entity_id: str) -> dict[str, Any]:
         """统一动作层设备能力读取面（Wave 1B）。"""
         if hasattr(self, "get_device_capability"):

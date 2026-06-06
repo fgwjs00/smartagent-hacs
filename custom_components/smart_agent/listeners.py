@@ -1030,18 +1030,28 @@ class ListenersMixin:
                                 new_state,
                             )
                             return
-                        if reason == "no_match" and self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                        if reason == "no_match":
+                            if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                                self._sys_log(
+                                    "INFO",
+                                    f"[Add-on FastPath] no_match; scheduling slow inference | entity={entity_id} "
+                                    f"active_space={snapshot_diag.get('active_space') or '-'}",
+                                )
+                                self._schedule_inference(
+                                    entity_id,
+                                    f"{entity_id}: {old_state} -> {new_state}",
+                                    new_state,
+                                )
+                                return
+                            info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+                            if not isinstance(info, dict):
+                                info = {}
                             self._sys_log(
                                 "INFO",
-                                f"[Add-on FastPath] no_match; scheduling slow inference | entity={entity_id} "
-                                f"active_space={snapshot_diag.get('active_space') or '-'}",
+                                f"[Add-on FastPath] no_match; slow inference not scheduled | "
+                                f"reason=not_presence_arrival entity={entity_id} state={new_state} "
+                                f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
                             )
-                            self._schedule_inference(
-                                entity_id,
-                                f"{entity_id}: {old_state} -> {new_state}",
-                                new_state,
-                            )
-                            return
                         self._sys_log(
                             "INFO",
                             f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
