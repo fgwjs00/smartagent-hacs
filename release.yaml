@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.100
-display_version: Beta 0.0.100
+release_version: 0.0.101
+display_version: Beta 0.0.101
 channel: beta
 release_date: '2026-06-06'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.100 测试版热修：拦截慢脑幻觉设备动作，补齐执行守卫，并收紧 qwen3.5:2b 本地慢脑预算。
-  customer_visible_version: Beta 0.0.100
+  summary: Beta 0.0.101 测试版热修：实时信号流按触发、AI 判断、AI 认为需要动作与实际执行结果展示决策链路。
+  customer_visible_version: Beta 0.0.101
