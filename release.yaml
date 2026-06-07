@@ -1,12 +1,13 @@
 product: SmartAgent
-release_version: 0.0.103
-display_version: Beta 0.0.103
+release_version: 0.0.104
+display_version: Beta 0.0.104
 channel: beta
-release_date: '2026-06-06'
+release_date: '2026-06-07'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.103 测试版热修：照明预演 AI 上下文判断按当前推理引擎调用本地或线上大模型，不再把本地推理误判为线上大模型未启用。
-  customer_visible_version: Beta 0.0.103
+  summary: Beta 0.0.104 测试版热修：人员/占用到达快路径在习惯、基线和场景都未命中时，会按同空间灯具能力生成保守开灯兜底，并确保 no_match
+    仍回落慢脑。
+  customer_visible_version: Beta 0.0.104
