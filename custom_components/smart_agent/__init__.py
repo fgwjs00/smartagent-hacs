@@ -208,7 +208,7 @@ def _extract_bearer_token(request: web.Request) -> str:
 
 
 _TRUSTED_ADDON_PROXY_PEERS = {"127.0.0.1", "::1", "localhost", "172.30.33.1"}
-_TRUSTED_ADDON_PROXY_PEER_PREFIXES = ("127.", "172.30.32.")
+_TRUSTED_ADDON_PROXY_PEER_PREFIXES = ("127.", "172.30.32.", "172.30.33.")
 _LEGACY_PAIR_TOKEN_CLIENT_NAMES = {
     "SmartAgent 中控屏",
     "SmartAgent 管理端会话",
@@ -1013,7 +1013,7 @@ class SmartAgentHaExecuteView(HomeAssistantView):
             return self.json(
                 _json_error_payload(
                     "ha_execute_requires_addon_internal",
-                    "auth_failed",
+                    "forbidden",
                     False,
                     execution_path="ha_execute_adapter",
                 ),
