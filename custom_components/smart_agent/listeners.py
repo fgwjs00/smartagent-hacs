@@ -139,30 +139,45 @@ class ListenersMixin:
     def _is_presence_flap_suppressed(self, entity_id: str) -> tuple[bool, int]:
         """检查存在传感器是否处于抖动风暴抑制期。"""
         now_ts = time.time()
-        suppress_until = self._presence_flap_suppressed.get(entity_id, 0)
+        suppressed = getattr(self, "_presence_flap_suppressed", None)
+        if not isinstance(suppressed, dict):
+            suppressed = {}
+            self._presence_flap_suppressed = suppressed
+        suppress_until = suppressed.get(entity_id, 0)
         if now_ts < suppress_until:
             return True, int(suppress_until - now_ts)
         if suppress_until:
-            self._presence_flap_suppressed.pop(entity_id, None)
+            suppressed.pop(entity_id, None)
         return False, 0
 
     def _record_presence_flap(self, entity_id: str) -> None:
         """记录 on/off 反转并在高频抖动时进入抑制期。"""
         now_ts = time.time()
-        history = self._presence_flap_history.setdefault(entity_id, [])
+        history_map = getattr(self, "_presence_flap_history", None)
+        if not isinstance(history_map, dict):
+            history_map = {}
+            self._presence_flap_history = history_map
+        suppressed = getattr(self, "_presence_flap_suppressed", None)
+        if not isinstance(suppressed, dict):
+            suppressed = {}
+            self._presence_flap_suppressed = suppressed
+        history = history_map.setdefault(entity_id, [])
         history.append(now_ts)
-        self._presence_flap_history[entity_id] = [
+        history_map[entity_id] = [
             t for t in history if now_ts - t <= self._PRESENCE_FLAP_WINDOW
         ]
-        flap_count = len(self._presence_flap_history[entity_id])
+        flap_count = len(history_map[entity_id])
         if flap_count < self._PRESENCE_FLAP_THRESHOLD:
             return
 
         suppress_until = now_ts + self._PRESENCE_FLAP_SUPPRESS_SECS
-        self._presence_flap_suppressed[entity_id] = suppress_until
-        self._presence_flap_history[entity_id] = []
-        self._presence_on_start.pop(entity_id, None)
-        old_off = self._presence_off_timers.pop(entity_id, None)
+        suppressed[entity_id] = suppress_until
+        history_map[entity_id] = []
+        presence_on_start = getattr(self, "_presence_on_start", None)
+        if isinstance(presence_on_start, dict):
+            presence_on_start.pop(entity_id, None)
+        presence_off_timers = getattr(self, "_presence_off_timers", None)
+        old_off = presence_off_timers.pop(entity_id, None) if isinstance(presence_off_timers, dict) else None
         if old_off:
             try:
                 old_off()
@@ -652,6 +667,17 @@ class ListenersMixin:
                 manual_actions = dict(getattr(self, "_user_manual_actions", {}) or {})
         if isinstance(manual_actions, dict):
             snapshot["user_manual_actions"] = manual_actions
+        priority_getter = getattr(self, "_get_priority_summary", None)
+        if callable(priority_getter):
+            try:
+                priority_guards = priority_getter()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] _get_priority_summary failed for add-on snapshot: %s", exc)
+                priority_guards = None
+            if isinstance(priority_guards, list):
+                snapshot["manual_action_summary"] = {
+                    "priority_guards": [dict(item) for item in priority_guards if isinstance(item, dict)]
+                }
         snapshot["now_ts"] = time.time()
 
         for key, getter_name in (
@@ -1052,6 +1078,31 @@ class ListenersMixin:
                                 f"reason=not_presence_arrival entity={entity_id} state={new_state} "
                                 f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
                             )
+                        if reason == "confidence_below_auto_threshold" and not confirm_required:
+                            if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                                self._sys_log(
+                                    "INFO",
+                                    f"[Add-on FastPath] confidence_below_auto_threshold; scheduling slow inference | "
+                                    f"entity={entity_id} confidence={confidence if confidence is not None else '-'} "
+                                    f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
+                                    f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
+                                    f"active_space={snapshot_diag.get('active_space') or '-'}",
+                                )
+                                self._schedule_inference(
+                                    entity_id,
+                                    f"{entity_id}: {old_state} -> {new_state}",
+                                    new_state,
+                                )
+                                return
+                            info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+                            if not isinstance(info, dict):
+                                info = {}
+                            self._sys_log(
+                                "INFO",
+                                f"[Add-on FastPath] confidence_below_auto_threshold; slow inference not scheduled | "
+                                f"reason=not_presence_arrival entity={entity_id} state={new_state} "
+                                f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
+                            )
                         self._sys_log(
                             "INFO",
                             f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
@@ -1255,6 +1306,40 @@ class ListenersMixin:
                         ai_action_age=int(ai_action_age),
                     )
                     return
+
+            info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}
+            sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
+            eid_lower = entity_id.lower()
+            name_lower = str((info or {}).get("name") or "").lower()
+            is_presence_sensor = (
+                domain == "binary_sensor"
+                and (
+                    sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}
+                    or any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
+                )
+            )
+            old_presence_state = str(old_s or "").strip().lower()
+            new_presence_state = str(new_s or "").strip().lower()
+            if (
+                is_presence_sensor
+                and old_presence_state != new_presence_state
+                and old_presence_state in {"on", "off"}
+                and new_presence_state in {"on", "off"}
+            ):
+                suppressed, remaining = self._is_presence_flap_suppressed(entity_id)
+                if suppressed:
+                    self._sys_log("INFO", f"[存在去抖] {entity_id} 抖动抑制中，剩余 {remaining}s，跳过 add-on 快路")
+                    self._emit_listener_event(
+                        listener_action="filtered",
+                        entity_id=entity_id,
+                        old_state=old_s,
+                        new_state=new_s,
+                        filter_reason="presence_flap_suppressed",
+                        source_type=source_type,
+                        suppress_remaining=remaining,
+                    )
+                    return
+                self._record_presence_flap(entity_id)
 
             self._schedule_arrival_baseline_sample(entity_id, old_s, new_s)
             self._emit_listener_event(

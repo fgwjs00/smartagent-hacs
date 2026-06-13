@@ -1595,6 +1595,63 @@ class SmartAgentCoordinator(
         if not callable(enqueue) or not enqueue("cache_invalidate", payload):
             _LOGGER.debug("[DecisionCache] write_decision enqueue skipped room=%s", trigger_room)
 
+    def _behavior_expected_state_from_action(self, action: dict[str, Any]) -> str:
+        service = str(action.get("service") or action.get("action") or "").strip().lower()
+        service_name = service.rsplit(".", 1)[-1]
+        service_state = {
+            "turn_on": "on",
+            "open_cover": "open",
+            "open": "open",
+            "turn_off": "off",
+            "close_cover": "off",
+            "close": "off",
+        }
+        if service_name in service_state:
+            return service_state[service_name]
+        expected = str(action.get("expected_state") or action.get("state") or "").strip().lower()
+        return expected if expected in {"on", "off", "open", "closed", "close"} else ""
+
+    def _enqueue_behavior_pattern_write(
+        self,
+        *,
+        bundle: dict[str, Any],
+        result: dict[str, Any],
+        actions: list[dict[str, Any]],
+        confidence: int,
+    ) -> None:
+        trigger_room = str(bundle.get("trigger_room") or result.get("trigger_room") or "").strip()
+        if not trigger_room or not actions:
+            return
+        now = datetime.now()
+        hour_start = (now.hour - 1) % 24
+        hour_end = (now.hour + 1) % 24
+        weekday_mask = str(now.strftime("%w"))
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue):
+            return
+        normalized_confidence = max(55, min(95, int(confidence or result.get("confidence") or 70)))
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            entity_id = str(action.get("entity_id") or "").strip()
+            expected_state = self._behavior_expected_state_from_action(action)
+            if not entity_id or not expected_state:
+                continue
+            payload = {
+                "action": "upsert",
+                "entity_id": entity_id,
+                "expected_state": expected_state,
+                "room": trigger_room,
+                "hour_start": hour_start,
+                "hour_end": hour_end,
+                "weekday_mask": weekday_mask,
+                "confidence": normalized_confidence,
+                "hit_count": 1,
+                "lifecycle_state": "active",
+            }
+            if not enqueue("behavior", payload, ts=now.strftime("%Y-%m-%d %H:%M:%S")):
+                _LOGGER.debug("[BehaviorPattern] upsert enqueue skipped entity=%s", entity_id)
+
     async def _run_addon_decision(
         self,
         trigger: str,
@@ -1633,50 +1690,65 @@ class SmartAgentCoordinator(
                 "confidence": 0,
                 "reason": "empty_device_table_no_action",
             }
-        try:
-            result = await addon_client.run_decision(trigger=str(trigger or ""), bundle=bundle)
-        except Exception as exc:
-            self._sys_log("WARN", f"[决策] add-on decision provider 调用失败: {exc}")
-            return {"status": "error", "message": str(exc)}
-        if not isinstance(result, dict):
-            self._sys_log("WARN", "[决策] add-on decision provider 无响应")
-            return {"status": "error", "message": "add-on decision provider unavailable"}
-        status = int(result.get("__status", 200) or 200)
-        if status >= 400 or result.get("ok") is False:
-            error = result.get("error") or result.get("error_type") or f"http_{status}"
-            self._sys_log("WARN", f"[决策] add-on decision provider 返回失败: {error}")
-            return {"status": "error", "message": str(error), **result}
+        room_lock_key = str(bundle.get("trigger_room") or "").strip()
+        inference_lock = self._get_room_lock(room_lock_key) if room_lock_key else getattr(self, "_inference_lock", None)
+        if inference_lock is None:
+            self._inference_lock = asyncio.Lock()
+            inference_lock = self._inference_lock
+        if hasattr(inference_lock, "locked") and inference_lock.locked():
+            self._sys_log("INFO", f"[决策] 同空间推理进行中，等待: {room_lock_key or 'global'}")
+        async with inference_lock:
+            try:
+                result = await addon_client.run_decision(trigger=str(trigger or ""), bundle=bundle)
+            except Exception as exc:
+                self._sys_log("WARN", f"[决策] add-on decision provider 调用失败: {exc}")
+                return {"status": "error", "message": str(exc)}
+            if not isinstance(result, dict):
+                self._sys_log("WARN", "[决策] add-on decision provider 无响应")
+                return {"status": "error", "message": "add-on decision provider unavailable"}
+            status = int(result.get("__status", 200) or 200)
+            if status >= 400 or result.get("ok") is False:
+                error = result.get("error") or result.get("error_type") or f"http_{status}"
+                self._sys_log("WARN", f"[决策] add-on decision provider 返回失败: {error}")
+                return {"status": "error", "message": str(error), **result}
 
-        actions = result.get("actions") if isinstance(result.get("actions"), list) else []
-        valid_actions = [item for item in actions if isinstance(item, dict)]
-        scene = str(result.get("scene") or "")
-        try:
-            confidence = int(float(result.get("confidence") or 0))
-        except (TypeError, ValueError):
-            confidence = 0
-        if valid_actions:
-            executed = await self._execute_actions(
-                valid_actions,
-                trigger_summary=str(trigger or ""),
-                scene_desc=scene,
-                confidence=confidence,
-            )
-            result["executed_count"] = executed
-            if executed == len(valid_actions):
-                self._enqueue_decision_cache_write(
-                    bundle=bundle,
-                    result=result,
-                    actions=valid_actions,
+            actions = result.get("actions") if isinstance(result.get("actions"), list) else []
+            valid_actions = [item for item in actions if isinstance(item, dict)]
+            scene = str(result.get("scene") or "")
+            try:
+                confidence = int(float(result.get("confidence") or 0))
+            except (TypeError, ValueError):
+                confidence = 0
+            if valid_actions:
+                executed = await self._execute_actions(
+                    valid_actions,
+                    trigger_summary=str(trigger or ""),
+                    scene_desc=scene,
                     confidence=confidence,
-                    scene=scene,
+                    trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
                 )
-            self._sys_log("INFO", f"[决策] add-on 返回 {len(valid_actions)} 个动作，已执行 {executed} 个")
-        else:
-            self._sys_log("INFO", f"[决策] add-on 未返回可执行动作: {result.get('reason') or 'no_actions'}")
-        nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-        result.setdefault("reply", nested.get("reply") or ("已处理" if actions else "未命中可执行动作"))
-        result.setdefault("status", "ok")
-        return result
+                result["executed_count"] = executed
+                if executed == len(valid_actions):
+                    self._enqueue_decision_cache_write(
+                        bundle=bundle,
+                        result=result,
+                        actions=valid_actions,
+                        confidence=confidence,
+                        scene=scene,
+                    )
+                    self._enqueue_behavior_pattern_write(
+                        bundle=bundle,
+                        result=result,
+                        actions=valid_actions,
+                        confidence=confidence,
+                    )
+                self._sys_log("INFO", f"[决策] add-on 返回 {len(valid_actions)} 个动作，已执行 {executed} 个")
+            else:
+                self._sys_log("INFO", f"[决策] add-on 未返回可执行动作: {result.get('reason') or 'no_actions'}")
+            nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+            result.setdefault("reply", nested.get("reply") or ("已处理" if actions else "未命中可执行动作"))
+            result.setdefault("status", "ok")
+            return result
 
     async def _run_voice_inference(self, text: str, source: str = "touch") -> dict:
         """Handle voice text through add-on owned decision provider."""
