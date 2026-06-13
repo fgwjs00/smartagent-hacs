@@ -1105,6 +1105,50 @@ class AddOnClient:
             return self._handle_request_exception(exc)
         return None
 
+    async def get_behavior_patterns(self) -> dict[str, Any] | None:
+        """Read canonical behavior patterns from the add-on."""
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{self._base}/behavior-patterns",
+                headers=self._auth_headers,
+                timeout=_HEALTH_TIMEOUT,
+            ) as resp:
+                if resp.status in (404, 405):
+                    return None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                return self._build_status_result(resp.status, data)
+        except Exception as exc:
+            return self._handle_request_exception(exc)
+        return None
+
+    async def post_behavior_pattern_action(self, pattern_id: int, action: str) -> dict[str, Any] | None:
+        """Apply a lifecycle action to a canonical add-on behavior pattern."""
+        normalized = str(action or "").strip().lower()
+        if normalized not in {"delete", "archive", "promote-habit", "promote-rule"}:
+            normalized = "archive"
+        try:
+            session = await self._get_session()
+            async with session.post(
+                f"{self._base}/behavior-patterns/{int(pattern_id)}/{normalized}",
+                json={},
+                headers=self._auth_headers,
+                timeout=_HEALTH_TIMEOUT,
+            ) as resp:
+                if resp.status in (404, 405):
+                    return None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                return self._build_status_result(resp.status, data)
+        except Exception as exc:
+            return self._handle_request_exception(exc)
+        return None
+
     async def get_ai_scenes(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取 AI 场景列表（优先 add-on 服务面）。"""
         for path in ("/ai-scenes",):

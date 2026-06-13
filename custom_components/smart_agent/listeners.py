@@ -262,6 +262,7 @@ class ListenersMixin:
         one_off_prompt: str = "",
         *,
         _policy_synced: bool = False,
+        _allow_learning_mode_inference: bool = False,
     ) -> None:
 
         # ── 门控检查（所有路径统一入口，包括 Frigate MQTT / 巡检 / HA 状态变化）──────
@@ -283,10 +284,11 @@ class ListenersMixin:
                     trigger,
                     new_state,
                     one_off_prompt,
+                    _allow_learning_mode_inference=_allow_learning_mode_inference,
                 )
             )
             return
-        if self._learning_mode:
+        if self._learning_mode and not _allow_learning_mode_inference:
             # 仅记录真实 HA 实体（entity_id 必须含"."，排除"展厅系统"等虚拟调度实体）
             _is_real_entity = "." in entity_id and not entity_id.startswith(".")
             if _is_real_entity:
@@ -337,6 +339,8 @@ class ListenersMixin:
         trigger: str,
         new_state: str = "",
         one_off_prompt: str = "",
+        *,
+        _allow_learning_mode_inference: bool = False,
     ) -> None:
         try:
             await self._async_apply_addon_system_settings()
@@ -348,6 +352,7 @@ class ListenersMixin:
             new_state,
             one_off_prompt,
             _policy_synced=True,
+            _allow_learning_mode_inference=_allow_learning_mode_inference,
         )
 
     @callback
@@ -1079,19 +1084,22 @@ class ListenersMixin:
                                 f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
                             )
                         if reason == "confidence_below_auto_threshold" and not confirm_required:
-                            if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                            if action_count > 0 or self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
                                 self._sys_log(
                                     "INFO",
                                     f"[Add-on FastPath] confidence_below_auto_threshold; scheduling slow inference | "
                                     f"entity={entity_id} confidence={confidence if confidence is not None else '-'} "
                                     f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
                                     f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
+                                    f"actions={action_count} "
+                                    f"confirm_suppressed_reason={confirm_suppressed_reason or '-'} "
                                     f"active_space={snapshot_diag.get('active_space') or '-'}",
                                 )
                                 self._schedule_inference(
                                     entity_id,
                                     f"{entity_id}: {old_state} -> {new_state}",
                                     new_state,
+                                    _allow_learning_mode_inference=(confirm_suppressed_reason == "learning_mode"),
                                 )
                                 return
                             info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
@@ -1100,7 +1108,7 @@ class ListenersMixin:
                             self._sys_log(
                                 "INFO",
                                 f"[Add-on FastPath] confidence_below_auto_threshold; slow inference not scheduled | "
-                                f"reason=not_presence_arrival entity={entity_id} state={new_state} "
+                                f"reason=no_action_candidate_or_not_presence_arrival entity={entity_id} state={new_state} "
                                 f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
                             )
                         self._sys_log(

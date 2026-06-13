@@ -288,7 +288,31 @@ def build_smart_agent_websocket_commands(
         if coord is None:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
-        patterns = coord._behavior_patterns_cache if isinstance(coord._behavior_patterns_cache, list) else []
+        addon_client = getattr(coord, "_addon_client", None)
+        if addon_client is None:
+            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            return
+        try:
+            result = await addon_client.get_behavior_patterns()
+        except Exception as exc:
+            _LOGGER.warning("[WS] get_behavior_patterns add-on query failed: %s", exc)
+            connection.send_error(msg["id"], "addon_unreachable", str(exc))
+            return
+        if not isinstance(result, dict):
+            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            return
+        status = int(result.get("__status") or result.get("status_code") or 0)
+        if status >= 400:
+            connection.send_error(
+                msg["id"],
+                str(result.get("error") or "addon_error"),
+                str(result.get("message") or result.get("error") or "SmartAgent add-on request failed"),
+            )
+            return
+        data = result.get("data")
+        patterns = data if isinstance(data, list) else result.get("patterns")
+        if not isinstance(patterns, list):
+            patterns = []
         connection.send_result(msg["id"], {"patterns": patterns})
 
     @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_ai_actions"})
@@ -346,61 +370,26 @@ def build_smart_agent_websocket_commands(
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
 
-        def _query_stats():
-            q = coord._db.query
-            # _safe_int: 返回 COUNT/SUM 查询结果中 "c" 列的整数值
-            # 原错误：_safe(sql)[0] 对 dict 使用整数下标 → KeyError: 0（v4.11.1 修复）
-            _safe_int = lambda sql: ((q(sql) or [{}])[0].get("c") or 0)
-
-            # 各表记录数
-            arrival_count    = _safe_int("SELECT COUNT(*) as c FROM arrival_baseline")
-            correction_count = _safe_int("SELECT COUNT(*) as c FROM corrections")
-            cache_count      = _safe_int("SELECT COUNT(*) as c FROM decision_cache")
-            cache_hits       = _safe_int("SELECT SUM(hit_count) as c FROM decision_cache")
-            pattern_count    = _safe_int("SELECT COUNT(*) as c FROM behavior_patterns")
-            reflexion_count  = _safe_int("SELECT COUNT(*) as c FROM reflexion_patterns")
-
-            # 设备区域覆盖率
-            total_devices  = _safe_int("SELECT COUNT(*) as c FROM devices")
-            noroom_devices = _safe_int("SELECT COUNT(*) as c FROM devices WHERE area='' OR area IS NULL")
-
-            # 近 7 天纠正趋势（按天分组）
-            correction_trend = []
-            rows = q(
-                "SELECT DATE(time) as day, COUNT(*) as cnt "
-                "FROM corrections WHERE time >= DATE('now','-7 days') "
-                "GROUP BY DATE(time) ORDER BY day"
-            )
-            if rows:
-                correction_trend = [{"day": r["day"], "count": r["cnt"]} for r in rows]
-
-            # 被纠正最多的 Top-5 设备
-            top_corrected = []
-            rows = q(
-                "SELECT entity_id, SUM(correction_count) as total "
-                "FROM corrections GROUP BY entity_id ORDER BY total DESC LIMIT 5"
-            )
-            if rows:
-                top_corrected = [{"entity_id": r["entity_id"], "count": r["total"]} for r in rows]
-
-            return {
-                "arrival_baseline": arrival_count,
-                "corrections": correction_count,
-                "decision_cache": cache_count,
-                "decision_cache_hits": cache_hits,
-                "behavior_patterns": pattern_count,
-                "reflexion_patterns": reflexion_count,
-                "total_devices": total_devices,
-                "noroom_devices": noroom_devices,
-                "correction_trend": correction_trend,
-                "top_corrected": top_corrected,
-            }
-
+        addon_client = getattr(coord, "_addon_client", None)
+        if addon_client is None:
+            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            return
         try:
-            stats = await hass.async_add_executor_job(_query_stats)
+            stats = await addon_client.get_learning_stats()
         except Exception as _exc:
-            _LOGGER.warning("[WS] get_learning_stats 查询异常: %s", _exc)
-            connection.send_error(msg["id"], "query_error", str(_exc))
+            _LOGGER.warning("[WS] get_learning_stats add-on query failed: %s", _exc)
+            connection.send_error(msg["id"], "addon_unreachable", str(_exc))
+            return
+        if not isinstance(stats, dict):
+            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            return
+        status = int(stats.get("__status") or stats.get("status_code") or 0)
+        if status >= 400:
+            connection.send_error(
+                msg["id"],
+                str(stats.get("error") or "addon_error"),
+                str(stats.get("message") or stats.get("error") or "SmartAgent add-on request failed"),
+            )
             return
         connection.send_result(msg["id"], stats)
 

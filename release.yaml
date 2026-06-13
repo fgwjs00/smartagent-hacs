@@ -1,13 +1,12 @@
 product: SmartAgent
-release_version: 0.0.108
-display_version: Beta 0.0.108
+release_version: 0.0.109
+display_version: Beta 0.0.109
 channel: beta
-release_date: '2026-06-13'
+release_date: '2026-06-14'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.108 测试版热修：快脑低置信度回退慢脑、确认后行为模式学习、实时快路径世界模型统一、抖动抑制、同空间慢脑推理串行、P0-P4
-    保护窗，以及 API 入口拆分。
-  customer_visible_version: Beta 0.0.108
+  summary: Beta 0.0.109 测试版热修：统一习惯管理端数据源，修复快脑非 presence 与学习模式低置信度沉默死角，确保不确定候选可升级慢脑。
+  customer_visible_version: Beta 0.0.109

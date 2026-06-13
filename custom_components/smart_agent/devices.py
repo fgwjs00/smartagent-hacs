@@ -985,14 +985,21 @@ class DevicesMixin:
     # ── 行为规律管理 ──────────────────────────────────────────────────────────
 
     async def async_delete_behavior_pattern(self, pattern_id: int) -> None:
-        """Delete a single behavior pattern by its DB id."""
+        """Delete a single behavior pattern through the canonical add-on store."""
         try:
-            _ok = await self._async_db_exec("DELETE FROM behavior_patterns WHERE id=?", (pattern_id,))
-            if not _ok:
-                self._sys_log("WARN", f"[行为习惯] 删除失败: id={pattern_id}")
+            addon_client = getattr(self, "_addon_client", None)
+            if addon_client is None:
+                self._sys_log("WARN", f"[行为习惯] Add-on 不可用，跳过删除: id={pattern_id}")
+                return
+            result = await addon_client.post_behavior_pattern_action(int(pattern_id), "delete")
+            if not isinstance(result, dict):
+                self._sys_log("WARN", f"[行为习惯] Add-on 无响应，删除失败: id={pattern_id}")
+                return
+            status = int(result.get("__status") or result.get("status_code") or 0)
+            if status >= 400 or result.get("ok") is False:
+                self._sys_log("WARN", f"[行为习惯] 删除失败: id={pattern_id}, result={result}")
                 return
             self._sys_log("INFO", f"[行为习惯] 已删除习惯规律 id={pattern_id}")
-            await self.hass.async_add_executor_job(self._refresh_behavior_patterns_cache)
             self.async_set_updated_data({})
         except Exception as e:
             _LOGGER.warning("[DevicesMixin] Delete pattern failed: %s", e)
