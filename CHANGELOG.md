@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.106 - 2026-06-07
+## Beta 0.0.107 - 2026-06-13
 
-Beta 0.0.106 测试版热修：补发 AI 决策页可执行动作明细与中控屏房间归一化修复，并提升 add-on 对外版本，确保 HA Add-on Store/HACS 能检测到最新更新。
+Beta 0.0.107 测试版热修：发布网关换 IP 登录兼容、HA 实体重命名同步、AI 决策待确认过期与确认学习、设备状态 HA 回读确认，以及 Dashboard 在线数口径修复。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.106`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.107`，用于 Home Assistant 更新检测。

@@ -10,6 +10,7 @@ import threading
 from datetime import datetime
 
 from .action_mapping import entities_to_actions, normalize_raw_actions
+from .entity_naming import name_to_entity_id
 from typing import Any
 from .const import (
     DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF,
@@ -561,6 +562,131 @@ class DevicesMixin:
         if isinstance(info, dict):
             info["room"] = target_room
             self.async_set_updated_data({})
+        return result
+
+    async def async_sync_device_identity_to_ha(self, entity_id: str, name: str) -> dict:
+        """Mirror a SmartAgent display name into HA Entity Registry entity_id."""
+        eid = str(entity_id or "").strip()
+        target_name = str(name or "").strip()
+        target_entity_id = name_to_entity_id(eid, target_name)
+        result = {
+            "ok": True,
+            "old_entity_id": eid,
+            "entity_id": target_entity_id or eid,
+            "new_entity_id": target_entity_id or eid,
+            "name": target_name,
+            "renamed": False,
+            "errors": 0,
+            "source": "ha_entity_registry_mirror",
+        }
+        if not eid:
+            result.update({"ok": False, "error": "entity_id_required", "error_type": "bad_request", "status": 400, "errors": 1})
+            return result
+        if not target_name:
+            result.update({"skipped": True, "reason": "name_not_provided", "entity_id": eid, "new_entity_id": eid})
+            return result
+        if not target_entity_id:
+            result.update({"ok": False, "error": "target_entity_id_required", "error_type": "bad_request", "status": 400, "errors": 1})
+            return result
+
+        entity_reg = er.async_get(self.hass)
+        entry = entity_reg.async_get(eid)
+        if entry is None:
+            result.update({"ok": False, "error": "entity_not_found", "error_type": "not_found", "status": 404, "errors": 1})
+            return result
+        if target_entity_id != eid and entity_reg.async_get(target_entity_id) is not None:
+            result.update(
+                {
+                    "ok": False,
+                    "error": "entity_id_conflict",
+                    "error_type": "conflict",
+                    "status": 409,
+                    "target_entity_id": target_entity_id,
+                    "entity_id": eid,
+                    "new_entity_id": target_entity_id,
+                    "errors": 1,
+                }
+            )
+            return result
+
+        try:
+            update_kwargs: dict[str, Any] = {"name": target_name}
+            if target_entity_id != eid:
+                update_kwargs["new_entity_id"] = target_entity_id
+            entity_reg.async_update_entity(eid, **update_kwargs)
+        except ValueError as exc:
+            result.update(
+                {
+                    "ok": False,
+                    "error": "entity_id_conflict",
+                    "error_type": "conflict",
+                    "status": 409,
+                    "details": str(exc),
+                    "target_entity_id": target_entity_id,
+                    "errors": 1,
+                }
+            )
+            return result
+        except Exception as exc:
+            self._sys_log("ERROR", f"[EntityRegistry] rename {eid} -> {target_entity_id} failed: {exc}")
+            result.update({"ok": False, "error": "entity_registry_update_failed", "error_type": "internal_error", "status": 500, "errors": 1})
+            return result
+
+        info = self.device_info.pop(eid, None) if target_entity_id != eid else self.device_info.get(eid)
+        if isinstance(info, dict):
+            info["name"] = target_name
+            info["entity_id"] = target_entity_id
+            self.device_info[target_entity_id] = info
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        await self._async_db_exec(
+            "UPDATE devices SET entity_id=?, name=?, updated=? WHERE entity_id=?",
+            (target_entity_id, target_name, now, eid),
+        )
+        result.update({"entity_id": target_entity_id, "new_entity_id": target_entity_id, "renamed": target_entity_id != eid})
+        self.async_set_updated_data({})
+        return result
+
+    async def async_sync_device_patch_to_ha(self, entity_id: str, patch: dict[str, Any]) -> dict:
+        """Mirror a SmartAgent device PATCH into HA registries."""
+        eid = str(entity_id or "").strip()
+        body = dict(patch) if isinstance(patch, dict) else {}
+        name = str(body.get("name") or body.get("friendly_name") or "").strip()
+        room = str(body.get("room") or body.get("area") or body.get("space") or "").strip()
+        result: dict[str, Any] = {
+            "ok": True,
+            "old_entity_id": eid,
+            "entity_id": eid,
+            "new_entity_id": eid,
+            "source": "ha_entity_registry_mirror",
+        }
+        if not name and not room:
+            result.update({"skipped": True, "reason": "patch_has_no_ha_registry_fields"})
+            return result
+
+        active_entity_id = eid
+        if name:
+            identity_result = await self.async_sync_device_identity_to_ha(active_entity_id, name)
+            result["ha_entity_sync"] = identity_result
+            if not identity_result.get("ok", True):
+                result.update(identity_result)
+                result.setdefault("source", "ha_entity_registry_mirror")
+                return result
+            active_entity_id = str(identity_result.get("new_entity_id") or identity_result.get("entity_id") or active_entity_id)
+            result["entity_id"] = active_entity_id
+            result["new_entity_id"] = active_entity_id
+
+        if room:
+            area_result = await self.async_sync_device_room_to_ha(active_entity_id, room)
+            result["ha_area_sync"] = area_result
+            if not area_result.get("ok", True):
+                result.update(area_result)
+                result["old_entity_id"] = eid
+                result["entity_id"] = active_entity_id
+                result["new_entity_id"] = active_entity_id
+                result.setdefault("source", "ha_entity_registry_mirror")
+                return result
+            result["room"] = room
+
         return result
 
     # ── 设备管辖域 ────────────────────────────────────────────────────────────

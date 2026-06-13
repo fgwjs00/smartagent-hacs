@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.106
-display_version: Beta 0.0.106
+release_version: 0.0.107
+display_version: Beta 0.0.107
 channel: beta
-release_date: '2026-06-07'
+release_date: '2026-06-13'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.106 测试版热修：补发 AI 决策页可执行动作明细与中控屏房间归一化修复，并提升 add-on 对外版本，确保 HA Add-on
-    Store/HACS 能检测到最新更新。
-  customer_visible_version: Beta 0.0.106
+  summary: Beta 0.0.107 测试版热修：发布网关换 IP 登录兼容、HA 实体重命名同步、AI 决策待确认过期与确认学习、设备状态 HA 回读确认，以及
+    Dashboard 在线数口径修复。
+  customer_visible_version: Beta 0.0.107

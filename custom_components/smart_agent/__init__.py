@@ -1174,57 +1174,42 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
             body = await request.json()
         except Exception:
             return self.json(
-                _json_error_payload("invalid_json", "bad_request", False, scope="device_area_sync"),
+                _json_error_payload("invalid_json", "bad_request", False, scope="device_registry_sync"),
                 status_code=400,
             )
         if not isinstance(body, dict):
             return self.json(
-                _json_error_payload("invalid_body", "bad_request", False, scope="device_area_sync"),
+                _json_error_payload("invalid_body", "bad_request", False, scope="device_registry_sync"),
                 status_code=400,
             )
 
-        room = str(body.get("room") or body.get("area") or body.get("space") or "").strip()
-        if not room:
-            return self.json(
-                {
-                    "ok": True,
-                    "entity_id": str(entity_id or "").strip(),
-                    "skipped": True,
-                    "reason": "room_not_provided",
-                    "source": "ha_area_registry_mirror",
-                },
-                status_code=200,
-            )
-
         coord = _get_first_coordinator(request.app["hass"])
-        sync_room = getattr(coord, "async_sync_device_room_to_ha", None) if coord is not None else None
-        if not callable(sync_room):
+        sync_patch = getattr(coord, "async_sync_device_patch_to_ha", None) if coord is not None else None
+        if not callable(sync_patch):
             return self.json(
                 _json_error_payload(
                     "addon_unreachable",
                     "dependency_unreachable",
                     True,
-                    scope="device_area_sync",
+                    scope="device_registry_sync",
                     source="ha_host_local",
                     entity_id=str(entity_id or "").strip(),
-                    room=room,
                 ),
                 status_code=502,
             )
 
         try:
-            result = await sync_room(str(entity_id or "").strip(), room)
+            result = await sync_patch(str(entity_id or "").strip(), body)
         except Exception as exc:
-            _LOGGER.exception("[DeviceAreaSync] HA area registry sync failed: %s", exc)
+            _LOGGER.exception("[DeviceRegistrySync] HA registry sync failed: %s", exc)
             return self.json(
                 _json_error_payload(
                     "addon_unreachable",
                     "dependency_unreachable",
                     True,
-                    scope="device_area_sync",
+                    scope="device_registry_sync",
                     source="ha_host_local",
                     entity_id=str(entity_id or "").strip(),
-                    room=room,
                     exception_type=exc.__class__.__name__,
                 ),
                 status_code=502,
@@ -1234,9 +1219,21 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
         errors = int(payload.get("errors", 0) or 0)
         payload.setdefault("ok", errors == 0)
         payload.setdefault("entity_id", str(entity_id or "").strip())
-        payload.setdefault("room", room)
-        payload.setdefault("source", "ha_area_registry_mirror")
-        return self.json(payload, status_code=200)
+        payload.setdefault("source", "ha_entity_registry_mirror")
+        status_code = int(payload.get("status") or 0)
+        if status_code <= 0:
+            error_type = str(payload.get("error_type") or "")
+            if payload.get("ok", True):
+                status_code = 200
+            elif error_type == "bad_request":
+                status_code = 400
+            elif error_type == "not_found":
+                status_code = 404
+            elif error_type == "conflict":
+                status_code = 409
+            else:
+                status_code = 502
+        return self.json(payload, status_code=status_code)
 
 
 class SmartAgentBackupsView(HomeAssistantView):

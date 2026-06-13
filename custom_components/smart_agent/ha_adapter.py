@@ -39,6 +39,44 @@ def _state_snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     }
 
 
+def _brightness_pct_from_snapshot(snapshot: dict[str, Any]) -> int | None:
+    attrs = snapshot.get("attributes") if isinstance(snapshot.get("attributes"), dict) else {}
+    raw = attrs.get("brightness")
+    try:
+        brightness = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if brightness < 0:
+        return 0
+    if brightness > 255:
+        brightness = 255
+    return int(round(brightness * 100 / 255))
+
+
+def _command_already_in_target_state(command: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    if not snapshot.get("available"):
+        return False
+    state = str(snapshot.get("state") or "").strip().lower()
+    service = str(command.get("service") or "").strip()
+    domain = str(command.get("domain") or "").strip()
+    data = command.get("data") if isinstance(command.get("data"), dict) else {}
+
+    if service == "turn_off":
+        return state == "off"
+    if service != "turn_on":
+        return False
+    if state != "on":
+        return False
+    if domain == "light" and "brightness_pct" in data:
+        try:
+            requested_pct = int(round(float(data.get("brightness_pct"))))
+        except (TypeError, ValueError):
+            return False
+        current_pct = _brightness_pct_from_snapshot(snapshot)
+        return current_pct is not None and current_pct == requested_pct
+    return True
+
+
 def async_get_entity_registry(hass: HomeAssistant) -> Any:
     """最小运行时读取：返回实体 registry 快照对象。"""
     from homeassistant.helpers import entity_registry as er
@@ -519,7 +557,20 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 stopped_after_error = True
             continue
 
-        pre_state_snapshot.append(_state_snapshot(hass, command["entity_id"]))
+        snapshot = _state_snapshot(hass, command["entity_id"])
+        pre_state_snapshot.append(snapshot)
+        if _command_already_in_target_state(command, snapshot):
+            results.append({
+                **command,
+                "ok": True,
+                "error": "",
+                "error_type": "",
+                "retryable": False,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+                "status": "skipped",
+                "reason": "already_in_target_state",
+            })
+            continue
         try:
             await hass.services.async_call(
                 command["domain"],
@@ -551,7 +602,7 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
 
     ok = bool(results) and all(bool(item.get("ok")) for item in results)
     first_error = next((item for item in results if not item.get("ok")), None)
-    succeeded_count = sum(1 for item in results if bool(item.get("ok")))
+    succeeded_count = sum(1 for item in results if bool(item.get("ok")) and item.get("status") != "skipped")
     failed_count = sum(1 for item in results if not bool(item.get("ok")) and item.get("status") != "skipped")
     skipped_count = sum(1 for item in results if item.get("status") == "skipped")
     partial_success = succeeded_count > 0 and (failed_count > 0 or skipped_count > 0)
