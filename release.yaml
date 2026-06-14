@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.113
-display_version: Beta 0.0.113
+release_version: 0.0.114
+display_version: Beta 0.0.114
 channel: beta
-release_date: '2026-06-14'
+release_date: '2026-06-15'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.113 测试版热修：补齐 ML 快脑训练样本表、训练样本质量门禁与慢脑成功执行后的脱敏训练样本回写。
-  customer_visible_version: Beta 0.0.113
+  summary: Beta 0.0.114 测试版热修：收口快脑默认阈值与证据驱动置信度，补齐慢脑结构化上下文摘要和 planner 记忆可观测性。
+  customer_visible_version: Beta 0.0.114

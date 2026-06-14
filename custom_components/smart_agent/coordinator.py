@@ -78,6 +78,8 @@ from .const import (
     CONF_CONFIDENCE_AUTO,
     CONF_CONFIDENCE_NOTIFY,
     CONF_CLOUD_FALLBACK,
+    DEFAULT_CONFIDENCE_AUTO,
+    DEFAULT_CONFIDENCE_NOTIFY,
     CONF_VISION_ENABLED,
     CONF_VISION_ENGINE,
     CONF_VISION_MODEL,
@@ -227,8 +229,8 @@ class SmartAgentCoordinator(
         self._online_api_key = data.get(CONF_ONLINE_API_KEY, "")
         self.online_base_url = data.get(CONF_ONLINE_BASE_URL, "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.online_model = data.get(CONF_ONLINE_MODEL, "qwen3.5-flash")
-        self.confidence_auto = int(data.get(CONF_CONFIDENCE_AUTO, 90))
-        self.confidence_notify = int(data.get(CONF_CONFIDENCE_NOTIFY, 60))
+        self.confidence_auto = int(data.get(CONF_CONFIDENCE_AUTO, DEFAULT_CONFIDENCE_AUTO))
+        self.confidence_notify = int(data.get(CONF_CONFIDENCE_NOTIFY, DEFAULT_CONFIDENCE_NOTIFY))
         self.cooldown = int(data.get(CONF_COOLDOWN, 60))
         self.showroom_biz_start_min: int = parse_biz_time(data.get(CONF_SHOWROOM_BIZ_START, DEFAULT_SHOWROOM_BIZ_START))
         self.showroom_biz_end_min: int   = parse_biz_time(data.get(CONF_SHOWROOM_BIZ_END, DEFAULT_SHOWROOM_BIZ_END))
