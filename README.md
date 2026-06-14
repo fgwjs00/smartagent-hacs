@@ -1,6 +1,6 @@
 # SmartAgent for Home Assistant
 
-当前公开版本：`Beta 0.0.109`
+当前公开版本：`Beta 0.0.111`
 
 ## 中文说明
 
@@ -16,4 +16,4 @@ Gitee 仓库仅作为镜像和手动下载来源，不能作为 HACS 自定义�
 
 ### 更新
 
-SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.109`。
+SmartAgent Home Assistant 集成通过 HACS 更新。当前公开版本为 `Beta 0.0.111`。

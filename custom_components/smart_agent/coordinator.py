@@ -1728,6 +1728,53 @@ class SmartAgentCoordinator(
                     trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
                 )
                 result["executed_count"] = executed
+                final_outcome = (
+                    "succeeded"
+                    if executed >= len(valid_actions)
+                    else "partial"
+                    if executed > 0
+                    else "failed"
+                )
+                transaction_id = str(
+                    result.get("transaction_id")
+                    or result.get("decision_id")
+                    or result.get("id")
+                    or ""
+                ).strip()
+                action_results = []
+                for index, action in enumerate(valid_actions):
+                    if not isinstance(action, dict):
+                        continue
+                    action_results.append(
+                        {
+                            "domain": str(action.get("domain") or ""),
+                            "service": str(action.get("service") or ""),
+                            "entity_id": str(action.get("entity_id") or ""),
+                            "status": "executed" if index < executed else "not_executed",
+                            "reason": "ha_execute_actions_returned_count_only",
+                        }
+                    )
+                if transaction_id:
+                    execution_event_enqueued = self._enqueue_internal_event(
+                        "decision_execution",
+                        {
+                            "transaction_id": transaction_id,
+                            "trigger": str(trigger or ""),
+                            "scene": scene,
+                            "confidence": confidence,
+                            "planned_count": len(valid_actions),
+                            "executed_count": executed,
+                            "final_outcome": final_outcome,
+                            "actions": valid_actions,
+                            "action_results": action_results,
+                            "source": "ha_slow_decision",
+                        },
+                    )
+                    if not execution_event_enqueued:
+                        self._sys_log(
+                            "WARN",
+                            f"[决策] decision_execution 回写入队失败 transaction_id={transaction_id}",
+                        )
                 if executed == len(valid_actions):
                     self._enqueue_decision_cache_write(
                         bundle=bundle,
