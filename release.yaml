@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.111
-display_version: Beta 0.0.111
+release_version: 0.0.112
+display_version: Beta 0.0.112
 channel: beta
 release_date: '2026-06-14'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.111 测试版热修：补齐线上大模型返回结果的日志事件解析，避免 fast-path 转入线上后在系统日志事件流中看起来一直等待。
-  customer_visible_version: Beta 0.0.111
+  summary: Beta 0.0.112 测试版热修：补齐线上大模型慢脑成功/失败结果回流、AI 决策证据链本地兜底与无动作原因码展示。
+  customer_visible_version: Beta 0.0.112
