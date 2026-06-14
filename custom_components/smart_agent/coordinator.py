@@ -1652,6 +1652,70 @@ class SmartAgentCoordinator(
             if not enqueue("behavior", payload, ts=now.strftime("%Y-%m-%d %H:%M:%S")):
                 _LOGGER.debug("[BehaviorPattern] upsert enqueue skipped entity=%s", entity_id)
 
+    def _build_training_sample_payload(
+        self,
+        *,
+        bundle: dict[str, Any],
+        actions: list[dict[str, Any]],
+        confidence: int,
+        final_outcome: str,
+    ) -> dict[str, Any] | None:
+        if final_outcome != "succeeded" or not actions:
+            return None
+
+        sample_actions: list[dict[str, Any]] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            entity_id = str(action.get("entity_id") or action.get("entity") or "").strip()
+            service = str(action.get("service") or "").strip()
+            if not entity_id or not service:
+                continue
+            domain = str(action.get("domain") or entity_id.split(".", 1)[0]).strip()
+            sample_actions.append(
+                {
+                    "domain": domain,
+                    "service": service,
+                    "entity_id": entity_id,
+                    "confidence": max(0.0, min(float(confidence or 0) / 100.0, 1.0)),
+                }
+            )
+        if not sample_actions:
+            return None
+
+        now = datetime.now()
+        trigger_entity = str(bundle.get("trigger_entity_id") or "").strip()
+        trigger_domain = trigger_entity.split(".", 1)[0] if "." in trigger_entity else ""
+        trigger_room = str(bundle.get("trigger_room") or "").strip()
+        presence_snapshot = bundle.get("presence_snapshot") if isinstance(bundle.get("presence_snapshot"), dict) else {}
+        room_presence = {}
+        rooms = presence_snapshot.get("rooms") if isinstance(presence_snapshot, dict) else {}
+        if isinstance(rooms, dict) and trigger_room:
+            room_presence = rooms.get(trigger_room) if isinstance(rooms.get(trigger_room), dict) else {}
+        room_state = str(room_presence.get("state") or room_presence.get("presence") or "").strip().lower()
+        room_person_count = 1 if room_state in {"occupied", "present", "on", "home"} else 0
+        month = now.month
+        season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
+        quality_score = max(0.0, min(float(confidence or 0) / 100.0, 1.0))
+        return {
+            "source": "ha_slow_decision",
+            "feature_json": {
+                "time_hour": now.hour,
+                "is_weekend": now.weekday() >= 5,
+                "trigger_domain": trigger_domain or "unknown",
+                "room_person_count": room_person_count,
+                "outdoor_temp": None,
+                "season_encoding": season,
+            },
+            "decision_json": {"actions": sample_actions},
+            "label": 1,
+            "quality_score": quality_score,
+            "is_verified": True,
+            "lifecycle_state": "active",
+            "privacy_tier": "derived_private",
+            "model_schema_version": "system1_v1",
+        }
+
     async def _run_addon_decision(
         self,
         trigger: str,
@@ -1842,6 +1906,12 @@ class SmartAgentCoordinator(
                             "reason": "ha_execute_actions_returned_count_only",
                         }
                     )
+                training_sample_payload = self._build_training_sample_payload(
+                    bundle=bundle,
+                    actions=valid_actions,
+                    confidence=confidence,
+                    final_outcome=final_outcome,
+                )
                 if transaction_id:
                     execution_event_enqueued = self._enqueue_internal_event(
                         "decision_execution",
@@ -1855,6 +1925,7 @@ class SmartAgentCoordinator(
                             "final_outcome": final_outcome,
                             "actions": valid_actions,
                             "action_results": action_results,
+                            "training_sample": training_sample_payload,
                             "source": "ha_slow_decision",
                         },
                     )

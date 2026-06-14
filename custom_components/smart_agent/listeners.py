@@ -278,14 +278,16 @@ class ListenersMixin:
             return
         # 3. 静默学习模式（只记录不推理）
         if not _policy_synced:
-            self.hass.async_create_task(
+            self._spawn_slow_inference_task(
                 self._schedule_inference_after_addon_policy_sync(
                     entity_id,
                     trigger,
                     new_state,
                     one_off_prompt,
                     _allow_learning_mode_inference=_allow_learning_mode_inference,
-                )
+                ),
+                trigger=trigger,
+                entity_id=entity_id,
             )
             return
         if self._learning_mode and not _allow_learning_mode_inference:
@@ -354,6 +356,118 @@ class ListenersMixin:
             _policy_synced=True,
             _allow_learning_mode_inference=_allow_learning_mode_inference,
         )
+
+    def _emit_slow_inference_task_failure(
+        self,
+        *,
+        trigger: str,
+        entity_id: str,
+        reason: str,
+        scene: str,
+        status: int,
+        message: str = "",
+    ) -> None:
+        old_state = ""
+        new_state = ""
+        match = re.match(r"^\s*([^:]+):\s*(.*?)\s*->\s*(.*?)\s*$", str(trigger or ""))
+        if match:
+            entity_id = entity_id or match.group(1).strip()
+            old_state = match.group(2).strip()
+            new_state = match.group(3).strip()
+        try:
+            self.hass.bus.async_fire("smart_agent_decision_bubble", {
+                "source": "ha_slow_decision",
+                "entity_id": str(entity_id or ""),
+                "trigger_entity_id": str(entity_id or ""),
+                "old_state": old_state,
+                "new_state": new_state,
+                "trigger": str(trigger or ""),
+                "status": status,
+                "matched": False,
+                "path_taken": "llm",
+                "reason": reason,
+                "scene": scene,
+                "confidence": 0,
+                "action_count": 0,
+                "actions": [],
+                "transaction_id": "",
+                "executed": False,
+                "executed_count": 0,
+                "final_outcome": "failed",
+                "fail_closed": True,
+                "message": str(message or ""),
+            })
+        except Exception as exc:
+            _LOGGER.debug("[SlowInference] failure bubble emit failed: %s", exc)
+
+    def _handle_slow_inference_task_done(self, task: Any, *, trigger: str, entity_id: str) -> None:
+        cancelled = False
+        try:
+            cancelled = bool(task.cancelled()) if hasattr(task, "cancelled") else False
+        except Exception:
+            cancelled = False
+        if cancelled:
+            self._sys_log("WARN", f"[决策] 线上大模型任务被取消: {entity_id}")
+            self._emit_slow_inference_task_failure(
+                trigger=trigger,
+                entity_id=entity_id,
+                reason="slow_inference_task_cancelled",
+                scene="线上大模型任务已取消",
+                status=499,
+            )
+            return
+        try:
+            exc = task.exception() if hasattr(task, "exception") else None
+        except asyncio.CancelledError:
+            self._sys_log("WARN", f"[决策] 线上大模型任务被取消: {entity_id}")
+            self._emit_slow_inference_task_failure(
+                trigger=trigger,
+                entity_id=entity_id,
+                reason="slow_inference_task_cancelled",
+                scene="线上大模型任务已取消",
+                status=499,
+            )
+            return
+        except Exception as err:
+            exc = err
+        if exc is None:
+            return
+        self._sys_log("ERROR", f"[决策] 线上大模型任务异常: {entity_id} | {exc}")
+        self._emit_slow_inference_task_failure(
+            trigger=trigger,
+            entity_id=entity_id,
+            reason="slow_inference_task_failed",
+            scene="线上大模型任务失败",
+            status=500,
+            message=str(exc),
+        )
+
+    def _spawn_slow_inference_task(self, coro: Any, *, trigger: str, entity_id: str) -> None:
+        try:
+            task = self.hass.async_create_task(coro)
+        except Exception as exc:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            self._sys_log("ERROR", f"[决策] 创建线上大模型任务失败: {entity_id} | {exc}")
+            self._emit_slow_inference_task_failure(
+                trigger=trigger,
+                entity_id=entity_id,
+                reason="slow_inference_task_create_failed",
+                scene="线上大模型任务创建失败",
+                status=500,
+                message=str(exc),
+            )
+            return
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(
+                lambda finished: self._handle_slow_inference_task_done(
+                    finished,
+                    trigger=trigger,
+                    entity_id=entity_id,
+                )
+            )
 
     @callback
     def _flush_triggers(self, _: datetime) -> None:
@@ -440,7 +554,11 @@ class ListenersMixin:
             merged = self._compact_merged_trigger(texts)
         self._sys_log("INFO", f"[合并] 合并 {len(triggers)} 个触发，启动推理: {merged[:80]}")
         try:
-            self.hass.async_create_task(self._run_addon_decision(merged, one_off_prompt=final_one_off))
+            self._spawn_slow_inference_task(
+                self._run_addon_decision(merged, one_off_prompt=final_one_off),
+                trigger=merged,
+                entity_id=str(triggers[0].get("entity_id") or ""),
+            )
         except Exception as exc:
             self._sys_log("ERROR", f"[合并] 创建推理任务失败: {exc}")
 
