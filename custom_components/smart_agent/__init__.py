@@ -1969,6 +1969,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             room=call.data.get("room", ""),
             dev_type=call.data.get("type", ""),
             ops=call.data.get("ops", ""),
+            capability=call.data.get("capability", ""),
         )
 
     async def svc_add_habit(call: ServiceCall) -> None:

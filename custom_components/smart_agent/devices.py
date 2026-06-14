@@ -177,7 +177,11 @@ class DevicesMixin:
 
         domain_capabilities = {
             "light": "lighting",
-            "switch": "lighting",
+            "switch": "switch",
+            "button": "scene",
+            "input_button": "scene",
+            "scene": "scene",
+            "script": "scene",
             "binary_sensor": "sensor",
             "sensor": "sensor",
             "climate": "climate",
@@ -191,6 +195,10 @@ class DevicesMixin:
             "humidifier": "appliance",
             "water_heater": "appliance",
         }
+        supported_capabilities = set(domain_capabilities.values()) | {"unknown"}
+        type_capability = str(info.get("type") or "").strip().lower()
+        if type_capability not in supported_capabilities:
+            type_capability = ""
         raw_roles = info.get("roles") or info.get("role") or info.get("fixture_roles")
         roles: list[str] = []
         if isinstance(raw_roles, str):
@@ -209,10 +217,11 @@ class DevicesMixin:
         capability_name = str(
             info.get("capability")
             or info.get("device_class")
+            or type_capability
             or domain_capabilities.get(domain)
             or domain
             or "unknown"
-        )
+        ).strip().lower()
 
         capability = {
             "entity_id": entity_id,
@@ -367,7 +376,8 @@ class DevicesMixin:
             self.async_set_updated_data({})
 
     async def async_svc_update_device(self, entity_id: str, name: str = "", room: str = "",
-                                      dev_type: str = "", ops: str = "", sensor_type: str = "") -> None:
+                                      dev_type: str = "", ops: str = "", sensor_type: str = "",
+                                      capability: str = "") -> None:
         """Service handler: update device fields."""
         if entity_id not in self.device_info:
             return
@@ -383,6 +393,10 @@ class DevicesMixin:
             info["ops"] = ops
         if sensor_type:
             info["sensor_type"] = sensor_type
+        normalized_capability = str(capability or "").strip().lower()
+        if normalized_capability:
+            info["capability"] = normalized_capability
+            info["type"] = normalized_capability
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _ok = await self._async_db_exec(
@@ -652,6 +666,7 @@ class DevicesMixin:
         body = dict(patch) if isinstance(patch, dict) else {}
         name = str(body.get("name") or body.get("friendly_name") or "").strip()
         room = str(body.get("room") or body.get("area") or body.get("space") or "").strip()
+        capability_name = str(body.get("capability") or body.get("device_class") or "").strip().lower()
         result: dict[str, Any] = {
             "ok": True,
             "old_entity_id": eid,
@@ -659,7 +674,27 @@ class DevicesMixin:
             "new_entity_id": eid,
             "source": "ha_entity_registry_mirror",
         }
+
+        async def _apply_local_capability(active_entity_id: str) -> None:
+            if not capability_name:
+                return
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            info = dict(self.device_info.get(active_entity_id, {}) or {})
+            if info:
+                info["capability"] = capability_name
+                info["type"] = capability_name
+                self.device_info[active_entity_id] = info
+            _ok = await self._async_db_exec(
+                "UPDATE devices SET type=?, updated=? WHERE entity_id=?",
+                (capability_name, now, active_entity_id),
+            )
+            if not _ok:
+                self._sys_log("WARN", f"[设备能力] 写入失败，未更新: {active_entity_id}")
+                result.setdefault("warnings", []).append("capability_persist_failed")
+            result["capability"] = capability_name
+
         if not name and not room:
+            await _apply_local_capability(eid)
             result.update({"skipped": True, "reason": "patch_has_no_ha_registry_fields"})
             return result
 
@@ -687,6 +722,7 @@ class DevicesMixin:
                 return result
             result["room"] = room
 
+        await _apply_local_capability(active_entity_id)
         return result
 
     # ── 设备管辖域 ────────────────────────────────────────────────────────────

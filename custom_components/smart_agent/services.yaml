@@ -76,6 +76,22 @@ update_device:
       name: 类型
       selector:
         text:
+    capability:
+      name: 能力/用途
+      selector:
+        select:
+          options:
+            - lighting
+            - switch
+            - scene
+            - sensor
+            - climate
+            - cover
+            - fan
+            - media
+            - security
+            - vacuum
+            - appliance
     ops:
       name: 操作说明
       selector:

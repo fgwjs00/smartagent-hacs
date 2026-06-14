@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.115
-display_version: Beta 0.0.115
+release_version: 0.0.116
+display_version: Beta 0.0.116
 channel: beta
 release_date: '2026-06-15'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.115 测试版热修：修复本地快脑关闭、慢脑无动作和慢脑失败分支不进入 AI 决策日志的问题，并补齐线上模型返回在实时事件流和
-    Dashboard 中的可见性。
-  customer_visible_version: Beta 0.0.115
+  summary: Beta 0.0.116 测试版热修：修复睡眠安全低打扰灯具的夜间起夜兜底，并支持开关实体按灯具开关、普通开关或场景按钮配置用途，避免场景按钮进入照明候选。
+  customer_visible_version: Beta 0.0.116
