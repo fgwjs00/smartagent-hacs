@@ -1725,15 +1725,12 @@ class SmartAgentCoordinator(
         one_off_prompt: str = "",
         source: str = "listener",
     ) -> dict[str, Any]:
-        addon_client = getattr(self, "_addon_client", None)
-        if addon_client is None:
-            self._sys_log("WARN", "[决策] add-on decision provider unavailable")
-            return {"status": "error", "message": "add-on decision provider unavailable"}
         bundle = self._build_addon_slow_decision_bundle(
             trigger,
             one_off_prompt=one_off_prompt,
             source=source,
         )
+        addon_client = getattr(self, "_addon_client", None)
         self._sys_log(
             "INFO",
             "[决策] 慢脑上下文 "
@@ -1756,6 +1753,7 @@ class SmartAgentCoordinator(
             executed_count: int = 0,
             final_outcome_value: str = "no_actions",
             fail_closed: bool = False,
+            record_decision_log: bool = False,
         ) -> None:
             result_payload = result_payload if isinstance(result_payload, dict) else {}
             actions_payload = actions_payload if isinstance(actions_payload, list) else []
@@ -1766,30 +1764,78 @@ class SmartAgentCoordinator(
                 or result_payload.get("id")
                 or ""
             ).strip()
+            path_taken = str(result_payload.get("path_taken") or "llm")
+            reason_value = str(reason or result_payload.get("reason") or ("matched" if matched else "no_actions"))
+            scene_value = str(scene_desc or result_payload.get("scene") or "")
+            event_payload = {
+                "source": "ha_slow_decision",
+                "entity_id": str(bundle.get("trigger_entity_id") or ""),
+                "trigger_entity_id": str(bundle.get("trigger_entity_id") or ""),
+                "old_state": str(bundle.get("old_state") or ""),
+                "new_state": str(bundle.get("new_state") or ""),
+                "trigger": str(trigger or ""),
+                "status": status_code,
+                "matched": matched,
+                "path_taken": path_taken,
+                "reason": reason_value,
+                "scene": scene_value,
+                "confidence": confidence_value,
+                "action_count": len(actions_payload),
+                "actions": actions_payload,
+                "transaction_id": transaction_id_value,
+                "executed": bool(actions_payload and executed_count >= len(actions_payload)),
+                "executed_count": executed_count,
+                "final_outcome": final_outcome_value,
+                "fail_closed": fail_closed,
+            }
             try:
-                self.hass.bus.async_fire("smart_agent_decision_bubble", {
-                    "source": "ha_slow_decision",
-                    "entity_id": str(bundle.get("trigger_entity_id") or ""),
-                    "trigger_entity_id": str(bundle.get("trigger_entity_id") or ""),
-                    "old_state": str(bundle.get("old_state") or ""),
-                    "new_state": str(bundle.get("new_state") or ""),
-                    "trigger": str(trigger or ""),
-                    "status": status_code,
-                    "matched": matched,
-                    "path_taken": str(result_payload.get("path_taken") or "llm"),
-                    "reason": str(reason or result_payload.get("reason") or ("matched" if matched else "no_actions")),
-                    "scene": str(scene_desc or result_payload.get("scene") or ""),
-                    "confidence": confidence_value,
-                    "action_count": len(actions_payload),
-                    "actions": actions_payload,
-                    "transaction_id": transaction_id_value,
-                    "executed": bool(actions_payload and executed_count >= len(actions_payload)),
-                    "executed_count": executed_count,
-                    "final_outcome": final_outcome_value,
-                    "fail_closed": fail_closed,
-                })
+                self.hass.bus.async_fire("smart_agent_decision_bubble", event_payload)
             except Exception as exc:
                 _LOGGER.debug("[Coordinator] slow decision bubble emit failed: %s", exc)
+            if record_decision_log:
+                log_result = dict(result_payload)
+                log_result.setdefault("source", "ha_slow_decision")
+                log_result.setdefault("path_taken", path_taken)
+                log_result.setdefault("reason", reason_value)
+                log_result.setdefault("scene", scene_value)
+                log_result.setdefault("actions", actions_payload)
+                log_result["trigger"] = str(trigger or "")
+                log_result["matched"] = bool(matched)
+                log_result["final_outcome"] = final_outcome_value
+                log_result["fail_closed"] = bool(fail_closed)
+                log_payload: dict[str, Any] = {
+                    "trigger": str(trigger or ""),
+                    "scene": scene_value,
+                    "source": "ha_slow_decision",
+                    "path_taken": path_taken,
+                    "confidence": confidence_value,
+                    "matched": bool(matched),
+                    "action_count": len(actions_payload),
+                    "reason": reason_value,
+                    "actions": actions_payload,
+                    "result": log_result,
+                }
+                if transaction_id_value:
+                    log_payload["id"] = transaction_id_value
+                enqueue = getattr(self, "_enqueue_internal_event", None)
+                if not callable(enqueue) or not enqueue("decision_log", log_payload):
+                    self._sys_log(
+                        "WARN",
+                        f"[决策] decision_log 回写入队失败 reason={reason_value or '-'} trigger={trigger or '-'}",
+                    )
+
+        if addon_client is None:
+            self._sys_log("WARN", "[决策] add-on decision provider unavailable")
+            _emit_slow_decision_bubble(
+                status_code=502,
+                matched=False,
+                reason="addon_decision_provider_unavailable",
+                scene_desc="add-on decision provider unavailable",
+                final_outcome_value="failed",
+                fail_closed=True,
+                record_decision_log=True,
+            )
+            return {"status": "error", "message": "add-on decision provider unavailable"}
 
         # ── 空设备表防裸推：无已同步设备时直接判无动作，避免模型在零设备上凭空幻觉 ──
         if not str(bundle.get("device_table") or "").strip():
@@ -1804,6 +1850,7 @@ class SmartAgentCoordinator(
                 scene_desc="无已同步设备，跳过决策",
                 final_outcome_value="no_actions",
                 fail_closed=True,
+                record_decision_log=True,
             )
             return {
                 "status": "ok",
@@ -1832,6 +1879,7 @@ class SmartAgentCoordinator(
                     scene_desc="线上大模型调用失败",
                     final_outcome_value="failed",
                     fail_closed=True,
+                    record_decision_log=True,
                 )
                 return {"status": "error", "message": str(exc)}
             if not isinstance(result, dict):
@@ -1843,6 +1891,7 @@ class SmartAgentCoordinator(
                     scene_desc="线上大模型无响应",
                     final_outcome_value="failed",
                     fail_closed=True,
+                    record_decision_log=True,
                 )
                 return {"status": "error", "message": "add-on decision provider unavailable"}
             status = int(result.get("__status", 200) or 200)
@@ -1861,6 +1910,7 @@ class SmartAgentCoordinator(
                     executed_count=0,
                     final_outcome_value="failed",
                     fail_closed=True,
+                    record_decision_log=True,
                 )
                 return {"status": "error", "message": str(error), **result}
 
@@ -1965,6 +2015,7 @@ class SmartAgentCoordinator(
                 executed_count=executed,
                 final_outcome_value=final_outcome,
                 fail_closed=False,
+                record_decision_log=not bool(transaction_id),
             )
             nested = result.get("result") if isinstance(result.get("result"), dict) else {}
             result.setdefault("reply", nested.get("reply") or ("已处理" if actions else "未命中可执行动作"))

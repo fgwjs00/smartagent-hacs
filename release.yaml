@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.114
-display_version: Beta 0.0.114
+release_version: 0.0.115
+display_version: Beta 0.0.115
 channel: beta
 release_date: '2026-06-15'
 public_release_ready: true
@@ -8,5 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.114 测试版热修：收口快脑默认阈值与证据驱动置信度，补齐慢脑结构化上下文摘要和 planner 记忆可观测性。
-  customer_visible_version: Beta 0.0.114
+  summary: Beta 0.0.115 测试版热修：修复本地快脑关闭、慢脑无动作和慢脑失败分支不进入 AI 决策日志的问题，并补齐线上模型返回在实时事件流和
+    Dashboard 中的可见性。
+  customer_visible_version: Beta 0.0.115

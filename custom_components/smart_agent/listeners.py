@@ -49,6 +49,8 @@ class ListenersMixin:
     _PRESENCE_KW = ("occupancy", "presence", "motion", "人体", "存在", "有人", "移动",
                     "ren_ti", "cun_zai", "radar", "mmwave", "雷达",
                     "person_occupancy", "object_count")  # Frigate 生成的占用实体
+    _ACTIONABLE_CONTACT_SENSOR_TYPES = frozenset({"door", "window", "contact", "opening", "garage_door"})
+    _ACTIONABLE_CONTACT_KW = ("door", "window", "contact", "opening", "men_chuang", "garage", "门", "窗", "门窗")
     _PRESENCE_OFF_DELAY = PRESENCE_OFF_DELAY
     _PRESENCE_ON_COOLDOWN = PRESENCE_ON_COOLDOWN
     _PRESENCE_ON_MIN_HOLD = PRESENCE_ON_MIN_HOLD
@@ -399,6 +401,37 @@ class ListenersMixin:
             })
         except Exception as exc:
             _LOGGER.debug("[SlowInference] failure bubble emit failed: %s", exc)
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if callable(enqueue):
+            result_payload = {
+                "source": "ha_slow_decision",
+                "path_taken": "llm",
+                "reason": reason,
+                "scene": scene,
+                "trigger": str(trigger or ""),
+                "actions": [],
+                "matched": False,
+                "final_outcome": "failed",
+                "fail_closed": True,
+                "message": str(message or ""),
+            }
+            log_payload = {
+                "trigger": str(trigger or ""),
+                "scene": scene,
+                "source": "ha_slow_decision",
+                "path_taken": "llm",
+                "confidence": 0,
+                "matched": False,
+                "action_count": 0,
+                "reason": reason,
+                "actions": [],
+                "result": result_payload,
+            }
+            try:
+                if not enqueue("decision_log", log_payload):
+                    self._sys_log("WARN", f"[SlowInference] decision_log enqueue failed reason={reason}")
+            except Exception as exc:
+                _LOGGER.debug("[SlowInference] decision_log enqueue failed: %s", exc)
 
     def _handle_slow_inference_task_done(self, task: Any, *, trigger: str, entity_id: str) -> None:
         cancelled = False
@@ -876,8 +909,7 @@ class ListenersMixin:
             "topology_count": len(topology),
         }
 
-    def _should_slow_infer_after_fast_path_no_match(self, entity_id: str, new_state: str) -> bool:
-        """Only presence arrival misses should fall through to slow inference."""
+    def _is_presence_arrival_for_slow_inference(self, entity_id: str, new_state: str) -> bool:
         domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
         state = str(new_state or "").strip().lower()
         if state not in {"on", "open", "home", "playing", "occupied", "present"}:
@@ -892,13 +924,35 @@ class ListenersMixin:
         name_lower = str((info or {}).get("name") or "").lower()
         return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
 
+    def _is_actionable_contact_arrival_for_slow_inference(self, entity_id: str, new_state: str) -> bool:
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        state = str(new_state or "").strip().lower()
+        if state not in {"on", "open"}:
+            return False
+        if domain != "binary_sensor":
+            return False
+        info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+        sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
+        if sensor_type in self._ACTIONABLE_CONTACT_SENSOR_TYPES:
+            return True
+        eid_lower = entity_id.lower()
+        name_lower = str((info or {}).get("name") or "").lower()
+        return any(kw in eid_lower or kw in name_lower for kw in self._ACTIONABLE_CONTACT_KW)
+
+    def _should_slow_infer_after_fast_path_no_match(self, entity_id: str, new_state: str) -> bool:
+        """Allow slow inference for presence arrivals and actionable contact openings."""
+        return (
+            self._is_presence_arrival_for_slow_inference(entity_id, new_state)
+            or self._is_actionable_contact_arrival_for_slow_inference(entity_id, new_state)
+        )
+
     def _schedule_arrival_baseline_sample(self, entity_id: str, old_state: str, new_state: str) -> None:
         """Sample room lights shortly after a presence arrival."""
         old_value = str(old_state or "").strip().lower()
         new_value = str(new_state or "").strip().lower()
         if old_value not in {"off", "closed", "not_home", "away", "idle", "clear", "empty", "vacant", "0", ""}:
             return
-        if not self._should_slow_infer_after_fast_path_no_match(entity_id, new_value):
+        if not self._is_presence_arrival_for_slow_inference(entity_id, new_value):
             return
         device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
         info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
