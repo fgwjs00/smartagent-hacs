@@ -1466,6 +1466,72 @@ class SmartAgentCoordinator(
             rows.append(f"- {room}: state={state or 'unknown'} confidence={confidence if confidence is not None else 'unknown'}")
         return "【占用快照】\n" + "\n".join(rows) + "\n" if rows else ""
 
+    @staticmethod
+    def _addon_decision_json_list(value: Any) -> list[dict[str, Any]]:
+        raw = value
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = []
+        if not isinstance(raw, list):
+            return []
+        return [dict(item) for item in raw if isinstance(item, dict)]
+
+    @staticmethod
+    def _render_addon_decision_automation_policy_section(
+        ai_scenes: Any,
+        ha_scenes: Any,
+        ha_scripts: Any,
+        *,
+        trigger_room: str = "",
+        max_rows: int = 12,
+    ) -> str:
+        rows: list[str] = []
+        room_filter = str(trigger_room or "").strip().lower()
+
+        def _append(row: str) -> None:
+            if row and len(rows) < max_rows:
+                rows.append(row)
+
+        for raw in ai_scenes if isinstance(ai_scenes, list) else []:
+            scene = raw if isinstance(raw, dict) else {}
+            status = str(scene.get("status") or scene.get("lifecycle_state") or "").strip().lower()
+            if status and status not in {"active", "approved", "enabled"}:
+                continue
+            room = str(scene.get("room") or scene.get("trigger_room") or scene.get("area") or "").strip()
+            if room_filter and room and room.lower() != room_filter:
+                continue
+            entities = SmartAgentCoordinator._addon_decision_json_list(scene.get("entities_json"))
+            actions = SmartAgentCoordinator._addon_decision_json_list(scene.get("actions_json"))
+            entity_ids = [
+                str(item.get("entity_id") or "").strip()
+                for item in entities
+                if str(item.get("entity_id") or "").strip()
+            ][:4]
+            name = str(scene.get("name") or scene.get("title") or scene.get("id") or "ai_scene").strip()
+            desc = str(scene.get("description") or scene.get("trigger_hint") or "").strip()
+            _append(
+                f"- AI scene {name}: {desc or 'no description'}; "
+                f"entities={', '.join(entity_ids) if entity_ids else '-'}; actions={len(actions)}"
+            )
+
+        for source_label, items in (("HA scene", ha_scenes), ("HA script", ha_scripts)):
+            for raw in items if isinstance(items, list) else []:
+                item = raw if isinstance(raw, dict) else {}
+                room = str(item.get("room") or item.get("area") or "").strip()
+                if room_filter and room and room.lower() != room_filter:
+                    continue
+                entity_id = str(item.get("entity_id") or item.get("id") or "").strip()
+                name = str(item.get("name") or item.get("friendly_name") or entity_id or source_label).strip()
+                _append(f"- {source_label} {name}: entity={entity_id or '-'}")
+
+        return "Automation policies and scenes:\n" + "\n".join(rows) if rows else ""
+
+    @staticmethod
+    def _is_fast_path_audit_prompt(one_off_prompt: str) -> bool:
+        return "[fast_path_audit]" in str(one_off_prompt or "")
+
     def _build_addon_slow_decision_bundle(
         self,
         trigger: str,
@@ -1475,6 +1541,7 @@ class SmartAgentCoordinator(
     ) -> dict[str, Any]:
         """Build the rich bundle used by add-on slow decisions."""
         parsed = self._parse_addon_decision_trigger(trigger)
+        audit_pending = self._is_fast_path_audit_prompt(one_off_prompt)
         entity_id = parsed.get("trigger_entity_id", "")
         snapshot: dict[str, Any] = {}
         if entity_id:
@@ -1517,11 +1584,25 @@ class SmartAgentCoordinator(
             presence_snapshot,
             trigger_room=trigger_room,
         )
+        automation_policy_section = self._render_addon_decision_automation_policy_section(
+            getattr(self, "_ai_scenes_cache", []),
+            getattr(self, "_ha_scenes", []),
+            getattr(self, "_ha_scripts", []),
+            trigger_room=trigger_room,
+        )
 
         context_parts = [
             str(one_off_prompt or "").strip(),
             f"触发事件：{trigger}",
         ]
+        if audit_pending:
+            fast_path_audit_marker = "[fast_path_audit]"
+            context_parts.append(
+                f"{fast_path_audit_marker} Fast path already executed a provisional low-risk action. "
+                "Audit the action, do not repeat identical light actions, and return approve/adjust/observe_only."
+            )
+        if automation_policy_section:
+            context_parts.append(automation_policy_section)
         if entity_id:
             context_parts.append(f"触发实体：{entity_id}")
         if trigger_room:
@@ -1554,6 +1635,9 @@ class SmartAgentCoordinator(
             "old_state": parsed.get("old_state", ""),
             "new_state": parsed.get("new_state", ""),
             "trigger_room": trigger_room,
+            "audit_pending": audit_pending,
+            "provisional_execution": audit_pending,
+            "audit_source": "fast_path" if audit_pending else "",
             "device_info": device_info,
             "states": states,
             "presence_snapshot": presence_snapshot,
@@ -1562,6 +1646,7 @@ class SmartAgentCoordinator(
             "room_topology": snapshot.get("room_topology") if isinstance(snapshot.get("room_topology"), dict) else {},
             "device_table": device_table,
             "occupancy_section": occupancy_section,
+            "automation_policy_section": automation_policy_section,
         }
         return bundle
 

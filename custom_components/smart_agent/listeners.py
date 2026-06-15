@@ -881,6 +881,29 @@ class ListenersMixin:
             cmd_source=_CMD_SOURCE_SENSOR,
         )
 
+    def _fast_path_audit_action_is_low_risk(self, action: Any) -> bool:
+        if not isinstance(action, dict):
+            return False
+        entity_id = str(action.get("entity_id") or "").strip()
+        domain = str(action.get("domain") or "").strip().lower()
+        if not domain and "." in entity_id:
+            domain = entity_id.split(".", 1)[0].lower()
+        service = str(action.get("service") or action.get("action") or "").strip().lower()
+        service = service.rsplit(".", 1)[-1]
+        return domain in {"light", "input_boolean"} and service in {"turn_on", "turn_off", "toggle"}
+
+    def _fast_path_result_allows_slow_audit(self, actions: Any) -> bool:
+        if not isinstance(actions, list) or not actions:
+            return False
+        return all(self._fast_path_audit_action_is_low_risk(action) for action in actions)
+
+    def _fast_path_slow_audit_prompt(self) -> str:
+        return (
+            "[fast_path_audit]\n"
+            "Fast path already executed a provisional low-risk action.\n"
+            "Audit the action, do not repeat identical light actions, and return approve/adjust/observe_only."
+        )
+
     def _addon_fast_path_snapshot_diagnostics(self, snapshot: dict[str, Any], entity_id: str) -> dict[str, Any]:
         device_info = snapshot.get("device_info") if isinstance(snapshot.get("device_info"), dict) else {}
         topology = snapshot.get("room_topology") if isinstance(snapshot.get("room_topology"), dict) else {}
@@ -1121,6 +1144,7 @@ class ListenersMixin:
                         elif result.get("action"):
                             action_count = 1
                         transaction_id = str(result.get("transaction_id") or result.get("txn_id") or "")
+                    audit_pending = bool(matched and self._fast_path_result_allows_slow_audit(actions))
                     self._sys_log(
                         "INFO",
                         "[Add-on FastPath] result "
@@ -1155,6 +1179,9 @@ class ListenersMixin:
                             "actions": actions,
                             "transaction_id": transaction_id,
                             "executed": matched and not execution_suppressed_reason,
+                            "provisional_execution": audit_pending,
+                            "audit_pending": audit_pending,
+                            "rollback_allowed": audit_pending,
                             "execution_suppressed_reason": execution_suppressed_reason,
                             "fail_closed": not (200 <= status < 300),
                             "snapshot": snapshot_diag,
@@ -1219,6 +1246,14 @@ class ListenersMixin:
                             )
                         finally:
                             self._batch_trigger_controllable = previous_batch_trigger_controllable
+                        if audit_pending:
+                            self._schedule_inference(
+                                entity_id,
+                                f"{entity_id}: {old_state} -> {new_state}",
+                                new_state,
+                                one_off_prompt=self._fast_path_slow_audit_prompt(),
+                                _allow_learning_mode_inference=True,
+                            )
                         return
                     if 200 <= status < 300:
                         should_fail_closed = False

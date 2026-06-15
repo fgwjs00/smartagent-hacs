@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.116
-display_version: Beta 0.0.116
+release_version: 0.0.117
+display_version: Beta 0.0.117
 channel: beta
 release_date: '2026-06-15'
 public_release_ready: true
@@ -8,5 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.116 测试版热修：修复睡眠安全低打扰灯具的夜间起夜兜底，并支持开关实体按灯具开关、普通开关或场景按钮配置用途，避免场景按钮进入照明候选。
-  customer_visible_version: Beta 0.0.116
+  summary: Beta 0.0.117 测试版热修：接入快脑低风险灯光临时执行后的慢脑同步审核，并把 AI 场景、HA 场景和脚本摘要写入慢脑上下文，便于茶室等旧自动化被
+    AI 理解。
+  customer_visible_version: Beta 0.0.117
