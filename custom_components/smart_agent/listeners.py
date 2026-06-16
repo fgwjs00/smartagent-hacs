@@ -1015,6 +1015,71 @@ class ListenersMixin:
         except Exception as exc:
             _LOGGER.debug("[ArrivalBaseline] sample scheduling failed for %s: %s", entity_id, exc)
 
+    def _silent_learning_expected_state(self, entity_id: str, state: str) -> str:
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        value = str(state or "").strip().lower()
+        if domain in {"light", "switch", "fan", "input_boolean"}:
+            return value if value in {"on", "off"} else ""
+        if domain == "cover":
+            if value in {"open", "opening"}:
+                return "open"
+            if value in {"closed", "closing"}:
+                return "closed"
+            return ""
+        if domain == "media_player":
+            if value == "playing":
+                return "on"
+            if value in {"off", "idle", "paused", "standby"}:
+                return "off"
+        return ""
+
+    def _record_silent_learning_behavior_sample(
+        self,
+        entity_id: str,
+        old_state: str,
+        new_state: str,
+        source_type: str,
+    ) -> None:
+        if not bool(getattr(self, "_learning_mode", False)):
+            return
+        old_value = str(old_state or "").strip().lower()
+        new_value = str(new_state or "").strip().lower()
+        if not new_value or old_value == new_value:
+            return
+        expected_state = self._silent_learning_expected_state(entity_id, new_value)
+        if not expected_state:
+            return
+        device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+        info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        room = str(info.get("room") or info.get("area") or "").strip()
+        if not room:
+            area_getter = getattr(self, "_get_entity_area", None)
+            if callable(area_getter):
+                try:
+                    room = str(area_getter(entity_id) or "").strip()
+                except Exception:
+                    room = ""
+        now = datetime.now()
+        payload = {
+            "action": "upsert",
+            "entity_id": entity_id,
+            "expected_state": expected_state,
+            "room": room,
+            "hour_start": (now.hour - 1) % 24,
+            "hour_end": (now.hour + 1) % 24,
+            "weekday_mask": str(now.strftime("%w")),
+            "confidence": 62,
+            "hit_count": 1,
+            "lifecycle_state": "active",
+            "source": "silent_learning",
+            "source_type": str(source_type or ""),
+        }
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if callable(enqueue) and enqueue("behavior", payload, ts=now.strftime("%Y-%m-%d %H:%M:%S")):
+            self._sys_log("INFO", f"[SilentLearning] behavior sample recorded: {entity_id} -> {expected_state}")
+
     def _emit_addon_fast_path_event(self, payload: dict[str, Any]) -> None:
         try:
             self.hass.bus.async_fire("smart_agent_decision_bubble", payload)
@@ -1521,6 +1586,8 @@ class ListenersMixin:
                         ai_action_age=int(ai_action_age),
                     )
                     return
+
+            self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type)
 
             info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}
             sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()

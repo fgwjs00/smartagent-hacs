@@ -2012,9 +2012,72 @@ class SmartAgentCoordinator(
                 confidence = int(float(result.get("confidence") or 0))
             except (TypeError, ValueError):
                 confidence = 0
+            learning_observe_only = bool(getattr(self, "_learning_mode", False)) and source == "listener"
             executed = 0
             final_outcome = "no_actions"
             if valid_actions:
+                if learning_observe_only:
+                    result["executed_count"] = 0
+                    result["execution_suppressed_reason"] = "learning_mode"
+                    result.setdefault("reason", "learning_mode_observe_only")
+                    final_outcome = "observe_only"
+                    action_results = []
+                    for action in valid_actions:
+                        if not isinstance(action, dict):
+                            continue
+                        action_results.append(
+                            {
+                                "domain": str(action.get("domain") or ""),
+                                "service": str(action.get("service") or ""),
+                                "entity_id": str(action.get("entity_id") or ""),
+                                "status": "not_executed",
+                                "reason": "learning_mode_observe_only",
+                            }
+                        )
+                    if transaction_id:
+                        execution_event_enqueued = self._enqueue_internal_event(
+                            "decision_execution",
+                            {
+                                "transaction_id": transaction_id,
+                                "trigger": str(trigger or ""),
+                                "scene": scene,
+                                "confidence": confidence,
+                                "planned_count": len(valid_actions),
+                                "executed_count": 0,
+                                "final_outcome": final_outcome,
+                                "actions": valid_actions,
+                                "action_results": action_results,
+                                "training_sample": None,
+                                "source": "ha_slow_decision",
+                            },
+                        )
+                        if not execution_event_enqueued:
+                            self._sys_log(
+                                "WARN",
+                                f"[Decision] decision_execution enqueue failed transaction_id={transaction_id}",
+                            )
+                    self._sys_log(
+                        "INFO",
+                        f"[Decision] learning observe-only: received {len(valid_actions)} action(s), executed 0",
+                    )
+                    _emit_slow_decision_bubble(
+                        result_payload=result,
+                        status_code=status,
+                        matched=True,
+                        reason=str(result.get("reason") or "learning_mode_observe_only"),
+                        scene_desc=scene,
+                        confidence_value=confidence,
+                        actions_payload=valid_actions,
+                        transaction_id_value=transaction_id,
+                        executed_count=0,
+                        final_outcome_value=final_outcome,
+                        fail_closed=False,
+                        record_decision_log=not bool(transaction_id),
+                    )
+                    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+                    result.setdefault("reply", nested.get("reply") or "learning_mode_observe_only")
+                    result.setdefault("status", "ok")
+                    return result
                 executed = await self._execute_actions(
                     valid_actions,
                     trigger_summary=str(trigger or ""),

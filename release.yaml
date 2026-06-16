@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.117
-display_version: Beta 0.0.117
+release_version: 0.0.118
+display_version: Beta 0.0.118
 channel: beta
-release_date: '2026-06-15'
+release_date: '2026-06-16'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.117 测试版热修：接入快脑低风险灯光临时执行后的慢脑同步审核，并把 AI 场景、HA 场景和脚本摘要写入慢脑上下文，便于茶室等旧自动化被
-    AI 理解。
-  customer_visible_version: Beta 0.0.117
+  summary: Beta 0.0.118 测试版热修：发布快脑先执行、慢脑同步审核与静默学习链路，补齐本地大模型提示词性能优化，并让 Home Assistant
+    插件配置页显示中文字段。
+  customer_visible_version: Beta 0.0.118
