@@ -24,6 +24,7 @@ from .const import (
     FRIGATE_COUNT_ON_HOLD, FRIGATE_COUNT_CHANGE_HOLD,
     FRIGATE_COUNT_OFF_HOLD, FRIGATE_COUNT_COOLDOWN,
     SENSOR_DEADBAND_PCT,
+    SOURCE_AUTOMATION, SOURCE_DASHBOARD, SOURCE_PHYSICAL, SOURCE_VOICE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ class ListenersMixin:
 
     # 数值型传感器触发死区
     _SENSOR_DEADBAND_PCT: float = SENSOR_DEADBAND_PCT
+
+    # 人工交互可作为无硬件房间的 enter-only 在场证据。
+    _PRESENCE_INTERACTION_DOMAINS = frozenset({"light", "media_player", "climate"})
+    _PRESENCE_INTERACTION_HUMAN_SOURCES = frozenset({SOURCE_PHYSICAL, SOURCE_DASHBOARD, SOURCE_VOICE})
 
     # 按时段调整开灯亮度的参考表
     _BRIGHTNESS_TABLE = (
@@ -252,6 +257,56 @@ class ListenersMixin:
             "localized_spaces": [room] if room else [],
             "blocked_actions": list(blocked_actions or []),
         }
+
+    def _is_presence_interaction_active(self, domain: str, state: str) -> bool:
+        normalized = str(state or "").strip().lower()
+        if domain == "light":
+            return normalized == "on"
+        if domain == "media_player":
+            return normalized in {"on", "playing", "paused"}
+        if domain == "climate":
+            return normalized not in {"", "off", "unavailable", "unknown"}
+        return False
+
+    def _presence_interaction_source(self, entity_id: str, source_type: str) -> str:
+        classifier = getattr(self, "_classify_source", None)
+        if callable(classifier):
+            try:
+                return str(classifier(entity_id, source_type))
+            except Exception as exc:
+                _LOGGER.debug("[PresenceInference] classify interaction source failed: %s", exc)
+        if source_type == "自动化/脚本":
+            return SOURCE_AUTOMATION
+        if source_type == "用户界面":
+            return SOURCE_DASHBOARD
+        if source_type == "语音":
+            return SOURCE_VOICE
+        return SOURCE_PHYSICAL
+
+    def _record_presence_interaction_trace(
+        self,
+        entity_id: str,
+        domain: str,
+        new_state: str,
+        source_type: str,
+        *,
+        source: str | None = None,
+    ) -> bool:
+        if domain not in self._PRESENCE_INTERACTION_DOMAINS:
+            return False
+        if not self._is_presence_interaction_active(domain, new_state):
+            return False
+        trace_source = str(source or self._presence_interaction_source(entity_id, source_type))
+        inference = getattr(self, "_presence_inference", None)
+        update_trace = getattr(inference, "update_device_trace", None)
+        if not callable(update_trace):
+            return False
+        try:
+            update_trace(entity_id, new_state, source=trace_source)
+            return trace_source in self._PRESENCE_INTERACTION_HUMAN_SOURCES
+        except Exception as exc:
+            _LOGGER.debug("[PresenceInference] update_device_trace failed for %s: %s", entity_id, exc)
+            return False
 
     # ── 触发调度与合并 ────────────────────────────────────────────────────────
 
@@ -1572,6 +1627,13 @@ class ListenersMixin:
                 except (TypeError, ValueError):
                     ai_action_age = self._AI_ACTION_SKIP_WINDOW + 1
                 if 0 <= ai_action_age < self._AI_ACTION_SKIP_WINDOW:
+                    self._record_presence_interaction_trace(
+                        entity_id,
+                        domain,
+                        new_s,
+                        source_type,
+                        source=SOURCE_AUTOMATION,
+                    )
                     self._sys_log(
                         "INFO",
                         f"[过滤] AI 操作后 {int(ai_action_age)}s 内同向变化，跳过 add-on 快路: {entity_id} -> {new_s}",
@@ -1588,6 +1650,7 @@ class ListenersMixin:
                     return
 
             self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type)
+            self._record_presence_interaction_trace(entity_id, domain, new_s, source_type)
 
             info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}
             sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()

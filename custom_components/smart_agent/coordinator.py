@@ -975,44 +975,9 @@ class SmartAgentCoordinator(
         return [str(value)] if str(value) else []
 
     def _presence_fusion_scopes_from_core_config(self, config: dict[str, Any]) -> list[dict[str, Any]]:
-        presence = config.get("presence") if isinstance(config.get("presence"), dict) else {}
-        policies = presence.get("policies") if isinstance(presence, dict) else []
-        if not isinstance(policies, list):
-            return []
+        from .presence_migration import legacy_presence_fusion_scopes_from_core_config
 
-        scopes: list[dict[str, Any]] = []
-        for policy in policies:
-            if not isinstance(policy, dict):
-                continue
-            space_id = str(policy.get("space_id") or policy.get("room") or policy.get("scope_id") or "").strip()
-            if not space_id:
-                continue
-            members = [
-                {
-                    "entity_id": entity_id,
-                    "can_enter_trigger": True,
-                    "can_leave_evidence": True,
-                    "priority": 50,
-                    "confidence": 1,
-                }
-                for entity_id in self._presence_string_list(policy.get("member_evidence_ids") or policy.get("members"))
-            ]
-            strategy = str(policy.get("strategy") or policy.get("occupied_strategy") or "")
-            scopes.append(
-                {
-                    "scope_id": str(policy.get("scope_id") or space_id),
-                    "name": str(policy.get("name") or policy.get("display_name") or space_id),
-                    "strategy": "vacant_and" if strategy == "vacant_and" else "occupied_or",
-                    "rooms": (
-                        self._presence_string_list(policy.get("rooms") or policy.get("space_ids"))
-                        or [space_id]
-                    ),
-                    "members": members,
-                    "enter_hold_secs": int(policy.get("enter_hold_secs") or 3),
-                    "vacant_hold_secs": int(policy.get("vacant_hold_secs") or 60),
-                }
-            )
-        return scopes
+        return legacy_presence_fusion_scopes_from_core_config(config)
 
     async def _async_presence_fusion_json_from_core(self) -> str | None:
         """Read Core Config presence policies and export the legacy registry shape."""
@@ -1040,6 +1005,60 @@ class SmartAgentCoordinator(
         if not scopes:
             return None
         return json.dumps(scopes, ensure_ascii=False)
+
+    async def _async_seed_legacy_presence_fusion_to_core(self) -> bool:
+        """One-time seed legacy HA `presence_fusion` options into Core Config."""
+        from .const import CONF_PRESENCE_FUSION
+        from .presence_migration import seed_legacy_presence_fusion_into_core_config
+
+        legacy_json = (
+            (self._entry.options or {}).get(CONF_PRESENCE_FUSION)
+            or (self._entry.data or {}).get(CONF_PRESENCE_FUSION)
+            or ""
+        )
+        if not str(legacy_json or "").strip() or str(legacy_json or "").strip() == "[]":
+            return False
+
+        addon_client = getattr(self, "_addon_client", None)
+        request_json = getattr(addon_client, "request_json", None)
+        if not callable(request_json):
+            return False
+
+        try:
+            result = await request_json("GET", "/core/config")
+        except Exception as exc:
+            _LOGGER.debug("[FusionRegistry] legacy presence seed read failed: %s", exc)
+            return False
+        if not isinstance(result, dict):
+            return False
+        status = int(result.get("status_code") or 0)
+        if status < 200 or status >= 300:
+            return False
+        body = result.get("body")
+        config = body.get("config") if isinstance(body, dict) else None
+        if not isinstance(config, dict):
+            config = {}
+
+        seeded_config, applied = seed_legacy_presence_fusion_into_core_config(config, str(legacy_json))
+        if not applied:
+            return False
+
+        try:
+            post_result = await request_json("POST", "/core/config", body={"config": seeded_config})
+        except Exception as exc:
+            _LOGGER.debug("[FusionRegistry] legacy presence seed write failed: %s", exc)
+            return False
+        if not isinstance(post_result, dict):
+            return False
+        post_status = int(post_result.get("status_code") or 0)
+        if post_status < 200 or post_status >= 300:
+            _LOGGER.warning("[FusionRegistry] legacy presence seed rejected by Core Config: HTTP %s", post_status)
+            return False
+
+        policies = ((seeded_config.get("presence") or {}).get("policies") or [])
+        count = len(policies) if isinstance(policies, list) else 0
+        self._sys_log("INFO", f"[FusionRegistry] 已将 legacy presence_fusion 种子写入 Core Config，共 {count} 个域")
+        return True
 
     async def _async_apply_addon_system_settings(self) -> bool:
         """Pull canonical system settings from add-on and apply to coordinator state.
@@ -1203,6 +1222,10 @@ class SmartAgentCoordinator(
         try:
             from .presence_fusion import PresenceFusionRegistry
             from .const import CONF_PRESENCE_FUSION, DEFAULT_PRESENCE_FUSION
+            try:
+                await self._async_seed_legacy_presence_fusion_to_core()
+            except Exception as exc:
+                _LOGGER.debug("[FusionRegistry] legacy presence seed skipped: %s", exc)
             _core_presence_fusion_json = await self._async_presence_fusion_json_from_core()
             _fusion_json = (
                 _core_presence_fusion_json

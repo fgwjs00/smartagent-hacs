@@ -50,6 +50,9 @@ HOME_STATES = frozenset(("home", "Home", "HOME"))
 # 媒体播放器"活跃"状态
 MEDIA_ACTIVE_STATES = frozenset(("playing", "paused"))
 
+# 只有人工交互可以作为在场证据，AI/自动化动作必须过滤，避免自强化。
+HUMAN_DEVICE_TRACE_SOURCES = frozenset(("user", "manual", "physical", "dashboard", "voice"))
+
 
 @dataclass
 class RoomPresence:
@@ -155,6 +158,10 @@ class PresenceInference:
             "state": state,
             "source": source,
         }
+
+    def _is_human_device_trace(self, trace: dict[str, Any]) -> bool:
+        source = str(trace.get("source") or "user").strip().lower()
+        return source in HUMAN_DEVICE_TRACE_SOURCES
 
     def infer_all_rooms(self) -> dict[str, RoomPresence]:
         """
@@ -421,6 +428,9 @@ class PresenceInference:
             if not state:
                 continue
             if state.state in MEDIA_ACTIVE_STATES:
+                trace = self._device_traces.get(eid)
+                if isinstance(trace, dict) and not self._is_human_device_trace(trace):
+                    continue
                 name = info.get("name", eid)
                 return 0.55, [(eid, f"{name} 正在播放", 0.55)]
         return 0.0, []
@@ -438,6 +448,8 @@ class PresenceInference:
         best_sig = None
 
         for eid, trace in self._device_traces.items():
+            if not isinstance(trace, dict) or not self._is_human_device_trace(trace):
+                continue
             info = self.device_info.get(eid, {})
             r = info.get("room", "").strip()
             if not r:
