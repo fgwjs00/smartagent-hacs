@@ -290,7 +290,7 @@ class PresenceInference:
 
     _PRESENCE_KW = (
         "presence", "occupancy", "motion", "人体", "存在", "人员",
-        "mmwave", "pir", "radar", "radar_occupancy",
+        "mmwave", "pir", "radar", "radar_occupancy", "ld2402",
     )
 
     def _check_hw_sensors(self, room: str) -> tuple[str, str] | None:

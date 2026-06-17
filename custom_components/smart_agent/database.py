@@ -574,6 +574,15 @@ class DatabaseMixin:
                 state = self.hass.states.get(entity_id)
                 light_states[entity_id] = state.state if state else None
 
+        normalized_states = [
+            str(state or "").strip().lower()
+            for state in light_states.values()
+            if state is not None
+        ]
+        if normalized_states and not any(state == "on" for state in normalized_states):
+            _LOGGER.debug("[ArrivalBaseline] skip ambiguous all-off sample: room=%s sensor=%s", room, presence_entity_id)
+            return
+
         for entity_id, state in light_states.items():
             if state is None:
                 continue
