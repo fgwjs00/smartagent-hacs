@@ -1276,6 +1276,124 @@ class SmartAgentBackupsView(HomeAssistantView):
         return self.json({"backups": rows, "source": "ha_host_local"}, status_code=200)
 
 
+class SmartAgentBackupsActionView(HomeAssistantView):
+    """Operations Bridge action model: HA-owned backup create endpoint for the add-on."""
+
+    url = "/api/v1/backups/{action}"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:backups:action"
+    requires_auth = True
+
+    async def post(self, request: web.Request, action: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        act = str(action or "").strip().lower()
+        if act not in {"create", "restore", "delete"}:
+            return self.json(
+                _json_error_payload(
+                    "unknown_backup_action",
+                    "not_found",
+                    False,
+                    scope="backups_action",
+                    action=act,
+                    source="ha_host_local",
+                ),
+                status_code=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json(
+                _json_error_payload(
+                    "invalid_json",
+                    "bad_request",
+                    False,
+                    scope="backups_action",
+                    action=act,
+                    source="ha_host_local",
+                ),
+                status_code=400,
+            )
+        if not isinstance(body, dict):
+            return self.json(
+                _json_error_payload(
+                    "invalid_body",
+                    "bad_request",
+                    False,
+                    scope="backups_action",
+                    action=act,
+                    source="ha_host_local",
+                ),
+                status_code=400,
+            )
+
+        if act != "create":
+            return self.json(
+                _json_error_payload(
+                    "backup_action_not_open",
+                    "safety_blocked",
+                    False,
+                    scope="backups_action",
+                    action=act,
+                    source="ha_host_local",
+                ),
+                status_code=409,
+            )
+
+        coord = _get_first_coordinator(request.app["hass"])
+        backup_mgr = getattr(coord, "_backup_manager", None) if coord is not None else None
+        backup_now = getattr(backup_mgr, "backup_now", None)
+        if not callable(backup_now):
+            return self.json(
+                _json_error_payload(
+                    "backup_manager_unavailable",
+                    "dependency_unreachable",
+                    True,
+                    scope="backups_action",
+                    action=act,
+                    source="ha_host_local",
+                ),
+                status_code=503,
+            )
+
+        requested_level = str(body.get("level") or "").strip().lower()
+        if requested_level == "full":
+            level = "full"
+        elif requested_level == "basic":
+            level = "basic"
+        else:
+            level = "standard"
+        password = str(body.get("password") or body.get("backup_password") or "smart_agent_local_backup")
+
+        try:
+            result = backup_now(password=password, level=level)
+            if hasattr(result, "__await__"):
+                result = await result
+        except Exception as exc:
+            _LOGGER.exception("[BackupsBridge] create backup failed: %s", exc)
+            return self.json(
+                _json_error_payload(
+                    "backup_create_failed",
+                    "dependency_unreachable",
+                    True,
+                    scope="backups_action",
+                    action=act,
+                    source="ha_host_local",
+                    exception_type=exc.__class__.__name__,
+                ),
+                status_code=502,
+            )
+
+        payload = dict(result) if isinstance(result, dict) else {}
+        ok = bool(payload.get("ok", payload.get("success", True)))
+        payload.setdefault("ok", ok)
+        payload.setdefault("action", act)
+        payload.setdefault("source", "ha_host_local")
+        return self.json(payload, status_code=200)
+
+
 class SmartAgentLicenseStatusView(HomeAssistantView):
     """Operations Bridge read model: HA-owned license state for the add-on."""
 

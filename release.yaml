@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.120
-display_version: Beta 0.0.120
+release_version: 0.0.121
+display_version: Beta 0.0.121
 channel: beta
-release_date: '2026-06-17'
+release_date: '2026-06-18'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.120 测试版热修：合并备份创建门禁、AI 决策页、行为资产详情、Presence/灯光规划和模型演进数据同步修复，并发布
-    0.0.120 ACR 镜像 tag。
-  customer_visible_version: Beta 0.0.120
+  summary: Beta 0.0.121 HACS ????? HA ??????????? /api/v1/backups/create 404?add-on
+    ????? 0.0.120?
+  customer_visible_version: Beta 0.0.121
