@@ -129,7 +129,7 @@ class SmartAgentSensorMuteSwitch(CoordinatorEntity, SwitchEntity):
 
 
 class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
-    """Switch: on = 静默学习（仅记录事件不执行），off = 正常推理与执行。"""
+    """Switch: on = 静默学习（记录与学习但不执行动作），off = 正常推理与执行。"""
 
     _attr_has_entity_name = False
     _attr_name = "静默学习模式"
@@ -179,7 +179,7 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         self.coordinator._learning_mode = True
         self._attr_is_on = True
         self._persist(True)
-        self.coordinator._sys_log("INFO", "静默学习模式已开启：仅记录设备事件，不执行推理与动作")
+        self.coordinator._sys_log("INFO", "静默学习模式已开启：记录设备事件并学习习惯，但不执行动作")
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:

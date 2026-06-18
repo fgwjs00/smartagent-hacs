@@ -204,7 +204,7 @@ class ListenersMixin:
         blocked_actions: list[str] | None = None,
         reasons: list[str] | None = None,
     ) -> dict[str, Any]:
-        """统一构建 Presence Snapshot（优先融合域，其次 PresenceInference）。"""
+        """Build a compatibility Presence Snapshot without local HA inference."""
         room = (self.device_info.get(entity_id, {}) or {}).get("room", "").strip()
         snapshot_fn = getattr(self, "get_presence_snapshot", None)
         if callable(snapshot_fn) and room:
@@ -227,27 +227,10 @@ class ListenersMixin:
                 snap["localized_spaces"] = localized_spaces
                 return snap
 
-        _fusion = getattr(self, "_fusion_registry", None)
-        if _fusion is not None:
-            snap = _fusion.build_presence_snapshot_for_entity(
-                entity_id,
-                blocked_actions=blocked_actions,
-                reasons=reasons,
-            )
-            if snap is not None:
-                return snap
-
-        room = (self.device_info.get(entity_id, {}) or {}).get("room", "").strip()
-        if room and hasattr(self, "_presence_inference") and self._presence_inference is not None:
-            snap = self._presence_inference.infer_room_presence_snapshot(room)
-            if reasons:
-                snap["reasons"] = list(snap.get("reasons", [])) + list(reasons)
-            if blocked_actions:
-                snap["blocked_actions"] = list(snap.get("blocked_actions", [])) + list(blocked_actions)
-            return snap
-
         fallback_reasons = list(reasons or [])
-        fallback_reasons.append("no_room_or_inference")
+        fallback_reasons.append("presence_decision_owned_by_addon")
+        if not room:
+            fallback_reasons.append("no_room")
         return {
             "state": "unknown",
             "confidence": 0.0,
@@ -333,7 +316,7 @@ class ListenersMixin:
             _remaining = int(self._startup_grace - _startup_elapsed)
             self._sys_log("INFO", f"启动冷却中({_remaining}s 后就绪)，忽略触发: {entity_id}")
             return
-        # 3. 静默学习模式（只记录不推理）
+        # 3. 静默学习模式（记录与学习，抑制执行）
         if not _policy_synced:
             self._spawn_slow_inference_task(
                 self._schedule_inference_after_addon_policy_sync(
@@ -351,12 +334,12 @@ class ListenersMixin:
             # 仅记录真实 HA 实体（entity_id 必须含"."，排除"展厅系统"等虚拟调度实体）
             _is_real_entity = "." in entity_id and not entity_id.startswith(".")
             if _is_real_entity:
-                self._sys_log("INFO", f"[静默学习] {entity_id} {new_state}，仅记录")
+                self._sys_log("INFO", f"[静默学习] {entity_id} {new_state}，记录与学习，抑制执行")
                 self.hass.async_add_executor_job(
                     self._record_event, "Learning", trigger, entity_id, new_state
                 )
             else:
-                self._sys_log("INFO", f"[静默学习] {entity_id} {new_state}，仅记录（不推理）")
+                self._sys_log("INFO", f"[静默学习] {entity_id} {new_state}，记录与学习，抑制执行")
             return
         # ──────────────────────────────────────────────────────────────────────────
 
@@ -832,9 +815,9 @@ class ListenersMixin:
             "device_info": device_info,
             "states": states,
             "ai_scenes": list(getattr(self, "_ai_scenes_cache", []) or []),
-            "behavior_patterns": list(getattr(self, "_behavior_patterns_cache", []) or []),
             "room_topology": topology,
             "mode": str(getattr(self, "_mode", "") or ""),
+            "presence_contract_source": "addon_presence_engine",
         }
 
         occ_getter = getattr(self, "_get_room_occupancy_map", None)
@@ -893,7 +876,6 @@ class ListenersMixin:
 
         for key, getter_name in (
             ("space_snapshot", "get_space_runtime_snapshot"),
-            ("presence_snapshot", "get_presence_snapshot"),
             ("device_capability_snapshot", "get_device_capability_snapshot"),
         ):
             getter = getattr(self, getter_name, None)
@@ -1088,26 +1070,214 @@ class ListenersMixin:
                 return "off"
         return ""
 
+    @staticmethod
+    def _silent_learning_truthy(value: Any, default: bool = True) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value).strip().lower()
+        if text in {"0", "false", "no", "n", "off", "disabled"}:
+            return False
+        if text in {"1", "true", "yes", "y", "on", "enabled"}:
+            return True
+        return default
+
+    @staticmethod
+    def _silent_learning_clean_states(value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return (value.strip().lower(),) if value.strip() else ()
+        if isinstance(value, (list, tuple, set)):
+            return tuple(str(item).strip().lower() for item in value if str(item).strip())
+        return ()
+
+    @staticmethod
+    def _silent_learning_range(value: Any) -> tuple[float, float] | None:
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.replace("..", "-").split("-") if part.strip()]
+        elif isinstance(value, (list, tuple)):
+            parts = list(value[:2])
+        else:
+            parts = []
+        if len(parts) < 2:
+            return None
+        try:
+            return (float(parts[0]), float(parts[1]))
+        except (TypeError, ValueError):
+            return None
+
+    def _silent_learning_default_behavior_dims(self, entity_id: str) -> list[dict[str, Any]]:
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        if domain == "light":
+            return [
+                {"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"},
+                {"key": "brightness", "kind": "position", "range": (0, 100), "unit": "percent"},
+            ]
+        if domain in {"switch", "input_boolean"}:
+            return [{"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"}]
+        if domain == "fan":
+            return [
+                {"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"},
+                {"key": "speed", "kind": "enum", "states": ("low", "medium", "high")},
+            ]
+        if domain == "cover":
+            return [
+                {"key": "power", "kind": "discrete", "states": ("open", "closed"), "active_when": "open"},
+                {"key": "position", "kind": "position", "range": (0, 100), "unit": "percent"},
+            ]
+        if domain == "climate":
+            return [
+                {"key": "hvac_mode", "kind": "enum", "states": ("cool", "heat", "auto", "off"), "active_when": "cool"},
+                {"key": "target_temp", "kind": "continuous", "range": (16, 30), "unit": "c"},
+            ]
+        if domain == "media_player":
+            return [{"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"}]
+        return []
+
+    def _silent_learning_behavior_dims(self, entity_id: str, info: dict[str, Any]) -> list[dict[str, Any]]:
+        if not self._silent_learning_truthy(info.get("learnable"), True):
+            return []
+        raw_dims = info.get("behavior_dims") or info.get("behavior_dimensions")
+        dims: list[dict[str, Any]] = []
+        if isinstance(raw_dims, (list, tuple)):
+            for raw_dim in raw_dims:
+                if not isinstance(raw_dim, dict):
+                    continue
+                key = str(raw_dim.get("key") or raw_dim.get("name") or "").strip().lower()
+                kind = str(raw_dim.get("kind") or raw_dim.get("type") or "").strip().lower()
+                if not key or not kind:
+                    continue
+                dim = {"key": key, "kind": kind}
+                states = self._silent_learning_clean_states(raw_dim.get("states") or raw_dim.get("values"))
+                if states:
+                    dim["states"] = states
+                value_range = self._silent_learning_range(raw_dim.get("range") or raw_dim.get("value_range"))
+                if value_range is not None:
+                    dim["range"] = value_range
+                unit = str(raw_dim.get("unit") or "").strip()
+                if unit:
+                    dim["unit"] = unit
+                dims.append(dim)
+        return dims or self._silent_learning_default_behavior_dims(entity_id)
+
+    @staticmethod
+    def _silent_learning_attributes(state_obj: Any) -> dict[str, Any]:
+        attrs = getattr(state_obj, "attributes", None)
+        return dict(attrs) if isinstance(attrs, dict) else {}
+
+    @staticmethod
+    def _silent_learning_number_text(value: float) -> str:
+        return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+    def _silent_learning_numeric_value(
+        self,
+        entity_id: str,
+        dim_key: str,
+        attrs: dict[str, Any],
+    ) -> str:
+        candidates_by_key = {
+            "brightness": ("brightness_pct", "brightness"),
+            "position": ("current_position", "position", "current_cover_position"),
+            "target_temp": ("target_temp", "target_temperature", "temperature"),
+        }
+        candidates = candidates_by_key.get(dim_key, (dim_key,))
+        raw_value: Any = None
+        raw_key = ""
+        for key in candidates:
+            if key in attrs and attrs.get(key) is not None:
+                raw_key = key
+                raw_value = attrs.get(key)
+                break
+        if raw_value is None:
+            return ""
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError):
+            return ""
+        if dim_key == "brightness" and raw_key == "brightness":
+            number = round(max(0.0, min(255.0, number)) * 100 / 255)
+        return self._silent_learning_number_text(number)
+
+    def _silent_learning_dimension_value(
+        self,
+        entity_id: str,
+        state: str,
+        state_obj: Any,
+        dim: dict[str, Any],
+    ) -> str:
+        dim_key = str(dim.get("key") or "").strip().lower()
+        kind = str(dim.get("kind") or "").strip().lower()
+        raw_state = str(state or "").strip().lower()
+        attrs = self._silent_learning_attributes(state_obj)
+        if kind in {"position", "continuous"}:
+            value = self._silent_learning_numeric_value(entity_id, dim_key, attrs)
+            if not value:
+                return ""
+            value_range = dim.get("range")
+            if isinstance(value_range, tuple) and len(value_range) >= 2:
+                try:
+                    numeric = float(value)
+                    if numeric < float(value_range[0]) or numeric > float(value_range[1]):
+                        return ""
+                except (TypeError, ValueError):
+                    return ""
+            return value
+
+        if dim_key == "power":
+            value = self._silent_learning_expected_state(entity_id, raw_state)
+        else:
+            raw_value = attrs.get(dim_key)
+            value = str(raw_value if raw_value is not None else raw_state).strip().lower()
+        states = self._silent_learning_clean_states(dim.get("states"))
+        if states and value not in states:
+            return ""
+        return value
+
+    @staticmethod
+    def _silent_learning_season(now: datetime) -> str:
+        month = int(now.month)
+        if month in {12, 1, 2}:
+            return "winter"
+        if month in {3, 4, 5}:
+            return "spring"
+        if month in {6, 7, 8}:
+            return "summer"
+        return "autumn"
+
+    def _silent_learning_source_allowed(self, source_type: str) -> bool:
+        normalized = str(source_type or "").strip().lower()
+        if not normalized:
+            return True
+        blocked_tokens = ("自动化", "脚本", "automation", "script")
+        return not any(token in normalized for token in blocked_tokens)
+
     def _record_silent_learning_behavior_sample(
         self,
         entity_id: str,
         old_state: str,
         new_state: str,
         source_type: str,
+        old_state_obj: Any = None,
+        new_state_obj: Any = None,
     ) -> None:
         if not bool(getattr(self, "_learning_mode", False)):
             return
+        if not self._silent_learning_source_allowed(source_type):
+            self._sys_log("INFO", f"[SilentLearning] behavior sample skipped for automation/script source: {entity_id}")
+            return
         old_value = str(old_state or "").strip().lower()
         new_value = str(new_state or "").strip().lower()
-        if not new_value or old_value == new_value:
-            return
-        expected_state = self._silent_learning_expected_state(entity_id, new_value)
-        if not expected_state:
+        if not new_value:
             return
         device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
         info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
         if not isinstance(info, dict):
             info = {}
+        dims = self._silent_learning_behavior_dims(entity_id, info)
+        if not dims:
+            return
         room = str(info.get("room") or info.get("area") or "").strip()
         if not room:
             area_getter = getattr(self, "_get_entity_area", None)
@@ -1117,23 +1287,44 @@ class ListenersMixin:
                 except Exception:
                     room = ""
         now = datetime.now()
-        payload = {
-            "action": "upsert",
-            "entity_id": entity_id,
-            "expected_state": expected_state,
-            "room": room,
-            "hour_start": (now.hour - 1) % 24,
-            "hour_end": (now.hour + 1) % 24,
-            "weekday_mask": str(now.strftime("%w")),
-            "confidence": 62,
-            "hit_count": 1,
-            "lifecycle_state": "active",
-            "source": "silent_learning",
-            "source_type": str(source_type or ""),
-        }
         enqueue = getattr(self, "_enqueue_internal_event", None)
-        if callable(enqueue) and enqueue("behavior", payload, ts=now.strftime("%Y-%m-%d %H:%M:%S")):
-            self._sys_log("INFO", f"[SilentLearning] behavior sample recorded: {entity_id} -> {expected_state}")
+        if not callable(enqueue):
+            return
+        recorded: list[str] = []
+        season_sensitive = self._silent_learning_truthy(info.get("season_sensitive"), False)
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        for dim in dims:
+            dim_key = str(dim.get("key") or "").strip().lower()
+            if not dim_key:
+                continue
+            expected_value = self._silent_learning_dimension_value(entity_id, new_value, new_state_obj, dim)
+            if not expected_value:
+                continue
+            previous_value = self._silent_learning_dimension_value(entity_id, old_value, old_state_obj, dim)
+            if previous_value and previous_value == expected_value:
+                continue
+            season = self._silent_learning_season(now) if season_sensitive or str(dim.get("kind") or "") == "continuous" else ""
+            payload = {
+                "action": "upsert",
+                "entity_id": entity_id,
+                "expected_state": expected_value,
+                "dim_key": dim_key,
+                "expected_value": expected_value,
+                "season": season,
+                "room": room,
+                "hour_start": (now.hour - 1) % 24,
+                "hour_end": (now.hour + 1) % 24,
+                "weekday_mask": str(now.strftime("%w")),
+                "confidence": 62,
+                "hit_count": 1,
+                "lifecycle_state": "active",
+                "source": "silent_learning",
+                "source_type": str(source_type or ""),
+            }
+            if enqueue("behavior", payload, ts=ts):
+                recorded.append(f"{dim_key}={expected_value}")
+        if recorded:
+            self._sys_log("INFO", f"[SilentLearning] behavior sample recorded: {entity_id} -> {', '.join(recorded)}")
 
     def _emit_addon_fast_path_event(self, payload: dict[str, Any]) -> None:
         try:
@@ -1649,7 +1840,7 @@ class ListenersMixin:
                     )
                     return
 
-            self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type)
+            self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type, old, new)
             self._record_presence_interaction_trace(entity_id, domain, new_s, source_type)
 
             info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}

@@ -189,14 +189,15 @@ class RAGRetriever:
         try:
             sqlite_wd = str((weekday + 1) % 7)
             rows = self._query(
-                "SELECT bp.entity_id, bp.expected_state, bp.hour_start, bp.hour_end, "
-                "bp.confidence, bp.hit_count "
+                "SELECT bp.entity_id, bp.expected_state, bp.dim_key, bp.expected_value, bp.season, "
+                "bp.hour_start, bp.hour_end, bp.confidence, bp.hit_count, bp.source, bp.source_type "
                 "FROM behavior_patterns bp "
                 "INNER JOIN devices d ON bp.entity_id = d.entity_id "
                 "WHERE d.area = ? "
                 "AND bp.hour_start <= ? AND bp.hour_end >= ? "
                 "AND bp.weekday_mask LIKE ? "
                 "AND bp.confidence >= ? "
+                "AND (COALESCE(bp.source, '') != 'silent_learning' OR COALESCE(bp.hit_count, 0) >= 3) "
                 "ORDER BY bp.confidence DESC, bp.hit_count DESC LIMIT 5",
                 (room, hour, hour, f"%{sqlite_wd}%", RAG_BEHAVIOR_MIN_CONFIDENCE),
             )
@@ -206,7 +207,9 @@ class RAGRetriever:
             lines: list[str] = []
             for r in rows:
                 name = self._name(r["entity_id"])
-                state = r.get("expected_state", "?")
+                dim_key = str(r.get("dim_key") or "power").strip().lower() or "power"
+                expected_value = str(r.get("expected_value") or r.get("expected_state") or "?")
+                state = expected_value if dim_key == "power" else f"{dim_key}={expected_value}"
                 h_s = r.get("hour_start", 0)
                 h_e = r.get("hour_end", 23)
                 conf = r.get("confidence", 0)

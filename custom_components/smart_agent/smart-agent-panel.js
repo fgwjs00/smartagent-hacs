@@ -1610,7 +1610,7 @@ md-filled-tonal-button.dim {
                   <div class="mode-card-icon">${ICO.book}</div>
                   <div style="flex:1">
                     <div class="label-l">静默学习模式</div>
-                    <div class="body-s">只记录操作，不执行推理</div>
+                    <div class="body-s">记录并学习习惯，不执行动作</div>
                   </div>
                   <md-switch id="learningModeToggle"></md-switch>
                 </div>

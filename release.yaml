@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.121 HACS ????? HA ??????????? /api/v1/backups/create 404?add-on
-    ????? 0.0.120?
+  summary: Beta 0.0.121 测试版发布：合并设备学习可扩展化 S0-S6、AI 行为读模型、静默学习安全闸和前端交互契约收敛，并发布 0.0.121
+    ACR 镜像 tag。
   customer_visible_version: Beta 0.0.121

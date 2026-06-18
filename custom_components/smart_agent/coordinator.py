@@ -337,7 +337,6 @@ class SmartAgentCoordinator(
         self._habit_suggest_timeout_handle: Any = None
         self._glitch_history: dict[str, list[float]] = {}      # 闪断检测历史
         self._glitch_suppressed: dict[str, float] = {}         # 闪断抑制期
-        self._behavior_patterns_cache: list[dict] = []
         self._room_topology_cache: dict[str, set[str]] = {}  # P1-2: room → {adjacent rooms}
         self._room_topology_cache_updated_at: float = 0.0
         self._room_topology_refresh_pending: bool = False
@@ -942,12 +941,6 @@ class SmartAgentCoordinator(
         self._global_suppress_reason = reason
         self._record_device_operation(entity_id, SOURCE_EMERGENCY, "alert")
         self._sys_log("ERROR", f"[P0紧急] {reason}，全局 AI 抑制 {suppress_seconds}s | 触发: {entity_id}")
-
-    def _refresh_behavior_patterns_cache(self) -> None:
-        self._behavior_patterns_cache = []
-
-    def _get_behavior_patterns_snapshot(self) -> list[dict]:
-        return list(self._behavior_patterns_cache)
 
     async def async_confirm_habit(self) -> None:
         self._sys_log("INFO", "[习惯建议] HA 本地确认入口已下架，请在 8234/add-on 侧处理")
@@ -2969,145 +2962,41 @@ class SmartAgentCoordinator(
         }
 
     def get_presence_snapshot(self) -> dict[str, Any]:
-        """Return the HA-side canonical presence snapshot adapter."""
+        """Return a fail-closed compatibility snapshot.
 
-        def _text(value: Any) -> str:
-            return str(value or "").strip()
-
-        def _as_list(value: Any) -> list[str]:
-            if value is None:
-                return []
-            if isinstance(value, (list, tuple, set)):
-                result: list[str] = []
-                for item in value:
-                    text = _text(item)
-                    if text and text not in result:
-                        result.append(text)
-                return result
-            text = _text(value)
-            return [text] if text else []
-
-        def _confidence(value: Any) -> float:
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError):
-                return 0.0
-            return max(0.0, min(1.0, parsed))
-
-        def _state(value: Any) -> str:
-            raw = _text(value).lower()
-            if raw in {"on", "occupied", "present", "detected", "home", "person", "motion"}:
-                return "occupied"
-            if raw in {"off", "vacant", "empty", "away", "clear", "none", "idle"}:
-                return "vacant"
-            return "unknown"
-
-        def _bool_or_default(value: Any, default: bool) -> bool:
-            if isinstance(value, bool):
-                return value
-            return default
-
-        def _merge_room(room: Any, raw: Any) -> None:
-            room_id = _text(room)
-            if not room_id:
-                return
-            row = raw if isinstance(raw, dict) else {"state": raw}
-            state = _state(row.get("state"))
-            existing = rooms.setdefault(
-                room_id,
-                {
-                    "state": "unknown",
-                    "confidence": 0.0,
-                    "reasons": [],
-                    "enter_qualified": False,
-                    "leave_qualified": False,
-                    "localized_spaces": [room_id],
-                    "blocked_actions": [],
-                    "occupied_evidence_ids": [],
-                    "vacant_evidence_ids": [],
-                },
-            )
-            if state != "unknown" or existing.get("state") == "unknown":
-                existing["state"] = state
-            existing["confidence"] = max(float(existing.get("confidence") or 0.0), _confidence(row.get("confidence")))
-            existing["enter_qualified"] = _bool_or_default(row.get("enter_qualified"), state == "occupied")
-            existing["leave_qualified"] = _bool_or_default(row.get("leave_qualified"), state == "vacant")
-            for key in (
-                "reasons",
-                "localized_spaces",
-                "blocked_actions",
-                "occupied_evidence_ids",
-                "vacant_evidence_ids",
-            ):
-                merged = list(existing.get(key) or [])
-                for item in _as_list(row.get(key)):
-                    if item not in merged:
-                        merged.append(item)
-                if key == "localized_spaces" and room_id not in merged:
-                    merged.insert(0, room_id)
-                existing[key] = merged
+        Presence semantics are produced by the add-on PresenceEngine. HA keeps
+        this adapter only so older callers can fail closed while the add-on owns
+        occupied/vacant/enter/leave decisions.
+        """
 
         rooms: dict[str, dict[str, Any]] = {}
-
-        inference = getattr(self, "_presence_inference", None)
-        if inference is not None:
-            snapshots_fn = getattr(inference, "infer_presence_snapshots", None)
-            if callable(snapshots_fn):
-                try:
-                    snapshots = snapshots_fn()
-                except Exception:
-                    snapshots = None
-                if isinstance(snapshots, dict):
-                    for room, raw in snapshots.items():
-                        _merge_room(room, raw)
-
-            room_fn = getattr(inference, "infer_room_presence_snapshot", None)
-            if callable(room_fn):
-                device_info = getattr(self, "device_info", {}) or {}
-                for info in device_info.values():
-                    if not isinstance(info, dict):
-                        continue
-                    room = _text(info.get("room"))
-                    if not room or room in rooms:
-                        continue
-                    try:
-                        _merge_room(room, room_fn(room))
-                    except Exception:
-                        continue
-
-        fusion = getattr(self, "_fusion_registry", None)
-        if fusion is not None:
-            scopes = getattr(fusion, "scopes", None)
-            if scopes is None:
-                scopes = getattr(fusion, "_scopes", None)
-            scope_rows = scopes.values() if isinstance(scopes, dict) else scopes
-            evaluate_scope = getattr(fusion, "evaluate_scope", None)
-            if scope_rows and callable(evaluate_scope):
-                for scope in scope_rows:
-                    scope_id = _text(getattr(scope, "scope_id", None) or getattr(scope, "id", None))
-                    scope_rooms = getattr(scope, "rooms", None)
-                    if not scope_rooms and isinstance(scope, dict):
-                        scope_id = _text(scope.get("scope_id") or scope.get("id"))
-                        scope_rooms = scope.get("rooms")
-                    if not scope_id:
-                        continue
-                    try:
-                        result = evaluate_scope(scope_id)
-                    except Exception:
-                        continue
-                    raw_state = getattr(result, "state", None)
-                    for room in _as_list(scope_rooms):
-                        _merge_room(
-                            room,
-                            {
-                                "state": raw_state,
-                                "confidence": getattr(result, "confidence", 0.0),
-                                "reasons": [f"fusion:{scope_id}"],
-                            },
-                        )
+        device_info = getattr(self, "device_info", {}) or {}
+        if isinstance(device_info, dict):
+            for info in device_info.values():
+                if not isinstance(info, dict):
+                    continue
+                room = str(info.get("space_id") or info.get("room") or info.get("area") or "").strip()
+                if not room or room in rooms:
+                    continue
+                rooms[room] = {
+                    "state": "unknown",
+                    "confidence": 0.0,
+                    "reasons": ["presence_decision_owned_by_addon"],
+                    "enter_qualified": False,
+                    "leave_qualified": False,
+                    "localized_spaces": [room],
+                    "blocked_actions": ["turn_off"],
+                    "occupied_evidence_ids": [],
+                    "vacant_evidence_ids": [],
+                    "metadata": {"presence_contract_source": "addon_presence_engine"},
+                }
 
         return {
             "version": "1.0",
-            "source": "ha_presence_snapshot_adapter",
+            "source": "ha_presence_snapshot_adapter_disabled",
             "rooms": rooms,
+            "metadata": {
+                "presence_contract_source": "addon_presence_engine",
+                "reason": "presence_decision_owned_by_addon",
+            },
         }
