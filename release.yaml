@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.121
-display_version: Beta 0.0.121
+release_version: 0.0.122
+display_version: Beta 0.0.122
 channel: beta
-release_date: '2026-06-18'
+release_date: '2026-06-21'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.121 测试版发布：合并设备学习可扩展化 S0-S6、AI 行为读模型、静默学习安全闸和前端交互契约收敛，并发布 0.0.121
-    ACR 镜像 tag。
-  customer_visible_version: Beta 0.0.121
+  summary: Beta 0.0.122 测试版发布：合并未纳管设备过滤、设备名称投影、前端下拉层与首页实时信号流修复，并发布 0.0.122 ACR 镜像
+    tag。
+  customer_visible_version: Beta 0.0.122
