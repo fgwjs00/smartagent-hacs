@@ -1689,6 +1689,23 @@ class ListenersMixin:
                 elif new.context.parent_id:
                     source_type = "自动化/脚本"
 
+            domain = entity_id.split(".")[0]
+            device_info_snapshot = getattr(self, "device_info", {}) or {}
+            if not isinstance(device_info_snapshot, dict):
+                device_info_snapshot = {}
+            if entity_id not in device_info_snapshot:
+                unmanaged_filter_reason = "unmanaged_entity"
+                _LOGGER.debug(
+                    "[ListenerFilter] managed=false filter_reason=unmanaged_entity "
+                    "path=state_handler entity=%s old_state=%s new_state=%s source_type=%s reason=%s",
+                    entity_id,
+                    old_s,
+                    new_s,
+                    source_type,
+                    unmanaged_filter_reason,
+                )
+                return
+
             self._sys_log("INFO", f"[事件] {entity_id}: {old_s} → {new_s} (来源: {source_type})")
             self._emit_listener_event(
                 listener_action="received",
@@ -1697,7 +1714,6 @@ class ListenersMixin:
                 new_state=new_s,
                 source_type=source_type,
             )
-            domain = entity_id.split(".")[0]
 
             # ── 传感器静默 ──
             if self._sensors_muted and domain in ("binary_sensor", "sensor"):
@@ -1786,26 +1802,6 @@ class ListenersMixin:
                     old_state=old_s,
                     new_state=new_s,
                     filter_reason="state_recovery_inactive",
-                    source_type=source_type,
-                )
-                return
-
-            device_info_snapshot = getattr(self, "device_info", {}) or {}
-            if not isinstance(device_info_snapshot, dict):
-                device_info_snapshot = {}
-            if entity_id not in device_info_snapshot:
-                self._sys_log(
-                    "INFO",
-                    f"[ListenerFilter] managed=false filter_reason=unmanaged_entity "
-                    f"path=state_handler entity={entity_id} old_state={old_s} new_state={new_s} "
-                    f"source_type={source_type}",
-                )
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="unmanaged_entity",
                     source_type=source_type,
                 )
                 return

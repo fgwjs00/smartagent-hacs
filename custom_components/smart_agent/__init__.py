@@ -873,6 +873,31 @@ class SmartAgentEventsWSView(HomeAssistantView):
             "scene.",
             "automation.",
         )
+        managed_event_entity_ids: set[str] = set()
+        managed_event_entity_ids_updated_at = 0.0
+
+        def _refresh_managed_event_entity_ids() -> set[str]:
+            nonlocal managed_event_entity_ids, managed_event_entity_ids_updated_at
+            now_monotonic = time.monotonic()
+            if managed_event_entity_ids_updated_at and now_monotonic - managed_event_entity_ids_updated_at < 5:
+                return managed_event_entity_ids
+
+            coord = _get_first_coordinator(hass)
+            next_ids: set[str] = set()
+            if coord is not None:
+                for row in _local_device_rows(coord, hass):
+                    if not isinstance(row, dict):
+                        continue
+                    entity_id = str(row.get("entity_id") or "").strip()
+                    if not entity_id:
+                        continue
+                    if row.get("managed") is False or row.get("in_sa") is False:
+                        continue
+                    next_ids.add(entity_id)
+
+            managed_event_entity_ids = next_ids
+            managed_event_entity_ids_updated_at = now_monotonic
+            return managed_event_entity_ids
 
         def _state_obj_to_jsonable(value):
             if value is None:
@@ -906,15 +931,22 @@ class SmartAgentEventsWSView(HomeAssistantView):
                 )
                 if not entity_id.startswith(state_changed_domains):
                     return
+                managed_event_entity_ids = _refresh_managed_event_entity_ids()
+                if entity_id not in managed_event_entity_ids:
+                    return
                 event_data = {
                     "entity_id": entity_id,
                     "old_state": old_state,
                     "new_state": new_state,
                 }
             elif evt_type == "smart_agent_listener_event":
+                listener_entity_id = str(event_data.get("entity_id") or "")
+                managed_event_entity_ids = _refresh_managed_event_entity_ids()
+                if listener_entity_id and listener_entity_id not in managed_event_entity_ids:
+                    return
                 event_data = {
                     "listener_action": str(event_data.get("listener_action") or ""),
-                    "entity_id": str(event_data.get("entity_id") or ""),
+                    "entity_id": listener_entity_id,
                     "old_state": str(event_data.get("old_state") or ""),
                     "new_state": str(event_data.get("new_state") or ""),
                     "filter_reason": str(event_data.get("filter_reason") or ""),
