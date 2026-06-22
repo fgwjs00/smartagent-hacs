@@ -195,9 +195,13 @@ ONLINE_PROVIDER_URLS: dict[str, str] = {
 }
 
 # 云端文本模型下拉列表（支持 custom_value，用户可手动输入任意名称）
-# 全系迁移至 Qwen3.5 系列（2026-04）
+# 百炼新版模型优先，旧 Qwen3.5/Qwen 仍保留兼容。
 ONLINE_MODELS_ALL: list[str] = [
-    # ── 通义千问 Qwen3.5 系列（推荐，DashScope）──
+    # ── 通义千问 Qwen3.7 / Qwen3.6 系列（百炼新版文档推荐）──
+    "qwen3.7-plus",           # 推荐默认：百炼新版文档示例模型
+    "qwen3.7-max",            # 旗舰：最高精度，成本较高
+    "qwen3.6-flash",          # 快速：低延迟/低成本
+    # ── 通义千问 Qwen3.5 系列（向后兼容）──
     "qwen3.5-flash",          # 推荐默认：高性价比，智能家居场景首选
     "qwen3.5-plus",           # 均衡：复杂场景/展厅模式推荐
     "qwen3.5-max",            # 旗舰：最高精度，成本较高
@@ -250,7 +254,7 @@ DEFAULT_ENGINE = ENGINE_LOCAL
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3-smarthome"
 DEFAULT_ONLINE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_ONLINE_MODEL = "qwen3.5-flash"       # 全系切换至 Qwen3.5-Flash
+DEFAULT_ONLINE_MODEL = "qwen3.7-plus"        # 百炼新版文档示例模型；旧 qwen3.5-flash 保留兼容
 DEFAULT_VISION_MODEL = "qwen3.5-omni-flash"  # 云端视觉默认模型
 DEFAULT_CONFIDENCE_AUTO = 70
 DEFAULT_CONFIDENCE_NOTIFY = 50

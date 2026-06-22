@@ -228,7 +228,7 @@ class SmartAgentCoordinator(
         self.ollama_model = data.get(CONF_OLLAMA_MODEL, "qwen3-smarthome")
         self._online_api_key = data.get(CONF_ONLINE_API_KEY, "")
         self.online_base_url = data.get(CONF_ONLINE_BASE_URL, "https://dashscope.aliyuncs.com/compatible-mode/v1")
-        self.online_model = data.get(CONF_ONLINE_MODEL, "qwen3.5-flash")
+        self.online_model = data.get(CONF_ONLINE_MODEL, "qwen3.7-plus")
         self.confidence_auto = int(data.get(CONF_CONFIDENCE_AUTO, DEFAULT_CONFIDENCE_AUTO))
         self.confidence_notify = int(data.get(CONF_CONFIDENCE_NOTIFY, DEFAULT_CONFIDENCE_NOTIFY))
         self.cooldown = int(data.get(CONF_COOLDOWN, 60))
