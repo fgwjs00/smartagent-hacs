@@ -17,6 +17,7 @@ V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentRoomsView",
     "SmartAgentRoomsSyncView",
     "SmartAgentRoomDetailView",
+    "SmartAgentManagedDevicesView",
     "SmartAgentDeviceDetailView",
     "SmartAgentBackupsView",
     "SmartAgentBackupsActionView",

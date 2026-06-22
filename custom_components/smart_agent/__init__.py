@@ -1190,6 +1190,24 @@ class SmartAgentRoomDetailView(HomeAssistantView):
         return self.json(result, status_code=200)
 
 
+class SmartAgentManagedDevicesView(HomeAssistantView):
+    """Read-only SmartAgent managed-device projection for add-on reinstall recovery."""
+
+    url = "/api/v1/devices"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:devices"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json([])
+        return self.json(_local_device_rows(coord, request.app["hass"]))
+
+
 class SmartAgentDeviceDetailView(HomeAssistantView):
     """Area Registry Bridge：仅把 add-on 设备房间选择镜像到 HA 实体 Area。"""
 

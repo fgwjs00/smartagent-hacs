@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.123
-display_version: Beta 0.0.123
+release_version: 0.0.124
+display_version: Beta 0.0.124
 channel: beta
 release_date: '2026-06-22'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.123 测试版发布：合并存在融合 strict-leave 收口、证据过期保护、房间级 presence 策略生成与前端体验修复，并发布
-    0.0.123 ACR 镜像 tag。
-  customer_visible_version: Beta 0.0.123
+  summary: Beta 0.0.124 测试版发布：修复纳管设备删除后重新添加仍被本地删除墓碑过滤的问题，并发布 0.0.124 ACR 镜像 tag。
+  customer_visible_version: Beta 0.0.124
