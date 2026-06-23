@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.125
-display_version: Beta 0.0.125
+release_version: 0.0.126
+display_version: Beta 0.0.126
 channel: beta
-release_date: '2026-06-22'
+release_date: '2026-06-23'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.125 测试版发布：修复存在融合策略弹窗表格裁切问题，更新百炼新版 OpenAI 兼容接口配置与 qwen3.7-plus
-    默认模型，并发布 0.0.125 ACR 镜像 tag。
-  customer_visible_version: Beta 0.0.125
+  summary: Beta 0.0.126 测试版发布：修复 Presence 传感器本地投影与 HA 实时状态不同步、传感器类型保存仍代理 HA 旧端点的问题，并携带最新存在融合页面与
+    add-on UI 构建产物。
+  customer_visible_version: Beta 0.0.126
