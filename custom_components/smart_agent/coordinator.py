@@ -1204,6 +1204,23 @@ class SmartAgentCoordinator(
 
         # Phase 10.0: 初始化虚拟在场推断引擎（device_info 此时已加载完成）
         try:
+            async def _patrol_safety_net_periodic(_now: Any) -> None:
+                try:
+                    await self._async_submit_patrol_safety_net_plan(source="ha_low_frequency_patrol")
+                except Exception as exc:
+                    _LOGGER.debug("[PatrolSafetyNet] periodic plan failed: %s", exc)
+
+            self._listener_removers.append(
+                async_track_time_interval(
+                    self.hass,
+                    _patrol_safety_net_periodic,
+                    timedelta(minutes=15),
+                )
+            )
+        except Exception as exc:
+            _LOGGER.debug("[PatrolSafetyNet] periodic registration failed: %s", exc)
+
+        try:
             from .presence_inference import PresenceInference
             self._presence_inference = PresenceInference(self.hass, self.device_info)
             _LOGGER.debug("[PresenceInference] 虚拟在场推断引擎已初始化")
@@ -2898,6 +2915,68 @@ class SmartAgentCoordinator(
 
         self._room_topology_cache = topology
         self._room_topology_cache_updated_at = time.monotonic()
+
+    def _build_patrol_safety_net_payload(self, *, source: str) -> dict[str, Any]:
+        capability_snapshot = self.get_device_capability_snapshot()
+        states: dict[str, dict[str, str]] = {}
+        for entity_id in capability_snapshot:
+            state_obj = self.hass.states.get(entity_id)
+            if state_obj is None:
+                continue
+            last_changed = getattr(state_obj, "last_changed", None)
+            last_updated = getattr(state_obj, "last_updated", None)
+            states[entity_id] = {
+                "state": str(getattr(state_obj, "state", "") or ""),
+                "last_changed": last_changed.isoformat() if last_changed else "",
+                "last_updated": last_updated.isoformat() if last_updated else "",
+            }
+        return {
+            "source": source,
+            "mode": "safety_net",
+            "device_capability_snapshot": capability_snapshot,
+            "states": states,
+            "presence_snapshot": self.get_presence_snapshot(),
+        }
+
+    async def _async_submit_patrol_safety_net_plan(
+        self,
+        *,
+        source: str = "ha_low_frequency_patrol",
+    ) -> dict[str, Any] | None:
+        if not self._is_enabled():
+            return None
+        if bool(getattr(self, "_learning_mode", False)):
+            return None
+        addon_client = getattr(self, "_addon_client", None)
+        if addon_client is None:
+            return None
+
+        payload = self._build_patrol_safety_net_payload(source=source)
+        fingerprint = json.dumps(
+            {
+                "devices": sorted((payload.get("device_capability_snapshot") or {}).keys()),
+                "states": payload.get("states") or {},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if fingerprint == self._last_patrol_snapshot:
+            self._patrol_no_change_count += 1
+        else:
+            self._last_patrol_snapshot = fingerprint
+            self._patrol_no_change_count = 0
+
+        result = await addon_client.post_patrol_trigger(payload)
+        if isinstance(result, dict):
+            status = int(result.get("__status") or 0)
+            plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
+            safety = plan.get("safety_net") if isinstance(plan.get("safety_net"), dict) else {}
+            candidate_count = int(safety.get("candidate_count") or 0) if safety else 0
+            self._sys_log(
+                "INFO",
+                f"[PatrolSafetyNet] plan submitted | status={status} candidates={candidate_count} source={source}",
+            )
+        return result if isinstance(result, dict) else None
 
     def get_space_runtime_snapshot(self) -> dict[str, Any]:
         """返回空间运行时快照（只读内存态，不触发 DB 热路径）。"""

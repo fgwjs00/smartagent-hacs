@@ -49,7 +49,6 @@ def _safe_add_column(conn: sqlite3.Connection, table: str, column_def: str) -> N
 
 
 class DatabaseMixin:
-
     _VALID_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
 
     def _init_memory_db(self) -> None:
@@ -118,7 +117,6 @@ class DatabaseMixin:
                 conn.execute("INSERT INTO rules (content, created) VALUES (?,?)", (rule, now))
         except Exception as exc:
             _LOGGER.warning("[DB] legacy JSON migration failed: %s", exc)
-
     def _load_config(self) -> None:
         """Load devices, habits, and rules from local HA bridge config tables."""
         self.device_info = {}
@@ -162,7 +160,6 @@ class DatabaseMixin:
         if self._p1_blocks_local_write(sql):
             return False
         return bool(await self.hass.async_add_executor_job(self._db.execute, sql, params))
-
     def _p1_blocks_local_write(self, sql: str) -> bool:
         """P1/P5 gate: HA storage is read-only except scene entity registration."""
         normalized = " ".join(str(sql or "").split())
@@ -200,7 +197,6 @@ class DatabaseMixin:
         if not callable(enqueue):
             return False
         return bool(enqueue(kind, payload, ts=ts))
-
     def _record_event(
         self,
         event_type: str,

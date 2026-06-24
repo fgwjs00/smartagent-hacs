@@ -1588,13 +1588,13 @@ class AddOnClient:
             return self._handle_request_exception(exc)
         return None
 
-    async def post_patrol_trigger(self) -> dict[str, Any] | None:
+    async def post_patrol_trigger(self, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """触发巡检（优先 add-on 服务面）。"""
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/patrol/trigger",
-                json={},
+                json=payload if isinstance(payload, dict) else {},
                 headers=self._auth_headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
