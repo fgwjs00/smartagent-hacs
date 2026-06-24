@@ -74,6 +74,20 @@ class ListenersMixin:
     # 人工交互可作为无硬件房间的 enter-only 在场证据。
     _PRESENCE_INTERACTION_DOMAINS = frozenset({"light", "media_player", "climate"})
     _PRESENCE_INTERACTION_HUMAN_SOURCES = frozenset({SOURCE_PHYSICAL, SOURCE_DASHBOARD, SOURCE_VOICE})
+    _LISTENER_DOMAINS = frozenset(
+        (
+            "binary_sensor",
+            "sensor",
+            "device_tracker",
+            "person",
+            "light",
+            "switch",
+            "climate",
+            "cover",
+            "fan",
+            "media_player",
+        )
+    )
 
     # 按时段调整开灯亮度的参考表
     _BRIGHTNESS_TABLE = (
@@ -1937,19 +1951,42 @@ class ListenersMixin:
             return
         return _state_changed
 
+    def _managed_listener_entity_ids(self) -> list[str]:
+        """Return managed entity ids that should receive HA state listeners."""
+        device_info = getattr(self, "device_info", {}) or {}
+        if not isinstance(device_info, dict):
+            return []
+        return [
+            eid
+            for eid in device_info
+            if isinstance(eid, str) and eid.split(".", 1)[0] in self._LISTENER_DOMAINS
+        ]
+
+    def _refresh_listeners_if_entity_set_changed(self) -> bool:
+        """Refresh HA state listeners when the managed entity id set drifts."""
+        next_ids = set(self._managed_listener_entity_ids())
+        current_ids = set(getattr(self, "_listener_entity_ids", set()) or set())
+        if next_ids == current_ids:
+            return False
+        self._refresh_listeners()
+        return True
+
     def _refresh_listeners(self) -> None:
         """Re-register state-change listeners after device list changes."""
-        for remove in self._listener_removers:
+        state_removers = getattr(self, "_state_listener_removers", None)
+        if state_removers is None:
+            state_removers = []
+            self._state_listener_removers = state_removers
+        for remove in state_removers:
             try:
                 remove()
             except Exception:
                 pass
-        self._listener_removers.clear()
-        entity_ids = [eid for eid in self.device_info
-                      if eid.split(".")[0] in ("binary_sensor", "sensor", "device_tracker", "person",
-                                               "light", "switch", "climate", "cover", "fan", "media_player")]
+        state_removers.clear()
+        entity_ids = self._managed_listener_entity_ids()
+        self._listener_entity_ids = set(entity_ids)
         if entity_ids:
-            self._listener_removers.append(
+            state_removers.append(
                 async_track_state_change_event(self.hass, entity_ids, self._make_state_handler())
             )
             self._sys_log("INFO", f"监听器已刷新，监听 {len(entity_ids)} 个实体: {', '.join(entity_ids[:5])}{'...' if len(entity_ids)>5 else ''}")

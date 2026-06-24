@@ -285,6 +285,8 @@ class SmartAgentCoordinator(
         # 初始化优先级仲裁引擎
         self._init_priority_system()
         self._listener_removers: list = []
+        self._state_listener_removers: list = []
+        self._listener_entity_ids: set[str] = set()
         self._enabled = bool(data.get(CONF_AI_ENABLED, True))
         self._sensors_muted = bool(data.get(CONF_SENSORS_MUTED, False))
         self._learning_mode = bool(data.get(CONF_LEARNING_MODE, False))
@@ -1221,6 +1223,24 @@ class SmartAgentCoordinator(
             _LOGGER.debug("[PatrolSafetyNet] periodic registration failed: %s", exc)
 
         try:
+            async def _listener_entity_set_periodic_refresh(_now: Any) -> None:
+                try:
+                    if self._refresh_listeners_if_entity_set_changed():
+                        _LOGGER.debug("[Listeners] refreshed subscriptions after managed entity set changed")
+                except Exception as exc:
+                    _LOGGER.debug("[Listeners] periodic subscription refresh failed: %s", exc)
+
+            self._listener_removers.append(
+                async_track_time_interval(
+                    self.hass,
+                    _listener_entity_set_periodic_refresh,
+                    timedelta(seconds=60),
+                )
+            )
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] periodic subscription refresh registration failed: %s", exc)
+
+        try:
             from .presence_inference import PresenceInference
             self._presence_inference = PresenceInference(self.hass, self.device_info)
             _LOGGER.debug("[PresenceInference] 虚拟在场推断引擎已初始化")
@@ -1346,6 +1366,13 @@ class SmartAgentCoordinator(
         self.hass.async_create_task(_startup_unavail_check())
 
     async def async_shutdown(self) -> None:
+        for remove in getattr(self, "_state_listener_removers", []):
+            try:
+                remove()
+            except Exception:
+                pass
+        self._state_listener_removers.clear()
+        self._listener_entity_ids.clear()
         for remove in self._listener_removers:
             try:
                 remove()
