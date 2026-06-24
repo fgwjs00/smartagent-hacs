@@ -34,8 +34,8 @@ strategy 说明：
                         单个子区无人不影响整体判断，需所有成员都安静才关灯。
 
 主要用途：
-  1. Listeners._confirm_left  → 离开触发前检查融合域；域仍有人则抑制离开推理
-  2. ProtectionMixin._get_room_occupancy_map → 优先使用域状态而非单个传感器
+  1. 监听器状态变化链路 → 形成离开/无人证据，交由 add-on PresenceEngine 与 Guard 校验
+  2. 保护层占用判断 → 优先使用域状态而非单个传感器，避免子区无人误关共享设备
 """
 from __future__ import annotations
 

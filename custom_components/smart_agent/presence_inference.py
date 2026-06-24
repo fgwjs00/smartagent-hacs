@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
@@ -162,6 +162,60 @@ class PresenceInference:
     def _is_human_device_trace(self, trace: dict[str, Any]) -> bool:
         source = str(trace.get("source") or "user").strip().lower()
         return source in HUMAN_DEVICE_TRACE_SOURCES
+
+    def get_recent_device_trace_evidence(self) -> list[dict[str, Any]]:
+        """Export recent human device interactions as raw presence evidence.
+
+        The add-on PresenceEngine remains the semantic owner. HA only forwards
+        interaction traces that can guard a leave/turn-off decision.
+        """
+        now = time.time()
+        evidence: list[dict[str, Any]] = []
+        for entity_id, trace in self._device_traces.items():
+            if not isinstance(trace, dict) or not self._is_human_device_trace(trace):
+                continue
+            try:
+                trace_ts = float(trace.get("time") or 0)
+            except (TypeError, ValueError):
+                continue
+            if trace_ts <= 0 or now - trace_ts > DEVICE_TRACE_WINDOW_SEC:
+                continue
+
+            info = self.device_info.get(entity_id, {}) if isinstance(self.device_info, dict) else {}
+            if not isinstance(info, dict):
+                info = {}
+            space_id = str(
+                info.get("space_id")
+                or info.get("room")
+                or info.get("area")
+                or info.get("control_space_id")
+                or ""
+            ).strip()
+            if not space_id:
+                continue
+
+            trace_age = max(0, int(now - trace_ts))
+            evidence.append(
+                {
+                    "id": f"{entity_id}:presence_interaction",
+                    "entity_id": entity_id,
+                    "source": entity_id,
+                    "source_type": "manual_action",
+                    "action": "presence_interaction",
+                    "state": "on",
+                    "space_id": space_id,
+                    "target_space_ids": [space_id],
+                    "coverage_space_ids": [space_id],
+                    "confidence": 0.6,
+                    "use_for": ["turn_off", "guard"],
+                    "observed_at": datetime.fromtimestamp(trace_ts, timezone.utc).isoformat(),
+                    "attributes": {
+                        "interaction_source": str(trace.get("source") or "user").strip().lower(),
+                        "trace_age_sec": trace_age,
+                    },
+                }
+            )
+        return evidence
 
     def infer_all_rooms(self) -> dict[str, RoomPresence]:
         """

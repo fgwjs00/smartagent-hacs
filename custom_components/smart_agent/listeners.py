@@ -309,12 +309,29 @@ class ListenersMixin:
         # 1. AI 是否已暂停
         if not self._is_enabled():
             self._sys_log("WARN", f"触发被拒: AI 已暂停 | {entity_id}")
+            self._emit_listener_event(
+                listener_action="filtered",
+                entity_id=entity_id,
+                new_state=new_state,
+                filter_reason="ai_disabled",
+                source_type="schedule_gate",
+                trigger=trigger,
+            )
             return
         # 2. 启动冷却（HA 重启后等待设备状态稳定）
         _startup_elapsed = time.time() - self._startup_time
         if _startup_elapsed < self._startup_grace:
             _remaining = int(self._startup_grace - _startup_elapsed)
             self._sys_log("INFO", f"启动冷却中({_remaining}s 后就绪)，忽略触发: {entity_id}")
+            self._emit_listener_event(
+                listener_action="filtered",
+                entity_id=entity_id,
+                new_state=new_state,
+                filter_reason="startup_cooldown",
+                source_type="schedule_gate",
+                trigger=trigger,
+                cooldown_remaining=_remaining,
+            )
             return
         # 3. 静默学习模式（记录与学习，抑制执行）
         if not _policy_synced:
@@ -331,6 +348,14 @@ class ListenersMixin:
             )
             return
         if self._learning_mode and not _allow_learning_mode_inference:
+            self._emit_listener_event(
+                listener_action="filtered",
+                entity_id=entity_id,
+                new_state=new_state,
+                filter_reason="learning_mode",
+                source_type="schedule_gate",
+                trigger=trigger,
+            )
             # 仅记录真实 HA 实体（entity_id 必须含"."，排除"展厅系统"等虚拟调度实体）
             _is_real_entity = "." in entity_id and not entity_id.startswith(".")
             if _is_real_entity:
@@ -347,7 +372,17 @@ class ListenersMixin:
         cooldown = self._effective_cooldown()
         elapsed = now - self._last_inference.get(entity_id, 0)
         if elapsed < cooldown:
-            self._sys_log("INFO", f"[冷却] {entity_id} 冷却中({int(cooldown - elapsed)}s 后可再触发)")
+            _remaining = int(cooldown - elapsed)
+            self._sys_log("INFO", f"[冷却] {entity_id} 冷却中({_remaining}s 后可再触发)")
+            self._emit_listener_event(
+                listener_action="filtered",
+                entity_id=entity_id,
+                new_state=new_state,
+                filter_reason="cooldown",
+                source_type="schedule_gate",
+                trigger=trigger,
+                cooldown_remaining=_remaining,
+            )
             return
         self._last_inference[entity_id] = now
         with self._pending_triggers_lock:
@@ -861,6 +896,17 @@ class ListenersMixin:
                 manual_actions = dict(getattr(self, "_user_manual_actions", {}) or {})
         if isinstance(manual_actions, dict):
             snapshot["user_manual_actions"] = manual_actions
+        trace_getter = getattr(getattr(self, "_presence_inference", None), "get_recent_device_trace_evidence", None)
+        if callable(trace_getter):
+            try:
+                interaction_evidence = trace_getter()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] get_recent_device_trace_evidence failed for add-on snapshot: %s", exc)
+                interaction_evidence = None
+            if isinstance(interaction_evidence, list) and interaction_evidence:
+                snapshot["presence_interaction_evidence"] = [
+                    dict(item) for item in interaction_evidence if isinstance(item, dict)
+                ]
         priority_getter = getattr(self, "_get_priority_summary", None)
         if callable(priority_getter):
             try:

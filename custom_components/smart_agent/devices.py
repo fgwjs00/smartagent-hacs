@@ -656,8 +656,11 @@ class DevicesMixin:
             "UPDATE devices SET entity_id=?, name=?, updated=? WHERE entity_id=?",
             (target_entity_id, target_name, now, eid),
         )
-        result.update({"entity_id": target_entity_id, "new_entity_id": target_entity_id, "renamed": target_entity_id != eid})
+        renamed = target_entity_id != eid
+        result.update({"entity_id": target_entity_id, "new_entity_id": target_entity_id, "renamed": renamed})
         self.async_set_updated_data({})
+        if renamed:
+            self._refresh_listeners()
         return result
 
     async def async_sync_device_patch_to_ha(self, entity_id: str, patch: dict[str, Any]) -> dict:

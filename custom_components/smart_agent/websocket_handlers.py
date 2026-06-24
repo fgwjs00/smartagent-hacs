@@ -1,7 +1,7 @@
 """HA WebSocket command handlers for the SmartAgent host."""
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 import logging
 from typing import Any
 
@@ -26,9 +26,6 @@ def build_smart_agent_websocket_commands(
     *,
     _normalize_addon_diagnostics: Callable[[Any], dict[str, Any]],
     _build_presence_sensors_payload: Callable[[HomeAssistant, SmartAgentCoordinator], dict[str, Any]],
-    _async_save_presence_sensor_type: Callable[
-        [HomeAssistant, SmartAgentCoordinator, str, str], Awaitable[dict[str, Any]]
-    ],
 ) -> tuple[Any, ...]:
     # ── WebSocket API：大数据列表通过 WS 按需下发，绕过 sensor 属性 16KB 上限 ──
 
@@ -46,6 +43,21 @@ def build_smart_agent_websocket_commands(
             connection.send_error(msg_id, "forbidden", "Admin access required")
             return False
         return True
+
+    def _addon_status_code(payload: dict[str, Any]) -> int:
+        """Extract add-on status code from structured bridge payloads."""
+        for key in ("__status", "status_code", "status"):
+            value = payload.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        return 0
+
+    def _is_addon_failure_payload(payload: dict[str, Any]) -> bool:
+        """Return True when add-on explicitly returned an error-shaped payload."""
+        status = _addon_status_code(payload)
+        return payload.get("ok") is False or status >= 400
 
     @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_devices"})
     @websocket_api.async_response
@@ -148,11 +160,27 @@ def build_smart_agent_websocket_commands(
                 if isinstance(addon_payload, list):
                     txns = [row for row in addon_payload if isinstance(row, dict)]
                 elif isinstance(addon_payload, dict):
+                    if _is_addon_failure_payload(addon_payload):
+                        connection.send_error(
+                            msg["id"],
+                            "addon_unreachable",
+                            str(
+                                addon_payload.get("error")
+                                or "SmartAgent add-on transactions unavailable"
+                            ),
+                        )
+                        return
                     rows = addon_payload.get("transactions") or addon_payload.get("items") or addon_payload.get("data")
                     if isinstance(rows, list):
                         txns = [row for row in rows if isinstance(row, dict)]
             except Exception as exc:
                 _LOGGER.debug("[WebSocket] add-on transactions fetch failed: %s", exc)
+                connection.send_error(
+                    msg["id"],
+                    "addon_unreachable",
+                    "SmartAgent add-on transactions unavailable",
+                )
+                return
         if txns is None:
             txns = get_transactions_cache_snapshot(coord)
         # 去掉超大 JSON 快照字段，只保留展示所需字段
@@ -592,7 +620,7 @@ def build_smart_agent_websocket_commands(
     })
     @websocket_api.async_response
     async def ws_save_sensor_type(hass: HomeAssistant, connection, msg: dict) -> None:
-        """保存单个传感器的 sensor_type（pir / mmwave / frigate / ""）到 DB。"""
+        """保存单个传感器的 sensor_type 到 add-on Core Config。"""
         if not _require_admin(connection, msg["id"]):
             return
         coord = _get_coord(hass)
@@ -600,15 +628,30 @@ def build_smart_agent_websocket_commands(
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
 
-        result = await _async_save_presence_sensor_type(
-            hass,
-            coord,
-            msg["entity_id"],
-            msg["sensor_type"],
-        )
-        status = int(result.pop("status", 200) or 200)
-        if not result.get("ok"):
-            code = "invalid_input" if status == 400 else "not_found" if status == 404 else "db_write_failed"
+        _addon_client = getattr(coord, "_addon_client", None)
+        if _addon_client is None:
+            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            return
+
+        try:
+            addon_response = await _addon_client.request_json(
+                "POST",
+                "/presence/sensors/type",
+                body={"entity_id": msg["entity_id"], "sensor_type": msg["sensor_type"]},
+            )
+        except Exception as exc:
+            _LOGGER.debug("[WebSocket] add-on sensor_type save failed: %s", exc)
+            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            return
+
+        if not isinstance(addon_response, dict):
+            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            return
+        status = int(addon_response.get("status_code") or addon_response.get("__status") or 0)
+        body = addon_response.get("body")
+        result = dict(body) if isinstance(body, dict) else {"ok": 200 <= status < 300}
+        if not (200 <= status < 300) or not result.get("ok"):
+            code = "invalid_input" if status in (400, 422) else "not_found" if status == 404 else "addon_unreachable"
             connection.send_error(msg["id"], code, str(result.get("error") or "保存 sensor_type 失败"))
             return
 

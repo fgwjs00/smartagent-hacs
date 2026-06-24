@@ -796,35 +796,24 @@ class AddOnClient:
         return {}
 
     async def get_system_status(self) -> dict[str, Any]:
-        """获取系统状态（优先新端点 /system/status，失败时兼容 /status）。"""
+        """获取系统状态，禁止用旧 /status 伪造健康态。"""
         result = await self.request_json("GET", "/system/status")
         if isinstance(result, dict):
             status = int(result.get("status_code", 0) or 0)
             body = result.get("body")
             if status == 200 and isinstance(body, dict):
                 return body
-            if status in (404, 405):
-                pass
-            else:
-                return self._build_status_result(status, body)
+            return self._build_status_result(status or 502, body)
 
-        legacy = await self.get_status()
-        if not isinstance(legacy, dict) or not legacy:
-            return {}
-        return {
-            "gateway": "online",
-            "core": "online",
-            "ha": "online",
-            "mode": legacy.get("mode", "unknown"),
-            "uptime_sec": 0,
-            "devices_managed": 0,
-            "active_scenes": 0,
-            "voice_provider": "unknown",
-            "cpu": 0,
-            "memory": 0,
-            "addon_version": legacy.get("addon_version", ""),
-            "inference_count_today": int(legacy.get("inference_count_today", 0) or 0),
-        }
+        return self._build_status_result(
+            502,
+            {
+                "ok": False,
+                "error": "addon_unreachable",
+                "error_type": "dependency_unreachable",
+                "retryable": True,
+            },
+        )
 
     async def get_dashboard_summary(self) -> dict[str, Any]:
         """获取仪表盘摘要（优先 /dashboard/summary）。"""

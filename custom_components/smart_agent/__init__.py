@@ -29,7 +29,6 @@ from homeassistant.helpers import config_validation as cv
 from .const import CONF_CLEANUP_LEGACY_PAIR_TOKENS, DOMAIN, MODE_HOME, MODE_SHOWROOM
 from .coordinator import SmartAgentCoordinator
 from .host_read_models import (
-    async_save_presence_sensor_type as _async_save_presence_sensor_type,
     build_presence_sensors_payload as _build_presence_sensors_payload,
     local_device_rows as _local_device_rows,
     local_room_rows as _local_room_rows,
@@ -472,36 +471,6 @@ def _ha_local_log_error_payload(
         source="ha_host_local_logs",
         exception_type=exc.__class__.__name__ if exc is not None else None,
     )
-
-
-def _patrol_trigger_plan_only_payload(reason: str = "controlled_provider_pending") -> dict[str, Any]:
-    return {
-        "ok": False,
-        "error": "operation_plan_only",
-        "error_type": "plan_only",
-        "retryable": False,
-        "source": "ha_host_patrol_plan_only_fallback",
-        "contract_version": "1.1",
-        "domain": "patrol",
-        "action": "trigger",
-        "dry_run": True,
-        "executed": False,
-        "provider_status": "pending_deepening",
-        "plan": {
-            "domain": "patrol",
-            "action": "trigger",
-            "status": "plan_only",
-            "execution": "blocked",
-            "reason": reason,
-            "rollback": {
-                "supported": False,
-                "strategy": "not_supported_for_diagnostic_trigger",
-            },
-        },
-        "warnings": [
-            "patrol trigger remains plan-only until a controlled execution provider exists"
-        ],
-    }
 
 
 def _default_capability_dry_run_payload() -> dict[str, Any]:
@@ -1930,10 +1899,6 @@ LEGACY_ENTITY_IDS: tuple[str, ...] = (
     "text.smart_agent_habit_input",
     "text.smart_agent_rule_input",
     "sensor.smart_agent_config",
-    "switch.smart_agent_learning_mode",
-    "switch.smart_agent_habit_proactive",
-    "switch.smart_agent_frigate_enabled",
-    "switch.smart_agent_vision_enabled",
 )
 
 LEGACY_ENTITY_KEY_DOMAINS: dict[str, tuple[str, ...]] = {
@@ -1961,10 +1926,6 @@ LEGACY_ENTITY_KEY_DOMAINS: dict[str, tuple[str, ...]] = {
     "habit_input": ("text",),
     "rule_input": ("text",),
     "config": ("sensor",),
-    "learning_mode": ("switch",),
-    "habit_proactive": ("switch",),
-    "frigate_enabled": ("switch",),
-    "vision_enabled": ("switch",),
 }
 LEGACY_ENTITY_KEYS: tuple[str, ...] = tuple(LEGACY_ENTITY_KEY_DOMAINS)
 
@@ -2662,7 +2623,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         build_smart_agent_websocket_commands(
             _normalize_addon_diagnostics=_normalize_addon_diagnostics,
             _build_presence_sensors_payload=_build_presence_sensors_payload,
-            _async_save_presence_sensor_type=_async_save_presence_sensor_type,
         ),
     )
 
