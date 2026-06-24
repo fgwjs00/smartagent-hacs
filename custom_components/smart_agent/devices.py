@@ -80,6 +80,24 @@ class DevicesMixin:
             return ["(无)"]
         return [self._rule_display(c, lk)[:255] for c, lk in self._rules[:100]]
 
+    def _get_entity_registry_metadata(self, entity_id: str) -> dict[str, str]:
+        """Return stable HA registry identifiers for a managed entity."""
+        eid = str(entity_id or "").strip()
+        if not eid:
+            return {}
+        try:
+            ent_reg = er.async_get(self.hass)
+            entry = ent_reg.async_get(eid)
+        except Exception as exc:
+            _LOGGER.debug("[Devices] entity registry metadata unavailable for %s: %s", eid, exc)
+            return {}
+        if not entry:
+            return {}
+        return {
+            "ha_unique_id": str(getattr(entry, "unique_id", "") or ""),
+            "ha_device_id": str(getattr(entry, "device_id", "") or ""),
+        }
+
     def _get_entity_area(self, entity_id: str) -> str:
         """Look up the area name for an entity via HA's entity/device/area registries."""
         try:
@@ -339,10 +357,31 @@ class DevicesMixin:
                     elif any(kw in eid_low or kw in name_low for kw in ("radar", "mmwave", "雷达", "presence", "存在")):
                         s_type = "mmwave"
 
-                info = {"name": name, "room": area_name, "type": label, "ops": ops, "control_mode": "shared", "sensor_type": s_type}
+                registry_meta = self._get_entity_registry_metadata(eid)
+                info = {
+                    "name": name,
+                    "room": area_name,
+                    "type": label,
+                    "ops": ops,
+                    "control_mode": "shared",
+                    "sensor_type": s_type,
+                    **registry_meta,
+                }
                 _ok = await self._async_db_exec(
-                    "INSERT OR IGNORE INTO devices (entity_id, name, area, type, ops, control_mode, sensor_type, created, updated) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (eid, name, area_name, label, ops, "shared", s_type, now, now),
+                    "INSERT OR IGNORE INTO devices (entity_id, name, area, type, ops, control_mode, sensor_type, ha_unique_id, ha_device_id, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        eid,
+                        name,
+                        area_name,
+                        label,
+                        ops,
+                        "shared",
+                        s_type,
+                        registry_meta.get("ha_unique_id", ""),
+                        registry_meta.get("ha_device_id", ""),
+                        now,
+                        now,
+                    ),
                 )
                 if not _ok:
                     self._sys_log("WARN", f"[批量添加] 写入失败，跳过设备: {eid}")
@@ -425,7 +464,13 @@ class DevicesMixin:
         if not entity_id or not desc:
             return
         parts = [p.strip() for p in desc.split("|")]
-        existing_mode = self.device_info.get(entity_id, {}).get("control_mode", "shared")
+        existing = self.device_info.get(entity_id, {}) or {}
+        existing_mode = existing.get("control_mode", "shared")
+        registry_meta = {
+            "ha_unique_id": existing.get("ha_unique_id", ""),
+            "ha_device_id": existing.get("ha_device_id", ""),
+            **self._get_entity_registry_metadata(entity_id),
+        }
         info = {
             "name": parts[0] if parts else entity_id,
             "room": parts[1] if len(parts) > 1 else "未知区域",
@@ -433,12 +478,25 @@ class DevicesMixin:
             "ops": parts[3] if len(parts) > 3 else "",
             "sensor_type": parts[4] if len(parts) > 4 else "",
             "control_mode": existing_mode,
+            **registry_meta,
         }
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _ok = await self._async_db_exec(
-            "INSERT INTO devices (entity_id, name, area, type, ops, control_mode, sensor_type, created, updated) VALUES (?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(entity_id) DO UPDATE SET name=excluded.name, area=excluded.area, type=excluded.type, ops=excluded.ops, sensor_type=excluded.sensor_type, updated=excluded.updated",
-            (entity_id, info["name"], info["room"], info["type"], info["ops"], info["control_mode"], info["sensor_type"], now, now),
+            "INSERT INTO devices (entity_id, name, area, type, ops, control_mode, sensor_type, ha_unique_id, ha_device_id, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(entity_id) DO UPDATE SET name=excluded.name, area=excluded.area, type=excluded.type, ops=excluded.ops, sensor_type=excluded.sensor_type, ha_unique_id=excluded.ha_unique_id, ha_device_id=excluded.ha_device_id, updated=excluded.updated",
+            (
+                entity_id,
+                info["name"],
+                info["room"],
+                info["type"],
+                info["ops"],
+                info["control_mode"],
+                info["sensor_type"],
+                info.get("ha_unique_id", ""),
+                info.get("ha_device_id", ""),
+                now,
+                now,
+            ),
         )
         if not _ok:
             self._sys_log("WARN", f"[设备新增] 写入失败，未更新内存态: {entity_id}")
@@ -647,14 +705,23 @@ class DevicesMixin:
             return result
 
         info = self.device_info.pop(eid, None) if target_entity_id != eid else self.device_info.get(eid)
+        registry_meta = self._get_entity_registry_metadata(target_entity_id)
         if isinstance(info, dict):
             info["name"] = target_name
             info["entity_id"] = target_entity_id
+            info.update(registry_meta)
             self.device_info[target_entity_id] = info
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         await self._async_db_exec(
-            "UPDATE devices SET entity_id=?, name=?, updated=? WHERE entity_id=?",
-            (target_entity_id, target_name, now, eid),
+            "UPDATE devices SET entity_id=?, name=?, ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
+            (
+                target_entity_id,
+                target_name,
+                registry_meta.get("ha_unique_id", ""),
+                registry_meta.get("ha_device_id", ""),
+                now,
+                eid,
+            ),
         )
         renamed = target_entity_id != eid
         result.update({"entity_id": target_entity_id, "new_entity_id": target_entity_id, "renamed": renamed})

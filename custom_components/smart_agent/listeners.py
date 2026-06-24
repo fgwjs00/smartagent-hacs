@@ -1754,7 +1754,14 @@ class ListenersMixin:
             if not isinstance(device_info_snapshot, dict):
                 device_info_snapshot = {}
             if entity_id not in device_info_snapshot:
+                try:
+                    if self._reconcile_device_info_entity_ids_from_ha_registry():
+                        device_info_snapshot = getattr(self, "device_info", {}) or {}
+                except Exception as exc:
+                    _LOGGER.debug("[Listeners] state-handler reconciliation skipped for %s: %s", entity_id, exc)
+            if entity_id not in device_info_snapshot:
                 unmanaged_filter_reason = "unmanaged_entity"
+                self._last_listener_filter_reason = unmanaged_filter_reason
                 _LOGGER.debug(
                     "[ListenerFilter] managed=false filter_reason=unmanaged_entity "
                     "path=state_handler entity=%s old_state=%s new_state=%s source_type=%s reason=%s",
@@ -1764,6 +1771,21 @@ class ListenersMixin:
                     source_type,
                     unmanaged_filter_reason,
                 )
+                warned = getattr(self, "_unmanaged_listener_entity_warned", set())
+                if not isinstance(warned, set):
+                    warned = set()
+                if entity_id not in warned:
+                    warned.add(entity_id)
+                    self._unmanaged_listener_entity_warned = warned
+                    log = getattr(self, "_sys_log", None)
+                    message = (
+                        "[监听器] 收到未纳管实体状态变化，未触发 AI 决策: "
+                        f"{entity_id} {old_s}->{new_s}。请在设备页纳管该实体，或检查 HA 实体 ID 是否已改名。"
+                    )
+                    if callable(log):
+                        log("WARN", message)
+                    else:
+                        _LOGGER.warning(message)
                 return
 
             self._sys_log("INFO", f"[事件] {entity_id}: {old_s} → {new_s} (来源: {source_type})")
@@ -1953,6 +1975,10 @@ class ListenersMixin:
 
     def _managed_listener_entity_ids(self) -> list[str]:
         """Return managed entity ids that should receive HA state listeners."""
+        try:
+            self._reconcile_device_info_entity_ids_from_ha_registry()
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] entity registry reconciliation failed: %s", exc)
         device_info = getattr(self, "device_info", {}) or {}
         if not isinstance(device_info, dict):
             return []
@@ -1961,6 +1987,214 @@ class ListenersMixin:
             for eid in device_info
             if isinstance(eid, str) and eid.split(".", 1)[0] in self._LISTENER_DOMAINS
         ]
+
+    def _reconcile_device_info_entity_ids_from_ha_registry(self) -> bool:
+        """Migrate managed entity ids when HA's entity registry renamed them."""
+        device_info = getattr(self, "device_info", {}) or {}
+        if not isinstance(device_info, dict) or not device_info:
+            return False
+
+        hass = getattr(self, "hass", None)
+        if hass is None:
+            return False
+        states = getattr(hass, "states", None)
+
+        try:
+            from homeassistant.helpers import entity_registry as er
+            entity_reg = er.async_get(hass)
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] entity registry unavailable for reconciliation: %s", exc)
+            return False
+
+        def _state_obj(entity_id: str) -> Any:
+            getter = getattr(states, "get", None)
+            if not callable(getter):
+                return None
+            try:
+                return getter(entity_id)
+            except Exception:
+                return None
+
+        def _entry_obj(entity_id: str) -> Any:
+            getter = getattr(entity_reg, "async_get", None)
+            if not callable(getter):
+                return None
+            try:
+                return getter(entity_id)
+            except Exception:
+                return None
+
+        raw_entries = getattr(entity_reg, "entities", {}) or {}
+        if isinstance(raw_entries, dict):
+            registry_entries = list(raw_entries.values())
+        elif isinstance(raw_entries, (list, tuple, set)):
+            registry_entries = list(raw_entries)
+        else:
+            registry_entries = []
+
+        def _entry_entity_id(entry: Any) -> str:
+            return str(getattr(entry, "entity_id", "") or "").strip()
+
+        def _entry_unique_id(entry: Any) -> str:
+            return str(getattr(entry, "unique_id", "") or "").strip()
+
+        def _entry_device_id(entry: Any) -> str:
+            return str(getattr(entry, "device_id", "") or "").strip()
+
+        by_unique_id: dict[str, list[Any]] = {}
+        for entry in registry_entries:
+            unique_id = _entry_unique_id(entry)
+            entity_id = _entry_entity_id(entry)
+            if unique_id and entity_id:
+                by_unique_id.setdefault(unique_id, []).append(entry)
+
+        def _friendly_name(entity_id: str) -> str:
+            state = _state_obj(entity_id)
+            attrs = getattr(state, "attributes", None)
+            if isinstance(attrs, dict):
+                return str(attrs.get("friendly_name") or "").strip()
+            return ""
+
+        def _find_legacy_name_match(old_entity_id: str, info: dict[str, Any]) -> Any | None:
+            old_domain = old_entity_id.split(".", 1)[0] if "." in old_entity_id else ""
+            old_name = str(info.get("name") or info.get("friendly_name") or "").strip()
+            if not old_domain or not old_name:
+                return None
+            matches: list[Any] = []
+            for entry in registry_entries:
+                new_entity_id = _entry_entity_id(entry)
+                if not new_entity_id or new_entity_id == old_entity_id or new_entity_id in device_info:
+                    continue
+                if new_entity_id.split(".", 1)[0] != old_domain:
+                    continue
+                if _state_obj(new_entity_id) is None:
+                    continue
+                if _friendly_name(new_entity_id) == old_name:
+                    matches.append(entry)
+            return matches[0] if len(matches) == 1 else None
+
+        changed = False
+        for old_entity_id, raw_info in list(device_info.items()):
+            if not isinstance(old_entity_id, str) or "." not in old_entity_id:
+                continue
+            info = raw_info if isinstance(raw_info, dict) else {}
+            current_entry = _entry_obj(old_entity_id)
+            if _state_obj(old_entity_id) is not None or current_entry is not None:
+                self._persist_ha_registry_metadata(old_entity_id, info, current_entry)
+                continue
+
+            match_entry = None
+            match_reason = ""
+            unique_id = str(info.get("ha_unique_id") or info.get("unique_id") or "").strip()
+            if unique_id:
+                unique_matches = [
+                    entry
+                    for entry in by_unique_id.get(unique_id, [])
+                    if _entry_entity_id(entry) and _entry_entity_id(entry) not in device_info
+                ]
+                if len(unique_matches) == 1:
+                    match_entry = unique_matches[0]
+                    match_reason = "unique_id"
+            if match_entry is None:
+                match_entry = _find_legacy_name_match(old_entity_id, info)
+                if match_entry is not None:
+                    match_reason = "legacy_name_match"
+            if match_entry is None:
+                continue
+
+            new_entity_id = _entry_entity_id(match_entry)
+            if not new_entity_id or new_entity_id in device_info:
+                continue
+            migrated = dict(info)
+            migrated["entity_id"] = new_entity_id
+            if _entry_unique_id(match_entry):
+                migrated["ha_unique_id"] = _entry_unique_id(match_entry)
+            if _entry_device_id(match_entry):
+                migrated["ha_device_id"] = _entry_device_id(match_entry)
+            device_info.pop(old_entity_id, None)
+            device_info[new_entity_id] = migrated
+            self._persist_device_entity_id_migration(old_entity_id, new_entity_id, migrated)
+            changed = True
+            log = getattr(self, "_sys_log", None)
+            message = (
+                f"[监听器] HA 实体 ID 已对账迁移: {old_entity_id} -> {new_entity_id} "
+                f"({match_reason})"
+            )
+            if callable(log):
+                log("WARN", message)
+            else:
+                _LOGGER.warning(message)
+        if changed:
+            updater = getattr(self, "async_set_updated_data", None)
+            if callable(updater):
+                try:
+                    updater({})
+                except Exception:
+                    pass
+        return changed
+
+    def _persist_ha_registry_metadata(self, entity_id: str, info: dict[str, Any], entry: Any) -> None:
+        """Remember HA registry identity metadata so future HA-side renames can be reconciled."""
+        if not isinstance(info, dict) or entry is None:
+            return
+        unique_id = str(getattr(entry, "unique_id", "") or "").strip()
+        device_id = str(getattr(entry, "device_id", "") or "").strip()
+        if not unique_id and not device_id:
+            return
+        changed = False
+        if unique_id and info.get("ha_unique_id") != unique_id:
+            info["ha_unique_id"] = unique_id
+            changed = True
+        if device_id and info.get("ha_device_id") != device_id:
+            info["ha_device_id"] = device_id
+            changed = True
+        if changed:
+            self._persist_device_registry_metadata(entity_id, info)
+
+    def _persist_device_registry_metadata(self, entity_id: str, info: dict[str, Any]) -> None:
+        db = getattr(self, "_db", None)
+        execute = getattr(db, "execute", None)
+        if not callable(execute):
+            return
+        try:
+            execute(
+                "UPDATE devices SET ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
+                (
+                    str(info.get("ha_unique_id") or ""),
+                    str(info.get("ha_device_id") or ""),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    entity_id,
+                ),
+            )
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] device registry metadata persist skipped for %s: %s", entity_id, exc)
+
+    def _persist_device_entity_id_migration(self, old_entity_id: str, new_entity_id: str, info: dict[str, Any]) -> None:
+        db = getattr(self, "_db", None)
+        execute = getattr(db, "execute", None)
+        if not callable(execute):
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            execute(
+                "UPDATE devices SET entity_id=?, updated=? WHERE entity_id=?",
+                (new_entity_id, now, old_entity_id),
+            )
+        except Exception as exc:
+            _LOGGER.warning("[Listeners] device entity_id migration persist failed %s -> %s: %s", old_entity_id, new_entity_id, exc)
+            return
+        try:
+            execute(
+                "UPDATE devices SET ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
+                (
+                    str(info.get("ha_unique_id") or ""),
+                    str(info.get("ha_device_id") or ""),
+                    now,
+                    new_entity_id,
+                ),
+            )
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] migrated registry metadata persist skipped for %s: %s", new_entity_id, exc)
 
     def _refresh_listeners_if_entity_set_changed(self) -> bool:
         """Refresh HA state listeners when the managed entity id set drifts."""

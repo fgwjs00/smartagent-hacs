@@ -18,7 +18,7 @@ _VALID_MIGRATION_TABLES = frozenset({"events", "devices", "habits", "rules", "ac
 
 _BRIDGE_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], ...] = (
     ("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, type TEXT NOT NULL, detail TEXT, entity TEXT, state TEXT, source TEXT DEFAULT 'system', area TEXT, confidence INTEGER, transaction_id INTEGER DEFAULT 0, action_seq INTEGER DEFAULT 0)", ("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)", "CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)", "CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity)"), (("events", "transaction_id INTEGER DEFAULT 0"), ("events", "action_seq INTEGER DEFAULT 0"))),
-    ("CREATE TABLE IF NOT EXISTS devices (entity_id TEXT PRIMARY KEY, name TEXT NOT NULL, area TEXT DEFAULT '', type TEXT DEFAULT '', ops TEXT DEFAULT '', control_mode TEXT DEFAULT 'shared', sensor_type TEXT DEFAULT '', created TEXT, updated TEXT)", (), (("devices", "control_mode TEXT DEFAULT 'shared'"), ("devices", "sensor_type TEXT DEFAULT ''"))),
+    ("CREATE TABLE IF NOT EXISTS devices (entity_id TEXT PRIMARY KEY, name TEXT NOT NULL, area TEXT DEFAULT '', type TEXT DEFAULT '', ops TEXT DEFAULT '', control_mode TEXT DEFAULT 'shared', sensor_type TEXT DEFAULT '', ha_unique_id TEXT DEFAULT '', ha_device_id TEXT DEFAULT '', created TEXT, updated TEXT)", (), (("devices", "control_mode TEXT DEFAULT 'shared'"), ("devices", "sensor_type TEXT DEFAULT ''"), ("devices", "ha_unique_id TEXT DEFAULT ''"), ("devices", "ha_device_id TEXT DEFAULT ''"))),
     ("CREATE TABLE IF NOT EXISTS habits (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, locked INTEGER DEFAULT 0, created TEXT)", (), (("habits", "locked INTEGER DEFAULT 0"),)),
     ("CREATE TABLE IF NOT EXISTS rules (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, locked INTEGER DEFAULT 0, created TEXT)", (), (("rules", "locked INTEGER DEFAULT 0"),)),
     ("CREATE TABLE IF NOT EXISTS action_results (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, entity_id TEXT NOT NULL, domain TEXT NOT NULL, service TEXT NOT NULL, expected_state TEXT, actual_state TEXT, verified INTEGER DEFAULT 0, success INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, latency_ms INTEGER DEFAULT 0, reason TEXT DEFAULT '', transaction_id INTEGER DEFAULT 0, action_seq INTEGER DEFAULT 0)", ("CREATE INDEX IF NOT EXISTS idx_ar_time ON action_results(time)", "CREATE INDEX IF NOT EXISTS idx_ar_entity ON action_results(entity_id)"), (("action_results", "transaction_id INTEGER DEFAULT 0"), ("action_results", "action_seq INTEGER DEFAULT 0"))),
@@ -135,6 +135,8 @@ class DatabaseMixin:
                     "ops": row["ops"],
                     "control_mode": mode,
                     "sensor_type": sensor_type,
+                    "ha_unique_id": row["ha_unique_id"] if "ha_unique_id" in columns else "",
+                    "ha_device_id": row["ha_device_id"] if "ha_device_id" in columns else "",
                 }
             self._habits = [
                 (row["content"], bool(row["locked"]))
