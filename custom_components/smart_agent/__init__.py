@@ -910,15 +910,20 @@ class SmartAgentEventsWSView(HomeAssistantView):
                 }
             elif evt_type == "smart_agent_listener_event":
                 listener_entity_id = str(event_data.get("entity_id") or "")
+                listener_filter_reason = str(event_data.get("filter_reason") or "")
                 managed_event_entity_ids = _refresh_managed_event_entity_ids()
-                if listener_entity_id and listener_entity_id not in managed_event_entity_ids:
+                if (
+                    listener_entity_id
+                    and listener_entity_id not in managed_event_entity_ids
+                    and listener_filter_reason != "unmanaged_entity"
+                ):
                     return
                 event_data = {
                     "listener_action": str(event_data.get("listener_action") or ""),
                     "entity_id": listener_entity_id,
                     "old_state": str(event_data.get("old_state") or ""),
                     "new_state": str(event_data.get("new_state") or ""),
-                    "filter_reason": str(event_data.get("filter_reason") or ""),
+                    "filter_reason": listener_filter_reason,
                     "source_type": str(event_data.get("source_type") or ""),
                     "ai_enabled": bool(event_data.get("ai_enabled", False)),
                     "sensors_muted": bool(event_data.get("sensors_muted", False)),
@@ -997,6 +1002,83 @@ class SmartAgentEventsWSView(HomeAssistantView):
 
 
 
+
+
+class SmartAgentListenerDiagnosticsView(HomeAssistantView):
+    """Expose HA listener subscription state for SmartAgent UI diagnostics."""
+
+    url = "/api/v1/listener/diagnostics"
+    name = "api:smart_agent:v1:listener:diagnostics"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        hass = request.app["hass"]
+        coord = _get_first_coordinator(hass)
+        if coord is None:
+            return self.json(
+                _json_error_payload("coordinator_unavailable", "dependency_unavailable", True),
+                status_code=503,
+            )
+
+        def _sorted_str_list(value: Any) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, dict):
+                items = value.keys()
+            elif isinstance(value, (set, list, tuple)):
+                items = value
+            else:
+                items = []
+            return sorted({str(item).strip() for item in items if str(item or "").strip()})
+
+        device_info = getattr(coord, "device_info", {}) or {}
+        managed_entity_ids = _sorted_str_list(device_info)
+        if not managed_entity_ids:
+            managed_getter = getattr(coord, "_managed_listener_entity_ids", None)
+            if callable(managed_getter):
+                managed_entity_ids = _sorted_str_list(managed_getter())
+
+        listener_entity_ids = _sorted_str_list(getattr(coord, "_listener_entity_ids", set()) or set())
+        unmanaged_warned_entity_ids = _sorted_str_list(
+            getattr(coord, "_unmanaged_listener_entity_warned", set()) or set()
+        )
+        last_listener_event_raw = getattr(coord, "_last_listener_event", {}) or {}
+        last_listener_event = dict(last_listener_event_raw) if isinstance(last_listener_event_raw, dict) else {}
+        last_listener_filter_reason = str(
+            last_listener_event.get("filter_reason")
+            or getattr(coord, "_last_listener_filter_reason", "")
+            or ""
+        )
+
+        managed_set = set(managed_entity_ids)
+        listener_set = set(listener_entity_ids)
+
+        is_enabled = getattr(coord, "_is_enabled", None)
+        enabled = bool(is_enabled()) if callable(is_enabled) else bool(getattr(coord, "_enabled", False))
+
+        return self.json(
+            {
+                "ok": True,
+                "source": "ha_listener_runtime",
+                "enabled": enabled,
+                "sensors_muted": bool(getattr(coord, "_sensors_muted", False)),
+                "mode": str(getattr(coord, "_mode", "") or ""),
+                "device_info_count": len(managed_entity_ids),
+                "subscribed_entity_count": len(listener_entity_ids),
+                "managed_entity_ids": managed_entity_ids,
+                "listener_entity_ids": listener_entity_ids,
+                "missing_listener_entity_ids": sorted(managed_set - listener_set),
+                "extra_listener_entity_ids": sorted(listener_set - managed_set),
+                "unmanaged_warned_entity_ids": unmanaged_warned_entity_ids,
+                "last_listener_event": last_listener_event,
+                "last_listener_filter_reason": last_listener_filter_reason,
+                "state_listener_active": bool(getattr(coord, "_state_listener_removers", []) or []),
+                "periodic_refresh_active": bool(getattr(coord, "_listener_removers", []) or []),
+            }
+        )
 
 
 class SmartAgentHaExecuteView(HomeAssistantView):
@@ -1253,6 +1335,55 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
             else:
                 status_code = 502
         return self.json(payload, status_code=status_code)
+
+    async def delete(self, request: web.Request, entity_id: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        eid = str(entity_id or "").strip()
+        coord = _get_first_coordinator(request.app["hass"])
+        delete_device = getattr(coord, "async_svc_delete_device", None) if coord is not None else None
+        if not callable(delete_device):
+            return self.json(
+                _json_error_payload(
+                    "addon_unreachable",
+                    "dependency_unreachable",
+                    True,
+                    scope="device_delete",
+                    source="ha_host_local",
+                    entity_id=eid,
+                ),
+                status_code=502,
+            )
+
+        try:
+            await delete_device(eid)
+        except Exception as exc:
+            _LOGGER.exception("[DeviceRegistrySync] HA device delete failed: %s", exc)
+            return self.json(
+                _json_error_payload(
+                    "addon_unreachable",
+                    "dependency_unreachable",
+                    True,
+                    scope="device_delete",
+                    source="ha_host_local",
+                    entity_id=eid,
+                    exception_type=exc.__class__.__name__,
+                ),
+                status_code=502,
+            )
+
+        return self.json(
+            {
+                "ok": True,
+                "entity_id": eid,
+                "deleted_entity_id": eid,
+                "deleted": True,
+                "scope": "entity",
+                "source": "ha_host_local",
+            },
+            status_code=200,
+        )
 
 
 class SmartAgentBackupsView(HomeAssistantView):

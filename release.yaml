@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.130
-display_version: Beta 0.0.130
+release_version: 0.0.131
+display_version: Beta 0.0.131
 channel: beta
 release_date: '2026-06-25'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.130 测试版发布：修复 HA Entity Registry 改名导致 device_info 实体 ID 漂移的问题，自动迁移监听实体并补充未纳管实体告警，恢复传感器触发后的
-    fast-path 与慢脑链路。
-  customer_visible_version: Beta 0.0.130
+  summary: Beta 0.0.131 测试版发布：新增监听器诊断接口与首页诊断面板，暴露当前订阅实体、纳管实体和最近过滤原因；同时修复 add-on 设备删除在
+    HA 405 时误报成功的问题，避免本地投影与 HA 实体继续漂移。
+  customer_visible_version: Beta 0.0.131

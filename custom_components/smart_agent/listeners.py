@@ -1786,6 +1786,14 @@ class ListenersMixin:
                         log("WARN", message)
                     else:
                         _LOGGER.warning(message)
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason=unmanaged_filter_reason,
+                    source_type=source_type,
+                )
                 return
 
             self._sys_log("INFO", f"[事件] {entity_id}: {old_s} → {new_s} (来源: {source_type})")
