@@ -1981,6 +1981,98 @@ class ListenersMixin:
             return
         return _state_changed
 
+    def _is_presence_listener_entity(self, entity_id: str, info: dict[str, Any] | None = None) -> bool:
+        """Return True for managed entities that can represent human presence."""
+        domain = str(entity_id or "").split(".", 1)[0]
+        if domain != "binary_sensor":
+            return False
+        row = info if isinstance(info, dict) else {}
+        sensor_type = str(row.get("sensor_type") or "").strip().lower()
+        if sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}:
+            return True
+        eid_lower = str(entity_id or "").lower()
+        name_lower = str(row.get("name") or "").lower()
+        return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
+
+    def _reconcile_active_listener_states(self, entity_ids: list[str]) -> None:
+        """Catch up active managed presence sensors that were already on before listener binding."""
+        if not entity_ids:
+            return
+        states = getattr(getattr(self, "hass", None), "states", None)
+        get_state = getattr(states, "get", None)
+        if not callable(get_state):
+            return
+        reconciled = getattr(self, "_listener_active_state_reconciled", None)
+        if not isinstance(reconciled, dict):
+            reconciled = {}
+            self._listener_active_state_reconciled = reconciled
+        device_info = getattr(self, "device_info", {}) or {}
+        if not isinstance(device_info, dict):
+            device_info = {}
+
+        for entity_id in entity_ids:
+            raw_info = device_info.get(entity_id)
+            info = raw_info if isinstance(raw_info, dict) else {}
+            if not self._is_presence_listener_entity(entity_id, info):
+                continue
+            try:
+                state_obj = get_state(entity_id)
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] active state reconcile read failed for %s: %s", entity_id, exc)
+                continue
+            state = str(getattr(state_obj, "state", "") or "").strip().lower()
+            if state != "on":
+                reconciled.pop(entity_id, None)
+                continue
+            state_marker = str(
+                getattr(state_obj, "last_changed", "")
+                or getattr(state_obj, "last_updated", "")
+                or state
+            )
+            reconcile_marker = f"{state}:{state_marker}"
+            if reconciled.get(entity_id) == reconcile_marker:
+                continue
+            reconciled[entity_id] = reconcile_marker
+
+            if not self._is_enabled():
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state="unknown",
+                    new_state=state,
+                    filter_reason="ai_disabled",
+                    source_type="state_reconcile",
+                    reconcile_reason="listener_refresh_active_state",
+                )
+                continue
+            if getattr(self, "_sensors_muted", False):
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state="unknown",
+                    new_state=state,
+                    filter_reason="sensors_muted",
+                    source_type="state_reconcile",
+                    reconcile_reason="listener_refresh_active_state",
+                )
+                continue
+
+            self._emit_listener_event(
+                listener_action="state_reconciled",
+                entity_id=entity_id,
+                old_state="unknown",
+                new_state=state,
+                source_type="state_reconcile",
+                reconcile_reason="listener_refresh_active_state",
+            )
+            self.hass.async_create_task(
+                self._run_addon_fast_path_fail_closed(
+                    entity_id,
+                    state,
+                    "unknown",
+                )
+            )
+
     def _managed_listener_entity_ids(self) -> list[str]:
         """Return managed entity ids that should receive HA state listeners."""
         try:
@@ -2231,6 +2323,7 @@ class ListenersMixin:
             state_removers.append(
                 async_track_state_change_event(self.hass, entity_ids, self._make_state_handler())
             )
+            self._reconcile_active_listener_states(entity_ids)
             self._sys_log("INFO", f"监听器已刷新，监听 {len(entity_ids)} 个实体: {', '.join(entity_ids[:5])}{'...' if len(entity_ids)>5 else ''}")
         else:
             self._sys_log("WARN", "监听器刷新：无可监听设备，请先添加设备")
