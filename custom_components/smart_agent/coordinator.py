@@ -1188,6 +1188,11 @@ class SmartAgentCoordinator(
 
         # 周期同步：每 60 秒比对一次 add-on settings，发现变更即时刷内存
         try:
+            await self._async_refresh_device_info_from_addon_devices(reason="startup")
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] startup add-on device_info sync failed: %s", exc)
+
+        try:
             async def _settings_periodic_sync(_now: Any) -> None:
                 try:
                     await self._async_apply_addon_system_settings()
@@ -1225,6 +1230,7 @@ class SmartAgentCoordinator(
         try:
             async def _listener_entity_set_periodic_refresh(_now: Any) -> None:
                 try:
+                    await self._async_refresh_device_info_from_addon_devices(reason="periodic_listener")
                     if self._refresh_listeners_if_entity_set_changed():
                         _LOGGER.debug("[Listeners] refreshed subscriptions after managed entity set changed")
                 except Exception as exc:

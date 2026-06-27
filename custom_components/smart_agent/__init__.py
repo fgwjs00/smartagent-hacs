@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import time
 from typing import Any
@@ -16,9 +15,7 @@ from urllib.parse import quote
 import voluptuous as vol
 import aiohttp
 from aiohttp import web
-from homeassistant.components.frontend import async_remove_panel
-from homeassistant.components.http import HomeAssistantView, StaticPathConfig
-from homeassistant.components.panel_custom import async_register_panel
+from homeassistant.components.http import HomeAssistantView
 from homeassistant.auth import models as auth_models
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -49,21 +46,6 @@ from .view_registration import register_host_views
 
 
 # AI Scene snake_case/legacy 仅作为迁移兼容入口，统一集中管理。
-
-def _env_flag(name: str, default: bool = True) -> bool:
-    raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return bool(default)
-
-
-# HA 面板降级控制：迁移阶段默认进入降级（不作为主入口）。
-_HA_PANEL_DEGRADED_MODE = _env_flag("SA_HA_PANEL_DEGRADED_MODE", True)
-_HA_PANEL_REGISTER_ENABLED = _env_flag("SA_HA_PANEL_REGISTER_ENABLED", not _HA_PANEL_DEGRADED_MODE)
-_HA_PANEL_STATIC_EXPOSED = _env_flag("SA_HA_PANEL_STATIC_EXPOSED", not _HA_PANEL_DEGRADED_MODE)
-_HA_SCREEN_STATIC_EXPOSED = _env_flag("SA_HA_SCREEN_STATIC_EXPOSED", True)
 _SYSTEM_CPU_SNAPSHOT: tuple[int, int] | None = None
 
 
@@ -1055,9 +1037,72 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
 
         managed_set = set(managed_entity_ids)
         listener_set = set(listener_entity_ids)
+        sync_status_raw = getattr(coord, "_last_addon_device_sync_status", {}) or {}
+        sync_status = dict(sync_status_raw) if isinstance(sync_status_raw, dict) else {}
 
         is_enabled = getattr(coord, "_is_enabled", None)
         enabled = bool(is_enabled()) if callable(is_enabled) else bool(getattr(coord, "_enabled", False))
+        states = getattr(hass, "states", None)
+        get_state = getattr(states, "get", None)
+        presence_checker = getattr(coord, "_is_presence_listener_entity", None)
+        reconciled = getattr(coord, "_listener_active_state_reconciled", {}) or {}
+        if not isinstance(reconciled, dict):
+            reconciled = {}
+
+        def _state_value(entity_id: str) -> Any:
+            if not callable(get_state):
+                return None
+            try:
+                return get_state(entity_id)
+            except Exception:
+                return None
+
+        def _state_time_value(value: Any) -> str:
+            if value is None:
+                return ""
+            isoformat = getattr(value, "isoformat", None)
+            if callable(isoformat):
+                try:
+                    return str(isoformat())
+                except Exception:
+                    return str(value)
+            return str(value)
+
+        def _listener_entity_row(entity_id: str) -> dict[str, Any]:
+            raw_info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
+            info = raw_info if isinstance(raw_info, dict) else {}
+            state_obj = _state_value(entity_id)
+            attrs = getattr(state_obj, "attributes", None)
+            if not isinstance(attrs, dict):
+                attrs = {}
+            is_presence = False
+            if callable(presence_checker):
+                try:
+                    is_presence = bool(presence_checker(entity_id, info))
+                except Exception:
+                    is_presence = False
+            state_value = str(getattr(state_obj, "state", "") or "").strip()
+            return {
+                "entity_id": entity_id,
+                "domain": entity_id.split(".", 1)[0] if "." in entity_id else "",
+                "name": str(info.get("name") or attrs.get("friendly_name") or ""),
+                "room": str(info.get("room") or info.get("space_id") or ""),
+                "sensor_type": str(info.get("sensor_type") or ""),
+                "managed": entity_id in managed_set,
+                "subscribed": entity_id in listener_set,
+                "state_exists": state_obj is not None,
+                "current_state": state_value,
+                "is_active_state": state_value.lower() in {"on", "open", "home", "playing"},
+                "is_presence_listener": is_presence,
+                "reconcile_marker": str(reconciled.get(entity_id) or ""),
+                "last_changed": _state_time_value(getattr(state_obj, "last_changed", None)),
+                "last_updated": _state_time_value(getattr(state_obj, "last_updated", None)),
+            }
+
+        listener_entities = [
+            _listener_entity_row(entity_id)
+            for entity_id in sorted(managed_set | listener_set)
+        ]
 
         return self.json(
             {
@@ -1072,6 +1117,9 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 "listener_entity_ids": listener_entity_ids,
                 "missing_listener_entity_ids": sorted(managed_set - listener_set),
                 "extra_listener_entity_ids": sorted(listener_set - managed_set),
+                "listener_entities": listener_entities,
+                "device_info_source": str(getattr(coord, "_device_info_source", "") or "ha_local_devices"),
+                "last_addon_device_sync_status": sync_status,
                 "unmanaged_warned_entity_ids": unmanaged_warned_entity_ids,
                 "last_listener_event": last_listener_event,
                 "last_listener_filter_reason": last_listener_filter_reason,
@@ -2078,67 +2126,8 @@ async def _async_remove_legacy_entities(hass: HomeAssistant, entry: ConfigEntry)
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Set up the SmartAgent component."""
-    from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-
     hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN]["panel_degraded_mode"] = _HA_PANEL_DEGRADED_MODE
-
-    async def _register_panel(_event=None) -> None:
-        frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
-        www_dir = os.path.join(os.path.dirname(__file__), "www")
-
-        static_paths: list[StaticPathConfig] = []
-        if _HA_PANEL_STATIC_EXPOSED:
-            static_paths.append(StaticPathConfig("/smart_agent_static", frontend_dir, cache_headers=False))
-        if _HA_SCREEN_STATIC_EXPOSED:
-            static_paths.append(StaticPathConfig("/smart_agent_screen", www_dir, cache_headers=True))
-
-        if static_paths:
-            try:
-                await hass.http.async_register_static_paths(static_paths)
-            except Exception as ex:
-                _LOGGER.debug("Static path already registered or failed: %s", ex)
-
-        if _HA_PANEL_REGISTER_ENABLED:
-            if not _HA_PANEL_STATIC_EXPOSED:
-                _LOGGER.warning(
-                    "Skip SmartAgent panel registration because SA_HA_PANEL_STATIC_EXPOSED=0",
-                )
-            else:
-                try:
-                    await async_register_panel(
-                        hass,
-                        webcomponent_name="smart-agent-panel",
-                        sidebar_title="AI 智能管家",
-                        sidebar_icon="mdi:brain",
-                        frontend_url_path="smart-agent",
-                        module_url="/smart_agent_static/smart-agent-panel.js?v=5.5.2",
-                        require_admin=True,
-                        config={},
-                    )
-                    _LOGGER.info("SmartAgent panel registered at /smart-agent")
-                except Exception as ex:
-                    _LOGGER.error("Panel registration failed: %s", ex)
-
-    if hass.is_running:
-        await _register_panel()
-    else:
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_panel)
-
-    if _HA_PANEL_DEGRADED_MODE:
-        _LOGGER.info(
-            "SmartAgent panel degraded mode active | panel_register=%s | panel_static=%s | screen_static=%s | /api/v1 chain stays enabled",
-            _HA_PANEL_REGISTER_ENABLED,
-            _HA_PANEL_STATIC_EXPOSED,
-            _HA_SCREEN_STATIC_EXPOSED,
-        )
-    else:
-        _LOGGER.info(
-            "SmartAgent panel normal mode active | panel_register=%s | panel_static=%s | screen_static=%s",
-            _HA_PANEL_REGISTER_ENABLED,
-            _HA_PANEL_STATIC_EXPOSED,
-            _HA_SCREEN_STATIC_EXPOSED,
-        )
+    _LOGGER.info("SmartAgent HA host bridge active; product UI is served by the add-on gateway")
     return True
 
 
@@ -2791,8 +2780,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # 只有在 domain 数据为空时才移除服务（多实例场景下其他实例仍在运行）
     if not hass.data.get(DOMAIN):
         remove_smart_agent_services(hass)
-        try:
-            async_remove_panel(hass, "smart-agent")
-        except Exception:
-            pass
     return unload_ok

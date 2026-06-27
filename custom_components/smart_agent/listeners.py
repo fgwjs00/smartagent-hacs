@@ -2073,6 +2073,148 @@ class ListenersMixin:
                 )
             )
 
+    async def _async_refresh_device_info_from_addon_devices(self, *, reason: str = "") -> bool:
+        """Refresh runtime listener device_info from the add-on device projection."""
+        status = {
+            "ok": False,
+            "source": "addon_devices",
+            "reason": str(reason or "manual"),
+            "count": 0,
+        }
+        client = getattr(self, "_addon_client", None)
+        get_devices = getattr(client, "get_devices", None)
+        if not callable(get_devices):
+            status["reason"] = "addon_client_unavailable"
+            self._last_addon_device_sync_status = status
+            return False
+
+        try:
+            rows = await get_devices()
+        except Exception as exc:
+            status["reason"] = "addon_exception"
+            status["error"] = str(exc)
+            self._last_addon_device_sync_status = status
+            return False
+
+        if rows is None:
+            status["reason"] = "addon_not_available"
+            self._last_addon_device_sync_status = status
+            return False
+        if isinstance(rows, dict):
+            status["reason"] = "addon_error"
+            if rows.get("__status") is not None:
+                status["status"] = rows.get("__status")
+            if rows.get("error") is not None:
+                status["error"] = str(rows.get("error"))
+            self._last_addon_device_sync_status = status
+            return False
+        if not isinstance(rows, list):
+            status["reason"] = "invalid_payload"
+            status["payload_type"] = type(rows).__name__
+            self._last_addon_device_sync_status = status
+            return False
+
+        next_device_info: dict[str, dict[str, Any]] = {}
+        skipped = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
+            mapped = self._device_info_row_from_addon_device(row)
+            if mapped is None:
+                skipped += 1
+                continue
+            entity_id, info = mapped
+            next_device_info[entity_id] = info
+
+        current = getattr(self, "device_info", {}) or {}
+        if not isinstance(current, dict):
+            current = {}
+        changed = current != next_device_info
+        if changed:
+            self.device_info = next_device_info
+            reconciled = getattr(self, "_listener_active_state_reconciled", None)
+            if isinstance(reconciled, dict):
+                for entity_id in list(reconciled):
+                    if entity_id not in next_device_info:
+                        reconciled.pop(entity_id, None)
+            presence_inference = getattr(self, "_presence_inference", None)
+            if presence_inference is not None and hasattr(presence_inference, "device_info"):
+                try:
+                    presence_inference.device_info = self.device_info
+                except Exception:
+                    pass
+            updater = getattr(self, "async_set_updated_data", None)
+            if callable(updater):
+                try:
+                    updater({})
+                except Exception:
+                    pass
+
+        status.update(
+            {
+                "ok": True,
+                "reason": str(reason or "manual"),
+                "count": len(next_device_info),
+                "skipped": skipped,
+                "changed": changed,
+            }
+        )
+        self._device_info_source = "addon_devices"
+        self._last_addon_device_sync_status = status
+        return changed
+
+    def _device_info_row_from_addon_device(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        if row.get("managed") is False or row.get("in_sa") is False:
+            return None
+        entity_id = str(row.get("entity_id") or row.get("id") or "").strip()
+        if "." not in entity_id:
+            return None
+        ops = str(row.get("ops") or "").strip()
+        if ops == "__smartagent_deleted__":
+            return None
+        domain = entity_id.split(".", 1)[0]
+        if domain not in self._LISTENER_DOMAINS:
+            return None
+
+        mode = str(row.get("control_mode") or row.get("policy") or "shared").strip() or "shared"
+        valid_modes = getattr(self, "_VALID_CONTROL_MODES", {"ai", "ha", "shared"})
+        if mode not in valid_modes:
+            mode = "shared"
+
+        room = (
+            row.get("room")
+            or row.get("area")
+            or row.get("space_id")
+            or row.get("space")
+            or ""
+        )
+        if isinstance(room, (list, tuple)):
+            room = next((str(item).strip() for item in room if str(item).strip()), "")
+        name = (
+            row.get("name")
+            or row.get("friendly_name")
+            or row.get("display_name")
+            or entity_id
+        )
+        dev_type = (
+            row.get("type")
+            or row.get("dev_type")
+            or row.get("capability")
+            or row.get("domain")
+            or domain
+        )
+        return entity_id, {
+            "name": str(name or entity_id),
+            "room": str(room or ""),
+            "type": str(dev_type or domain),
+            "ops": ops,
+            "control_mode": mode,
+            "sensor_type": str(row.get("sensor_type") or ""),
+            "ha_unique_id": str(row.get("ha_unique_id") or row.get("unique_id") or ""),
+            "ha_device_id": str(row.get("ha_device_id") or row.get("device_id") or ""),
+        }
+
     def _managed_listener_entity_ids(self) -> list[str]:
         """Return managed entity ids that should receive HA state listeners."""
         try:
@@ -2301,6 +2443,7 @@ class ListenersMixin:
         next_ids = set(self._managed_listener_entity_ids())
         current_ids = set(getattr(self, "_listener_entity_ids", set()) or set())
         if next_ids == current_ids:
+            self._reconcile_active_listener_states(sorted(next_ids))
             return False
         self._refresh_listeners()
         return True
