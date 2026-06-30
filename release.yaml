@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.135
-display_version: Beta 0.0.135
+release_version: 0.0.137
+display_version: Beta 0.0.137
 channel: beta
 release_date: '2026-06-30'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.135 测试版发布：纳入主动闭环恢复、快路 409 trace、慢脑执行回流、近期信号后端持久化与快脑离开兜底等修复，并同步新版管理
-    UI。
-  customer_visible_version: Beta 0.0.135
+  summary: Beta 0.0.137 小版本发布：应用 SmartAgent 新项目图标，刷新 add-on 商店图标、管理 UI favicon 与正式发布工作区，确保现场客户端能检测到图标资产更新。
+  customer_visible_version: Beta 0.0.137

@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.135 - 2026-06-30
+## Beta 0.0.137 - 2026-06-30
 
-Beta 0.0.135 测试版发布：纳入主动闭环恢复、快路 409 trace、慢脑执行回流、近期信号后端持久化与快脑离开兜底等修复，并同步新版管理 UI。
+Beta 0.0.137 小版本发布：应用 SmartAgent 新项目图标，刷新 add-on 商店图标、管理 UI favicon 与正式发布工作区，确保现场客户端能检测到图标资产更新。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.135`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.137`，用于 Home Assistant 更新检测。
