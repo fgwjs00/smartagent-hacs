@@ -972,6 +972,8 @@ class ListenersMixin:
         *,
         entity_id: str,
         source_label: str,
+        transaction_id: str = "",
+        trigger: str = "",
     ) -> None:
         actions = result.get("actions", [])
         scene = result.get("scene", source_label)
@@ -985,8 +987,9 @@ class ListenersMixin:
         if defer_seconds > 0:
             await asyncio.sleep(defer_seconds)
 
-        await self._execute_actions(
-            actions if isinstance(actions, list) else [],
+        valid_actions = actions if isinstance(actions, list) else []
+        execution_result = await self._execute_actions(
+            valid_actions,
             trigger_summary=f"{source_label}[{scene}]",
             scene_desc=str(scene),
             confidence=confidence,
@@ -994,6 +997,83 @@ class ListenersMixin:
             is_global_cmd=False,
             cmd_source=_CMD_SOURCE_SENSOR,
         )
+        self._enqueue_fast_path_execution_audit(
+            transaction_id=transaction_id,
+            trigger=trigger or f"{entity_id}: state_changed",
+            scene=str(scene),
+            confidence=confidence,
+            actions=valid_actions,
+            execution_result=execution_result,
+        )
+
+    def _enqueue_fast_path_execution_audit(
+        self,
+        *,
+        transaction_id: str,
+        trigger: str,
+        scene: str,
+        confidence: Any,
+        actions: list[Any],
+        execution_result: Any,
+    ) -> None:
+        transaction_id = str(transaction_id or "").strip()
+        if not transaction_id:
+            return
+        valid_actions = [dict(item) for item in actions if isinstance(item, dict)]
+        try:
+            executed = int(execution_result)
+        except (TypeError, ValueError):
+            executed = 0
+        raw_action_results = getattr(execution_result, "action_results", None)
+        action_results = list(raw_action_results) if isinstance(raw_action_results, list) else []
+        for index, action in enumerate(valid_actions):
+            if index < len(action_results) and isinstance(action_results[index], dict):
+                action_results[index] = {
+                    **action_results[index],
+                    "domain": str(action_results[index].get("domain") or action.get("domain") or ""),
+                    "service": str(action_results[index].get("service") or action.get("service") or ""),
+                    "entity_id": str(action_results[index].get("entity_id") or action.get("entity_id") or ""),
+                }
+                continue
+            action_results.append(
+                {
+                    "domain": str(action.get("domain") or ""),
+                    "service": str(action.get("service") or ""),
+                    "entity_id": str(action.get("entity_id") or ""),
+                    "status": "executed" if index < executed else "not_executed",
+                    "reason": "ha_fast_path_missing_structured_result",
+                }
+            )
+        final_outcome = (
+            "succeeded"
+            if valid_actions and executed >= len(valid_actions)
+            else "partial"
+            if executed > 0
+            else "failed"
+        )
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue):
+            return
+        ok = enqueue(
+            "decision_execution",
+            {
+                "transaction_id": transaction_id,
+                "trigger": str(trigger or ""),
+                "scene": scene,
+                "confidence": confidence,
+                "planned_count": len(valid_actions),
+                "executed_count": executed,
+                "final_outcome": final_outcome,
+                "actions": valid_actions,
+                "action_results": action_results,
+                "source": "ha_fast_path",
+            },
+        )
+        if not ok:
+            self._sys_log(
+                "WARN",
+                f"[Add-on FastPath] decision_execution 回写入队失败 transaction_id={transaction_id}",
+            )
 
     def _fast_path_audit_action_is_low_risk(self, action: Any) -> bool:
         if not isinstance(action, dict):
@@ -1642,6 +1722,8 @@ class ListenersMixin:
                                 result,
                                 entity_id=entity_id,
                                 source_label="AddonFastPath",
+                                transaction_id=transaction_id,
+                                trigger=f"{entity_id}: {old_state} -> {new_state}",
                             )
                         finally:
                             self._batch_trigger_controllable = previous_batch_trigger_controllable
