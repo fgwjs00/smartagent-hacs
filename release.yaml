@@ -1,12 +1,14 @@
 product: SmartAgent
-release_version: 0.0.137
-display_version: Beta 0.0.137
+release_version: 0.0.138
+display_version: Beta 0.0.138
 channel: beta
-release_date: '2026-06-30'
+release_date: '2026-07-01'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.137 小版本发布：应用 SmartAgent 新项目图标，刷新 add-on 商店图标、管理 UI favicon 与正式发布工作区，确保现场客户端能检测到图标资产更新。
-  customer_visible_version: Beta 0.0.137
+  summary: Beta 0.0.138 快路 trace 回放修复：正常 fast-path 200 分支持久化 transaction/decision
+    trace，并通过响应与 HA listener 事件回传 trace 链接；推送 v0.0.138 tag 后由 GitHub Actions 构建并推送
+    ACR 0.0.138 与 beta 镜像。
+  customer_visible_version: Beta 0.0.138
