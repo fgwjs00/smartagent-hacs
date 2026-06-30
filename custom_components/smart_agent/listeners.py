@@ -317,6 +317,7 @@ class ListenersMixin:
         *,
         _policy_synced: bool = False,
         _allow_learning_mode_inference: bool = False,
+        source_trace_context: dict[str, Any] | None = None,
     ) -> None:
 
         # ── 门控检查（所有路径统一入口，包括 Frigate MQTT / 巡检 / HA 状态变化）──────
@@ -356,6 +357,7 @@ class ListenersMixin:
                     new_state,
                     one_off_prompt,
                     _allow_learning_mode_inference=_allow_learning_mode_inference,
+                    source_trace_context=source_trace_context,
                 ),
                 trigger=trigger,
                 entity_id=entity_id,
@@ -404,7 +406,10 @@ class ListenersMixin:
                 _dropped = [t.get("entity_id", "?") for t in self._pending_triggers[:25]]
                 self._sys_log("WARN", f"[事件溢出] 触发队列满，丢弃 25 个事件: {_dropped}")
                 self._pending_triggers = self._pending_triggers[-25:]
-            self._pending_triggers.append({"text": trigger, "entity_id": entity_id, "one_off": one_off_prompt})
+            pending_trigger = {"text": trigger, "entity_id": entity_id, "one_off": one_off_prompt}
+            if isinstance(source_trace_context, dict) and source_trace_context:
+                pending_trigger["source_trace_context"] = dict(source_trace_context)
+            self._pending_triggers.append(pending_trigger)
 
         domain = entity_id.split(".")[0]
         if domain in ("light", "switch", "fan", "cover", "climate", "media_player"):
@@ -432,6 +437,7 @@ class ListenersMixin:
         one_off_prompt: str = "",
         *,
         _allow_learning_mode_inference: bool = False,
+        source_trace_context: dict[str, Any] | None = None,
     ) -> None:
         try:
             await self._async_apply_addon_system_settings()
@@ -444,6 +450,7 @@ class ListenersMixin:
             one_off_prompt,
             _policy_synced=True,
             _allow_learning_mode_inference=_allow_learning_mode_inference,
+            source_trace_context=source_trace_context,
         )
 
     def _emit_slow_inference_task_failure(
@@ -666,6 +673,12 @@ class ListenersMixin:
         # 提取一客制化 Prompt（主要用于展示模式的一次性指令）
         one_off_prompts = [t.get("one_off") for t in triggers if t.get("one_off")]
         final_one_off = one_off_prompts[0] if one_off_prompts else ""
+        source_trace_contexts = [
+            t.get("source_trace_context")
+            for t in triggers
+            if isinstance(t.get("source_trace_context"), dict) and t.get("source_trace_context")
+        ]
+        final_source_trace_context = dict(source_trace_contexts[0]) if source_trace_contexts else None
         
         texts = [t["text"] for t in triggers]
         if len(texts) == 1:
@@ -675,7 +688,11 @@ class ListenersMixin:
         self._sys_log("INFO", f"[合并] 合并 {len(triggers)} 个触发，启动推理: {merged[:80]}")
         try:
             self._spawn_slow_inference_task(
-                self._run_addon_decision(merged, one_off_prompt=final_one_off),
+                self._run_addon_decision(
+                    merged,
+                    one_off_prompt=final_one_off,
+                    source_trace_context=final_source_trace_context,
+                ),
                 trigger=merged,
                 entity_id=str(triggers[0].get("entity_id") or ""),
             )
@@ -1503,7 +1520,15 @@ class ListenersMixin:
                     confidence = details.get("confidence")
                     action_count = 0
                     actions: list[Any] = []
-                    transaction_id = ""
+                    decision_trace = response.get("decision_trace") if isinstance(response.get("decision_trace"), dict) else {}
+                    transaction_id = str(
+                        response.get("transaction_id")
+                        or details.get("transaction_id")
+                        or (decision_trace.get("transaction_id") if isinstance(decision_trace, dict) else "")
+                        or ""
+                    )
+                    correlation_id = str(response.get("correlation_id") or details.get("correlation_id") or "")
+                    world_snapshot_id = str(response.get("world_snapshot_id") or details.get("world_snapshot_id") or "")
                     if isinstance(result, dict):
                         scene = str(result.get("scene") or result.get("source") or "")
                         if confidence is None:
@@ -1514,7 +1539,7 @@ class ListenersMixin:
                             action_count = len(raw_actions)
                         elif result.get("action"):
                             action_count = 1
-                        transaction_id = str(result.get("transaction_id") or result.get("txn_id") or "")
+                        transaction_id = transaction_id or str(result.get("transaction_id") or result.get("txn_id") or "")
                     audit_pending = bool(matched and self._fast_path_result_allows_slow_audit(actions))
                     self._sys_log(
                         "INFO",
@@ -1549,6 +1574,9 @@ class ListenersMixin:
                             "action_count": action_count,
                             "actions": actions,
                             "transaction_id": transaction_id,
+                            "decision_trace": decision_trace,
+                            "correlation_id": correlation_id,
+                            "world_snapshot_id": world_snapshot_id,
                             "executed": matched and not execution_suppressed_reason,
                             "provisional_execution": audit_pending,
                             "audit_pending": audit_pending,
@@ -1699,6 +1727,26 @@ class ListenersMixin:
                             f"[Add-on FastPath] addon_fast_path_input_incomplete fail-closed | "
                             f"status={status} reason={reason or 'input_incomplete'} entity={entity_id}",
                         )
+                        if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                            self._sys_log(
+                                "INFO",
+                                f"[Add-on FastPath] 409 input incomplete; scheduling slow inference | "
+                                f"entity={entity_id} reason={reason or 'input_incomplete'} "
+                                f"active_space={snapshot_diag.get('active_space') or '-'}",
+                            )
+                            self._schedule_inference(
+                                entity_id,
+                                f"{entity_id}: {old_state} -> {new_state}",
+                                new_state,
+                                source_trace_context={
+                                    "source": "addon_fast_path_409",
+                                    "transaction_id": transaction_id,
+                                    "correlation_id": correlation_id,
+                                    "world_snapshot_id": world_snapshot_id,
+                                    "reason": reason or "input_incomplete",
+                                    "decision_trace": dict(decision_trace) if isinstance(decision_trace, dict) else {},
+                                },
+                            )
                         return
                     elif status > 0:
                         self._sys_log(

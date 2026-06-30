@@ -1604,10 +1604,14 @@ class SmartAgentCoordinator(
         *,
         one_off_prompt: str = "",
         source: str = "listener",
+        source_trace_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the rich bundle used by add-on slow decisions."""
         parsed = self._parse_addon_decision_trigger(trigger)
         audit_pending = self._is_fast_path_audit_prompt(one_off_prompt)
+        if not isinstance(source_trace_context, dict):
+            source_trace_context = {}
+        source_trace_context = dict(source_trace_context or {})
         entity_id = parsed.get("trigger_entity_id", "")
         snapshot: dict[str, Any] = {}
         if entity_id:
@@ -1667,6 +1671,14 @@ class SmartAgentCoordinator(
                 f"{fast_path_audit_marker} Fast path already executed a provisional low-risk action. "
                 "Audit the action, do not repeat identical light actions, and return approve/adjust/observe_only."
             )
+        if source_trace_context:
+            context_parts.append(
+                "[fast_path_409_trace] "
+                f"transaction_id={source_trace_context.get('transaction_id') or '-'} "
+                f"correlation_id={source_trace_context.get('correlation_id') or '-'} "
+                f"world_snapshot_id={source_trace_context.get('world_snapshot_id') or '-'} "
+                f"reason={source_trace_context.get('reason') or '-'}"
+            )
         if automation_policy_section:
             context_parts.append(automation_policy_section)
         if entity_id:
@@ -1713,6 +1725,11 @@ class SmartAgentCoordinator(
             "device_table": device_table,
             "occupancy_section": occupancy_section,
             "automation_policy_section": automation_policy_section,
+            "source_trace_context": source_trace_context,
+            "parent_transaction_id": str(source_trace_context.get("transaction_id") or ""),
+            "parent_decision_trace": source_trace_context.get("decision_trace") if isinstance(source_trace_context.get("decision_trace"), dict) else {},
+            "parent_correlation_id": str(source_trace_context.get("correlation_id") or ""),
+            "parent_world_snapshot_id": str(source_trace_context.get("world_snapshot_id") or ""),
         }
         return bundle
 
@@ -1731,6 +1748,8 @@ class SmartAgentCoordinator(
         new_state = str(bundle.get("new_state") or "").strip().lower()
         trigger_type = "departure" if new_state in {"off", "closed", "not_home", "away", "idle", "clear"} else "arrival"
         now = datetime.now()
+        month = now.month
+        season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
         payload = {
             "action": "write_decision",
             "trigger_room": trigger_room,
@@ -1743,6 +1762,7 @@ class SmartAgentCoordinator(
             "scene": scene,
             "intent": str(result.get("intent") or ""),
             "scene_candidate": str(result.get("scene_candidate") or result.get("scene") or ""),
+            "season": season,
         }
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue) or not enqueue("cache_invalidate", payload):
@@ -1875,11 +1895,13 @@ class SmartAgentCoordinator(
         *,
         one_off_prompt: str = "",
         source: str = "listener",
+        source_trace_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         bundle = self._build_addon_slow_decision_bundle(
             trigger,
             one_off_prompt=one_off_prompt,
             source=source,
+            source_trace_context=source_trace_context,
         )
         addon_client = getattr(self, "_addon_client", None)
         self._sys_log(
@@ -1934,6 +1956,11 @@ class SmartAgentCoordinator(
                 "action_count": len(actions_payload),
                 "actions": actions_payload,
                 "transaction_id": transaction_id_value,
+                "parent_transaction_id": str(bundle.get("parent_transaction_id") or ""),
+                "parent_decision_trace": bundle.get("parent_decision_trace") if isinstance(bundle.get("parent_decision_trace"), dict) else {},
+                "source_trace_context": bundle.get("source_trace_context") if isinstance(bundle.get("source_trace_context"), dict) else {},
+                "parent_correlation_id": str(bundle.get("parent_correlation_id") or ""),
+                "parent_world_snapshot_id": str(bundle.get("parent_world_snapshot_id") or ""),
                 "executed": bool(actions_payload and executed_count >= len(actions_payload)),
                 "executed_count": executed_count,
                 "final_outcome": final_outcome_value,
@@ -2144,13 +2171,14 @@ class SmartAgentCoordinator(
                     result.setdefault("reply", nested.get("reply") or "learning_mode_observe_only")
                     result.setdefault("status", "ok")
                     return result
-                executed = await self._execute_actions(
+                execution_result = await self._execute_actions(
                     valid_actions,
                     trigger_summary=str(trigger or ""),
                     scene_desc=scene,
                     confidence=confidence,
                     trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
                 )
+                executed = int(execution_result)
                 result["executed_count"] = executed
                 final_outcome = (
                     "succeeded"
@@ -2159,9 +2187,18 @@ class SmartAgentCoordinator(
                     if executed > 0
                     else "failed"
                 )
-                action_results = []
+                raw_action_results = getattr(execution_result, "action_results", None)
+                action_results = list(raw_action_results) if isinstance(raw_action_results, list) else []
                 for index, action in enumerate(valid_actions):
                     if not isinstance(action, dict):
+                        continue
+                    if index < len(action_results) and isinstance(action_results[index], dict):
+                        action_results[index] = {
+                            **action_results[index],
+                            "domain": str(action_results[index].get("domain") or action.get("domain") or ""),
+                            "service": str(action_results[index].get("service") or action.get("service") or ""),
+                            "entity_id": str(action_results[index].get("entity_id") or action.get("entity_id") or ""),
+                        }
                         continue
                     action_results.append(
                         {
@@ -2169,7 +2206,7 @@ class SmartAgentCoordinator(
                             "service": str(action.get("service") or ""),
                             "entity_id": str(action.get("entity_id") or ""),
                             "status": "executed" if index < executed else "not_executed",
-                            "reason": "ha_execute_actions_returned_count_only",
+                            "reason": "ha_execute_actions_missing_structured_result",
                         }
                     )
                 training_sample_payload = self._build_training_sample_payload(

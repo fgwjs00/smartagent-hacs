@@ -564,6 +564,8 @@ class DatabaseMixin:
         """Forward arrival lighting samples to add-on owned memory."""
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        month = now.month
+        season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
         if light_states is None:
             light_states = {}
             for entity_id, info in getattr(self, "device_info", {}).items():
@@ -592,6 +594,7 @@ class DatabaseMixin:
                 "presence_entity_id": presence_entity_id,
                 "is_on": state == "on",
                 "hour_bucket": now.hour,
+                "season": season,
             }
             enqueue = getattr(self, "_enqueue_internal_event", None)
             if not callable(enqueue) or not enqueue("baseline", payload, ts=timestamp):

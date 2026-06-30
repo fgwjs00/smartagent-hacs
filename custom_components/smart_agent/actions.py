@@ -29,6 +29,25 @@ _LOGGER = logging.getLogger(__name__)
 class ActionsMixin:
     """Mixin: 动作执行 — 路由 / 保护 / 验证 / 重试。"""
 
+    class _ActionExecutionResult(int):
+        """Int-compatible execution summary with per-action trace results."""
+
+        def __new__(
+            cls,
+            executed_count: int = 0,
+            *,
+            action_results: list[dict[str, Any]] | None = None,
+            transaction_id: int = 0,
+            raw_results: list[dict[str, Any]] | None = None,
+        ):
+            value = max(0, int(executed_count or 0))
+            obj = int.__new__(cls, value)
+            obj.executed_count = value
+            obj.action_results = list(action_results or [])
+            obj.transaction_id = int(transaction_id or 0)
+            obj.raw_results = list(raw_results or [])
+            return obj
+
     # 合法的设备管辖域值（DatabaseMixin 也定义了此常量，MRO 取第一个即可）
     _VALID_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
 
@@ -54,6 +73,59 @@ class ActionsMixin:
 
     # 场景/脚本重复执行冷却
     _SCENE_COOLDOWN = 60        # 同一场景/脚本 N 秒内不重复执行
+    _DIM_TO_OFF_BRIGHTNESS_PCT = 5
+
+    @classmethod
+    def _action_execution_result(
+        cls,
+        executed_count: int = 0,
+        *,
+        transaction_id: int = 0,
+        results: list[dict[str, Any]] | None = None,
+    ) -> int:
+        raw_results = [dict(item) for item in results or [] if isinstance(item, dict)]
+        action_results = [
+            cls._decision_action_result_from_ha_result(item)
+            for item in raw_results
+        ]
+        return cls._ActionExecutionResult(
+            executed_count,
+            action_results=action_results,
+            transaction_id=transaction_id,
+            raw_results=raw_results,
+        )
+
+    @staticmethod
+    def _decision_action_result_from_ha_result(item: dict[str, Any]) -> dict[str, Any]:
+        ha_status = str(item.get("status") or "").strip()
+        if ha_status == "ok":
+            status = "executed"
+            reason = "ha_service_call_ok"
+        elif ha_status == "scheduled":
+            status = "scheduled"
+            reason = "delayed_action_scheduled"
+        elif ha_status == "skip":
+            status = "skipped"
+            reason = str(item.get("msg") or "already_in_target_state")
+        elif ha_status == "blocked_or_error":
+            status = "failed"
+            reason = str(item.get("msg") or "ha_service_returned_false")
+        elif ha_status.startswith("blocked"):
+            status = "blocked"
+            reason = str(item.get("msg") or ha_status)
+        else:
+            status = "unknown"
+            reason = str(item.get("msg") or ha_status or "unknown_action_result")
+        entity_id = str(item.get("entity_id") or "")
+        result = {
+            "domain": str(item.get("domain") or (entity_id.split(".", 1)[0] if "." in entity_id else "")),
+            "service": str(item.get("service") or ""),
+            "entity_id": entity_id,
+            "status": status,
+            "reason": reason,
+            "ha_status": ha_status,
+        }
+        return result
 
     @staticmethod
     def _is_night_time() -> bool:
@@ -132,7 +204,15 @@ class ActionsMixin:
                 room = ""
         return room
 
-    def _room_occupancy_entries(self, room: str) -> list[tuple[str, str]]:
+    def _normalize_room_occupancy_entries(self, entries: Any) -> list[tuple[str, str]]:
+        normalized: list[tuple[str, str]] = []
+        for item in entries or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            normalized.append((str(item[0]), str(item[1]).lower()))
+        return normalized
+
+    def _legacy_room_occupancy_entries(self, room: str) -> list[tuple[str, str]]:
         if not room or not hasattr(self, "_get_room_occupancy_map"):
             return []
         try:
@@ -142,12 +222,120 @@ class ActionsMixin:
         if not isinstance(occ_map, dict):
             return []
         entries = occ_map.get(room) or []
-        normalized: list[tuple[str, str]] = []
-        for item in entries:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
-                continue
-            normalized.append((str(item[0]), str(item[1]).lower()))
-        return normalized
+        return self._normalize_room_occupancy_entries(entries)
+
+    def _presence_snapshot_room_payload(self, snapshot: Any, room: str) -> Any:
+        if not isinstance(snapshot, dict) or not room:
+            return None
+        room_key = str(room).strip().casefold()
+        rooms = snapshot.get("rooms")
+        if isinstance(rooms, dict):
+            for raw_room, payload in rooms.items():
+                if str(raw_room or "").strip().casefold() == room_key:
+                    return payload
+        elif isinstance(rooms, list):
+            for payload in rooms:
+                if not isinstance(payload, dict):
+                    continue
+                raw_room = payload.get("room") or payload.get("space") or payload.get("space_id") or ""
+                if str(raw_room or "").strip().casefold() == room_key:
+                    return payload
+        raw_room = snapshot.get("room") or snapshot.get("space") or snapshot.get("space_id") or ""
+        if raw_room and str(raw_room).strip().casefold() == room_key:
+            return snapshot
+        return None
+
+    def _canonical_room_occupancy_entries(self, room: str) -> list[tuple[str, str]]:
+        getter = getattr(self, "get_presence_snapshot", None)
+        if not room or not callable(getter):
+            return []
+        try:
+            snapshot = getter()
+        except Exception:
+            return []
+        payload = self._presence_snapshot_room_payload(snapshot, room)
+        if isinstance(payload, str):
+            payload = {"state": payload}
+        if not isinstance(payload, dict):
+            return []
+        raw_state = payload.get("state") or payload.get("presence") or payload.get("occupancy") or ""
+        state = str(raw_state).strip().lower()
+        if state in {"occupied", "present", "on", "home", "motion", "person"}:
+            mapped_state = "on"
+            evidence_ids = (
+                payload.get("occupied_evidence_ids")
+                or payload.get("evidence_ids")
+                or payload.get("source_evidence_ids")
+                or ()
+            )
+        elif state in {"vacant", "clear", "off", "away", "none", "idle", "empty"}:
+            mapped_state = "off"
+            evidence_ids = (
+                payload.get("vacant_evidence_ids")
+                or payload.get("evidence_ids")
+                or payload.get("source_evidence_ids")
+                or ()
+            )
+        else:
+            mapped_state = "unknown"
+            evidence_ids = (
+                payload.get("evidence_ids")
+                or payload.get("source_evidence_ids")
+                or payload.get("occupied_evidence_ids")
+                or payload.get("vacant_evidence_ids")
+                or ()
+            )
+        if isinstance(evidence_ids, str):
+            evidence = [evidence_ids]
+        else:
+            evidence = [str(eid or "") for eid in evidence_ids or () if str(eid or "").strip()]
+        if not evidence:
+            evidence = [f"presence.{room}"]
+        return [(eid, mapped_state) for eid in evidence]
+
+    def _presence_entries_conflict(
+        self,
+        canonical: list[tuple[str, str]],
+        legacy: list[tuple[str, str]],
+    ) -> bool:
+        if not canonical or not legacy:
+            return False
+        canonical_states = {state for _, state in canonical}
+        legacy_states = {state for _, state in legacy}
+        return canonical_states != legacy_states
+
+    def _record_presence_guard_conflict(
+        self,
+        room: str,
+        canonical: list[tuple[str, str]],
+        legacy: list[tuple[str, str]],
+    ) -> None:
+        conflict = {
+            "reason": "canonical_presence_conflict",
+            "room": room,
+            "canonical": [{"entity_id": eid, "state": state} for eid, state in canonical],
+            "legacy": [{"entity_id": eid, "state": state} for eid, state in legacy],
+        }
+        self._last_presence_guard_conflict = conflict
+        logger = getattr(self, "_sys_log", None)
+        if callable(logger):
+            canonical_str = ", ".join(f"{eid}={state}" for eid, state in canonical[:3])
+            legacy_str = ", ".join(f"{eid}={state}" for eid, state in legacy[:3])
+            logger(
+                "INFO",
+                f"[PresenceGuard] canonical_presence_conflict room={room} canonical=({canonical_str}) legacy=({legacy_str})",
+            )
+
+    def _room_occupancy_entries(self, room: str) -> list[tuple[str, str]]:
+        canonical = self._canonical_room_occupancy_entries(room)
+        legacy = self._legacy_room_occupancy_entries(room)
+        if canonical:
+            if self._presence_entries_conflict(canonical, legacy):
+                self._record_presence_guard_conflict(room, canonical, legacy)
+            else:
+                self._last_presence_guard_conflict = {}
+            return canonical
+        return legacy
 
     def _occupancy_guard_check(self, entity_id: str, service: str) -> tuple[bool, str]:
         if service != "turn_on":
@@ -274,11 +462,22 @@ class ActionsMixin:
                 # 以便 AI 决策页能呈现“为什么没动”，而不是在此静默置空丢弃。
                 self._sys_log("ERROR", f"[动作修正] AI 返回无效 entity_id「{entity_id}」且无法匹配到已知设备，交由执行层硬闸拒绝")
 
-        # brightness_pct=0 的 turn_on 等同于关灯，规范化为 turn_off 以统一走守卫逻辑
-        # AI 有时用此手段绕过 P1 "禁止 turn_off 展厅灯" 的限制，必须在此拦截
-        if service == "turn_on" and domain == "light" and params.get("brightness_pct") == 0:
+        # 极低亮度的 turn_on 等同于关灯，规范化为 turn_off 以统一走守卫逻辑。
+        # AI 有时用此手段绕过 P1 "禁止 turn_off 展厅灯" 的限制，必须在此拦截。
+        brightness_pct = None
+        if service == "turn_on" and domain == "light" and isinstance(params, dict) and "brightness_pct" in params:
+            try:
+                brightness_pct = int(float(params.get("brightness_pct")))
+            except (TypeError, ValueError):
+                brightness_pct = None
+        if (
+            service == "turn_on"
+            and domain == "light"
+            and brightness_pct is not None
+            and 0 <= brightness_pct <= self._DIM_TO_OFF_BRIGHTNESS_PCT
+        ):
             self._sys_log("WARN",
-                f"[动作规范化] {entity_id} turn_on(brightness_pct=0) 等效关灯，转换为 turn_off"
+                f"[动作规范化] {entity_id} turn_on(brightness_pct={brightness_pct}) 等效关灯，转换为 turn_off"
                 "（防止绕过 P1 保护）")
             service = "turn_off"
             params = {}
@@ -421,7 +620,7 @@ class ActionsMixin:
         import json as _json
 
         if not actions:
-            return 0
+            return self._action_execution_result(0)
 
         # ── 区域隔离守卫校验 (AI-03) ──
         # 若有明确触发区域且非全局指令，过滤掉不属于该区域且非全局属性的动作
@@ -480,7 +679,7 @@ class ActionsMixin:
                 actions = filtered_actions
 
         if not actions:
-            return 0
+            return self._action_execution_result(0)
 
         # ── 自触发保护快速预过滤 ────────────────────────────────────────────────
         # 在动作执行前提前过滤掉触发了本次推理的可控设备，避免浪费完整 LLM 推理后才在
@@ -504,7 +703,7 @@ class ActionsMixin:
                 actions = _pre_filtered
             if not actions:
                 self._sys_log("INFO", "[自触发预过滤] 所有动作均为自触发设备，跳过执行")
-                return 0
+                return self._action_execution_result(0)
 
         # ── 1. 执行前：快照目标设备当前状态 ─────────────────────────────────
         pre_states: dict[str, str] = {}
@@ -530,7 +729,7 @@ class ActionsMixin:
         )
         if not txn_id:
             self._sys_log("WARN", "[事务] 事务记录写入失败（DB锁/磁盘等），已中止动作执行以保持审计一致性")
-            return 0
+            return self._action_execution_result(0)
 
         # ── 3. 执行所有动作，收集结果 ────────────────────────────────────────
         executed = 0
@@ -615,12 +814,33 @@ class ActionsMixin:
             except (ValueError, TypeError):
                 delay = 0
             if not all([domain, service, entity_id]):
+                blocked_count += 1
+                results.append({
+                    "entity_id": str(entity_id or raw_entity_id or ""),
+                    "service": str(service or ""),
+                    "status": "blocked_invalid_action",
+                    "msg": "missing_required_action_fields",
+                })
                 self._sys_log("WARN", f"[动作] 字段缺失，跳过: {raw_action} → 标准化后: {action}")
                 continue
             if domain not in self._ALLOWED_DOMAINS:
+                blocked_count += 1
+                results.append({
+                    "entity_id": entity_id,
+                    "service": service,
+                    "status": "blocked_disallowed_domain",
+                    "msg": f"domain_not_allowed:{domain}",
+                })
                 self._sys_log("WARN", f"[安全] 拒绝 AI 操作不在白名单中的域: {domain}.{service}({entity_id})")
                 continue
             if service in self._BLOCKED_SERVICES:
+                blocked_count += 1
+                results.append({
+                    "entity_id": entity_id,
+                    "service": service,
+                    "status": "blocked_service",
+                    "msg": f"service_blocked:{service}",
+                })
                 self._sys_log("WARN", f"[安全] 拒绝 AI 执行危险服务: {domain}.{service}({entity_id})")
                 continue
             if (
@@ -656,6 +876,12 @@ class ActionsMixin:
             if domain not in ("script", "scene"):
                 ctrl_mode = self.device_info.get(entity_id, {}).get("control_mode", "shared")
                 if ctrl_mode == "ha":
+                    results.append({
+                        "entity_id": entity_id,
+                        "service": service,
+                        "status": "skip",
+                        "msg": "ha_control_mode",
+                    })
                     # HA 优先模式：AI 不直接操作，仅记录建议
                     self._sys_log("INFO", f"[管辖域] {entity_id} 为 HA优先模式，AI 跳过直接操作（建议: {service}）")
                     continue
@@ -731,6 +957,13 @@ class ActionsMixin:
                 _eid_local = entity_id.split(".", 1)[-1].lower()
                 _GLOBAL_KW = ("turn_all", "all_on", "all_off", "quan_bu", "suo_you", "全部", "所有")
                 if any(_eid_local == kw or _eid_local.startswith(kw + "_") for kw in _GLOBAL_KW):
+                    blocked_count += 1
+                    results.append({
+                        "entity_id": entity_id,
+                        "service": service,
+                        "status": "blocked_global_scene",
+                        "msg": "global_scene_blocked",
+                    })
                     self._sys_log("WARN", f"[全局场景拦截] 拒绝执行 {entity_id}（以全局关键词开头），请使用区域场景替代")
                     continue
                 # 场景/脚本人员在场守卫（家庭模式）
@@ -742,6 +975,13 @@ class ActionsMixin:
                             occupied = any(s == "on" for _, s in sensors)
                             uncertain = any(s in ("unknown", "unavailable") for _, s in sensors)
                             if not occupied and not uncertain:
+                                blocked_count += 1
+                                results.append({
+                                    "entity_id": entity_id,
+                                    "service": service,
+                                    "status": "blocked_scene_vacant",
+                                    "msg": f"scene_room_vacant:{scene_room}",
+                                })
                                 sensor_str = ", ".join(f"{eid}={s}" for eid, s in sensors[:2])
                                 self._sys_log("WARN", f"[场景守卫] 拒绝 {domain}.turn_on({entity_id})：区域「{scene_room}」无人（{sensor_str}）")
                                 continue
@@ -749,6 +989,12 @@ class ActionsMixin:
                 now_ts = time.time()
                 last_exec = self._scene_last_exec.get(entity_id, 0)
                 if now_ts - last_exec < self._SCENE_COOLDOWN:
+                    results.append({
+                        "entity_id": entity_id,
+                        "service": service,
+                        "status": "skip",
+                        "msg": "scene_cooldown",
+                    })
                     remain = int(self._SCENE_COOLDOWN - (now_ts - last_exec))
                     self._sys_log("INFO", f"[场景冷却] {entity_id} 距上次执行 {int(now_ts - last_exec)}s < {self._SCENE_COOLDOWN}s，跳过（{remain}s 后可再执行）")
                     continue
@@ -960,7 +1206,7 @@ class ActionsMixin:
             self._transactions_cache = await self.hass.async_add_executor_job(
                 self._query_recent_transactions, 30
             )
-        return executed
+        return self._action_execution_result(executed, transaction_id=txn_id, results=results)
 
     # ── 服务调用 + 保护机制 ───────────────────────────────────────────────────
 

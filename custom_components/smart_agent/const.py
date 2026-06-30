@@ -554,13 +554,14 @@ FRIGATE_PERSON_COUNT_KW = (
 )
 FRIGATE_OCCUPANCY_KW    = ("person_occupancy", "object_count")   # Frigate 生成的占用 binary_sensor
 
-# ── Phase 5+ 动作优先级管理 (Action Priority System) ─────────────────────────
-# 优先级数值越小权限越高，高优先级可覆盖低优先级
-PRIORITY_EMERGENCY   = 0   # P0: 紧急安全（烟雾报警、漏水、安防告警）→ 立即强制执行
-PRIORITY_USER_DIRECT = 1   # P1: 用户直接操作（物理开关、面板点击、语音指令）→ AI 无条件让步
-PRIORITY_AUTOMATION  = 2   # P2: HA 自动化/脚本（用户预设的定时和联动规则）→ AI 退让
-PRIORITY_AI_LOCKED   = 3   # P3: AI 锁定规则（用户确认过的习惯规则）→ 正常执行
-PRIORITY_AI_LEARNED  = 4   # P4: AI 学习推理（巡检、传感器推理）→ 最低优先级，随时可被覆盖
+# ── Product Rule P1-P3 / legacy action priority management ──────────────────
+# Product Rule 优先级数值越小权限越高；高优先级可覆盖低优先级。
+# legacy 常量仍保留 0..4 数值，注释必须带 Product Rule 前缀，避免和 Guard P0-P4 混用。
+PRIORITY_EMERGENCY   = 0   # Product Rule P0: 紧急安全（烟雾报警、漏水、安防告警）→ 立即强制执行
+PRIORITY_USER_DIRECT = 1   # Product Rule P1: 用户直接操作（物理开关、面板点击、语音指令）→ AI 无条件让步
+PRIORITY_AUTOMATION  = 2   # Product Rule P2: HA 自动化/脚本（用户预设的定时和联动规则）→ AI 退让
+PRIORITY_AI_LOCKED   = 3   # Product Rule P3: AI 锁定规则（用户确认过的习惯规则）→ 正常执行
+PRIORITY_AI_LEARNED  = 4   # Product Rule P4: AI 学习推理（巡检、传感器推理）→ 最低优先级，随时可被覆盖
 
 # 操作来源类型
 SOURCE_PHYSICAL   = "physical"       # 物理开关 / Zigbee 联动
@@ -705,7 +706,7 @@ RAG_CORRECTIONS_LOOKBACK_DAYS: int = 90         # 修正记录回溯天数
 RAG_MIN_CORRECTION_COUNT: int = 2               # 最小修正次数（过滤噪声）
 RAG_BEHAVIOR_MIN_CONFIDENCE: int = 40           # 行为模式最低置信度
 
-# ── 房间拓扑关系类型（Phase P1-2）────────────────────────────────────────────
+# ── 房间拓扑关系类型（Roadmap Priority Phase P1-2）──────────────────────────
 ROOM_RELATION_ADJACENT: str = "adjacent"        # 相邻（如客厅-走廊）
 ROOM_RELATION_CONNECTED: str = "connected"      # 连通（如开放式客餐厅）
 
@@ -724,7 +725,7 @@ DEVICE_CAP_KEY_CAN_CONFIRM_LEAVE = "can_confirm_leave"
 DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF = "can_block_turn_off"
 DEVICE_CAP_KEY_CAN_LOCALIZE_ZONE = "can_localize_zone"
 
-# ── 中国法定节假日（Phase P0-2 特征工程）─────────────────────────────────────
+# ── 中国法定节假日（Roadmap Priority Phase P0-2 特征工程）───────────────────
 # 每年需更新；节假日期间 AI 行为应参照周末模式
 CHINESE_HOLIDAYS_2026: frozenset[str] = frozenset({
     # 元旦

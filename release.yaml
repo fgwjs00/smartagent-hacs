@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.134
-display_version: Beta 0.0.134
+release_version: 0.0.135
+display_version: Beta 0.0.135
 channel: beta
-release_date: '2026-06-27'
+release_date: '2026-06-30'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.134 测试版发布：移除 HA 侧旧 Lovelace 面板与静态前端入口，管理端统一由 add-on gateway 承载；同时修复
-    Presence 证据类型保存与本地纳管投影回填，避免页面保存时误报 presence_sensor_not_found。
-  customer_visible_version: Beta 0.0.134
+  summary: Beta 0.0.135 测试版发布：纳入主动闭环恢复、快路 409 trace、慢脑执行回流、近期信号后端持久化与快脑离开兜底等修复，并同步新版管理
+    UI。
+  customer_visible_version: Beta 0.0.135
