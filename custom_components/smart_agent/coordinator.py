@@ -2195,23 +2195,33 @@ class SmartAgentCoordinator(
                 for index, action in enumerate(valid_actions):
                     if not isinstance(action, dict):
                         continue
+                    params = action.get("params")
+                    action_reason = str(action.get("reason") or "").strip()
                     if index < len(action_results) and isinstance(action_results[index], dict):
-                        action_results[index] = {
+                        merged = {
                             **action_results[index],
                             "domain": str(action_results[index].get("domain") or action.get("domain") or ""),
                             "service": str(action_results[index].get("service") or action.get("service") or ""),
                             "entity_id": str(action_results[index].get("entity_id") or action.get("entity_id") or ""),
                         }
+                        if isinstance(params, dict) and params and not isinstance(merged.get("params"), dict):
+                            merged["params"] = dict(params)
+                        if action_reason and not str(merged.get("action_reason") or "").strip():
+                            merged["action_reason"] = action_reason
+                        action_results[index] = merged
                         continue
-                    action_results.append(
-                        {
-                            "domain": str(action.get("domain") or ""),
-                            "service": str(action.get("service") or ""),
-                            "entity_id": str(action.get("entity_id") or ""),
-                            "status": "executed" if index < executed else "not_executed",
-                            "reason": "ha_execute_actions_missing_structured_result",
-                        }
-                    )
+                    fallback_result = {
+                        "domain": str(action.get("domain") or ""),
+                        "service": str(action.get("service") or ""),
+                        "entity_id": str(action.get("entity_id") or ""),
+                        "status": "executed" if index < executed else "not_executed",
+                        "reason": "ha_execute_actions_missing_structured_result",
+                    }
+                    if isinstance(params, dict) and params:
+                        fallback_result["params"] = dict(params)
+                    if action_reason:
+                        fallback_result["action_reason"] = action_reason
+                    action_results.append(fallback_result)
                 training_sample_payload = self._build_training_sample_payload(
                     bundle=bundle,
                     actions=valid_actions,

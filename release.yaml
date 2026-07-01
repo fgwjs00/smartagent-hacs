@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.147
-display_version: Beta 0.0.147
+release_version: 0.0.148
+display_version: Beta 0.0.148
 channel: beta
 release_date: '2026-07-02'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.147 发布：补齐执行事务到父 AI 决策 trace 的串联展示，并放行 canonical vacant 的低风险离开关灯，用于
-    HA-L02/HA-L09 现场复测。
-  customer_visible_version: Beta 0.0.147
+  summary: Beta 0.0.148 发布：修正 recent timeline hours 窗口的新鲜度过滤，避免 HA 本地无时区旧事件被误判为现场新证据。
+  customer_visible_version: Beta 0.0.148

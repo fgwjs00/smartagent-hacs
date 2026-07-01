@@ -887,14 +887,14 @@ class ActionsMixin:
                 action_result_context["execution_transaction_id"] = txn_id
                 action_result_context["parent_transaction_id"] = parent_transaction_id
                 action_result_context["decision_trace"] = dict(parent_decision_trace)
+            if isinstance(params, dict) and params:
+                action_result_context["params"] = dict(params)
+            if scene_desc:
+                action_result_context["scene_desc"] = scene_desc
+            if trigger_summary:
+                action_result_context["trigger_summary"] = trigger_summary
             if reason:
                 action_result_context["reason"] = reason
-                if isinstance(params, dict) and params:
-                    action_result_context["params"] = dict(params)
-                if scene_desc:
-                    action_result_context["scene_desc"] = scene_desc
-                if trigger_summary:
-                    action_result_context["trigger_summary"] = trigger_summary
             raw_target = raw_action.get("target") if isinstance(raw_action, dict) else None
             raw_entity_id = (
                 raw_action.get("entity_id")

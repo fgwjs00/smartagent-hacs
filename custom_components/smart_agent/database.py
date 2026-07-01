@@ -440,6 +440,11 @@ class DatabaseMixin:
     ) -> int:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         txn_id = int(time.time() * 1000)
+        try:
+            decoded_actions = json.loads(actions_json or "[]")
+            actions_payload = list(decoded_actions) if isinstance(decoded_actions, list) else []
+        except Exception:
+            actions_payload = []
         payload = {
             "transaction_id": str(txn_id),
             "created_at": now,
@@ -449,7 +454,7 @@ class DatabaseMixin:
             "confidence": int(confidence),
             "action_count": int(action_count),
             "rollback_json": pre_states_json,
-            "envelope_json": {"actions": actions_json},
+            "envelope_json": {"actions": actions_payload},
         }
         if not self._enqueue_bridge_event("transaction_start", payload, ts=now):
             _LOGGER.warning("[Transaction] begin enqueue failed: trigger=%s", trigger_summary[:60])
@@ -467,13 +472,14 @@ class DatabaseMixin:
         if not txn_id:
             return
         has_scheduled = False
+        action_results: list[dict[str, Any]] = []
         try:
             decoded_results = json.loads(results_json or "[]")
             if isinstance(decoded_results, list):
+                action_results = [dict(item) for item in decoded_results if isinstance(item, dict)]
                 has_scheduled = any(
                     str((item or {}).get("status") or "") in {"scheduled", "delayed"}
-                    for item in decoded_results
-                    if isinstance(item, dict)
+                    for item in action_results
                 )
         except Exception:
             has_scheduled = False
@@ -496,10 +502,12 @@ class DatabaseMixin:
             "final_outcome": status,
             "blocked_count": int(blocked),
             "failed_count": int(failed),
+            "action_results": action_results,
             "result": {
                 "dispatched_count": int(dispatched),
                 "blocked_count": int(blocked),
                 "failed_count": int(failed),
+                "action_results": action_results,
                 "results": results_json,
             },
         }
