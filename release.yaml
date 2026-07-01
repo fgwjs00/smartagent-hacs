@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.148
-display_version: Beta 0.0.148
+release_version: 0.0.149
+display_version: Beta 0.0.149
 channel: beta
 release_date: '2026-07-02'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.148 发布：修正 recent timeline hours 窗口的新鲜度过滤，避免 HA 本地无时区旧事件被误判为现场新证据。
-  customer_visible_version: Beta 0.0.148
+  summary: Beta 0.0.149 发布：按 HA 本地时区过滤近期事件，并在 AI 决策页展示动作参数、原因和可展开 trace。
+  customer_visible_version: Beta 0.0.149
