@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.144 - 2026-07-01
+## Beta 0.0.145 - 2026-07-01
 
-Beta 0.0.144 发布：补齐主卧白天到达不开灯、离开低风险关灯和现场证据链诊断，日照守卫优先同房间真实 lux，仍需现场 HA 复测闭环。
+Beta 0.0.145 发布：阻断 HA 重启/恢复后的 unknown/unavailable -> active 状态恢复事件触发 AI 执行，避免现场重启后误开灯。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.144`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.145`，用于 Home Assistant 更新检测。

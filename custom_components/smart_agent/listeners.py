@@ -124,8 +124,8 @@ class ListenersMixin:
         if new in ("unavailable", "unknown"):
             self._sys_log("INFO", f"[过滤] 设备状态变为 {new}，跳过: {entity_id}")
             return False
-        if old in ("unavailable", "unknown") and new not in ("on", "open", "home", "playing"):
-            self._sys_log("INFO", f"[过滤] 设备从 {old} 恢复为 {new}（非激活状态），跳过: {entity_id}")
+        if old in ("unavailable", "unknown"):
+            self._sys_log("INFO", f"[过滤] 设备从 {old} 恢复为 {new}，跳过: {entity_id}")
             return False
         if entity_id not in self.device_info:
             self._sys_log("WARN", f"触发被拒: {entity_id} 不在已配置设备列表中（请在设备页面添加）")
@@ -2148,17 +2148,17 @@ class ListenersMixin:
                 )
                 return
 
-            if old_s in ("unavailable", "unknown") and new_s not in ("on", "open", "home", "playing"):
+            if old_s in ("unavailable", "unknown"):
                 self._sys_log(
                     "INFO",
-                    f"[过滤] 设备从 {old_s} 恢复为非激活状态 {new_s}，跳过 add-on 快路: {entity_id}",
+                    f"[过滤] 设备从 {old_s} 恢复为 {new_s}，跳过 add-on 快路: {entity_id}",
                 )
                 self._emit_listener_event(
                     listener_action="filtered",
                     entity_id=entity_id,
                     old_state=old_s,
                     new_state=new_s,
-                    filter_reason="state_recovery_inactive",
+                    filter_reason="state_recovery_unknown_unavailable",
                     source_type=source_type,
                 )
                 return
