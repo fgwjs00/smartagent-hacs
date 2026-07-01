@@ -1039,6 +1039,27 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
         listener_set = set(listener_entity_ids)
         sync_status_raw = getattr(coord, "_last_addon_device_sync_status", {}) or {}
         sync_status = dict(sync_status_raw) if isinstance(sync_status_raw, dict) else {}
+        runtime_version = str(
+            getattr(coord, "_integration_version", "")
+            or getattr(coord, "integration_version", "")
+            or getattr(coord, "_SA_VERSION", "")
+            or "unknown"
+        )
+        bridge = getattr(coord, "_internal_event_bridge", None)
+        bridge_stats_raw: Any = {}
+        if bridge is not None:
+            try:
+                bridge_stats_raw = getattr(bridge, "stats", {}) or {}
+            except Exception:
+                bridge_stats_raw = {}
+        bridge_stats = dict(bridge_stats_raw) if isinstance(bridge_stats_raw, dict) else {}
+        internal_event_bridge = {
+            "available": bridge is not None,
+            "queued": int(bridge_stats.get("queued") or 0),
+            "posted": int(bridge_stats.get("posted") or 0),
+            "failed": int(bridge_stats.get("failed") or 0),
+            "dropped": int(bridge_stats.get("dropped") or 0),
+        }
 
         is_enabled = getattr(coord, "_is_enabled", None)
         enabled = bool(is_enabled()) if callable(is_enabled) else bool(getattr(coord, "_enabled", False))
@@ -1108,6 +1129,9 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
             {
                 "ok": True,
                 "source": "ha_listener_runtime",
+                "integration_version": runtime_version,
+                "runtime_version": runtime_version,
+                "internal_event_bridge": internal_event_bridge,
                 "enabled": enabled,
                 "sensors_muted": bool(getattr(coord, "_sensors_muted", False)),
                 "mode": str(getattr(coord, "_mode", "") or ""),

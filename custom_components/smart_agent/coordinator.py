@@ -432,6 +432,7 @@ class SmartAgentCoordinator(
         self._skip_next_reload = False
 
         # UI state (entities read these)
+        self._integration_version = _SA_VERSION
         self.status_text = "正在初始化"
         self.last_action_text = ""
         self.last_correction_text = "" # 最新一次修正记录
@@ -474,6 +475,7 @@ class SmartAgentCoordinator(
                 _SA_VERSION = json.load(_mf).get("version", "unknown")
         except Exception:
             pass
+        self._integration_version = _SA_VERSION
         self._init_memory_db()
         self._load_config()
         # Phase 4: 加载 AI 场景缓存
