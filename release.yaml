@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.140
-display_version: Beta 0.0.140
+release_version: 0.0.141
+display_version: Beta 0.0.141
 channel: beta
 release_date: '2026-07-01'
 public_release_ready: true
@@ -8,8 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 'Beta 0.0.140 HACS integration diagnostics: /listener/diagnostics exposes
-    the HA-loaded integration version and internal event bridge queued/posted/failed/dropped
-    counters so live HA-L validation can distinguish stale HA runtime from decision_execution
-    merge failures.'
-  customer_visible_version: Beta 0.0.140
+  summary: Beta 0.0.141 HACS integration-only 热修：修复 HA fast-path 执行任务在 P1 人数规则 helper 缺失时崩溃的问题，使 listener 能继续完成真实动作执行并回写 decision_execution/action_results；add-on 镜像不变。
+  customer_visible_version: Beta 0.0.141

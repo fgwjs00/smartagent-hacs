@@ -127,6 +127,52 @@ class ActionsMixin:
         }
         return result
 
+    def _is_light_blocked_by_people_rule(
+        self,
+        *,
+        entity_id: str,
+        room: str,
+        person_count: int,
+        parsed_rules: list[dict[str, Any]] | None,
+    ) -> tuple[bool, str]:
+        """Check P1 people-count rules for automatic light turn_on."""
+        if not parsed_rules:
+            return False, ""
+        entity_id = str(entity_id or "")
+        room = str(room or "").strip()
+        try:
+            people = int(person_count or 0)
+        except (TypeError, ValueError):
+            people = 0
+        dev_name = str((self.device_info.get(entity_id) or {}).get("name") or "")
+        text = f"{dev_name} {entity_id}".lower()
+
+        for rule in parsed_rules:
+            if not isinstance(rule, dict):
+                continue
+            rule_room = str(rule.get("room") or "").strip()
+            if rule_room and room and rule_room != room:
+                continue
+
+            keywords = [
+                str(item).strip().lower()
+                for item in (rule.get("keywords") or [])
+                if str(item).strip()
+            ]
+            if keywords and not any(keyword in text for keyword in keywords):
+                continue
+
+            try:
+                threshold = int(rule.get("threshold", 0) or 0)
+            except (TypeError, ValueError):
+                threshold = 0
+            op = str(rule.get("operator") or ">=").strip()
+            allowed = people > threshold if op == ">" else people >= threshold
+            if not allowed:
+                return True, f"P1 people rule: need {op}{threshold}, current {people}"
+
+        return False, ""
+
     @staticmethod
     def _is_night_time() -> bool:
         """夜间窗口判定（保守）：22:00-06:00。"""
