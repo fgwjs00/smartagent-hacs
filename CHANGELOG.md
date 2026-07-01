@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.142 - 2026-07-01
+## Beta 0.0.143 - 2026-07-01
 
-Beta 0.0.142 发布：补强 HA-L10 现场状态新鲜度诊断，每个监听实体暴露 available、availability_reason、last_seen，并在管理台诊断面板展示，用于区分 Zigbee 不可用、状态缺失和物理状态复核阻塞。
+Beta 0.0.143 发布：收窄 HA-L10 listener runtime，普通温湿度等环境 sensor 不再作为 fast-path 主动触发源，保留 add-on 设备库和世界模型上下文，用于现场复测 HA-L10。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.142`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.143`，用于 Home Assistant 更新检测。

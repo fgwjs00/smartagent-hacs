@@ -50,6 +50,9 @@ class ListenersMixin:
     _PRESENCE_KW = ("occupancy", "presence", "motion", "人体", "存在", "有人", "移动",
                     "ren_ti", "cun_zai", "radar", "mmwave", "雷达",
                     "person_occupancy", "object_count")  # Frigate 生成的占用实体
+    _ACTIONABLE_SENSOR_TYPES = frozenset(
+        {"pir", "mmwave", "presence", "occupancy", "motion", "frigate", "radar", "person_count", "object_count"}
+    )
     _ACTIONABLE_CONTACT_SENSOR_TYPES = frozenset({"door", "window", "contact", "opening", "garage_door"})
     _ACTIONABLE_CONTACT_KW = ("door", "window", "contact", "opening", "men_chuang", "garage", "门", "窗", "门窗")
     _PRESENCE_OFF_DELAY = PRESENCE_OFF_DELAY
@@ -2294,6 +2297,25 @@ class ListenersMixin:
         self._last_addon_device_sync_status = status
         return changed
 
+    def _is_actionable_sensor_runtime_entity(self, entity_id: str, info: dict[str, Any]) -> bool:
+        sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
+        if sensor_type in self._ACTIONABLE_SENSOR_TYPES:
+            return True
+        text = " ".join(
+            str((info or {}).get(key) or "")
+            for key in ("name", "type", "capability", "device_class")
+        ).lower()
+        text = f"{entity_id.lower()} {text}"
+        return any(str(kw).lower() in text for kw in (*self._PRESENCE_KW, *self._PERSON_COUNT_KW))
+
+    def _is_listener_runtime_entity(self, entity_id: str, info: dict[str, Any]) -> bool:
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        if domain not in self._LISTENER_DOMAINS:
+            return False
+        if domain != "sensor":
+            return True
+        return self._is_actionable_sensor_runtime_entity(entity_id, info)
+
     def _device_info_row_from_addon_device(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
         if row.get("managed") is False or row.get("in_sa") is False:
             return None
@@ -2334,7 +2356,7 @@ class ListenersMixin:
             or row.get("domain")
             or domain
         )
-        return entity_id, {
+        info = {
             "name": str(name or entity_id),
             "room": str(room or ""),
             "type": str(dev_type or domain),
@@ -2344,6 +2366,9 @@ class ListenersMixin:
             "ha_unique_id": str(row.get("ha_unique_id") or row.get("unique_id") or ""),
             "ha_device_id": str(row.get("ha_device_id") or row.get("device_id") or ""),
         }
+        if not self._is_listener_runtime_entity(entity_id, info):
+            return None
+        return entity_id, info
 
     def _managed_listener_entity_ids(self) -> list[str]:
         """Return managed entity ids that should receive HA state listeners."""
@@ -2357,7 +2382,8 @@ class ListenersMixin:
         return [
             eid
             for eid in device_info
-            if isinstance(eid, str) and eid.split(".", 1)[0] in self._LISTENER_DOMAINS
+            if isinstance(eid, str)
+            and self._is_listener_runtime_entity(eid, device_info.get(eid) if isinstance(device_info.get(eid), dict) else {})
         ]
 
     def _reconcile_device_info_entity_ids_from_ha_registry(self) -> bool:

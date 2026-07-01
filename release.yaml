@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.142
-display_version: Beta 0.0.142
+release_version: 0.0.143
+display_version: Beta 0.0.143
 channel: beta
 release_date: '2026-07-01'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.142 发布：补强 HA-L10 现场状态新鲜度诊断，每个监听实体暴露 available、availability_reason、last_seen，并在管理台诊断面板展示，用于区分
-    Zigbee 不可用、状态缺失和物理状态复核阻塞。
-  customer_visible_version: Beta 0.0.142
+  summary: Beta 0.0.143 发布：收窄 HA-L10 listener runtime，普通温湿度等环境 sensor 不再作为 fast-path
+    主动触发源，保留 add-on 设备库和世界模型上下文，用于现场复测 HA-L10。
+  customer_visible_version: Beta 0.0.143
