@@ -77,6 +77,8 @@ class ListenersMixin:
     # 人工交互可作为无硬件房间的 enter-only 在场证据。
     _PRESENCE_INTERACTION_DOMAINS = frozenset({"light", "media_player", "climate"})
     _PRESENCE_INTERACTION_HUMAN_SOURCES = frozenset({SOURCE_PHYSICAL, SOURCE_DASHBOARD, SOURCE_VOICE})
+    _PRESENCE_INTERACTION_AI_SELF_WINDOW = 15 * 60
+    _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
     _LISTENER_DOMAINS = frozenset(
         (
             "binary_sensor",
@@ -861,12 +863,125 @@ class ListenersMixin:
                 lights.append(eid)
         return lights
 
+    def _build_fast_path_environment_context(
+        self,
+        device_info: dict[str, Any],
+        trigger_entity_id: str = "",
+    ) -> dict[str, Any]:
+        states = getattr(getattr(self, "hass", None), "states", None)
+        get_state = getattr(states, "get", None)
+        if not callable(get_state):
+            return {}
+        context: dict[str, Any] = {}
+        try:
+            sun = get_state("sun.sun")
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] sun.sun read failed for fast-path snapshot: %s", exc)
+            sun = None
+        if sun is not None:
+            sun_state = str(getattr(sun, "state", "") or "").strip().lower()
+            if sun_state:
+                context["sun_state"] = sun_state
+                context["is_daylight"] = sun_state == "above_horizon"
+                context["is_dark"] = sun_state == "below_horizon"
+            attrs = getattr(sun, "attributes", None)
+            if isinstance(attrs, dict):
+                for key in ("elevation", "next_rising", "next_setting"):
+                    value = attrs.get(key)
+                    if value not in (None, ""):
+                        context[f"sun_{key}"] = value
+
+        def _entity_room(entity_id: str, info: dict[str, Any]) -> str:
+            for key in ("space_id", "room", "area"):
+                value = str((info or {}).get(key) or "").strip()
+                if value:
+                    return value
+            area_getter = getattr(self, "_get_entity_area", None)
+            if callable(area_getter):
+                try:
+                    return str(area_getter(entity_id) or "").strip()
+                except Exception as exc:
+                    _LOGGER.debug("[Listeners] area lookup failed for daylight context %s: %s", entity_id, exc)
+            return ""
+
+        trigger_info = device_info.get(trigger_entity_id, {}) if trigger_entity_id else {}
+        if not isinstance(trigger_info, dict):
+            trigger_info = {}
+        trigger_room = _entity_room(trigger_entity_id, trigger_info) if trigger_entity_id else ""
+        lux_values: list[float] = []
+        trigger_room_lux_values: list[float] = []
+        for eid, raw_info in device_info.items():
+            entity_id = str(eid or "")
+            if not entity_id.startswith("sensor."):
+                continue
+            info = raw_info if isinstance(raw_info, dict) else {}
+            text = " ".join(
+                str(value or "").lower()
+                for value in (
+                    entity_id,
+                    info.get("name"),
+                    info.get("sensor_type"),
+                    info.get("device_class"),
+                    info.get("unit_of_measurement"),
+                )
+            )
+            if not any(token in text for token in ("illuminance", "lux", "light_level", "照度", "光照")):
+                continue
+            try:
+                state_obj = get_state(entity_id)
+                lux = float(str(getattr(state_obj, "state", "") or "").strip())
+                lux_values.append(lux)
+                if trigger_room and _entity_room(entity_id, info) == trigger_room:
+                    trigger_room_lux_values.append(lux)
+            except (TypeError, ValueError):
+                continue
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] illuminance read failed for %s: %s", entity_id, exc)
+        selected_lux_values = trigger_room_lux_values or lux_values
+        if selected_lux_values:
+            min_lux = min(selected_lux_values)
+            context["illuminance_lux_min"] = min_lux
+            context["illuminance_lux"] = min_lux
+            context["illuminance_scope"] = "trigger_room" if trigger_room_lux_values else "global"
+            if min_lux <= self._DAYLIGHT_GUARD_LUX_THRESHOLD:
+                context["is_dark"] = True
+                context["is_daylight"] = False
+        return context
+
+    def _is_ai_self_presence_interaction_evidence(self, item: dict[str, Any], now_ts: float) -> bool:
+        entity_id = str(item.get("entity_id") or "").strip()
+        if not entity_id:
+            return False
+        last_ai_actions = getattr(self, "_last_ai_actions", {})
+        last_ai = last_ai_actions.get(entity_id) if isinstance(last_ai_actions, dict) else None
+        if not isinstance(last_ai, dict):
+            return False
+        if str(last_ai.get("state") or "").strip().lower() != str(item.get("state") or "").strip().lower():
+            return False
+        try:
+            age = now_ts - float(last_ai.get("time") or 0)
+        except (TypeError, ValueError):
+            return False
+        return 0 <= age <= self._PRESENCE_INTERACTION_AI_SELF_WINDOW
+
+    def _filtered_presence_interaction_evidence(self, evidence: list[Any], now_ts: float) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            if self._is_ai_self_presence_interaction_evidence(row, now_ts):
+                continue
+            rows.append(row)
+        return rows
+
     # ── 状态变化处理器 ────────────────────────────────────────────────────────
 
     def _build_addon_fast_path_snapshot(self, entity_id: str) -> dict[str, Any]:
         """Build the plain snapshot consumed by add-on Core fast-path decisions."""
         raw_device_info = getattr(self, "device_info", {}) or {}
         device_info = dict(raw_device_info) if isinstance(raw_device_info, dict) else {}
+        now_ts = time.time()
         states: dict[str, str] = {}
         for eid in device_info.keys():
             if not eid:
@@ -888,6 +1003,9 @@ class ListenersMixin:
             "mode": str(getattr(self, "_mode", "") or ""),
             "presence_contract_source": "addon_presence_engine",
         }
+        environment_context = self._build_fast_path_environment_context(device_info, entity_id)
+        if environment_context:
+            snapshot["environment_context"] = environment_context
 
         occ_getter = getattr(self, "_get_room_occupancy_map", None)
         if callable(occ_getter):
@@ -938,9 +1056,9 @@ class ListenersMixin:
                 _LOGGER.debug("[Listeners] get_recent_device_trace_evidence failed for add-on snapshot: %s", exc)
                 interaction_evidence = None
             if isinstance(interaction_evidence, list) and interaction_evidence:
-                snapshot["presence_interaction_evidence"] = [
-                    dict(item) for item in interaction_evidence if isinstance(item, dict)
-                ]
+                filtered_evidence = self._filtered_presence_interaction_evidence(interaction_evidence, now_ts)
+                if filtered_evidence:
+                    snapshot["presence_interaction_evidence"] = filtered_evidence
         priority_getter = getattr(self, "_get_priority_summary", None)
         if callable(priority_getter):
             try:
@@ -952,7 +1070,7 @@ class ListenersMixin:
                 snapshot["manual_action_summary"] = {
                     "priority_guards": [dict(item) for item in priority_guards if isinstance(item, dict)]
                 }
-        snapshot["now_ts"] = time.time()
+        snapshot["now_ts"] = now_ts
 
         for key, getter_name in (
             ("space_snapshot", "get_space_runtime_snapshot"),
@@ -1144,6 +1262,21 @@ class ListenersMixin:
         name_lower = str((info or {}).get("name") or "").lower()
         return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
 
+    def _is_presence_departure_for_slow_inference(self, entity_id: str, new_state: str) -> bool:
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        state = str(new_state or "").strip().lower()
+        if state not in {"off", "closed", "not_home", "away", "idle", "clear", "empty", "vacant"}:
+            return False
+        if domain != "binary_sensor":
+            return False
+        info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+        sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
+        if sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}:
+            return True
+        eid_lower = entity_id.lower()
+        name_lower = str((info or {}).get("name") or "").lower()
+        return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
+
     def _is_actionable_contact_arrival_for_slow_inference(self, entity_id: str, new_state: str) -> bool:
         domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
         state = str(new_state or "").strip().lower()
@@ -1163,6 +1296,7 @@ class ListenersMixin:
         """Allow slow inference for presence arrivals and actionable contact openings."""
         return (
             self._is_presence_arrival_for_slow_inference(entity_id, new_state)
+            or self._is_presence_departure_for_slow_inference(entity_id, new_state)
             or self._is_actionable_contact_arrival_for_slow_inference(entity_id, new_state)
         )
 
