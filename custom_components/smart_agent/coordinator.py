@@ -2179,6 +2179,7 @@ class SmartAgentCoordinator(
                     scene_desc=scene,
                     confidence=confidence,
                     trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
+                    parent_transaction_id=transaction_id,
                 )
                 executed = int(execution_result)
                 result["executed_count"] = executed

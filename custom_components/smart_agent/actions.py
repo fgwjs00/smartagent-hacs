@@ -125,6 +125,26 @@ class ActionsMixin:
             "reason": reason,
             "ha_status": ha_status,
         }
+        if isinstance(item.get("params"), dict) and item.get("params"):
+            result["params"] = dict(item.get("params") or {})
+        action_reason = str(item.get("reason") or "").strip()
+        if action_reason:
+            result["action_reason"] = action_reason
+        scene_desc = str(item.get("scene_desc") or "").strip()
+        if scene_desc:
+            result["scene_desc"] = scene_desc
+        trigger_summary = str(item.get("trigger_summary") or "").strip()
+        if trigger_summary:
+            result["trigger_summary"] = trigger_summary
+        execution_transaction_id = item.get("execution_transaction_id")
+        if execution_transaction_id not in (None, ""):
+            result["execution_transaction_id"] = execution_transaction_id
+        parent_transaction_id = str(item.get("parent_transaction_id") or "").strip()
+        if parent_transaction_id:
+            result["parent_transaction_id"] = parent_transaction_id
+        decision_trace = item.get("decision_trace")
+        if isinstance(decision_trace, dict) and decision_trace:
+            result["decision_trace"] = dict(decision_trace)
         return result
 
     def _is_light_blocked_by_people_rule(
@@ -661,6 +681,7 @@ class ActionsMixin:
         trigger_room: str = "",
         is_global_cmd: bool = False,
         cmd_source: str = "",
+        parent_transaction_id: str = "",
     ) -> int:
         """Execute a list of AI actions with transaction tracking."""
         import json as _json
@@ -782,6 +803,14 @@ class ActionsMixin:
         blocked_count = 0
         failed_count = 0
         results: list[dict] = []
+        parent_transaction_id = str(parent_transaction_id or "").strip()
+        parent_decision_trace: dict[str, Any] = {}
+        if parent_transaction_id:
+            parent_decision_trace = {
+                "available": True,
+                "transaction_id": parent_transaction_id,
+                "url": f"/decision-trace/{parent_transaction_id}",
+            }
 
         # P1 优化：提前获取在场状态、展厅灯光层级与人数锁定规则，避免循环内重复调用
         occ_map = self._get_room_occupancy_map()
@@ -849,6 +878,23 @@ class ActionsMixin:
             entity_id = action.get("entity_id")
             params = action.get("params", {})
             reason = action.get("reason", "")
+            action_result_context = {
+                "domain": domain,
+                "service": service,
+                "entity_id": entity_id,
+            }
+            if parent_transaction_id:
+                action_result_context["execution_transaction_id"] = txn_id
+                action_result_context["parent_transaction_id"] = parent_transaction_id
+                action_result_context["decision_trace"] = dict(parent_decision_trace)
+            if reason:
+                action_result_context["reason"] = reason
+                if isinstance(params, dict) and params:
+                    action_result_context["params"] = dict(params)
+                if scene_desc:
+                    action_result_context["scene_desc"] = scene_desc
+                if trigger_summary:
+                    action_result_context["trigger_summary"] = trigger_summary
             raw_target = raw_action.get("target") if isinstance(raw_action, dict) else None
             raw_entity_id = (
                 raw_action.get("entity_id")
@@ -1196,15 +1242,17 @@ class ActionsMixin:
                     "status": "scheduled",
                     "delay": delay,
                 }
+                if reason:
+                    result_entry.update(action_result_context)
                 results.append(result_entry)
 
                 async def _run_delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
-                    sc: str, trig: str, txid: int, aseq: int,
+                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str,
                     result: dict,
                 ) -> None:
                     try:
-                        ok = await self._do_call_service(d, s, eid, p, r, sc, trig, txid, aseq)
+                        ok = await self._do_call_service(d, s, eid, p, r, sc, trig, txid, aseq, parent_txid)
                     except Exception as exc:
                         _LOGGER.debug("[Actions] 延迟动作执行失败 %s.%s(%s): %s", d, s, eid, exc)
                         ok = False
@@ -1213,30 +1261,32 @@ class ActionsMixin:
 
                 def _delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
-                    sc: str, trig: str, txid: int, aseq: int, result: dict, _: datetime,
+                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str, result: dict, _: datetime,
                 ) -> None:
                     self.hass.async_create_task(
-                        _run_delayed(d, s, eid, p, r, sc, trig, txid, aseq, result)
+                        _run_delayed(d, s, eid, p, r, sc, trig, txid, aseq, parent_txid, result)
                     )
 
                 handle = async_call_later(
                     self.hass, delay,
                     lambda dt, d=domain, s=service, e=entity_id, p=params, r=reason,
                            sc=scene_desc, trig=trigger_summary, txid=txn_id, aseq=action_seq,
+                           parent_txid=parent_transaction_id,
                            result=result_entry:
-                        _delayed(d, s, e, p, r, sc, trig, txid, aseq, result, dt),
+                        _delayed(d, s, e, p, r, sc, trig, txid, aseq, parent_txid, result, dt),
                 )
                 self._active_timers[entity_id] = handle
             else:
                 ok = await self._do_call_service(
-                    domain, service, entity_id, params, reason, scene_desc, trigger_summary, txn_id, action_seq
+                    domain, service, entity_id, params, reason, scene_desc, trigger_summary, txn_id, action_seq,
+                    parent_transaction_id,
                 )
                 if ok:
                     executed += 1
-                    results.append({"entity_id": entity_id, "service": service, "status": "ok"})
+                    results.append({**action_result_context, "status": "ok"})
                 else:
                     failed_count += 1
-                    results.append({"entity_id": entity_id, "service": service, "status": "blocked_or_error"})
+                    results.append({**action_result_context, "status": "blocked_or_error"})
 
         # ── 4. 提交事务结果 ────────────────────────────────────────────────────
         if txn_id:
@@ -1267,6 +1317,7 @@ class ActionsMixin:
         trigger_text: str = "",
         transaction_id: int = 0,
         action_seq: int = 0,
+        parent_transaction_id: str = "",
     ) -> bool:
         """Call HA service and record AI action for override detection. Returns True if executed.
 
@@ -1458,10 +1509,35 @@ class ActionsMixin:
             else:
                 self._sys_log("ERROR", f"[动作] {entity_id} 服务调用失败: {call_err}")
                 return False
+        parent_transaction_id = str(parent_transaction_id or "").strip()
+        event_detail = f"{entity_id} -> {service}"
+        event_metadata: dict[str, Any] = {
+            "detail": event_detail,
+            "domain": domain,
+            "service": service,
+            "entity_id": entity_id,
+        }
+        if isinstance(params, dict) and params:
+            event_metadata["params"] = dict(params)
+        if reason:
+            event_metadata["reason"] = reason
+        if scene_desc:
+            event_metadata["scene_desc"] = scene_desc
+        if trigger_text:
+            event_metadata["trigger_summary"] = trigger_text
+        if transaction_id:
+            event_metadata["execution_transaction_id"] = int(transaction_id)
+        if parent_transaction_id:
+            event_metadata["parent_transaction_id"] = parent_transaction_id
+            event_metadata["decision_trace"] = {
+                "available": True,
+                "transaction_id": parent_transaction_id,
+                "url": f"/decision-trace/{parent_transaction_id}",
+            }
         self.hass.async_add_executor_job(
-            self._record_event, "AI_Action", f"{entity_id} -> {service}",
+            self._record_event, "AI_Action", event_detail,
             entity_id, "on" if "turn_on" in service else "off", "ai", None,
-            transaction_id, action_seq,
+            transaction_id, action_seq, event_metadata,
         )
         # Phase 11.3: 若为 turn_off 且触发文本包含离开/departure，记录该房间冷却时间戳
         # 巡检将在冷却期（5分钟）内跳过对该房间的推理，防止巡检覆盖离开决策

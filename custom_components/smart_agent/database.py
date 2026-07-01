@@ -209,16 +209,22 @@ class DatabaseMixin:
         confidence: int | None = None,
         transaction_id: int = 0,
         action_seq: int = 0,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Forward an HA event into add-on owned storage."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         area = ""
         if entity_id and entity_id in getattr(self, "device_info", {}):
             area = self.device_info[entity_id].get("room", "")
+        detail_payload = detail
+        if isinstance(metadata, dict) and metadata:
+            structured = dict(metadata)
+            structured.setdefault("detail", detail)
+            detail_payload = json.dumps(structured, ensure_ascii=False, default=str)
         payload = {
             "time": timestamp,
             "type": event_type,
-            "detail": detail,
+            "detail": detail_payload,
             "entity_id": entity_id,
             "state": new_state,
             "source": source,

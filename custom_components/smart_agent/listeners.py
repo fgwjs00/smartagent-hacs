@@ -1117,6 +1117,7 @@ class ListenersMixin:
             trigger_room=room,
             is_global_cmd=False,
             cmd_source=_CMD_SOURCE_SENSOR,
+            parent_transaction_id=transaction_id,
         )
         self._enqueue_fast_path_execution_audit(
             transaction_id=transaction_id,
@@ -2325,19 +2326,13 @@ class ListenersMixin:
                 continue
 
             self._emit_listener_event(
-                listener_action="state_reconciled",
+                listener_action="filtered",
                 entity_id=entity_id,
                 old_state="unknown",
                 new_state=state,
+                filter_reason="state_recovery_unknown_unavailable",
                 source_type="state_reconcile",
                 reconcile_reason="listener_refresh_active_state",
-            )
-            self.hass.async_create_task(
-                self._run_addon_fast_path_fail_closed(
-                    entity_id,
-                    state,
-                    "unknown",
-                )
             )
 
     async def _async_refresh_device_info_from_addon_devices(self, *, reason: str = "") -> bool:

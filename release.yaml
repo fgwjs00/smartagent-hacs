@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.145
-display_version: Beta 0.0.145
+release_version: 0.0.147
+display_version: Beta 0.0.147
 channel: beta
-release_date: '2026-07-01'
+release_date: '2026-07-02'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.145 发布：阻断 HA 重启/恢复后的 unknown/unavailable -> active 状态恢复事件触发 AI
-    执行，避免现场重启后误开灯。
-  customer_visible_version: Beta 0.0.145
+  summary: Beta 0.0.147 发布：补齐执行事务到父 AI 决策 trace 的串联展示，并放行 canonical vacant 的低风险离开关灯，用于
+    HA-L02/HA-L09 现场复测。
+  customer_visible_version: Beta 0.0.147
