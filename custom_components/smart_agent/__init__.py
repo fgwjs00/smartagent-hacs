@@ -1089,6 +1089,23 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                     return str(value)
             return str(value)
 
+        def _state_availability_reason(state_obj: Any, state_value: str) -> str:
+            if state_obj is None:
+                return "state_missing"
+            normalized = str(state_value or "").strip().lower()
+            if normalized == "unavailable":
+                return "state_unavailable"
+            if normalized == "unknown":
+                return "state_unknown"
+            return ""
+
+        def _state_last_seen(attrs: dict[str, Any], state_obj: Any) -> str:
+            for key in ("last_seen", "last_seen_at", "last_observed_at"):
+                value = attrs.get(key)
+                if value not in (None, ""):
+                    return str(value)
+            return _state_time_value(getattr(state_obj, "last_reported", None))
+
         def _listener_entity_row(entity_id: str) -> dict[str, Any]:
             raw_info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
             info = raw_info if isinstance(raw_info, dict) else {}
@@ -1103,6 +1120,7 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 except Exception:
                     is_presence = False
             state_value = str(getattr(state_obj, "state", "") or "").strip()
+            availability_reason = _state_availability_reason(state_obj, state_value)
             return {
                 "entity_id": entity_id,
                 "domain": entity_id.split(".", 1)[0] if "." in entity_id else "",
@@ -1113,9 +1131,12 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 "subscribed": entity_id in listener_set,
                 "state_exists": state_obj is not None,
                 "current_state": state_value,
+                "available": availability_reason == "",
+                "availability_reason": availability_reason,
                 "is_active_state": state_value.lower() in {"on", "open", "home", "playing"},
                 "is_presence_listener": is_presence,
                 "reconcile_marker": str(reconciled.get(entity_id) or ""),
+                "last_seen": _state_last_seen(attrs, state_obj),
                 "last_changed": _state_time_value(getattr(state_obj, "last_changed", None)),
                 "last_updated": _state_time_value(getattr(state_obj, "last_updated", None)),
             }
