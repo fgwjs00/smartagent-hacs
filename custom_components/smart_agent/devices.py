@@ -44,6 +44,30 @@ DOMAIN_LABELS = {
 _ROLLBACK_OFF_STATES = {"", "off", "unavailable", "unknown", "none"}
 
 
+def _find_ha_area_by_id_or_name(area_reg: Any, target: str) -> Any | None:
+    target_norm = str(target or "").strip()
+    if not target_norm:
+        return None
+    getter = getattr(area_reg, "async_get_area", None)
+    if callable(getter):
+        try:
+            area = getter(target_norm)
+            if area is not None:
+                return area
+        except Exception:
+            pass
+
+    raw_areas = getattr(area_reg, "areas", None)
+    area_items = raw_areas.values() if isinstance(raw_areas, dict) else ()
+    folded = target_norm.casefold()
+    for area in area_items:
+        area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()
+        name = str(getattr(area, "name", "") or "").strip()
+        if target_norm in {area_id, name} or folded in {area_id.casefold(), name.casefold()}:
+            return area
+    return None
+
+
 def _rollback_service_for_snapshot_state(domain: str, state: Any) -> str:
     state_norm = str(state or "").strip().lower()
     if domain == "cover":
@@ -609,14 +633,15 @@ class DevicesMixin:
 
         area_reg = ar.async_get(self.hass)
         entity_reg = er.async_get(self.hass)
-        area_cache = {entry.name: entry.id for entry in area_reg.areas.values()}
-
-        area_id = area_cache.get(target_room)
-        if not area_id:
+        area = _find_ha_area_by_id_or_name(area_reg, target_room)
+        if area is None:
             result.update({"ok": False, "error": "area_not_found", "error_type": "not_found", "errors": 1})
             return result
 
+        area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()
+        area_name = str(getattr(area, "name", "") or target_room).strip()
         result["area_id"] = area_id
+        result["area_name"] = area_name
         try:
             entry = entity_reg.async_get(eid)
             if entry is None:
