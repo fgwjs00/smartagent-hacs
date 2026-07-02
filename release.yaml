@@ -1,12 +1,13 @@
 product: SmartAgent
-release_version: 0.0.157
-display_version: Beta 0.0.157
+release_version: 0.0.158
+display_version: Beta 0.0.158
 channel: beta
-release_date: '2026-07-02'
+release_date: '2026-07-03'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.157 发布：修复 HA Area Registry 非 dict 结构导致设备更新按主卧显示名匹配失败的问题。
-  customer_visible_version: Beta 0.0.157
+  summary: Beta 0.0.158 发布：一次性启用 add-on dev_source_root runner，用于局域网 Samba 源码联调；不声明
+    HA-L 现场验收通过。
+  customer_visible_version: Beta 0.0.158
