@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.149
-display_version: Beta 0.0.149
+release_version: 0.0.152
+display_version: Beta 0.0.152
 channel: beta
 release_date: '2026-07-02'
 public_release_ready: true
@@ -8,5 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.149 发布：按 HA 本地时区过滤近期事件，并在 AI 决策页展示动作参数、原因和可展开 trace。
-  customer_visible_version: Beta 0.0.149
+  summary: Beta 0.0.152 发布：修复空间列表默认丢失 SmartAgent 本地空间模型的问题，避免 core config、拓扑和存在证据仍有空间时空间管理页显示
+    0 个空间。
+  customer_visible_version: Beta 0.0.152
