@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.153
-display_version: Beta 0.0.153
+release_version: 0.0.154
+display_version: Beta 0.0.154
 channel: beta
 release_date: '2026-07-02'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.153 发布：修复设备编辑在 HA 设备桥接 404/405 时直接失败的问题，允许 room/name 变更先保存到 SmartAgent
-    本地设备投影并返回同步警告。
-  customer_visible_version: Beta 0.0.153
+  summary: Beta 0.0.154 发布：修复存在证据类型保存时 HA 区域显示名写入 Core Config 导致 unknown_device_space
+    / unknown_presence_target_space 的问题。
+  customer_visible_version: Beta 0.0.154
