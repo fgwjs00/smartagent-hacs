@@ -58,7 +58,11 @@ def _find_ha_area_by_id_or_name(area_reg: Any, target: str) -> Any | None:
             pass
 
     raw_areas = getattr(area_reg, "areas", None)
-    area_items = raw_areas.values() if isinstance(raw_areas, dict) else ()
+    values = getattr(raw_areas, "values", None)
+    try:
+        area_items = values() if callable(values) else ()
+    except Exception:
+        area_items = ()
     folded = target_norm.casefold()
     for area in area_items:
         area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()

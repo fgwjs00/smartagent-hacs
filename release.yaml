@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.156
-display_version: Beta 0.0.156
+release_version: 0.0.157
+display_version: Beta 0.0.157
 channel: beta
 release_date: '2026-07-02'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.156 发布：修复设备更新时 HA Area 同步只按名称匹配导致主卧设备 PATCH 返回 area_not_found
-    的问题。
-  customer_visible_version: Beta 0.0.156
+  summary: Beta 0.0.157 发布：修复 HA Area Registry 非 dict 结构导致设备更新按主卧显示名匹配失败的问题。
+  customer_visible_version: Beta 0.0.157
