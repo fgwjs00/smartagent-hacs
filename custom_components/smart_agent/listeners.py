@@ -5,10 +5,11 @@ ListenersMixin — 事件监听层。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from homeassistant.core import callback
@@ -1670,6 +1671,42 @@ class ListenersMixin:
             self._last_listener_event = payload
             if filter_reason:
                 self._last_listener_filter_reason = str(filter_reason)
+            enqueue = getattr(self, "_enqueue_internal_event", None)
+            if callable(enqueue):
+                try:
+                    event_time = datetime.now(timezone.utc).isoformat()
+                    info = {}
+                    device_info = getattr(self, "device_info", {})
+                    if isinstance(device_info, dict):
+                        maybe_info = device_info.get(str(entity_id or ""))
+                        if isinstance(maybe_info, dict):
+                            info = maybe_info
+                    area = str(info.get("room") or info.get("area") or "").strip()
+                    if not area:
+                        area_getter = getattr(self, "_get_entity_area", None)
+                        if callable(area_getter):
+                            try:
+                                area = str(area_getter(str(entity_id or "")) or "").strip()
+                            except Exception:
+                                area = ""
+                    enqueue(
+                        "event",
+                        {
+                            "time": event_time,
+                            "type": "smart_agent_listener_event",
+                            "detail": json.dumps(payload, ensure_ascii=False, default=str),
+                            "entity_id": str(entity_id or ""),
+                            "state": str(new_state or old_state or ""),
+                            "source": "ha_listener_runtime",
+                            "area": area,
+                            "confidence": 0,
+                            "transaction_id": 0,
+                            "action_seq": 0,
+                        },
+                        ts=event_time,
+                    )
+                except Exception as exc:
+                    _LOGGER.debug("[Listeners] smart_agent_listener_event persist skipped: %s", exc)
             self.hass.bus.async_fire("smart_agent_listener_event", payload)
         except Exception as exc:
             _LOGGER.debug("[Listeners] smart_agent_listener_event emit failed: %s", exc)
