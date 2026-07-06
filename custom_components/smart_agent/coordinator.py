@@ -22,7 +22,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # HA 2025.x 阻塞检测修复：不在模块级（事件循环内）执行任何 open() 调用。
@@ -30,6 +30,7 @@ from typing import Any
 # 与 manifest.json 的 version 字段保持一致，两者同步更新。
 _SA_VERSION: str = "unknown"
 _ROOM_INFERENCE_LOCKS_HARD_LIMIT = 256
+
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -47,6 +48,7 @@ from .frigate import FrigateMixin
 from .ha_adapter import async_call_service
 from .license import LicenseMixin
 from .listeners import ListenersMixin
+from .season import ha_season_for_datetime as _ha_season_for_datetime
 from .api import SmartAgentPairingView, SmartAgentAuthPageView, SmartAgentPairConfirmView
 
 from .const import (
@@ -1248,6 +1250,9 @@ class SmartAgentCoordinator(
         except Exception as exc:
             _LOGGER.debug("[Listeners] periodic subscription refresh registration failed: %s", exc)
 
+        # Boundary: legacy compatibility only. The HA-side PresenceInference
+        # object is not a canonical decision fact source; canonical presence
+        # decisions are owned by addon_presence_engine.
         try:
             from .presence_inference import PresenceInference
             self._presence_inference = PresenceInference(self.hass, self.device_info)
@@ -1257,6 +1262,9 @@ class SmartAgentCoordinator(
             self._presence_inference = None
 
         # Phase 12.0: 初始化存在传感器融合域注册表
+        # Boundary: legacy compatibility only. The HA-side PresenceFusionRegistry
+        # object is not a canonical decision fact source; canonical presence
+        # decisions are owned by addon_presence_engine.
         try:
             from .presence_fusion import PresenceFusionRegistry
             from .const import CONF_PRESENCE_FUSION, DEFAULT_PRESENCE_FUSION
@@ -1696,7 +1704,7 @@ class SmartAgentCoordinator(
                 "不要生成“有人离开，准备关闭灯光”的场景。"
             )
 
-        _now = datetime.now()
+        _now = self._ha_local_now()
         _weekdays = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
         time_str = _now.strftime("%H:%M")
         day_str = f"{_now.strftime('%Y-%m-%d')} {_weekdays[_now.weekday()]}"
@@ -1735,6 +1743,34 @@ class SmartAgentCoordinator(
         }
         return bundle
 
+    def _ha_local_now(self) -> datetime:
+        configured_timezone = str(
+            getattr(getattr(getattr(self, "hass", None), "config", None), "time_zone", "") or ""
+        ).strip()
+        if configured_timezone:
+            normalized_tz = configured_timezone.lower()
+            fixed_offset_hours = {
+                "asia/shanghai": 8,
+                "asia/chongqing": 8,
+                "asia/harbin": 8,
+                "asia/hong_kong": 8,
+                "hongkong": 8,
+                "prc": 8,
+                "utc": 0,
+            }.get(normalized_tz)
+            try:
+                from zoneinfo import ZoneInfo
+
+                return datetime.now(ZoneInfo(configured_timezone))
+            except Exception:
+                if fixed_offset_hours is not None:
+                    try:
+                        tz = timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
+                        return datetime.now(tz)
+                    except Exception:
+                        pass
+        return datetime.now()
+
     def _enqueue_decision_cache_write(
         self,
         *,
@@ -1749,9 +1785,8 @@ class SmartAgentCoordinator(
             return
         new_state = str(bundle.get("new_state") or "").strip().lower()
         trigger_type = "departure" if new_state in {"off", "closed", "not_home", "away", "idle", "clear"} else "arrival"
-        now = datetime.now()
-        month = now.month
-        season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
+        now = self._ha_local_now()
+        season = _ha_season_for_datetime(now)
         payload = {
             "action": "write_decision",
             "trigger_room": trigger_room,
@@ -1797,7 +1832,7 @@ class SmartAgentCoordinator(
         trigger_room = str(bundle.get("trigger_room") or result.get("trigger_room") or "").strip()
         if not trigger_room or not actions:
             return
-        now = datetime.now()
+        now = self._ha_local_now()
         hour_start = (now.hour - 1) % 24
         hour_end = (now.hour + 1) % 24
         weekday_mask = str(now.strftime("%w"))
@@ -1858,7 +1893,7 @@ class SmartAgentCoordinator(
         if not sample_actions:
             return None
 
-        now = datetime.now()
+        now = self._ha_local_now()
         trigger_entity = str(bundle.get("trigger_entity_id") or "").strip()
         trigger_domain = trigger_entity.split(".", 1)[0] if "." in trigger_entity else ""
         trigger_room = str(bundle.get("trigger_room") or "").strip()
@@ -1869,8 +1904,7 @@ class SmartAgentCoordinator(
             room_presence = rooms.get(trigger_room) if isinstance(rooms.get(trigger_room), dict) else {}
         room_state = str(room_presence.get("state") or room_presence.get("presence") or "").strip().lower()
         room_person_count = 1 if room_state in {"occupied", "present", "on", "home"} else 0
-        month = now.month
-        season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
+        season = _ha_season_for_datetime(now)
         quality_score = max(0.0, min(float(confidence or 0) / 100.0, 1.0))
         return {
             "source": "ha_slow_decision",

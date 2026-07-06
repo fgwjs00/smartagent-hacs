@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .db_service import DatabaseService
+from .scene_attribution import ai_scene_space_attribution
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ _BRIDGE_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], 
     ("CREATE TABLE IF NOT EXISTS habits (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, locked INTEGER DEFAULT 0, created TEXT)", (), (("habits", "locked INTEGER DEFAULT 0"),)),
     ("CREATE TABLE IF NOT EXISTS rules (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, locked INTEGER DEFAULT 0, created TEXT)", (), (("rules", "locked INTEGER DEFAULT 0"),)),
     ("CREATE TABLE IF NOT EXISTS action_results (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, entity_id TEXT NOT NULL, domain TEXT NOT NULL, service TEXT NOT NULL, expected_state TEXT, actual_state TEXT, verified INTEGER DEFAULT 0, success INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, latency_ms INTEGER DEFAULT 0, reason TEXT DEFAULT '', transaction_id INTEGER DEFAULT 0, action_seq INTEGER DEFAULT 0)", ("CREATE INDEX IF NOT EXISTS idx_ar_time ON action_results(time)", "CREATE INDEX IF NOT EXISTS idx_ar_entity ON action_results(entity_id)"), (("action_results", "transaction_id INTEGER DEFAULT 0"), ("action_results", "action_seq INTEGER DEFAULT 0"))),
-    ("CREATE TABLE IF NOT EXISTS ai_scenes (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT DEFAULT '', entities_json TEXT NOT NULL, trigger_context TEXT DEFAULT '', hour_start INTEGER DEFAULT 0, hour_end INTEGER DEFAULT 23, weekday_mask TEXT DEFAULT '0123456', confidence INTEGER DEFAULT 80, hit_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', source TEXT DEFAULT 'auto', created TEXT, updated TEXT, ha_entity_id TEXT DEFAULT '', actions_json TEXT DEFAULT '[]')", ("CREATE INDEX IF NOT EXISTS idx_ai_scenes_status ON ai_scenes(status)",), (("ai_scenes", "ha_entity_id TEXT DEFAULT ''"), ("ai_scenes", "actions_json TEXT DEFAULT '[]'"))),
+    ("CREATE TABLE IF NOT EXISTS ai_scenes (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT DEFAULT '', entities_json TEXT NOT NULL, trigger_context TEXT DEFAULT '', hour_start INTEGER DEFAULT 0, hour_end INTEGER DEFAULT 23, weekday_mask TEXT DEFAULT '0123456', confidence INTEGER DEFAULT 80, hit_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', source TEXT DEFAULT 'auto', created TEXT, updated TEXT, ha_entity_id TEXT DEFAULT '', actions_json TEXT DEFAULT '[]', space_id TEXT DEFAULT '', room TEXT DEFAULT '', explain_bundle_json TEXT DEFAULT '{}')", ("CREATE INDEX IF NOT EXISTS idx_ai_scenes_status ON ai_scenes(status)", "CREATE INDEX IF NOT EXISTS idx_ai_scenes_space ON ai_scenes(space_id)"), (("ai_scenes", "ha_entity_id TEXT DEFAULT ''"), ("ai_scenes", "actions_json TEXT DEFAULT '[]'"), ("ai_scenes", "space_id TEXT DEFAULT ''"), ("ai_scenes", "room TEXT DEFAULT ''"), ("ai_scenes", "explain_bundle_json TEXT DEFAULT '{}'"))),
     ("CREATE TABLE IF NOT EXISTS action_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, trigger_summary TEXT DEFAULT '', scene_desc TEXT DEFAULT '', confidence INTEGER DEFAULT 0, action_count INTEGER DEFAULT 0, dispatched_count INTEGER DEFAULT 0, blocked_count INTEGER DEFAULT 0, failed_count INTEGER DEFAULT 0, status TEXT DEFAULT 'pending', pre_states_json TEXT DEFAULT '{}', actions_json TEXT DEFAULT '[]', results_json TEXT DEFAULT '[]')", ("CREATE INDEX IF NOT EXISTS idx_txn_time ON action_transactions(time)",), ()),
     ("CREATE TABLE IF NOT EXISTS room_topology (id INTEGER PRIMARY KEY AUTOINCREMENT, room_a TEXT NOT NULL, room_b TEXT NOT NULL, relation TEXT DEFAULT 'adjacent', updated_at TEXT DEFAULT '', UNIQUE(room_a, room_b))", (), ()),
 )
@@ -58,10 +59,10 @@ class DatabaseMixin:
             conn = self._db.get_raw_connection()
             for create_sql, indexes, columns in _BRIDGE_SCHEMA:
                 conn.execute(create_sql)
-                for index_sql in indexes:
-                    conn.execute(index_sql)
                 for table, column_def in columns:
                     _safe_add_column(conn, table, column_def)
+                for index_sql in indexes:
+                    conn.execute(index_sql)
         except Exception as exc:
             _LOGGER.error("[DB] initialization failed: %s", exc)
             if hasattr(self, "_sys_log"):
@@ -341,6 +342,12 @@ class DatabaseMixin:
         actions_json: str = "[]",
     ) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        space_id, room, explain_bundle = ai_scene_space_attribution(
+            entities_json,
+            actions_json,
+            getattr(self, "device_info", {}),
+            source="ha_ai_scene_bridge",
+        )
         payload = {
             "action": "upsert",
             "name": name,
@@ -355,6 +362,9 @@ class DatabaseMixin:
             "hit_count": int(hit_count),
             "status": "pending",
             "source": "auto",
+            "space_id": space_id,
+            "room": room,
+            "explain_bundle": explain_bundle,
             "created": now,
             "updated": now,
         }
@@ -374,6 +384,12 @@ class DatabaseMixin:
         actions_json: str = "[]",
     ) -> bool:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        space_id, room, explain_bundle = ai_scene_space_attribution(
+            entities_json,
+            actions_json,
+            getattr(self, "device_info", {}),
+            source="ha_ai_scene_bridge",
+        )
         payload = {
             "action": "upsert",
             "name": name,
@@ -388,6 +404,9 @@ class DatabaseMixin:
             "hit_count": 0,
             "status": "pending",
             "source": "manual",
+            "space_id": space_id,
+            "room": room,
+            "explain_bundle": explain_bundle,
             "created": now,
             "updated": now,
         }

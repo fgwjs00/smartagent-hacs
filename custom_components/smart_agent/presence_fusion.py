@@ -1,6 +1,9 @@
 """
 PresenceFusion — 存在传感器融合域引擎 (Phase 12.0)
 
+Boundary: legacy compatibility only. This module is not a canonical decision fact source.
+Canonical presence decisions are owned by addon_presence_engine.
+
 解决「一镜多区 + 大开间 + 多传感器」场景下的误判问题：
   - Frigate zone 子区无人 ≠ 整个开间无人
   - 存在传感器只覆盖一侧，另一侧 zone 还有人

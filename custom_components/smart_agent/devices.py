@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import json as _json
 from datetime import datetime
 
 from .action_mapping import entities_to_actions, normalize_raw_actions
 from .entity_naming import name_to_entity_id
+from .scene_attribution import ai_scene_space_attribution
 from typing import Any
 from .const import (
     DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF,
@@ -152,6 +154,7 @@ class DevicesMixin:
         """返回单设备能力快照（Wave 6 只读语义，默认值保持保守）。"""
         info = dict(self.device_info.get(entity_id, {}) or {})
         room = (info.get("room") or "").strip()
+        space_id = (info.get("space_id") or room).strip()
 
         raw_spaces = info.get(DEVICE_CAP_KEY_COVERAGE_SPACES)
         coverage_spaces: list[str] = []
@@ -160,8 +163,8 @@ class DevicesMixin:
                 s = str(item).strip()
                 if s and s not in coverage_spaces:
                     coverage_spaces.append(s)
-        elif room:
-            coverage_spaces = [room]
+        elif space_id:
+            coverage_spaces = [space_id]
 
         explicit_truthy = {True, 1, "1", "true", "yes", "on", "explicit"}
         explicit_falsey = {False, 0, "0", "false", "no", "off"}
@@ -274,13 +277,13 @@ class DevicesMixin:
             "domain": domain,
             "capability": capability_name,
             "room": room,
-            "space_id": room,
+            "space_id": space_id,
             "control_mode": info.get("control_mode", "shared"),
             "sensor_type": info.get("sensor_type", ""),
             "role": info.get("role", ""),
             "roles": roles,
             "supported_services": supported_services,
-            "control_zone": info.get("control_zone", room),
+            "control_zone": info.get("control_zone", space_id),
             "disturbance_level": info.get("disturbance_level", ""),
             DEVICE_CAP_KEY_COVERAGE_SPACES: coverage_spaces,
             "coverage_space_ids": list(coverage_spaces),
@@ -1247,21 +1250,30 @@ class DevicesMixin:
         from datetime import datetime as _dt
         from .const import AI_SCENE_STATUS_PENDING
         ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        space_id, room, explain_bundle = ai_scene_space_attribution(
+            entities_json,
+            actions_json,
+            getattr(self, "device_info", {}),
+            source="ha_manual_ai_scene",
+        )
+        explain_bundle_json = _json.dumps(explain_bundle, ensure_ascii=False)
         _ok = self._db_exec(
             "INSERT INTO ai_scenes "
             "(name, description, entities_json, actions_json, trigger_context, "
             "hour_start, hour_end, weekday_mask, confidence, hit_count, "
-            "status, source, created, updated) "
-            "VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?) "
+            "status, source, space_id, room, explain_bundle_json, created, updated) "
+            "VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?) "
             "ON CONFLICT(name) DO UPDATE SET "
             "description=excluded.description, entities_json=excluded.entities_json, "
             "actions_json=excluded.actions_json, trigger_context=excluded.trigger_context, "
             "hour_start=excluded.hour_start, hour_end=excluded.hour_end, "
-            "weekday_mask=excluded.weekday_mask, confidence=excluded.confidence, updated=excluded.updated",
+            "weekday_mask=excluded.weekday_mask, confidence=excluded.confidence, "
+            "space_id=excluded.space_id, room=excluded.room, "
+            "explain_bundle_json=excluded.explain_bundle_json, updated=excluded.updated",
             (
                 name, description, entities_json, actions_json, trigger_context,
                 hour_start, hour_end, weekday_mask, confidence,
-                AI_SCENE_STATUS_PENDING, "manual", ts, ts,
+                AI_SCENE_STATUS_PENDING, "manual", space_id, room, explain_bundle_json, ts, ts,
             ),
         )
         if not _ok:

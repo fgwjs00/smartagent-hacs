@@ -1,6 +1,9 @@
 """
 PresenceInference — 虚拟在场推断引擎 (Phase 10.0)。
 
+Boundary: legacy compatibility only. This module is not a canonical decision fact source.
+Canonical presence decisions are owned by addon_presence_engine.
+
 解决无传感器家庭的"占用状态"判断问题。
 
 设计目标：

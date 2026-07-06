@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.159
-display_version: Beta 0.0.159
+release_version: 0.0.160
+display_version: Beta 0.0.160
 channel: beta
-release_date: '2026-07-03'
+release_date: '2026-07-04'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.159 发布：HA listener 事件直接写入 add-on recent timeline，避免近期信号依赖前端 WebSocket
-    打开；不声明 HA-L 现场验收通过。
-  customer_visible_version: Beta 0.0.159
+  summary: Beta 0.0.160 发布：同步最新 V3 管理控制台资源到正式 add-on 发布仓库，确保公开仓库与现场 dev-source 入口一致；不声明
+    HA-L 现场验收通过。
+  customer_visible_version: Beta 0.0.160

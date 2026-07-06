@@ -9,13 +9,15 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
 from .ha_adapter import async_call_service
+from .season import ha_season_for_datetime
 from .const import (
     FRIGATE_PERSON_COUNT_KW as _FRIGATE_PERSON_COUNT_KW,
     AI_ACTION_SKIP_WINDOW, URGENT_MERGE_WINDOW, NORMAL_MERGE_WINDOW,
@@ -30,6 +32,21 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 _CMD_SOURCE_SENSOR = "SENSOR"
+_FAST_PATH_FIXED_TIMEZONE_OFFSETS = {
+    "Asia/Shanghai": 8,
+    "Asia/Chongqing": 8,
+    "Asia/Harbin": 8,
+}
+
+
+def _fast_path_timezone(configured_timezone: str) -> Any | None:
+    try:
+        return ZoneInfo(configured_timezone)
+    except ZoneInfoNotFoundError:
+        offset = _FAST_PATH_FIXED_TIMEZONE_OFFSETS.get(configured_timezone)
+        if offset is None:
+            raise
+        return timezone(timedelta(hours=offset))
 
 
 class ListenersMixin:
@@ -79,7 +96,13 @@ class ListenersMixin:
     _PRESENCE_INTERACTION_DOMAINS = frozenset({"light", "media_player", "climate"})
     _PRESENCE_INTERACTION_HUMAN_SOURCES = frozenset({SOURCE_PHYSICAL, SOURCE_DASHBOARD, SOURCE_VOICE})
     _PRESENCE_INTERACTION_AI_SELF_WINDOW = 15 * 60
+    _DAYLIGHT_AUTO_LIGHTING_SUPPRESSED = "daylight_auto_lighting_suppressed"
+    _DAYLIGHT_SUN_STATES = frozenset({"above_horizon", "day", "daylight"})
+    _DARK_SUN_STATES = frozenset({"below_horizon", "night", "dark"})
     _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
+    _DAYLIGHT_FALLBACK_START_HOUR = 8
+    _DAYLIGHT_FALLBACK_END_HOUR = 20
+    _CORRECTION_SUPPRESSIONS_CACHE_TTL = 60.0
     _LISTENER_DOMAINS = frozenset(
         (
             "binary_sensor",
@@ -94,6 +117,7 @@ class ListenersMixin:
             "media_player",
         )
     )
+    _CONTROL_EVENT_DOMAINS = frozenset({"light", "switch", "climate", "cover", "fan", "media_player"})
 
     # 按时段调整开灯亮度的参考表
     _BRIGHTNESS_TABLE = (
@@ -162,6 +186,14 @@ class ListenersMixin:
     def _effective_cooldown(self) -> int:
         """展厅模式使用更短冷却以便快速响应演示。"""
         return self._SHOWROOM_COOLDOWN if self._mode == "showroom" else self.cooldown
+
+    def _slow_inference_cooldown_key(self, entity_id: str, new_state: str) -> str:
+        """避免同一存在传感器的到达和离开互相吞掉慢脑调度。"""
+        if self._is_presence_arrival_for_slow_inference(entity_id, new_state):
+            return f"{entity_id}:presence_arrival"
+        if self._is_presence_departure_for_slow_inference(entity_id, new_state):
+            return f"{entity_id}:presence_departure"
+        return entity_id
 
     def _is_presence_flap_suppressed(self, entity_id: str) -> tuple[bool, int]:
         """检查存在传感器是否处于抖动风暴抑制期。"""
@@ -392,7 +424,8 @@ class ListenersMixin:
 
         now = time.time()
         cooldown = self._effective_cooldown()
-        elapsed = now - self._last_inference.get(entity_id, 0)
+        cooldown_key = self._slow_inference_cooldown_key(entity_id, new_state)
+        elapsed = now - self._last_inference.get(cooldown_key, 0)
         if elapsed < cooldown:
             _remaining = int(cooldown - elapsed)
             self._sys_log("INFO", f"[冷却] {entity_id} 冷却中({_remaining}s 后可再触发)")
@@ -404,9 +437,10 @@ class ListenersMixin:
                 source_type="schedule_gate",
                 trigger=trigger,
                 cooldown_remaining=_remaining,
+                cooldown_key=cooldown_key,
             )
             return
-        self._last_inference[entity_id] = now
+        self._last_inference[cooldown_key] = now
         with self._pending_triggers_lock:
             if len(self._pending_triggers) >= 50:
                 _dropped = [t.get("entity_id", "?") for t in self._pending_triggers[:25]]
@@ -864,6 +898,18 @@ class ListenersMixin:
                 lights.append(eid)
         return lights
 
+    def _ha_local_now(self) -> datetime:
+        config = getattr(getattr(self, "hass", None), "config", None)
+        configured_timezone = str(getattr(config, "time_zone", "") or "").strip()
+        if configured_timezone:
+            try:
+                return datetime.now(_fast_path_timezone(configured_timezone))
+            except ZoneInfoNotFoundError:
+                _LOGGER.debug("[Listeners] invalid HA timezone for local clock: %s", configured_timezone)
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] HA timezone read failed for local clock: %s", exc)
+        return datetime.now()
+
     def _build_fast_path_environment_context(
         self,
         device_info: dict[str, Any],
@@ -874,6 +920,28 @@ class ListenersMixin:
         if not callable(get_state):
             return {}
         context: dict[str, Any] = {}
+        local_hour_source = "ha_local_clock"
+        local_timezone = ""
+        config = getattr(getattr(self, "hass", None), "config", None)
+        configured_timezone = str(getattr(config, "time_zone", "") or "").strip()
+        if configured_timezone:
+            try:
+                local_now = datetime.now(_fast_path_timezone(configured_timezone))
+                local_hour_source = "ha_config_timezone"
+                local_timezone = configured_timezone
+            except ZoneInfoNotFoundError:
+                _LOGGER.debug("[Listeners] invalid HA timezone for fast-path snapshot: %s", configured_timezone)
+                local_now = datetime.now()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] HA timezone read failed for fast-path snapshot: %s", exc)
+                local_now = datetime.now()
+        else:
+            local_now = datetime.now()
+        context["local_hour"] = local_now.hour
+        context["local_weekday"] = (local_now.weekday() + 1) % 7
+        context["local_hour_source"] = local_hour_source
+        if local_timezone:
+            context["local_timezone"] = local_timezone
         try:
             sun = get_state("sun.sun")
         except Exception as exc:
@@ -978,11 +1046,83 @@ class ListenersMixin:
 
     # ── 状态变化处理器 ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_correction_suppressions(rows: Any) -> list[dict[str, Any]]:
+        if not isinstance(rows, list):
+            return []
+        suppressions: list[dict[str, Any]] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            entity_id = str(raw.get("entity_id") or raw.get("target") or "").strip()
+            service = str(raw.get("service") or raw.get("ai_service") or "").strip().lower()
+            if "." in service:
+                service = service.rsplit(".", 1)[-1]
+            room = str(raw.get("room") or raw.get("space") or "").strip()
+            presence = str(raw.get("presence") or raw.get("presence_context") or "any").strip().lower() or "any"
+            if not entity_id or not service:
+                continue
+            try:
+                count = int(raw.get("count") or raw.get("correction_count") or 1)
+            except (TypeError, ValueError):
+                count = 1
+            try:
+                score = float(raw.get("score") or raw.get("decay_score") or raw.get("confidence") or 1.0)
+            except (TypeError, ValueError):
+                score = 1.0
+            suppressions.append(
+                {
+                    "entity_id": entity_id,
+                    "service": service,
+                    "room": room,
+                    "presence": presence,
+                    "suppress": bool(raw.get("suppress", True)),
+                    "count": max(1, count),
+                    "score": max(0.0, min(1.0, score)),
+                }
+            )
+            if len(suppressions) >= 50:
+                break
+        return suppressions
+
+    def _snapshot_correction_suppressions(self) -> list[dict[str, Any]]:
+        for attr in ("_correction_suppressions_cache", "_corrections_cache"):
+            cached = getattr(self, attr, None)
+            suppressions = self._normalize_correction_suppressions(cached)
+            if suppressions:
+                return suppressions
+        return []
+
+    async def _refresh_correction_suppressions_cache(self, addon_client: Any) -> None:
+        now_ts = time.time()
+        next_refresh = getattr(self, "_correction_suppressions_cache_refresh_at", 0.0)
+        try:
+            if now_ts < float(next_refresh or 0.0) and isinstance(
+                getattr(self, "_correction_suppressions_cache", None),
+                list,
+            ):
+                return
+        except (TypeError, ValueError):
+            pass
+        self._correction_suppressions_cache_refresh_at = now_ts + self._CORRECTION_SUPPRESSIONS_CACHE_TTL
+        getter = getattr(addon_client, "get_corrections", None)
+        if not callable(getter):
+            return
+        try:
+            rows = await getter()
+        except Exception as exc:
+            _LOGGER.debug("[Listeners] refresh correction suppressions failed: %s", exc)
+            return
+        if not isinstance(rows, list):
+            return
+        self._correction_suppressions_cache = self._normalize_correction_suppressions(rows)
+
     def _build_addon_fast_path_snapshot(self, entity_id: str) -> dict[str, Any]:
         """Build the plain snapshot consumed by add-on Core fast-path decisions."""
         raw_device_info = getattr(self, "device_info", {}) or {}
         device_info = dict(raw_device_info) if isinstance(raw_device_info, dict) else {}
         now_ts = time.time()
+        observed_at = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
         states: dict[str, str] = {}
         for eid in device_info.keys():
             if not eid:
@@ -1003,10 +1143,15 @@ class ListenersMixin:
             "room_topology": topology,
             "mode": str(getattr(self, "_mode", "") or ""),
             "presence_contract_source": "addon_presence_engine",
+            "observed_at": observed_at,
+            "created_at": observed_at,
         }
         environment_context = self._build_fast_path_environment_context(device_info, entity_id)
         if environment_context:
             snapshot["environment_context"] = environment_context
+        correction_suppressions = self._snapshot_correction_suppressions()
+        if correction_suppressions:
+            snapshot["correction_suppressions"] = correction_suppressions
 
         occ_getter = getattr(self, "_get_room_occupancy_map", None)
         if callable(occ_getter):
@@ -1017,6 +1162,12 @@ class ListenersMixin:
                 occ_map = None
             if isinstance(occ_map, dict):
                 snapshot["occ_map"] = occ_map
+                snapshot["occ_map_contract"] = {
+                    "compatibility_field": "occ_map",
+                    "semantic_role": "legacy_evidence_only",
+                    "canonical_source": "addon_presence_engine",
+                    "fallback_consumer": "none",
+                }
 
         rules_getter = getattr(self, "_build_locked_people_rules", None)
         if callable(rules_getter):
@@ -1110,9 +1261,12 @@ class ListenersMixin:
             await asyncio.sleep(defer_seconds)
 
         valid_actions = actions if isinstance(actions, list) else []
+        trigger_summary = f"{source_label}[{scene}]"
+        if trigger:
+            trigger_summary = f"{trigger_summary} {trigger}"
         execution_result = await self._execute_actions(
             valid_actions,
-            trigger_summary=f"{source_label}[{scene}]",
+            trigger_summary=trigger_summary,
             scene_desc=str(scene),
             confidence=confidence,
             trigger_room=room,
@@ -1304,12 +1458,113 @@ class ListenersMixin:
         name_lower = str((info or {}).get("name") or "").lower()
         return any(kw in eid_lower or kw in name_lower for kw in self._ACTIONABLE_CONTACT_KW)
 
-    def _should_slow_infer_after_fast_path_no_match(self, entity_id: str, new_state: str) -> bool:
-        """Allow slow inference for presence arrivals and actionable contact openings."""
+    def _is_managed_control_event_for_slow_inference(self, entity_id: str, new_state: str) -> bool:
+        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        if domain not in self._CONTROL_EVENT_DOMAINS:
+            return False
+        state = str(new_state or "").strip().lower()
+        if not state or state in {"unknown", "unavailable"}:
+            return False
+        device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+        info = device_info.get(entity_id) if isinstance(device_info, dict) else None
+        if not isinstance(info, dict):
+            return False
+        mode = str(info.get("control_mode") or info.get("policy") or "shared").strip().lower() or "shared"
+        return mode in {"ai", "shared"}
+
+    @staticmethod
+    def _fast_path_context_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if value in (None, ""):
+            return None
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on", "daylight"}:
+            return True
+        if text in {"0", "false", "no", "off", "dark"}:
+            return False
+        return None
+
+    @staticmethod
+    def _fast_path_context_float(*values: Any) -> float | None:
+        for value in values:
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _fast_path_context_hour(*values: Any) -> int | None:
+        for value in values:
+            if value in (None, ""):
+                continue
+            try:
+                hour = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= hour <= 23:
+                return hour
+        return None
+
+    def _fast_path_no_match_slow_inference_skip_reason(
+        self,
+        entity_id: str,
+        new_state: str,
+        snapshot: dict[str, Any] | None = None,
+    ) -> str:
+        if not self._is_presence_arrival_for_slow_inference(entity_id, new_state):
+            return ""
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        context = snapshot.get("environment_context") if isinstance(snapshot.get("environment_context"), dict) else {}
+        if not context:
+            return ""
+        is_dark = self._fast_path_context_bool(context.get("is_dark"))
+        if is_dark is True:
+            return ""
+        lux = self._fast_path_context_float(
+            context.get("illuminance_lux_min"),
+            context.get("illuminance_lux"),
+            context.get("lux"),
+            context.get("ambient_lux"),
+        )
+        if lux is not None and lux <= self._DAYLIGHT_GUARD_LUX_THRESHOLD:
+            return ""
+        sun_state = str(context.get("sun_state") or "").strip().lower()
+        if sun_state in self._DARK_SUN_STATES:
+            return ""
+        is_daylight = self._fast_path_context_bool(context.get("is_daylight"))
+        if sun_state in self._DAYLIGHT_SUN_STATES or is_daylight is True:
+            return self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED
+        if is_daylight is False:
+            return ""
+        if lux is not None and lux > self._DAYLIGHT_GUARD_LUX_THRESHOLD:
+            return self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED
+        local_hour = self._fast_path_context_hour(
+            context.get("local_hour"),
+            context.get("now_hour"),
+            context.get("hour"),
+        )
+        if local_hour is not None and self._DAYLIGHT_FALLBACK_START_HOUR <= local_hour <= self._DAYLIGHT_FALLBACK_END_HOUR:
+            return self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED
+        return ""
+
+    def _should_slow_infer_after_fast_path_no_match(
+        self,
+        entity_id: str,
+        new_state: str,
+        snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        """Allow slow inference for user-meaningful managed events after fast-path misses."""
+        if self._fast_path_no_match_slow_inference_skip_reason(entity_id, new_state, snapshot):
+            return False
         return (
             self._is_presence_arrival_for_slow_inference(entity_id, new_state)
             or self._is_presence_departure_for_slow_inference(entity_id, new_state)
             or self._is_actionable_contact_arrival_for_slow_inference(entity_id, new_state)
+            or self._is_managed_control_event_for_slow_inference(entity_id, new_state)
         )
 
     def _schedule_arrival_baseline_sample(self, entity_id: str, old_state: str, new_state: str) -> None:
@@ -1543,14 +1798,7 @@ class ListenersMixin:
 
     @staticmethod
     def _silent_learning_season(now: datetime) -> str:
-        month = int(now.month)
-        if month in {12, 1, 2}:
-            return "winter"
-        if month in {3, 4, 5}:
-            return "spring"
-        if month in {6, 7, 8}:
-            return "summer"
-        return "autumn"
+        return ha_season_for_datetime(now)
 
     def _silent_learning_source_allowed(self, source_type: str) -> bool:
         normalized = str(source_type or "").strip().lower()
@@ -1592,7 +1840,7 @@ class ListenersMixin:
                     room = str(area_getter(entity_id) or "").strip()
                 except Exception:
                     room = ""
-        now = datetime.now()
+        now = self._ha_local_now()
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue):
             return
@@ -1615,6 +1863,7 @@ class ListenersMixin:
                 "entity_id": entity_id,
                 "expected_state": expected_value,
                 "dim_key": dim_key,
+                "dim_kind": str(dim.get("kind") or "").strip().lower(),
                 "expected_value": expected_value,
                 "season": season,
                 "room": room,
@@ -1719,6 +1968,8 @@ class ListenersMixin:
     ) -> None:
         should_fail_closed = True
         addon_client = getattr(self, "_addon_client", None)
+        if addon_client is not None:
+            await self._refresh_correction_suppressions_cache(addon_client)
         snapshot = self._build_addon_fast_path_snapshot(entity_id)
         snapshot_diag = self._addon_fast_path_snapshot_diagnostics(snapshot, entity_id)
         self._sys_log(
@@ -1935,7 +2186,7 @@ class ListenersMixin:
                             )
                             return
                         if reason == "no_match":
-                            if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                            if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot):
                                 self._sys_log(
                                     "INFO",
                                     f"[Add-on FastPath] no_match; scheduling slow inference | entity={entity_id} "
@@ -1950,14 +2201,19 @@ class ListenersMixin:
                             info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
                             if not isinstance(info, dict):
                                 info = {}
+                            skip_reason = self._fast_path_no_match_slow_inference_skip_reason(
+                                entity_id,
+                                new_state,
+                                snapshot,
+                            )
                             self._sys_log(
                                 "INFO",
                                 f"[Add-on FastPath] no_match; slow inference not scheduled | "
-                                f"reason=not_presence_arrival entity={entity_id} state={new_state} "
+                                f"reason={skip_reason or 'not_presence_arrival'} entity={entity_id} state={new_state} "
                                 f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
                             )
                         if reason == "confidence_below_auto_threshold" and not confirm_required:
-                            if action_count > 0 or self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                            if action_count > 0 or self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot):
                                 self._sys_log(
                                     "INFO",
                                     f"[Add-on FastPath] confidence_below_auto_threshold; scheduling slow inference | "
@@ -1994,7 +2250,7 @@ class ListenersMixin:
                             f"[Add-on FastPath] addon_fast_path_input_incomplete fail-closed | "
                             f"status={status} reason={reason or 'input_incomplete'} entity={entity_id}",
                         )
-                        if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state):
+                        if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot):
                             self._sys_log(
                                 "INFO",
                                 f"[Add-on FastPath] 409 input incomplete; scheduling slow inference | "
@@ -2243,6 +2499,18 @@ class ListenersMixin:
 
             self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type, old, new)
             self._record_presence_interaction_trace(entity_id, domain, new_s, source_type)
+
+            if domain in self._CONTROL_EVENT_DOMAINS:
+                self._last_listener_filter_reason = "controllable_state_feedback"
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="controllable_state_feedback",
+                    source_type=source_type,
+                )
+                return
 
             info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}
             sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
@@ -2519,6 +2787,9 @@ class ListenersMixin:
         )
         if isinstance(room, (list, tuple)):
             room = next((str(item).strip() for item in room if str(item).strip()), "")
+        space_id = row.get("space_id") or row.get("space") or ""
+        if isinstance(space_id, (list, tuple)):
+            space_id = next((str(item).strip() for item in space_id if str(item).strip()), "")
         name = (
             row.get("name")
             or row.get("friendly_name")
@@ -2535,6 +2806,7 @@ class ListenersMixin:
         info = {
             "name": str(name or entity_id),
             "room": str(room or ""),
+            "space_id": str(space_id or ""),
             "type": str(dev_type or domain),
             "ops": ops,
             "control_mode": mode,

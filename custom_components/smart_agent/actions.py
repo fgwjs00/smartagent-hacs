@@ -74,6 +74,12 @@ class ActionsMixin:
     # 场景/脚本重复执行冷却
     _SCENE_COOLDOWN = 60        # 同一场景/脚本 N 秒内不重复执行
     _DIM_TO_OFF_BRIGHTNESS_PCT = 5
+    _DAYLIGHT_AUTO_LIGHTING_SUPPRESSED = "daylight_auto_lighting_suppressed"
+    _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
+    _DAYLIGHT_FALLBACK_START_HOUR = 8
+    _DAYLIGHT_FALLBACK_END_HOUR = 20
+    _DAYLIGHT_SUN_STATES = frozenset({"above_horizon", "day", "daylight"})
+    _DARK_SUN_STATES = frozenset({"below_horizon", "night", "dark"})
 
     @classmethod
     def _action_execution_result(
@@ -127,6 +133,12 @@ class ActionsMixin:
         }
         if isinstance(item.get("params"), dict) and item.get("params"):
             result["params"] = dict(item.get("params") or {})
+        error = str(item.get("error") or "").strip()
+        if error:
+            result["error"] = error
+        error_type = str(item.get("error_type") or "").strip()
+        if error_type:
+            result["error_type"] = error_type
         action_reason = str(item.get("reason") or "").strip()
         if action_reason:
             result["action_reason"] = action_reason
@@ -146,6 +158,47 @@ class ActionsMixin:
         if isinstance(decision_trace, dict) and decision_trace:
             result["decision_trace"] = dict(decision_trace)
         return result
+
+    @staticmethod
+    def _service_call_error_key(transaction_id: int, action_seq: int, entity_id: str) -> str:
+        return f"{int(transaction_id or 0)}:{int(action_seq or 0)}:{str(entity_id or '')}"
+
+    def _remember_service_call_error(
+        self,
+        transaction_id: int,
+        action_seq: int,
+        entity_id: str,
+        *,
+        msg: str,
+        error: str = "",
+        error_type: str = "",
+        status: str = "",
+    ) -> None:
+        key = self._service_call_error_key(transaction_id, action_seq, entity_id)
+        store = getattr(self, "_service_call_errors", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._service_call_errors = store
+        detail: dict[str, Any] = {"msg": str(msg or error or status or "ha_service_call_failed")}
+        if error:
+            detail["error"] = str(error)
+        if error_type:
+            detail["error_type"] = str(error_type)
+        if status:
+            detail["ha_command_status"] = str(status)
+        store[key] = detail
+
+    def _clear_service_call_error(self, transaction_id: int, action_seq: int, entity_id: str) -> None:
+        store = getattr(self, "_service_call_errors", None)
+        if isinstance(store, dict):
+            store.pop(self._service_call_error_key(transaction_id, action_seq, entity_id), None)
+
+    def _pop_service_call_error(self, transaction_id: int, action_seq: int, entity_id: str) -> dict[str, Any]:
+        store = getattr(self, "_service_call_errors", None)
+        if not isinstance(store, dict):
+            return {}
+        detail = store.pop(self._service_call_error_key(transaction_id, action_seq, entity_id), None)
+        return dict(detail) if isinstance(detail, dict) else {}
 
     def _is_light_blocked_by_people_rule(
         self,
@@ -193,10 +246,11 @@ class ActionsMixin:
 
         return False, ""
 
-    @staticmethod
-    def _is_night_time() -> bool:
+    def _is_night_time(self) -> bool:
         """夜间窗口判定（保守）：22:00-06:00。"""
-        h = datetime.now().hour
+        h = self._daylight_fallback_hour()
+        if h is None:
+            return False
         return h >= 22 or h < 6
 
     @staticmethod
@@ -269,6 +323,425 @@ class ActionsMixin:
             except Exception:
                 room = ""
         return room
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _looks_like_illuminance_sensor(sensor_id: str, sensor_info: Any, state: Any) -> bool:
+        info = sensor_info if isinstance(sensor_info, dict) else {}
+        attrs = getattr(state, "attributes", None)
+        attrs = attrs if isinstance(attrs, dict) else {}
+        device_class = str(info.get("device_class") or attrs.get("device_class") or "").strip().lower()
+        if device_class == "illuminance":
+            return True
+        unit = str(
+            info.get("unit_of_measurement")
+            or attrs.get("unit_of_measurement")
+            or attrs.get("unit")
+            or ""
+        ).strip().lower()
+        if unit in {"lx", "lux"}:
+            return True
+        label = f"{sensor_id} {info.get('name') or ''}".lower()
+        return any(key in label for key in ("illuminance", "lux", "light_level", "照度", "光照"))
+
+    def _same_room_illuminance_lux(self, entity_id: str) -> float | None:
+        room = self._action_entity_room(entity_id)
+        if not room:
+            return None
+        for sensor_id, sensor_info in self.device_info.items():
+            if not str(sensor_id or "").startswith("sensor."):
+                continue
+            sensor_room = self._action_entity_room(sensor_id)
+            if sensor_room != room:
+                continue
+            state = self.hass.states.get(sensor_id)
+            if not self._looks_like_illuminance_sensor(sensor_id, sensor_info, state):
+                continue
+            lux = self._float_or_none(getattr(state, "state", None))
+            if lux is not None:
+                return lux
+        return None
+
+    def _ha_local_now(self):
+        configured_timezone = str(
+            getattr(getattr(getattr(self, "hass", None), "config", None), "time_zone", "") or ""
+        ).strip()
+        if configured_timezone:
+            normalized_tz = configured_timezone.lower()
+            fixed_offset_hours = {
+                "asia/shanghai": 8,
+                "asia/chongqing": 8,
+                "asia/harbin": 8,
+                "asia/hong_kong": 8,
+                "hongkong": 8,
+                "prc": 8,
+                "utc": 0,
+            }.get(normalized_tz)
+            try:
+                from zoneinfo import ZoneInfo
+
+                return datetime.now(ZoneInfo(configured_timezone))
+            except Exception:
+                if fixed_offset_hours is not None:
+                    try:
+                        from datetime import timedelta, timezone
+
+                        tz = timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
+                        return datetime.now(tz)
+                    except Exception:
+                        pass
+        try:
+            return datetime.now()
+        except Exception:
+            return None
+
+    def _daylight_fallback_hour(self) -> int | None:
+        try:
+            now = self._ha_local_now()
+            return int(now.hour) if now is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _ha_local_minute_of_day(self) -> int | None:
+        try:
+            now = self._ha_local_now()
+            if now is None:
+                return None
+            return int(now.hour) * 60 + int(now.minute)
+        except (TypeError, ValueError):
+            return None
+
+    def _daylight_auto_lighting_suppressed_reason(self, entity_id: str) -> str:
+        lux = self._same_room_illuminance_lux(entity_id)
+        if lux is not None and lux <= self._DAYLIGHT_GUARD_LUX_THRESHOLD:
+            return ""
+
+        sun = self.hass.states.get("sun.sun")
+        sun_state = str(getattr(sun, "state", "") or "").strip().lower()
+        if sun_state in self._DAYLIGHT_SUN_STATES:
+            return self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED
+
+        if lux is not None and lux > self._DAYLIGHT_GUARD_LUX_THRESHOLD:
+            return self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED
+
+        hour = self._daylight_fallback_hour()
+        if hour is not None and self._DAYLIGHT_FALLBACK_START_HOUR <= hour <= self._DAYLIGHT_FALLBACK_END_HOUR:
+            return self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED
+        if sun_state in self._DARK_SUN_STATES:
+            return ""
+        return ""
+
+    @staticmethod
+    def _looks_like_automatic_presence_lighting(
+        *,
+        reason: str,
+        scene_desc: str,
+        trigger_summary: str,
+        cmd_source: str,
+    ) -> bool:
+        if str(cmd_source or "").strip() == "USER_EXPLICIT":
+            return False
+        text = f"{reason} {scene_desc} {trigger_summary}".lower()
+        if "lighting_capability_fallback" in text and any(
+            marker in text
+            for marker in ("occupancy", "presence", "arrival", "有人", "人体", "存在")
+        ):
+            return True
+        if "low_risk_presence_lighting_fallback" in text:
+            return True
+
+        if "fastbrain:habit" in text and any(marker in text for marker in ("occupancy", "presence", "arrival")):
+            return True
+
+        binary_arrival = "binary_sensor." in text and any(
+            marker in text for marker in ("off -> on", "off->on", "to on")
+        )
+        arrival_source_markers = (
+            "occupancy",
+            "presence",
+            "motion",
+            "arrival",
+            "ren_ti",
+            "cun_zai",
+            "you_ren",
+            "door",
+            "contact",
+            "entry",
+            "enter",
+            "reentry",
+            "men_chuang",
+            "men_ci",
+            "chuan_gan_qi_men",
+            "有人",
+            "人体",
+            "存在",
+            "检测到人",
+            "有人活动",
+            "门磁",
+            "门窗",
+            "开门",
+            "门打开",
+            "进入",
+            "进门",
+            "进房",
+            "回房",
+        )
+        if binary_arrival and any(marker in text for marker in arrival_source_markers):
+            return True
+
+        presence_markers = (
+            "occupancy",
+            "presence",
+            "有人",
+            "人体",
+            "存在",
+            "检测到人",
+            "门磁",
+            "门窗",
+            "开门",
+            "门打开",
+            "进入",
+            "进门",
+            "进房",
+            "回房",
+        )
+        arrival_markers = (
+            "off -> on",
+            "off->on",
+            "arrival",
+            "entry",
+            "enter",
+            "检测到有人",
+            "检测到人",
+            "有人活动",
+            "门打开",
+            "开门",
+            "进入",
+            "进门",
+            "进房",
+            "回房",
+        )
+        lighting_markers = ("turn_on", "开灯", "开启", "射灯", "照明", "补光", "light.")
+        return (
+            any(marker in text for marker in presence_markers)
+            and any(marker in text for marker in arrival_markers)
+            and any(marker in text for marker in lighting_markers)
+        )
+
+    @staticmethod
+    def _json_list_or_empty(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                import json as _json
+
+                parsed = _json.loads(value)
+            except Exception:
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return []
+
+    @staticmethod
+    def _scene_cache_entity_ids(scene: dict[str, Any]) -> list[str]:
+        entity_ids: list[str] = []
+        for key in ("entities", "entities_json"):
+            for item in ActionsMixin._json_list_or_empty(scene.get(key)):
+                if isinstance(item, dict):
+                    entity_id = str(item.get("entity_id") or item.get("entity") or "").strip()
+                else:
+                    entity_id = str(item or "").strip()
+                if entity_id:
+                    entity_ids.append(entity_id)
+        for key in ("actions", "actions_json"):
+            for item in ActionsMixin._json_list_or_empty(scene.get(key)):
+                if not isinstance(item, dict):
+                    continue
+                entity_id = str(item.get("entity_id") or item.get("entity") or "").strip()
+                if entity_id:
+                    entity_ids.append(entity_id)
+        return entity_ids
+
+    @staticmethod
+    def _scene_cache_has_light_turn_on(scene: dict[str, Any]) -> bool:
+        if any(entity_id.startswith("light.") for entity_id in ActionsMixin._scene_cache_entity_ids(scene)):
+            return True
+        for key in ("actions", "actions_json"):
+            for item in ActionsMixin._json_list_or_empty(scene.get(key)):
+                if not isinstance(item, dict):
+                    continue
+                entity_id = str(item.get("entity_id") or item.get("entity") or "").strip()
+                domain = str(item.get("domain") or (entity_id.split(".", 1)[0] if "." in entity_id else "")).strip()
+                service = str(item.get("service") or "").strip()
+                if domain == "light" and service in {"turn_on", "light.turn_on"}:
+                    return True
+        return False
+
+    def _ai_scene_cache_row_for_entity(self, entity_id: str) -> dict[str, Any] | None:
+        target = str(entity_id or "").strip()
+        local_id = target.split(".", 1)[-1] if "." in target else target
+        numeric_id = local_id[3:] if local_id.startswith("ai_") else ""
+        for scene in getattr(self, "_ai_scenes_cache", []) or []:
+            if not isinstance(scene, dict):
+                continue
+            scene_ids = {
+                str(scene.get("id") or "").strip(),
+                str(scene.get("source_id") or "").strip(),
+                str(scene.get("entity_id") or "").strip(),
+                str(scene.get("ha_entity_id") or "").strip(),
+                str(scene.get("scene_entity_id") or "").strip(),
+            }
+            if target in scene_ids or local_id in scene_ids or (numeric_id and numeric_id in scene_ids):
+                return scene
+        return None
+
+    def _scene_or_script_looks_like_lighting(
+        self,
+        entity_id: str,
+        *,
+        reason: str,
+        scene_desc: str,
+        trigger_summary: str,
+    ) -> bool:
+        scene = self._ai_scene_cache_row_for_entity(entity_id)
+        if scene is not None and self._scene_cache_has_light_turn_on(scene):
+            return True
+        text = f"{entity_id} {reason} {scene_desc} {trigger_summary}".lower()
+        if scene is None:
+            # Unknown scene/script bodies may hide light.turn_on; automatic
+            # presence-triggered daylight AI scenes fail closed.
+            local_id = str(entity_id or "").split(".", 1)[-1]
+            if local_id.startswith("ai_") or "[scene path]" in text or "ai_scene" in text:
+                return True
+
+        return any(
+            marker in text
+            for marker in (
+                "light",
+                "lighting",
+                "lamp",
+                "turn_on",
+                "开灯",
+                "灯",
+                "照明",
+                "补光",
+            )
+        )
+
+    @staticmethod
+    def _append_lighting_metadata(parts: list[str], value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for nested in value.values():
+                ActionsMixin._append_lighting_metadata(parts, nested)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                ActionsMixin._append_lighting_metadata(parts, nested)
+            return
+        parts.append(str(value))
+
+    def _entity_looks_like_lighting(
+        self,
+        entity_id: str,
+        domain: str,
+        *,
+        reason: str,
+        scene_desc: str,
+        trigger_summary: str,
+    ) -> bool:
+        if domain == "light":
+            return True
+        if domain in ("scene", "script"):
+            return self._scene_or_script_looks_like_lighting(
+                entity_id,
+                reason=reason,
+                scene_desc=scene_desc,
+                trigger_summary=trigger_summary,
+            )
+        if domain != "switch":
+            return False
+
+        info = {}
+        try:
+            info = (getattr(self, "device_info", {}) or {}).get(entity_id, {}) or {}
+        except Exception:
+            info = {}
+
+        parts: list[str] = [entity_id]
+        if isinstance(info, dict):
+            for key in (
+                "name",
+                "friendly_name",
+                "role",
+                "device_role",
+                "device_type",
+                "fixture_type",
+                "device_class",
+                "capability",
+                "capabilities",
+                "roles",
+                "fixture_roles",
+                "tags",
+            ):
+                self._append_lighting_metadata(parts, info.get(key))
+
+        text = (
+            " ".join(parts)
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+            .replace(".", "_")
+            .replace("/", "_")
+        )
+        tokens = {token for token in text.split("_") if token}
+        token_markers = {
+            "light",
+            "lighting",
+            "lamp",
+            "led",
+            "bulb",
+            "fixture",
+            "deng",
+            "zhaoming",
+        }
+        if tokens & token_markers:
+            return True
+        return any(
+            marker in text
+            for marker in (
+                "wall_lamp",
+                "ceiling_light",
+                "spotlight",
+                "downlight",
+                "shedeng",
+                "tongdeng",
+                "bideng",
+                "qiangdeng",
+                "deng_guang",
+                "zhao_ming",
+                "she_deng",
+                "tong_deng",
+                "bi_deng",
+                "qiang_deng",
+                "灯",
+                "灯光",
+                "照明",
+                "射灯",
+                "筒灯",
+                "壁灯",
+                "顶灯",
+            )
+        )
 
     def _normalize_room_occupancy_entries(self, entries: Any) -> list[tuple[str, str]]:
         normalized: list[tuple[str, str]] = []
@@ -812,21 +1285,24 @@ class ActionsMixin:
                 "url": f"/decision-trace/{parent_transaction_id}",
             }
 
-        # P1 优化：提前获取在场状态、展厅灯光层级与人数锁定规则，避免循环内重复调用
-        occ_map = self._get_room_occupancy_map()
+        # P1 优化：提前获取展厅兼容在场证据、灯光层级与人数锁定规则，避免循环内重复调用
+        # Contract: legacy_presence_evidence_only; canonical presence guards use _room_occupancy_entries().
+        legacy_occ_map = self._get_room_occupancy_map()
         people_counts_by_room = self._get_room_person_counts() if hasattr(self, "_get_room_person_counts") else {}
         parsed_people_rules = self._build_locked_people_rules() if hasattr(self, "_build_locked_people_rules") else []
 
-        _now = datetime.now()
-        _now_min = _now.hour * 60 + _now.minute
-        is_working_hour = self.showroom_biz_start_min <= _now_min < self.showroom_biz_end_min
+        _now_min = self._ha_local_minute_of_day()
+        is_working_hour = (
+            _now_min is not None
+            and self.showroom_biz_start_min <= _now_min < self.showroom_biz_end_min
+        )
         
         # 预取展厅有人状态
         is_showroom_occupied = False
         showroom_light_tiers = {}
         if self._mode == MODE_SHOWROOM:
             _showroom_area = self.showroom_area_name
-            showroom_sensors = occ_map.get(_showroom_area, []) if _showroom_area else []
+            showroom_sensors = legacy_occ_map.get(_showroom_area, []) if _showroom_area else []
             if not showroom_sensors:
                 is_showroom_occupied = True
             else:
@@ -965,6 +1441,39 @@ class ActionsMixin:
                 })
                 continue
             # ─── 设备管辖域 (Action Router) ───────────────────────────────────
+            # Run daylight guard before Action Router can rewrite a simple
+            # light.turn_on into scene.turn_on/script.turn_on. The guard must
+            # evaluate the original light entity and its room context.
+            pre_router_auto_presence_lighting = (
+                service == "turn_on"
+                and self._entity_looks_like_lighting(
+                    entity_id,
+                    domain,
+                    reason=str(reason or ""),
+                    scene_desc=str(scene_desc or ""),
+                    trigger_summary=str(trigger_summary or ""),
+                )
+                and self._looks_like_automatic_presence_lighting(
+                    reason=str(reason or ""),
+                    scene_desc=str(scene_desc or ""),
+                    trigger_summary=str(trigger_summary or ""),
+                    cmd_source=str(cmd_source or ""),
+                )
+            )
+            if pre_router_auto_presence_lighting:
+                daylight_reason = self._daylight_auto_lighting_suppressed_reason(entity_id)
+                if daylight_reason:
+                    self._sys_log(
+                        "WARN",
+                        f"[DaylightGuard] blocked daytime automatic presence lighting {domain}.turn_on({entity_id}): {daylight_reason}",
+                    )
+                    blocked_count += 1
+                    results.append({
+                        **action_result_context,
+                        "status": "blocked_daylight_auto_lighting",
+                        "msg": daylight_reason,
+                    })
+                    continue
             if domain not in ("script", "scene"):
                 ctrl_mode = self.device_info.get(entity_id, {}).get("control_mode", "shared")
                 if ctrl_mode == "ha":
@@ -1062,7 +1571,7 @@ class ActionsMixin:
                 if self._mode != MODE_SHOWROOM:
                     scene_room = self._guess_scene_room(entity_id)
                     if scene_room:
-                        sensors = occ_map.get(scene_room, [])
+                        sensors = self._room_occupancy_entries(scene_room)
                         if sensors:
                             occupied = any(s == "on" for _, s in sensors)
                             uncertain = any(s in ("unknown", "unavailable") for _, s in sensors)
@@ -1093,15 +1602,31 @@ class ActionsMixin:
                 self._sys_log("INFO", f"[动作] 场景/脚本通过前置守卫，转交统一保护链: {domain}.{service}({entity_id})")
 
             self._sys_log("INFO", f"[动作] 准备执行: {domain}.{service}({entity_id}) params={params} reason={reason}")
+            is_automatic_presence_lighting = (
+                service == "turn_on"
+                and self._entity_looks_like_lighting(
+                    entity_id,
+                    domain,
+                    reason=str(reason or ""),
+                    scene_desc=str(scene_desc or ""),
+                    trigger_summary=str(trigger_summary or ""),
+                )
+                and self._looks_like_automatic_presence_lighting(
+                    reason=str(reason or ""),
+                    scene_desc=str(scene_desc or ""),
+                    trigger_summary=str(trigger_summary or ""),
+                    cmd_source=str(cmd_source or ""),
+                )
+            )
             state = self.hass.states.get(entity_id)
             if state:
                 if service == "turn_off" and state.state == "off":
                     self._sys_log("INFO", f"[动作] 跳过(已是off): {entity_id}")
                     results.append({"entity_id": entity_id, "service": service, "status": "skip", "msg": "already off"})
                     continue
-                if service == "turn_on" and state.state == "on" and not params:
+                if service == "turn_on" and state.state == "on" and (not params or is_automatic_presence_lighting):
                     self._sys_log("INFO", f"[动作] 跳过(已是on): {entity_id}")
-                    results.append({"entity_id": entity_id, "service": service, "status": "skip", "msg": "already on"})
+                    results.append({**action_result_context, "status": "skip", "msg": "already on"})
                     continue
             # 人员在场守卫：light/switch turn_on 前确认区域有人（仅家庭模式）
             if domain in ("light", "switch") and self._mode != MODE_SHOWROOM:
@@ -1110,6 +1635,24 @@ class ActionsMixin:
                     self._sys_log("WARN", f"[人员守卫] 拒绝 {domain}.turn_on({entity_id})：{guard_reason}（无人区域禁止开灯）")
                     blocked_count += 1
                     results.append({"entity_id": entity_id, "service": service, "status": "blocked", "msg": guard_reason})
+                    continue
+
+            if (
+                service == "turn_on"
+                and is_automatic_presence_lighting
+            ):
+                daylight_reason = self._daylight_auto_lighting_suppressed_reason(entity_id)
+                if daylight_reason:
+                    self._sys_log(
+                        "WARN",
+                        f"[日照守卫] 拒绝白天自动开灯 {domain}.turn_on({entity_id})：{daylight_reason}",
+                    )
+                    blocked_count += 1
+                    results.append({
+                        **action_result_context,
+                        "status": "blocked_daylight_auto_lighting",
+                        "msg": daylight_reason,
+                    })
                     continue
 
             # 展厅模式人数阈值锁定规则（统一执行层）：
@@ -1144,8 +1687,9 @@ class ActionsMixin:
                             "msg": f"{_room}人数{_person_count}未满足锁定阈值",
                         })
                         continue
-            # 展厅灯 P1 铁律硬保护：展厅模式下上班时间实施分层保护
-            # 这是为了让 P1 铁律更智能：有人时全保，无人时按学习到的层级（Core/Display/Auxiliary）进行差异化保护
+            # 展厅代码层硬保护：展厅模式下上班时间实施分层保护。
+            # 这是确定性执行守卫，不是交给 LLM 遵守的 P1 运行时规则。
+            # 有人时全保，无人时按学习到的层级（Core/Display/Auxiliary）进行差异化保护。
             if self._mode == MODE_SHOWROOM and domain == "light":
                 _info = self.device_info.get(entity_id, {})
                 _room = (_info.get("room") or "").strip()
@@ -1256,7 +1800,11 @@ class ActionsMixin:
                     except Exception as exc:
                         _LOGGER.debug("[Actions] 延迟动作执行失败 %s.%s(%s): %s", d, s, eid, exc)
                         ok = False
-                    result["status"] = "ok" if ok else "blocked_or_error"
+                    if ok:
+                        result["status"] = "ok"
+                    else:
+                        result.update(self._pop_service_call_error(txid, aseq, eid))
+                        result["status"] = "blocked_or_error"
                     await _refresh_transaction_from_results()
 
                 def _delayed(
@@ -1286,7 +1834,8 @@ class ActionsMixin:
                     results.append({**action_result_context, "status": "ok"})
                 else:
                     failed_count += 1
-                    results.append({**action_result_context, "status": "blocked_or_error"})
+                    service_error = self._pop_service_call_error(txn_id, action_seq, entity_id)
+                    results.append({**action_result_context, **service_error, "status": "blocked_or_error"})
 
         # ── 4. 提交事务结果 ────────────────────────────────────────────────────
         if txn_id:
@@ -1425,6 +1974,7 @@ class ActionsMixin:
             self._sys_log("INFO", f"[动作] {entity_id} color_temp({mired_val}mireds)"
                           f" → color_temp_kelvin({safe_params['color_temp_kelvin']}K) 自动转换")
         from .ha_adapter import async_execute_command_envelope
+        self._clear_service_call_error(transaction_id, action_seq, entity_id)
 
         async def _execute_enveloped_service(call_params: dict[str, Any] | None = None) -> None:
             payload = call_params if isinstance(call_params, dict) else {}
@@ -1444,16 +1994,33 @@ class ActionsMixin:
                 },
             })
             if isinstance(result, dict) and result.get("ok"):
+                self._clear_service_call_error(transaction_id, action_seq, entity_id)
                 return
             failed = None
             if isinstance(result, dict):
                 failed = next((item for item in result.get("results", []) if not item.get("ok")), None)
             error = ""
+            error_type = ""
+            status = ""
             if isinstance(failed, dict):
                 error = str(failed.get("error") or failed.get("status") or "")
+                error_type = str(failed.get("error_type") or "")
+                status = str(failed.get("status") or "")
             if not error and isinstance(result, dict):
                 error = str(result.get("error") or result.get("error_type") or "")
-            raise RuntimeError(error or "command_envelope_failed")
+                error_type = str(result.get("error_type") or "")
+                status = str(result.get("status") or "")
+            msg = error or status or "command_envelope_failed"
+            self._remember_service_call_error(
+                transaction_id,
+                action_seq,
+                entity_id,
+                msg=msg,
+                error=error,
+                error_type=error_type,
+                status=status,
+            )
+            raise RuntimeError(msg)
 
         def _is_param_rejection(exc: Exception | str) -> bool:
             text = str(exc).lower()

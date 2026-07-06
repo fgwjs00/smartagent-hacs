@@ -1360,6 +1360,55 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
     name = "api:smart_agent:v1:devices:detail"
     requires_auth = True
 
+    async def get(self, request: web.Request, entity_id: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        eid = str(entity_id or "").strip()
+        coord = _get_first_coordinator(request.app["hass"])
+        if coord is None:
+            return self.json(
+                _json_error_payload(
+                    "coordinator_unavailable",
+                    "dependency_unavailable",
+                    True,
+                    scope="device_detail",
+                    source="ha_host_local",
+                    entity_id=eid,
+                ),
+                status_code=503,
+            )
+
+        for row in _local_device_rows(coord, request.app["hass"]):
+            if not isinstance(row, dict):
+                continue
+            row_entity_id = str(row.get("entity_id") or row.get("id") or "").strip()
+            if row_entity_id != eid:
+                continue
+            device = dict(row)
+            device["entity_id"] = eid
+            return self.json(
+                {
+                    "ok": True,
+                    "entity_id": eid,
+                    "device": device,
+                    "source": "ha_host_local",
+                },
+                status_code=200,
+            )
+
+        return self.json(
+            _json_error_payload(
+                "device_not_found",
+                "not_found",
+                False,
+                scope="device_detail",
+                source="ha_host_local",
+                entity_id=eid,
+            ),
+            status_code=404,
+        )
+
     async def patch(self, request: web.Request, entity_id: str) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
@@ -1474,6 +1523,77 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
                 "deleted": True,
                 "scope": "entity",
                 "source": "ha_host_local",
+            },
+            status_code=200,
+        )
+
+
+class SmartAgentEntityStateView(HomeAssistantView):
+    """Read-only HA raw state bridge for field diagnostics."""
+
+    url = "/api/v1/entities/{entity_id}/state"
+    extra_urls: list[str] = []
+    name = "api:smart_agent:v1:entities:state"
+    requires_auth = True
+
+    async def get(self, request: web.Request, entity_id: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+
+        eid = str(entity_id or "").strip()
+        if not eid or "." not in eid:
+            return self.json(
+                _json_error_payload(
+                    "invalid_entity_id",
+                    "bad_request",
+                    False,
+                    scope="entity_state",
+                    source="ha_host_raw_state",
+                    entity_id=eid,
+                ),
+                status_code=400,
+            )
+
+        state_obj = request.app["hass"].states.get(eid)
+        if state_obj is None:
+            return self.json(
+                _json_error_payload(
+                    "entity_state_not_found",
+                    "not_found",
+                    False,
+                    scope="entity_state",
+                    source="ha_host_raw_state",
+                    entity_id=eid,
+                ),
+                status_code=404,
+            )
+
+        attrs = getattr(state_obj, "attributes", None)
+        if not isinstance(attrs, dict):
+            attrs = {}
+
+        def _time_value(value: Any) -> str:
+            if value is None:
+                return ""
+            isoformat = getattr(value, "isoformat", None)
+            if callable(isoformat):
+                try:
+                    return str(isoformat())
+                except Exception:
+                    return str(value)
+            return str(value)
+
+        return self.json(
+            {
+                "ok": True,
+                "entity_id": eid,
+                "state": str(getattr(state_obj, "state", "") or ""),
+                "attributes": dict(attrs),
+                "last_changed": _time_value(getattr(state_obj, "last_changed", None)),
+                "last_updated": _time_value(getattr(state_obj, "last_updated", None)),
+                "last_reported": _time_value(getattr(state_obj, "last_reported", None)),
+                "context_id": str(getattr(getattr(state_obj, "context", None), "id", "") or ""),
+                "source": "ha_host_raw_state",
             },
             status_code=200,
         )
