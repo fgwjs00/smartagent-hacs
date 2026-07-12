@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.162
-display_version: Beta 0.0.162
+release_version: 0.0.163
+display_version: Beta 0.0.163
 channel: beta
 release_date: '2026-07-13'
 public_release_ready: true
@@ -8,6 +8,7 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.162 发布：交付 G40-G89 的执行安全、世界模型、学习治理、V3 管理端与 Frigate 控制面修复，并修复 Linux
-    CI 时区与 packaged browser 依赖门禁；G13 保持关闭，MCP 暂缓，不声明 HA-L 或 B-VISION 现场验收通过。
-  customer_visible_version: Beta 0.0.162
+  summary: Beta 0.0.163 发布：交付 G40-G89 的执行安全、世界模型、学习治理、V3 管理端与 Frigate 控制面修复，并以同步检查和
+    source/package 浏览器 E2E 替代跨平台不稳定的生成资产字节漂移门禁；G13 保持关闭，MCP 暂缓，不声明 HA-L 或 B-VISION
+    现场验收通过。
+  customer_visible_version: Beta 0.0.163
