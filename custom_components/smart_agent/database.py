@@ -10,8 +10,10 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
+from homeassistant.util import dt as dt_util
+
 from .db_service import DatabaseService
-from .scene_attribution import ai_scene_space_attribution
+from .database_scenes import DatabaseSceneBridgeMixin
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,7 +51,7 @@ def _safe_add_column(conn: sqlite3.Connection, table: str, column_def: str) -> N
             raise
 
 
-class DatabaseMixin:
+class DatabaseMixin(DatabaseSceneBridgeMixin):
     _VALID_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
 
     def _init_memory_db(self) -> None:
@@ -95,7 +97,7 @@ class DatabaseMixin:
             _LOGGER.debug("[DB] legacy JSON read failed: %s", exc)
             return
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         try:
             for eid, desc in cfg.get("devices", {}).items():
                 parts = [part.strip() for part in str(desc).split("|")]
@@ -200,6 +202,48 @@ class DatabaseMixin:
         if not callable(enqueue):
             return False
         return bool(enqueue(kind, payload, ts=ts))
+
+    def _ha_db_now_text(self) -> str:
+        try:
+            local_now = getattr(self, "_ha_local_now", None)
+            now_value = local_now() if callable(local_now) else None
+            if hasattr(now_value, "strftime"):
+                return now_value.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        try:
+            from homeassistant.util import dt as dt_util
+            return dt_util.now().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            from datetime import timezone
+            return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _ha_db_cutoff_text(self, days: int) -> str:
+        try:
+            local_now = getattr(self, "_ha_local_now", None)
+            now_value = local_now() if callable(local_now) else None
+            if hasattr(now_value, "strftime"):
+                return (now_value - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        try:
+            from homeassistant.util import dt as dt_util
+            now = dt_util.now()
+        except Exception:
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+        return (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _ha_transaction_id_ms(self) -> int:
+        try:
+            local_now = getattr(self, "_ha_local_now", None)
+            now_value = local_now() if callable(local_now) else None
+            if hasattr(now_value, "timestamp"):
+                return int(now_value.timestamp() * 1000)
+        except Exception:
+            pass
+        return int(time.time() * 1000)
+
     def _record_event(
         self,
         event_type: str,
@@ -213,7 +257,7 @@ class DatabaseMixin:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Forward an HA event into add-on owned storage."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = self._ha_db_now_text()
         area = ""
         if entity_id and entity_id in getattr(self, "device_info", {}):
             area = self.device_info[entity_id].get("room", "")
@@ -253,10 +297,10 @@ class DatabaseMixin:
         action_seq: int = 0,
     ) -> None:
         """Forward action verification into add-on transaction storage."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = self._ha_db_now_text()
         payload = {
             "action": "action_result",
-            "transaction_id": str(transaction_id or f"action-{int(time.time() * 1000)}-{action_seq}"),
+            "transaction_id": str(transaction_id or f"action-{self._ha_transaction_id_ms()}-{action_seq}"),
             "updated_at": timestamp,
             "result": {
                 "action_results": [
@@ -291,7 +335,7 @@ class DatabaseMixin:
             "avg_latency_ms": 0,
             "top_failures": [],
         }
-        cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = self._ha_db_cutoff_text(7)
         try:
             rows = self._db.query(
                 "SELECT COUNT(*) as total, SUM(success) as ok, SUM(retry_count) as retries, "
@@ -316,138 +360,6 @@ class DatabaseMixin:
             _LOGGER.warning("[QualityStats] query failed: %s", exc)
         return stats
 
-    def _query_ai_scenes(self, status: str | None = None) -> list[dict]:
-        try:
-            if status:
-                return self._db.query(
-                    "SELECT * FROM ai_scenes WHERE status=? ORDER BY confidence DESC, id DESC",
-                    (status,),
-                )
-            return self._db.query("SELECT * FROM ai_scenes ORDER BY confidence DESC, id DESC")
-        except Exception as exc:
-            _LOGGER.warning("[AiScenes] query failed: %s", exc)
-            return []
-
-    def _upsert_ai_scene(
-        self,
-        name: str,
-        description: str,
-        entities_json: str,
-        trigger_context: str,
-        hour_start: int,
-        hour_end: int,
-        weekday_mask: str,
-        confidence: int,
-        hit_count: int,
-        actions_json: str = "[]",
-    ) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        space_id, room, explain_bundle = ai_scene_space_attribution(
-            entities_json,
-            actions_json,
-            getattr(self, "device_info", {}),
-            source="ha_ai_scene_bridge",
-        )
-        payload = {
-            "action": "upsert",
-            "name": name,
-            "description": description,
-            "entities_json": entities_json,
-            "actions_json": actions_json,
-            "trigger_context": trigger_context,
-            "hour_start": int(hour_start),
-            "hour_end": int(hour_end),
-            "weekday_mask": weekday_mask,
-            "confidence": int(confidence),
-            "hit_count": int(hit_count),
-            "status": "pending",
-            "source": "auto",
-            "space_id": space_id,
-            "room": room,
-            "explain_bundle": explain_bundle,
-            "created": now,
-            "updated": now,
-        }
-        if not self._enqueue_bridge_event("ai_scene", payload, ts=now):
-            _LOGGER.warning("[AiScenes] upsert enqueue failed: name=%s", name)
-
-    def _upsert_ai_scene_manual(
-        self,
-        name: str,
-        description: str,
-        entities_json: str,
-        trigger_context: str,
-        hour_start: int,
-        hour_end: int,
-        weekday_mask: str,
-        confidence: int,
-        actions_json: str = "[]",
-    ) -> bool:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        space_id, room, explain_bundle = ai_scene_space_attribution(
-            entities_json,
-            actions_json,
-            getattr(self, "device_info", {}),
-            source="ha_ai_scene_bridge",
-        )
-        payload = {
-            "action": "upsert",
-            "name": name,
-            "description": description,
-            "entities_json": entities_json,
-            "actions_json": actions_json,
-            "trigger_context": trigger_context,
-            "hour_start": int(hour_start),
-            "hour_end": int(hour_end),
-            "weekday_mask": weekday_mask,
-            "confidence": int(confidence),
-            "hit_count": 0,
-            "status": "pending",
-            "source": "manual",
-            "space_id": space_id,
-            "room": room,
-            "explain_bundle": explain_bundle,
-            "created": now,
-            "updated": now,
-        }
-        if not self._enqueue_bridge_event("ai_scene", payload, ts=now):
-            _LOGGER.warning("[AiScenes] manual upsert enqueue failed: name=%s", name)
-            return False
-        return True
-
-    def _update_ai_scene_status(self, scene_id: int, status: str) -> bool:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        payload = {"action": "update_status", "id": int(scene_id), "status": status, "updated": now}
-        if not self._enqueue_bridge_event("ai_scene", payload, ts=now):
-            _LOGGER.warning("[AiScenes] status enqueue failed: id=%s", scene_id)
-            return False
-        return True
-
-    def _update_ai_scene_ha_entity(self, scene_id: int, ha_entity_id: str) -> bool:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ok = self._db.execute(
-            "UPDATE ai_scenes SET ha_entity_id=?, updated=? WHERE id=?",
-            (ha_entity_id, now, scene_id),
-        )
-        if not ok:
-            _LOGGER.warning("[AiScenes] HA entity update failed: id=%s", scene_id)
-        return bool(ok)
-
-    def _mark_ai_scene_ephemeral(self, scene_id: int) -> bool:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        payload = {"action": "mark_ephemeral", "id": int(scene_id), "updated": now}
-        if not self._enqueue_bridge_event("ai_scene", payload, ts=now):
-            _LOGGER.warning("[AiScenes] ephemeral marker enqueue failed: id=%s", scene_id)
-            return False
-        return True
-
-    def _delete_ai_scene_db(self, scene_id: int) -> bool:
-        payload = {"action": "delete", "id": int(scene_id)}
-        if not self._enqueue_bridge_event("ai_scene", payload):
-            _LOGGER.warning("[AiScenes] delete enqueue failed: id=%s", scene_id)
-            return False
-        return True
-
     def _begin_transaction_db(
         self,
         trigger_summary: str,
@@ -457,8 +369,8 @@ class DatabaseMixin:
         pre_states_json: str,
         actions_json: str,
     ) -> int:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        txn_id = int(time.time() * 1000)
+        now = self._ha_db_now_text()
+        txn_id = self._ha_transaction_id_ms()
         try:
             decoded_actions = json.loads(actions_json or "[]")
             actions_payload = list(decoded_actions) if isinstance(decoded_actions, list) else []
@@ -513,7 +425,7 @@ class DatabaseMixin:
             status = "blocked"
         else:
             status = "failed"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = self._ha_db_now_text()
         payload = {
             "transaction_id": str(txn_id),
             "updated_at": timestamp,
@@ -534,19 +446,18 @@ class DatabaseMixin:
             _LOGGER.warning("[Transaction] complete enqueue failed: txn_id=%s", txn_id)
 
     def _rollback_transaction_db(self, txn_id: int) -> dict | None:
-        try:
-            rows = self._db.query("SELECT * FROM action_transactions WHERE id=?", (txn_id,))
-            return rows[0] if rows else None
-        except Exception as exc:
-            _LOGGER.warning("[Transaction] rollback query failed: %s", exc)
-            return None
+        _LOGGER.warning(
+            "[Transaction] legacy local rollback lookup disabled; use add-on rollback service: txn_id=%s",
+            txn_id,
+        )
+        return None
 
     def _query_recent_transactions(self, limit: int = 30) -> list[dict]:
-        try:
-            return self._db.query("SELECT * FROM action_transactions ORDER BY id DESC LIMIT ?", (limit,))
-        except Exception as exc:
-            _LOGGER.warning("[Transaction] query failed: %s", exc)
-            return []
+        _LOGGER.warning(
+            "[Transaction] legacy local transaction query disabled; use add-on transaction read API: limit=%s",
+            limit,
+        )
+        return []
 
     def _get_entity_room(self, entity_id: str) -> str:
         room = getattr(self, "device_info", {}).get(entity_id, {}).get("room", "")
@@ -562,7 +473,7 @@ class DatabaseMixin:
 
     def _get_device_usage_stats(self, days: int = 7) -> list[dict]:
         """Return a small HA-local energy projection from stored event rows."""
-        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = self._ha_db_cutoff_text(days)
         try:
             rows = self._query_events(
                 "SELECT entity AS entity_id, state, time FROM events WHERE time >= ? "
@@ -593,9 +504,28 @@ class DatabaseMixin:
         room: str,
         presence_entity_id: str,
         light_states: dict[str, str | None] | None = None,
+        *,
+        pre_light_states: dict[str, str | None] | None = None,
+        smartagent_actions: list[dict[str, Any]] | None = None,
+        sample_started_at: float | None = None,
+        sample_ended_at: float | None = None,
     ) -> None:
-        """Forward arrival lighting samples to add-on owned memory."""
-        now = datetime.now()
+        """Forward auditable arrival lighting samples to add-on owned memory."""
+        try:
+            local_now = getattr(self, "_ha_local_now", None)
+            now_value = local_now() if callable(local_now) else None
+            if hasattr(now_value, "strftime"):
+                now = now_value
+            else:
+                from homeassistant.util import dt as dt_util
+                now = dt_util.now()
+        except Exception:
+            try:
+                from homeassistant.util import dt as dt_util
+                now = dt_util.now()
+            except Exception:
+                from datetime import timezone
+                now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         month = now.month
         season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
@@ -607,32 +537,62 @@ class DatabaseMixin:
                 state = self.hass.states.get(entity_id)
                 light_states[entity_id] = state.state if state else None
 
-        normalized_states = [
-            str(state or "").strip().lower()
-            for state in light_states.values()
-            if state is not None
+        pre_light_states = pre_light_states if isinstance(pre_light_states, dict) else {}
+        raw_actions = smartagent_actions if isinstance(smartagent_actions, list) else []
+
+        def _action_in_sample_window(action: dict[str, Any]) -> bool:
+            if sample_started_at is None or sample_ended_at is None:
+                return True
+            try:
+                action_time = float(action.get("time"))
+            except (TypeError, ValueError):
+                return False
+            return sample_started_at <= action_time <= sample_ended_at
+
+        window_actions = [
+            dict(action)
+            for action in raw_actions
+            if isinstance(action, dict) and _action_in_sample_window(action)
         ]
-        if normalized_states and not any(state == "on" for state in normalized_states):
-            _LOGGER.debug("[ArrivalBaseline] skip ambiguous all-off sample: room=%s sensor=%s", room, presence_entity_id)
-            return
+        sampled_entities = {str(entity_id) for entity_id in light_states}
+        room_wide_actions = [
+            action
+            for action in window_actions
+            if str(action.get("entity_id") or "").strip() not in sampled_entities
+        ]
 
         for entity_id, state in light_states.items():
             if state is None:
                 continue
+            observed_state = str(state or "").strip().lower() or "unknown"
+            entity_actions = [
+                dict(action)
+                for action in window_actions
+                if str(action.get("entity_id") or "").strip() == entity_id
+            ]
+            influencing_actions = [*entity_actions, *room_wide_actions]
+            linked_action = influencing_actions[-1] if influencing_actions else {}
             payload = {
                 "action": "arrival_sample",
                 "time": timestamp,
                 "entity_id": entity_id,
                 "room": room,
                 "presence_entity_id": presence_entity_id,
-                "is_on": state == "on",
+                "pre_state": str(pre_light_states.get(entity_id) or "unknown").strip().lower() or "unknown",
+                "observed_state": observed_state,
+                "is_on": observed_state == "on",
+                "baseline_eligible": not influencing_actions,
+                "smartagent_actions": window_actions,
+                "sample_started_at": sample_started_at,
+                "sample_ended_at": sample_ended_at,
                 "hour_bucket": now.hour,
                 "season": season,
+                "origin": "presence_arrival_observation",
+                "actor": presence_entity_id or "unknown",
+                "decision_id": str(linked_action.get("decision_id") or "not_applicable"),
+                "transaction_id": str(linked_action.get("transaction_id") or "not_applicable"),
+                "world_snapshot_id": str(linked_action.get("world_snapshot_id") or "not_applicable"),
             }
             enqueue = getattr(self, "_enqueue_internal_event", None)
             if not callable(enqueue) or not enqueue("baseline", payload, ts=timestamp):
                 _LOGGER.debug("[ArrivalBaseline] sample enqueue failed: %s", entity_id)
-
-    def _get_showroom_light_tier_v2(self, entity_id: str) -> str:
-        """Return the neutral tier after HA-local showroom preference storage removal."""
-        return "core"

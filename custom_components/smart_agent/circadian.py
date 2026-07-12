@@ -14,13 +14,33 @@ CircadianEngine — 昼夜节律引擎 (Phase 13.2)。
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _circadian_timezone(configured_timezone: str):
+    normalized_tz = configured_timezone.lower()
+    fixed_offset_hours = {
+        "asia/shanghai": 8,
+        "asia/chongqing": 8,
+        "asia/harbin": 8,
+        "asia/hong_kong": 8,
+        "hongkong": 8,
+        "prc": 8,
+        "utc": 0,
+    }.get(normalized_tz)
+    try:
+        return ZoneInfo(configured_timezone)
+    except ZoneInfoNotFoundError:
+        if fixed_offset_hours is not None:
+            return timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
+        raise
 
 # 房间修正系数：(亮度倍率, 色温偏移K)
 _ROOM_MODIFIERS: dict[str, tuple[float, int]] = {
@@ -222,6 +242,20 @@ class CircadianEngine:
         ct = max(self.CT_MIN, min(self.CT_MAX, ct))
         return bri, ct
 
+    def _ha_local_now(self) -> datetime:
+        config = getattr(getattr(self, "hass", None), "config", None)
+        configured_timezone = str(getattr(config, "time_zone", "") or "").strip()
+        if configured_timezone:
+            try:
+                return datetime.now(_circadian_timezone(configured_timezone))
+            except ZoneInfoNotFoundError:
+                _LOGGER.debug("[CircadianEngine] invalid HA timezone for local clock: %s", configured_timezone)
+            except Exception as exc:
+                _LOGGER.debug("[CircadianEngine] HA timezone read failed for local clock: %s", exc)
+        from homeassistant.util import dt as dt_util
+
+        return dt_util.now()
+
     def get_target(
         self, room: str = "", now: datetime | None = None
     ) -> dict:
@@ -235,7 +269,7 @@ class CircadianEngine:
             return {"brightness_pct": 80, "color_temp_kelvin": 4000, "transition": 2}
 
         if now is None:
-            now = datetime.now()
+            now = self._ha_local_now()
         now_min = now.hour * 60 + now.minute + now.second / 60
 
         bri, ct, tr = self._interpolate(now_min)

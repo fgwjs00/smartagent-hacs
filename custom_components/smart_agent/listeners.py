@@ -5,6 +5,7 @@ ListenersMixin — 事件监听层。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -17,7 +18,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
 from .ha_adapter import async_call_service
-from .season import ha_season_for_datetime
+from .confidence_arbitration_contract import validate_auto_execution_arbitration
 from .const import (
     FRIGATE_PERSON_COUNT_KW as _FRIGATE_PERSON_COUNT_KW,
     AI_ACTION_SKIP_WINDOW, URGENT_MERGE_WINDOW, NORMAL_MERGE_WINDOW,
@@ -69,8 +70,24 @@ class ListenersMixin:
                     "ren_ti", "cun_zai", "radar", "mmwave", "雷达",
                     "person_occupancy", "object_count")  # Frigate 生成的占用实体
     _ACTIONABLE_SENSOR_TYPES = frozenset(
-        {"pir", "mmwave", "presence", "occupancy", "motion", "frigate", "radar", "person_count", "object_count"}
+        {
+            "pir",
+            "mmwave",
+            "presence",
+            "human_presence",
+            "occupancy",
+            "motion",
+            "moving",
+            "frigate",
+            "radar",
+            "person",
+            "person_count",
+            "object_count",
+            "vision",
+        }
     )
+    _PRESENCE_DEVICE_CLASSES = frozenset({"motion", "moving", "occupancy", "presence"})
+    _GENERIC_BINARY_CLASS_VALUES = frozenset({"", "binary_sensor", "sensor", "unknown"})
     _ACTIONABLE_CONTACT_SENSOR_TYPES = frozenset({"door", "window", "contact", "opening", "garage_door"})
     _ACTIONABLE_CONTACT_KW = ("door", "window", "contact", "opening", "men_chuang", "garage", "门", "窗", "门窗")
     _PRESENCE_OFF_DELAY = PRESENCE_OFF_DELAY
@@ -102,6 +119,8 @@ class ListenersMixin:
     _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
     _DAYLIGHT_FALLBACK_START_HOUR = 8
     _DAYLIGHT_FALLBACK_END_HOUR = 20
+    _PROTECTED_NIGHT_START_HOUR = 22
+    _PROTECTED_NIGHT_END_HOUR = 6
     _CORRECTION_SUPPRESSIONS_CACHE_TTL = 60.0
     _LISTENER_DOMAINS = frozenset(
         (
@@ -248,6 +267,92 @@ class ListenersMixin:
             f"[存在去抖] {entity_id} 在 {self._PRESENCE_FLAP_WINDOW}s 内状态反转 {flap_count} 次，"
             f"判定抖动风暴，抑制 {self._PRESENCE_FLAP_SUPPRESS_SECS}s",
         )
+
+    def _cancel_presence_temporal_recheck(self, entity_id: str) -> None:
+        timers = getattr(self, "_presence_off_timers", None)
+        if not isinstance(timers, dict):
+            return
+        cancel = timers.pop(entity_id, None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception as exc:
+                _LOGGER.debug("[PresenceTemporal] cancel recheck failed for %s: %s", entity_id, exc)
+
+    @staticmethod
+    def _presence_temporal_recheck_delay(presence: dict[str, Any]) -> float | None:
+        if str(presence.get("temporal_status") or "") != "vacant_hold_pending":
+            return None
+        try:
+            hold_secs = max(0.0, float(presence.get("hold_secs") or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if hold_secs <= 0:
+            return None
+        candidate_text = str(presence.get("candidate_since") or "").strip()
+        if not candidate_text:
+            return hold_secs
+        if candidate_text.endswith("Z"):
+            candidate_text = f"{candidate_text[:-1]}+00:00"
+        try:
+            candidate_since = datetime.fromisoformat(candidate_text)
+        except ValueError:
+            return hold_secs
+        if candidate_since.tzinfo is None:
+            candidate_since = candidate_since.replace(tzinfo=timezone.utc)
+        elapsed = max(0.0, time.time() - candidate_since.timestamp())
+        return max(1.0, hold_secs - elapsed)
+
+    def _schedule_presence_temporal_recheck(
+        self,
+        entity_id: str,
+        *,
+        old_state: str,
+        new_state: str,
+        presence: dict[str, Any] | None,
+    ) -> None:
+        vacant_states = {"off", "closed", "not_home", "away", "idle", "clear", "empty", "vacant"}
+        normalized_state = str(new_state or "").strip().lower()
+        temporal = presence if isinstance(presence, dict) else {}
+        delay = self._presence_temporal_recheck_delay(temporal)
+
+        if normalized_state not in vacant_states:
+            self._cancel_presence_temporal_recheck(entity_id)
+            return
+        if delay is None:
+            if str(temporal.get("temporal_status") or "") in {
+                "vacant_hold_satisfied",
+                "vacant_confirmed",
+            }:
+                self._cancel_presence_temporal_recheck(entity_id)
+            return
+
+        self._cancel_presence_temporal_recheck(entity_id)
+        timers = getattr(self, "_presence_off_timers", None)
+        if not isinstance(timers, dict):
+            timers = {}
+            self._presence_off_timers = timers
+
+        def _recheck(_: datetime) -> None:
+            timers.pop(entity_id, None)
+            states = getattr(getattr(self, "hass", None), "states", None)
+            get_state = getattr(states, "get", None)
+            state_obj = get_state(entity_id) if callable(get_state) else None
+            current_state = str(getattr(state_obj, "state", "") or "").strip().lower()
+            if current_state not in vacant_states:
+                return
+            self._spawn_addon_fast_path_task(
+                self._run_addon_fast_path_fail_closed(entity_id, current_state, old_state),
+                entity_id=entity_id,
+                old_state=old_state,
+                new_state=current_state,
+            )
+
+        try:
+            timers[entity_id] = async_call_later(self.hass, delay, _recheck)
+        except Exception as exc:
+            timers.pop(entity_id, None)
+            _LOGGER.debug("[PresenceTemporal] schedule recheck failed for %s: %s", entity_id, exc)
 
     def _build_presence_snapshot_for_entity(
         self,
@@ -710,34 +815,73 @@ class ListenersMixin:
         if self._batch_trigger_controllable:
             self._sys_log("INFO", f"[自触发保护] 本批次含可控设备触发: {', '.join(self._batch_trigger_controllable)}，AI 不可反向操作这些设备")
         
-        # 提取一客制化 Prompt（主要用于展示模式的一次性指令）
-        one_off_prompts = [t.get("one_off") for t in triggers if t.get("one_off")]
-        final_one_off = one_off_prompts[0] if one_off_prompts else ""
-        source_trace_contexts = [
-            t.get("source_trace_context")
-            for t in triggers
-            if isinstance(t.get("source_trace_context"), dict) and t.get("source_trace_context")
+        contextual_triggers = [
+            item
+            for item in triggers
+            if isinstance(item.get("source_trace_context"), dict)
+            and item.get("source_trace_context")
         ]
-        final_source_trace_context = dict(source_trace_contexts[0]) if source_trace_contexts else None
-        
-        texts = [t["text"] for t in triggers]
-        if len(texts) == 1:
-            merged = texts[0]
-        else:
-            merged = self._compact_merged_trigger(texts)
-        self._sys_log("INFO", f"[合并] 合并 {len(triggers)} 个触发，启动推理: {merged[:80]}")
-        try:
-            self._spawn_slow_inference_task(
-                self._run_addon_decision(
-                    merged,
-                    one_off_prompt=final_one_off,
-                    source_trace_context=final_source_trace_context,
-                ),
-                trigger=merged,
-                entity_id=str(triggers[0].get("entity_id") or ""),
+        mergeable_triggers = [item for item in triggers if item not in contextual_triggers]
+        inference_batches: list[dict[str, Any]] = []
+
+        merged_batch: dict[str, Any] | None = None
+        if mergeable_triggers:
+            mergeable_texts = [item["text"] for item in mergeable_triggers]
+            merged_trigger = (
+                mergeable_texts[0]
+                if len(mergeable_texts) == 1
+                else self._compact_merged_trigger(mergeable_texts)
             )
-        except Exception as exc:
-            self._sys_log("ERROR", f"[合并] 创建推理任务失败: {exc}")
+            one_off_prompts = [
+                item.get("one_off")
+                for item in mergeable_triggers
+                if item.get("one_off")
+            ]
+            merged_batch = {
+                "trigger": merged_trigger,
+                "entity_id": str(mergeable_triggers[0].get("entity_id") or ""),
+                "one_off_prompt": one_off_prompts[0] if one_off_prompts else "",
+                "source_trace_context": None,
+                "trigger_count": len(mergeable_triggers),
+                "public_summary": self._trigger_public_summary(mergeable_texts),
+            }
+
+        merged_batch_added = False
+        for item in triggers:
+            context = item.get("source_trace_context")
+            if isinstance(context, dict) and context:
+                inference_batches.append(
+                    {
+                        "trigger": item["text"],
+                        "entity_id": str(item.get("entity_id") or ""),
+                        "one_off_prompt": str(item.get("one_off") or ""),
+                        "source_trace_context": dict(context),
+                        "trigger_count": 1,
+                        "public_summary": self._trigger_public_summary([item["text"]]),
+                    }
+                )
+            elif merged_batch is not None and not merged_batch_added:
+                inference_batches.append(merged_batch)
+                merged_batch_added = True
+
+        for batch in inference_batches:
+            self._sys_log(
+                "INFO",
+                f"[合并] 合并 {batch['trigger_count']} 个触发，启动推理: {batch['public_summary']}",
+            )
+            try:
+                trigger_text = str(batch["trigger"])
+                self._spawn_slow_inference_task(
+                    self._run_addon_decision(
+                        trigger_text,
+                        one_off_prompt=str(batch["one_off_prompt"]),
+                        source_trace_context=batch["source_trace_context"],
+                    ),
+                    trigger=trigger_text,
+                    entity_id=str(batch["entity_id"]),
+                )
+            except Exception as exc:
+                self._sys_log("ERROR", f"[合并] 创建推理任务失败: {exc}")
 
     # ── 触发文本格式化 ────────────────────────────────────────────────────────
 
@@ -784,6 +928,67 @@ class ListenersMixin:
         nz = self._fmt_state(domain, entity_id, new_s)
         src_short = {"物理/自动": "物理", "自动化/脚本": "脚本", "用户界面": "用户"}.get(source, source)
         return f"[{src_short}] {dz}「{name}」{oz}→{nz}（{entity_id}）"
+
+    def _trigger_public_summary(
+        self,
+        trigger: Any,
+        *,
+        entity_id: str = "",
+        old_state: str = "",
+        new_state: str = "",
+    ) -> str:
+        """Return a log-safe trigger summary without friendly names or raw text."""
+        if isinstance(trigger, (list, tuple, set)):
+            texts = [str(item or "").strip() for item in trigger if str(item or "").strip()]
+        else:
+            text = str(trigger or "").strip()
+            texts = [text] if text else []
+
+        def _summary_from_text(text: str) -> str:
+            patterns = (
+                re.compile(r"\[(?P<src>[^\]]+)\].*?」(?P<old>[^→（）\s]+)→(?P<new>[^（）\s]+)（(?P<eid>[^）]+)）"),
+                re.compile(r"\[(?P<src>[^\]]+)\].*?\((?P<eid>[^)]+)\)\]\s+changed:\s+(?P<old>\S+)\s+->\s+(?P<new>\S+)"),
+                re.compile(r"(?P<eid>[A-Za-z0-9_]+\.[A-Za-z0-9_.:-]+)\s*[:：]?\s*(?P<old>[^\s→-]+)\s*(?:→|->)\s*(?P<new>\S+)"),
+            )
+            for pattern in patterns:
+                match = pattern.search(text)
+                if not match:
+                    continue
+                src = str(match.groupdict().get("src") or "").strip()
+                eid = str(match.group("eid") or "").strip()
+                old_s = str(match.group("old") or "?").strip()
+                new_s = str(match.group("new") or "?").strip()
+                if eid:
+                    prefix = f"[{src}] " if src else ""
+                    return f"{prefix}{eid}:{old_s}->{new_s}"
+            return ""
+
+        summaries: list[str] = []
+        seen: set[str] = set()
+        for text in texts:
+            summary = _summary_from_text(text)
+            if summary and summary not in seen:
+                summaries.append(summary)
+                seen.add(summary)
+
+        fallback_entity = str(entity_id or "").strip()
+        if fallback_entity:
+            old_s = str(old_state or "?").strip() or "?"
+            new_s = str(new_state or "?").strip() or "?"
+            fallback = f"{fallback_entity}:{old_s}->{new_s}"
+            if fallback not in seen:
+                summaries.append(fallback)
+
+        if summaries:
+            visible = summaries[:6]
+            suffix = f"; +{len(summaries) - len(visible)} more" if len(summaries) > len(visible) else ""
+            return ("; ".join(visible) + suffix)[:240]
+
+        combined = "\n".join(texts)
+        if not combined:
+            return "-"
+        digest = hashlib.sha256(combined.encode("utf-8", "ignore")).hexdigest()[:12]
+        return f"trigger_hash={digest} len={len(combined)}"
 
     # ── 触发合并压缩 ──────────────────────────────────────────────────────────
 
@@ -908,7 +1113,15 @@ class ListenersMixin:
                 _LOGGER.debug("[Listeners] invalid HA timezone for local clock: %s", configured_timezone)
             except Exception as exc:
                 _LOGGER.debug("[Listeners] HA timezone read failed for local clock: %s", exc)
-        return datetime.now()
+        try:
+            from homeassistant.util import dt as dt_util
+
+            return dt_util.now()
+        except Exception:
+            return datetime.now(timezone.utc)
+
+    def _listener_db_now_text(self) -> str:
+        return self._ha_local_now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _build_fast_path_environment_context(
         self,
@@ -931,12 +1144,12 @@ class ListenersMixin:
                 local_timezone = configured_timezone
             except ZoneInfoNotFoundError:
                 _LOGGER.debug("[Listeners] invalid HA timezone for fast-path snapshot: %s", configured_timezone)
-                local_now = datetime.now()
+                local_now = self._ha_local_now()
             except Exception as exc:
                 _LOGGER.debug("[Listeners] HA timezone read failed for fast-path snapshot: %s", exc)
-                local_now = datetime.now()
+                local_now = self._ha_local_now()
         else:
-            local_now = datetime.now()
+            local_now = self._ha_local_now()
         context["local_hour"] = local_now.hour
         context["local_weekday"] = (local_now.weekday() + 1) % 7
         context["local_hour_source"] = local_hour_source
@@ -977,8 +1190,8 @@ class ListenersMixin:
         if not isinstance(trigger_info, dict):
             trigger_info = {}
         trigger_room = _entity_room(trigger_entity_id, trigger_info) if trigger_entity_id else ""
-        lux_values: list[float] = []
-        trigger_room_lux_values: list[float] = []
+        lux_values: list[tuple[float, str]] = []
+        trigger_room_lux_values: list[tuple[float, str]] = []
         for eid, raw_info in device_info.items():
             entity_id = str(eid or "")
             if not entity_id.startswith("sensor."):
@@ -999,19 +1212,28 @@ class ListenersMixin:
             try:
                 state_obj = get_state(entity_id)
                 lux = float(str(getattr(state_obj, "state", "") or "").strip())
-                lux_values.append(lux)
+                lux_values.append((lux, entity_id))
                 if trigger_room and _entity_room(entity_id, info) == trigger_room:
-                    trigger_room_lux_values.append(lux)
+                    trigger_room_lux_values.append((lux, entity_id))
             except (TypeError, ValueError):
                 continue
             except Exception as exc:
                 _LOGGER.debug("[Listeners] illuminance read failed for %s: %s", entity_id, exc)
         selected_lux_values = trigger_room_lux_values or lux_values
         if selected_lux_values:
-            min_lux = min(selected_lux_values)
+            min_lux = min(lux for lux, _entity_id in selected_lux_values)
+            min_lux_entities = [
+                entity_id
+                for lux, entity_id in selected_lux_values
+                if lux == min_lux
+            ]
             context["illuminance_lux_min"] = min_lux
             context["illuminance_lux"] = min_lux
             context["illuminance_scope"] = "trigger_room" if trigger_room_lux_values else "global"
+            if min_lux_entities:
+                context["illuminance_entity_id"] = min_lux_entities[0]
+                context["illuminance_evidence_ids"] = min_lux_entities
+                context["illuminance_source"] = "ha_state"
             if min_lux <= self._DAYLIGHT_GUARD_LUX_THRESHOLD:
                 context["is_dark"] = True
                 context["is_daylight"] = False
@@ -1120,16 +1342,36 @@ class ListenersMixin:
     def _build_addon_fast_path_snapshot(self, entity_id: str) -> dict[str, Any]:
         """Build the plain snapshot consumed by add-on Core fast-path decisions."""
         raw_device_info = getattr(self, "device_info", {}) or {}
-        device_info = dict(raw_device_info) if isinstance(raw_device_info, dict) else {}
+        device_info = {
+            str(entity_id): dict(info) if isinstance(info, dict) else {}
+            for entity_id, info in raw_device_info.items()
+        } if isinstance(raw_device_info, dict) else {}
         now_ts = time.time()
         observed_at = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
         states: dict[str, str] = {}
+        state_observations: dict[str, dict[str, str]] = {}
         for eid in device_info.keys():
             if not eid:
                 continue
             state = self.hass.states.get(eid)
             if state is not None:
-                states[eid] = str(state.state or "")
+                state_value = str(state.state or "")
+                states[eid] = state_value
+                observation = {"state": state_value}
+                for timestamp_key in ("last_changed", "last_updated"):
+                    timestamp = getattr(state, timestamp_key, None)
+                    if timestamp in (None, ""):
+                        continue
+                    isoformat = getattr(timestamp, "isoformat", None)
+                    observation[timestamp_key] = (
+                        str(isoformat()) if callable(isoformat) else str(timestamp)
+                    )
+                state_observations[eid] = observation
+                attributes = getattr(state, "attributes", None)
+                if isinstance(attributes, dict):
+                    device_class = str(attributes.get("device_class") or "").strip().lower()
+                    if device_class and not device_info[eid].get("device_class"):
+                        device_info[eid]["device_class"] = device_class
 
         topology: dict[str, list[str]] = {}
         for room, neighbors in (getattr(self, "_room_topology_cache", {}) or {}).items():
@@ -1139,6 +1381,7 @@ class ListenersMixin:
         snapshot: dict[str, Any] = {
             "device_info": device_info,
             "states": states,
+            "state_observations": state_observations,
             "ai_scenes": list(getattr(self, "_ai_scenes_cache", []) or []),
             "room_topology": topology,
             "mode": str(getattr(self, "_mode", "") or ""),
@@ -1246,8 +1489,11 @@ class ListenersMixin:
         entity_id: str,
         source_label: str,
         transaction_id: str = "",
+        correlation_id: str = "",
+        world_snapshot_id: str = "",
+        decision_trace: dict[str, Any] | None = None,
         trigger: str = "",
-    ) -> None:
+    ) -> dict[str, Any]:
         actions = result.get("actions", [])
         scene = result.get("scene", source_label)
         confidence = result.get("confidence", 90)
@@ -1273,9 +1519,13 @@ class ListenersMixin:
             is_global_cmd=False,
             cmd_source=_CMD_SOURCE_SENSOR,
             parent_transaction_id=transaction_id,
+            world_snapshot_id=world_snapshot_id,
         )
-        self._enqueue_fast_path_execution_audit(
+        return self._enqueue_fast_path_execution_audit(
             transaction_id=transaction_id,
+            correlation_id=correlation_id,
+            world_snapshot_id=world_snapshot_id,
+            decision_trace=decision_trace,
             trigger=trigger or f"{entity_id}: state_changed",
             scene=str(scene),
             confidence=confidence,
@@ -1287,15 +1537,18 @@ class ListenersMixin:
         self,
         *,
         transaction_id: str,
+        correlation_id: str = "",
+        world_snapshot_id: str = "",
+        decision_trace: dict[str, Any] | None = None,
         trigger: str,
         scene: str,
         confidence: Any,
         actions: list[Any],
         execution_result: Any,
-    ) -> None:
+    ) -> dict[str, Any]:
         transaction_id = str(transaction_id or "").strip()
         if not transaction_id:
-            return
+            return {}
         valid_actions = [dict(item) for item in actions if isinstance(item, dict)]
         try:
             executed = int(execution_result)
@@ -1303,6 +1556,15 @@ class ListenersMixin:
             executed = 0
         raw_action_results = getattr(execution_result, "action_results", None)
         action_results = list(raw_action_results) if isinstance(raw_action_results, list) else []
+        raw_pre_states = getattr(execution_result, "pre_states", None)
+        pre_states = {
+            str(entity_id): str(state)
+            for entity_id, state in raw_pre_states.items()
+            if str(entity_id).strip()
+        } if isinstance(raw_pre_states, dict) else {}
+        execution_transaction_id = str(
+            getattr(execution_result, "transaction_id", "") or ""
+        ).strip()
         for index, action in enumerate(valid_actions):
             params = action.get("params")
             action_reason = str(action.get("reason") or "").strip()
@@ -1338,29 +1600,34 @@ class ListenersMixin:
             if executed > 0
             else "failed"
         )
+        audit_context = {
+            "source": "addon_fast_path_execution_audit",
+            "transaction_id": transaction_id,
+            "decision_id": transaction_id,
+            "execution_transaction_id": execution_transaction_id,
+            "correlation_id": str(correlation_id or "").strip(),
+            "world_snapshot_id": str(world_snapshot_id or "").strip(),
+            "decision_trace": dict(decision_trace) if isinstance(decision_trace, dict) else {},
+            "trigger": str(trigger or ""),
+            "scene": scene,
+            "confidence": confidence,
+            "planned_count": len(valid_actions),
+            "executed_count": executed,
+            "final_outcome": final_outcome,
+            "actions": valid_actions,
+            "action_results": action_results,
+            "pre_states": pre_states,
+        }
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue):
-            return
-        ok = enqueue(
-            "decision_execution",
-            {
-                "transaction_id": transaction_id,
-                "trigger": str(trigger or ""),
-                "scene": scene,
-                "confidence": confidence,
-                "planned_count": len(valid_actions),
-                "executed_count": executed,
-                "final_outcome": final_outcome,
-                "actions": valid_actions,
-                "action_results": action_results,
-                "source": "ha_fast_path",
-            },
-        )
+            return audit_context
+        ok = enqueue("decision_execution", audit_context)
         if not ok:
             self._sys_log(
                 "WARN",
                 f"[Add-on FastPath] decision_execution 回写入队失败 transaction_id={transaction_id}",
             )
+        return audit_context
 
     def _fast_path_audit_action_is_low_risk(self, action: Any) -> bool:
         if not isinstance(action, dict):
@@ -1420,13 +1687,7 @@ class ListenersMixin:
             return False
         if domain != "binary_sensor":
             return False
-        info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
-        sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
-        if sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}:
-            return True
-        eid_lower = entity_id.lower()
-        name_lower = str((info or {}).get("name") or "").lower()
-        return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
+        return self._is_presence_listener_entity(entity_id)
 
     def _is_presence_departure_for_slow_inference(self, entity_id: str, new_state: str) -> bool:
         domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
@@ -1435,13 +1696,7 @@ class ListenersMixin:
             return False
         if domain != "binary_sensor":
             return False
-        info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
-        sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
-        if sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}:
-            return True
-        eid_lower = entity_id.lower()
-        name_lower = str((info or {}).get("name") or "").lower()
-        return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
+        return self._is_presence_listener_entity(entity_id)
 
     def _is_actionable_contact_arrival_for_slow_inference(self, entity_id: str, new_state: str) -> bool:
         domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
@@ -1450,9 +1705,10 @@ class ListenersMixin:
             return False
         if domain != "binary_sensor":
             return False
-        info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
+        info = self._listener_entity_metadata(entity_id)
         sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
-        if sensor_type in self._ACTIONABLE_CONTACT_SENSOR_TYPES:
+        device_class = str((info or {}).get("device_class") or "").strip().lower()
+        if sensor_type in self._ACTIONABLE_CONTACT_SENSOR_TYPES or device_class in self._ACTIONABLE_CONTACT_SENSOR_TYPES:
             return True
         eid_lower = entity_id.lower()
         name_lower = str((info or {}).get("name") or "").lower()
@@ -1509,6 +1765,16 @@ class ListenersMixin:
                 return hour
         return None
 
+    def _fast_path_context_is_protected_night_hour(self, context: dict[str, Any]) -> bool:
+        local_hour = self._fast_path_context_hour(
+            context.get("local_hour"),
+            context.get("now_hour"),
+            context.get("hour"),
+        )
+        if local_hour is None:
+            return False
+        return local_hour >= self._PROTECTED_NIGHT_START_HOUR or local_hour < self._PROTECTED_NIGHT_END_HOUR
+
     def _fast_path_no_match_slow_inference_skip_reason(
         self,
         entity_id: str,
@@ -1541,6 +1807,8 @@ class ListenersMixin:
         if is_daylight is False:
             return ""
         if lux is not None and lux > self._DAYLIGHT_GUARD_LUX_THRESHOLD:
+            if self._fast_path_context_is_protected_night_hour(context):
+                return ""
             return self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED
         local_hour = self._fast_path_context_hour(
             context.get("local_hour"),
@@ -1588,6 +1856,18 @@ class ListenersMixin:
         if not room:
             return
 
+        states = getattr(self.hass, "states", None)
+        pre_light_states: dict[str, str | None] = {}
+        for light_entity_id, light_info in device_info.items():
+            if not str(light_entity_id).startswith("light.") or not isinstance(light_info, dict):
+                continue
+            light_room = str(light_info.get("room") or light_info.get("area") or "").strip()
+            if light_room != room:
+                continue
+            light_state = states.get(light_entity_id) if states is not None and hasattr(states, "get") else None
+            pre_light_states[light_entity_id] = getattr(light_state, "state", None) if light_state is not None else None
+        sample_started_at = time.time()
+
         def _sample(_now: Any = None) -> None:
             try:
                 states = getattr(self.hass, "states", None)
@@ -1603,7 +1883,35 @@ class ListenersMixin:
                     return
                 recorder = getattr(self, "_record_arrival_snapshot", None)
                 if callable(recorder):
-                    recorder(room, entity_id)
+                    sample_ended_at = time.time()
+                    observed_light_states: dict[str, str | None] = {}
+                    smartagent_actions: list[dict[str, Any]] = []
+                    last_ai_actions = getattr(self, "_last_ai_actions", {})
+                    for light_entity_id in pre_light_states:
+                        light_state = states.get(light_entity_id) if states is not None and hasattr(states, "get") else None
+                        observed_light_states[light_entity_id] = (
+                            getattr(light_state, "state", None) if light_state is not None else None
+                        )
+                    for action_entity_id, action in (
+                        last_ai_actions.items() if isinstance(last_ai_actions, dict) else ()
+                    ):
+                        if not isinstance(action, dict):
+                            continue
+                        try:
+                            action_time = float(action.get("time") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if sample_started_at <= action_time <= sample_ended_at:
+                            smartagent_actions.append({"entity_id": str(action_entity_id), **dict(action)})
+                    recorder(
+                        room,
+                        entity_id,
+                        observed_light_states,
+                        pre_light_states=pre_light_states,
+                        smartagent_actions=smartagent_actions,
+                        sample_started_at=sample_started_at,
+                        sample_ended_at=sample_ended_at,
+                    )
             except Exception as exc:
                 _LOGGER.debug("[ArrivalBaseline] delayed sample failed for %s: %s", entity_id, exc)
 
@@ -1612,200 +1920,6 @@ class ListenersMixin:
             async_call_later(self.hass, delay, _sample)
         except Exception as exc:
             _LOGGER.debug("[ArrivalBaseline] sample scheduling failed for %s: %s", entity_id, exc)
-
-    def _silent_learning_expected_state(self, entity_id: str, state: str) -> str:
-        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
-        value = str(state or "").strip().lower()
-        if domain in {"light", "switch", "fan", "input_boolean"}:
-            return value if value in {"on", "off"} else ""
-        if domain == "cover":
-            if value in {"open", "opening"}:
-                return "open"
-            if value in {"closed", "closing"}:
-                return "closed"
-            return ""
-        if domain == "media_player":
-            if value == "playing":
-                return "on"
-            if value in {"off", "idle", "paused", "standby"}:
-                return "off"
-        return ""
-
-    @staticmethod
-    def _silent_learning_truthy(value: Any, default: bool = True) -> bool:
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return default
-        if isinstance(value, (int, float)):
-            return value != 0
-        text = str(value).strip().lower()
-        if text in {"0", "false", "no", "n", "off", "disabled"}:
-            return False
-        if text in {"1", "true", "yes", "y", "on", "enabled"}:
-            return True
-        return default
-
-    @staticmethod
-    def _silent_learning_clean_states(value: Any) -> tuple[str, ...]:
-        if isinstance(value, str):
-            return (value.strip().lower(),) if value.strip() else ()
-        if isinstance(value, (list, tuple, set)):
-            return tuple(str(item).strip().lower() for item in value if str(item).strip())
-        return ()
-
-    @staticmethod
-    def _silent_learning_range(value: Any) -> tuple[float, float] | None:
-        if isinstance(value, str):
-            parts = [part.strip() for part in value.replace("..", "-").split("-") if part.strip()]
-        elif isinstance(value, (list, tuple)):
-            parts = list(value[:2])
-        else:
-            parts = []
-        if len(parts) < 2:
-            return None
-        try:
-            return (float(parts[0]), float(parts[1]))
-        except (TypeError, ValueError):
-            return None
-
-    def _silent_learning_default_behavior_dims(self, entity_id: str) -> list[dict[str, Any]]:
-        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
-        if domain == "light":
-            return [
-                {"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"},
-                {"key": "brightness", "kind": "position", "range": (0, 100), "unit": "percent"},
-            ]
-        if domain in {"switch", "input_boolean"}:
-            return [{"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"}]
-        if domain == "fan":
-            return [
-                {"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"},
-                {"key": "speed", "kind": "enum", "states": ("low", "medium", "high")},
-            ]
-        if domain == "cover":
-            return [
-                {"key": "power", "kind": "discrete", "states": ("open", "closed"), "active_when": "open"},
-                {"key": "position", "kind": "position", "range": (0, 100), "unit": "percent"},
-            ]
-        if domain == "climate":
-            return [
-                {"key": "hvac_mode", "kind": "enum", "states": ("cool", "heat", "auto", "off"), "active_when": "cool"},
-                {"key": "target_temp", "kind": "continuous", "range": (16, 30), "unit": "c"},
-            ]
-        if domain == "media_player":
-            return [{"key": "power", "kind": "discrete", "states": ("on", "off"), "active_when": "on"}]
-        return []
-
-    def _silent_learning_behavior_dims(self, entity_id: str, info: dict[str, Any]) -> list[dict[str, Any]]:
-        if not self._silent_learning_truthy(info.get("learnable"), True):
-            return []
-        raw_dims = info.get("behavior_dims") or info.get("behavior_dimensions")
-        dims: list[dict[str, Any]] = []
-        if isinstance(raw_dims, (list, tuple)):
-            for raw_dim in raw_dims:
-                if not isinstance(raw_dim, dict):
-                    continue
-                key = str(raw_dim.get("key") or raw_dim.get("name") or "").strip().lower()
-                kind = str(raw_dim.get("kind") or raw_dim.get("type") or "").strip().lower()
-                if not key or not kind:
-                    continue
-                dim = {"key": key, "kind": kind}
-                states = self._silent_learning_clean_states(raw_dim.get("states") or raw_dim.get("values"))
-                if states:
-                    dim["states"] = states
-                value_range = self._silent_learning_range(raw_dim.get("range") or raw_dim.get("value_range"))
-                if value_range is not None:
-                    dim["range"] = value_range
-                unit = str(raw_dim.get("unit") or "").strip()
-                if unit:
-                    dim["unit"] = unit
-                dims.append(dim)
-        return dims or self._silent_learning_default_behavior_dims(entity_id)
-
-    @staticmethod
-    def _silent_learning_attributes(state_obj: Any) -> dict[str, Any]:
-        attrs = getattr(state_obj, "attributes", None)
-        return dict(attrs) if isinstance(attrs, dict) else {}
-
-    @staticmethod
-    def _silent_learning_number_text(value: float) -> str:
-        return str(int(value)) if float(value).is_integer() else f"{value:g}"
-
-    def _silent_learning_numeric_value(
-        self,
-        entity_id: str,
-        dim_key: str,
-        attrs: dict[str, Any],
-    ) -> str:
-        candidates_by_key = {
-            "brightness": ("brightness_pct", "brightness"),
-            "position": ("current_position", "position", "current_cover_position"),
-            "target_temp": ("target_temp", "target_temperature", "temperature"),
-        }
-        candidates = candidates_by_key.get(dim_key, (dim_key,))
-        raw_value: Any = None
-        raw_key = ""
-        for key in candidates:
-            if key in attrs and attrs.get(key) is not None:
-                raw_key = key
-                raw_value = attrs.get(key)
-                break
-        if raw_value is None:
-            return ""
-        try:
-            number = float(raw_value)
-        except (TypeError, ValueError):
-            return ""
-        if dim_key == "brightness" and raw_key == "brightness":
-            number = round(max(0.0, min(255.0, number)) * 100 / 255)
-        return self._silent_learning_number_text(number)
-
-    def _silent_learning_dimension_value(
-        self,
-        entity_id: str,
-        state: str,
-        state_obj: Any,
-        dim: dict[str, Any],
-    ) -> str:
-        dim_key = str(dim.get("key") or "").strip().lower()
-        kind = str(dim.get("kind") or "").strip().lower()
-        raw_state = str(state or "").strip().lower()
-        attrs = self._silent_learning_attributes(state_obj)
-        if kind in {"position", "continuous"}:
-            value = self._silent_learning_numeric_value(entity_id, dim_key, attrs)
-            if not value:
-                return ""
-            value_range = dim.get("range")
-            if isinstance(value_range, tuple) and len(value_range) >= 2:
-                try:
-                    numeric = float(value)
-                    if numeric < float(value_range[0]) or numeric > float(value_range[1]):
-                        return ""
-                except (TypeError, ValueError):
-                    return ""
-            return value
-
-        if dim_key == "power":
-            value = self._silent_learning_expected_state(entity_id, raw_state)
-        else:
-            raw_value = attrs.get(dim_key)
-            value = str(raw_value if raw_value is not None else raw_state).strip().lower()
-        states = self._silent_learning_clean_states(dim.get("states"))
-        if states and value not in states:
-            return ""
-        return value
-
-    @staticmethod
-    def _silent_learning_season(now: datetime) -> str:
-        return ha_season_for_datetime(now)
-
-    def _silent_learning_source_allowed(self, source_type: str) -> bool:
-        normalized = str(source_type or "").strip().lower()
-        if not normalized:
-            return True
-        blocked_tokens = ("自动化", "脚本", "automation", "script")
-        return not any(token in normalized for token in blocked_tokens)
 
     def _record_silent_learning_behavior_sample(
         self,
@@ -1818,20 +1932,11 @@ class ListenersMixin:
     ) -> None:
         if not bool(getattr(self, "_learning_mode", False)):
             return
-        if not self._silent_learning_source_allowed(source_type):
-            self._sys_log("INFO", f"[SilentLearning] behavior sample skipped for automation/script source: {entity_id}")
-            return
-        old_value = str(old_state or "").strip().lower()
-        new_value = str(new_state or "").strip().lower()
-        if not new_value:
-            return
         device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
         info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
         if not isinstance(info, dict):
             info = {}
-        dims = self._silent_learning_behavior_dims(entity_id, info)
-        if not dims:
-            return
+        info_payload = dict(info)
         room = str(info.get("room") or info.get("area") or "").strip()
         if not room:
             area_getter = getattr(self, "_get_entity_area", None)
@@ -1840,52 +1945,191 @@ class ListenersMixin:
                     room = str(area_getter(entity_id) or "").strip()
                 except Exception:
                     room = ""
+        if room and not str(info_payload.get("room") or info_payload.get("area") or "").strip():
+            info_payload["room"] = room
         now = self._ha_local_now()
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue):
             return
-        recorded: list[str] = []
-        season_sensitive = self._silent_learning_truthy(info.get("season_sensitive"), False)
         ts = now.strftime("%Y-%m-%d %H:%M:%S")
-        for dim in dims:
-            dim_key = str(dim.get("key") or "").strip().lower()
-            if not dim_key:
-                continue
-            expected_value = self._silent_learning_dimension_value(entity_id, new_value, new_state_obj, dim)
-            if not expected_value:
-                continue
-            previous_value = self._silent_learning_dimension_value(entity_id, old_value, old_state_obj, dim)
-            if previous_value and previous_value == expected_value:
-                continue
-            season = self._silent_learning_season(now) if season_sensitive or str(dim.get("kind") or "") == "continuous" else ""
-            payload = {
-                "action": "upsert",
-                "entity_id": entity_id,
-                "expected_state": expected_value,
-                "dim_key": dim_key,
-                "dim_kind": str(dim.get("kind") or "").strip().lower(),
-                "expected_value": expected_value,
-                "season": season,
-                "room": room,
-                "hour_start": (now.hour - 1) % 24,
-                "hour_end": (now.hour + 1) % 24,
-                "weekday_mask": str(now.strftime("%w")),
-                "confidence": 62,
-                "hit_count": 1,
-                "lifecycle_state": "active",
-                "source": "silent_learning",
-                "source_type": str(source_type or ""),
-            }
-            if enqueue("behavior", payload, ts=ts):
-                recorded.append(f"{dim_key}={expected_value}")
-        if recorded:
-            self._sys_log("INFO", f"[SilentLearning] behavior sample recorded: {entity_id} -> {', '.join(recorded)}")
+        old_attrs = getattr(old_state_obj, "attributes", None)
+        new_attrs = getattr(new_state_obj, "attributes", None)
+        state_context = getattr(new_state_obj, "context", None)
+        user_id = str(getattr(state_context, "user_id", None) or "").strip()
+        parent_id = str(getattr(state_context, "parent_id", None) or "").strip()
+        context_id = str(getattr(state_context, "id", None) or "").strip()
+        if user_id:
+            origin = "user_action"
+            actor = f"ha_user:{user_id}"
+        elif parent_id:
+            origin = "automation"
+            actor = "homeassistant:automation"
+        else:
+            origin = "unknown"
+            actor = "unknown"
+        payload = {
+            "action": "sample_state_transition",
+            "entity_id": entity_id,
+            "old_state": str(old_state or ""),
+            "new_state": str(new_state or ""),
+            "old_attributes": dict(old_attrs) if isinstance(old_attrs, dict) else {},
+            "new_attributes": dict(new_attrs) if isinstance(new_attrs, dict) else {},
+            "device_info": info_payload,
+            "source_type": str(source_type or ""),
+            "origin": origin,
+            "actor": actor,
+            "decision_id": "not_applicable",
+            "transaction_id": context_id or "not_applicable",
+            "world_snapshot_id": "not_applicable",
+        }
+        if enqueue("behavior", payload, ts=ts):
+            self._sys_log("INFO", f"[SilentLearning] behavior sample forwarded: {entity_id}")
 
     def _emit_addon_fast_path_event(self, payload: dict[str, Any]) -> None:
         try:
             self.hass.bus.async_fire("smart_agent_decision_bubble", payload)
         except Exception as exc:
             _LOGGER.debug("[Listeners] smart_agent_decision_bubble emit failed: %s", exc)
+
+    def _spawn_addon_fast_path_task(
+        self,
+        coro: Any,
+        *,
+        entity_id: str,
+        old_state: str,
+        new_state: str,
+    ) -> None:
+        try:
+            task = self.hass.async_create_task(coro)
+        except Exception as exc:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            exception_type = type(exc).__name__
+            _LOGGER.warning(
+                "[Listeners] add-on fast-path task create failed entity=%s old_state=%s new_state=%s: %s",
+                entity_id,
+                old_state,
+                new_state,
+                exc,
+                exc_info=(type(exc), exc, getattr(exc, "__traceback__", None)),
+            )
+            self._sys_log(
+                "ERROR",
+                f"[Add-on FastPath] task create failed fail-closed | entity={entity_id} "
+                f"reason=task_create_failed exception_type={exception_type}",
+            )
+            self._emit_addon_fast_path_event(
+                {
+                    "source": "addon_fast_path",
+                    "entity_id": entity_id,
+                    "old_state": old_state,
+                    "new_state": new_state,
+                    "status": 0,
+                    "matched": False,
+                    "path_taken": "none",
+                    "reason": "task_create_failed",
+                    "exception_type": exception_type,
+                    "fail_closed": True,
+                }
+            )
+            return
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(
+                lambda done_task: self._handle_addon_fast_path_task_done(
+                    done_task,
+                    entity_id=entity_id,
+                    old_state=old_state,
+                    new_state=new_state,
+                )
+            )
+
+    def _handle_addon_fast_path_task_done(
+        self,
+        task: Any,
+        *,
+        entity_id: str,
+        old_state: str,
+        new_state: str,
+    ) -> None:
+        cancelled = False
+        try:
+            cancelled = bool(task.cancelled()) if hasattr(task, "cancelled") else False
+        except Exception:
+            cancelled = False
+        if cancelled:
+            self._sys_log(
+                "WARN",
+                f"[Add-on FastPath] task cancelled fail-closed | entity={entity_id} reason=task_cancelled",
+            )
+            self._emit_addon_fast_path_event(
+                {
+                    "source": "addon_fast_path",
+                    "entity_id": entity_id,
+                    "old_state": old_state,
+                    "new_state": new_state,
+                    "status": 0,
+                    "matched": False,
+                    "path_taken": "none",
+                    "reason": "task_cancelled",
+                    "fail_closed": True,
+                }
+            )
+            return
+        try:
+            exc = task.exception() if hasattr(task, "exception") else None
+        except asyncio.CancelledError:
+            self._sys_log(
+                "WARN",
+                f"[Add-on FastPath] task cancelled fail-closed | entity={entity_id} reason=task_cancelled",
+            )
+            self._emit_addon_fast_path_event(
+                {
+                    "source": "addon_fast_path",
+                    "entity_id": entity_id,
+                    "old_state": old_state,
+                    "new_state": new_state,
+                    "status": 0,
+                    "matched": False,
+                    "path_taken": "none",
+                    "reason": "task_cancelled",
+                    "fail_closed": True,
+                }
+            )
+            return
+        except Exception as err:
+            exc = err
+        if exc is None:
+            return
+        _LOGGER.warning(
+            "[Listeners] add-on fast-path task failed entity=%s old_state=%s new_state=%s: %s",
+            entity_id,
+            old_state,
+            new_state,
+            exc,
+            exc_info=(type(exc), exc, getattr(exc, "__traceback__", None)),
+        )
+        exception_type = type(exc).__name__
+        self._sys_log(
+            "ERROR",
+            f"[Add-on FastPath] task failed fail-closed | entity={entity_id} "
+            f"reason=task_exception exception_type={exception_type}",
+        )
+        self._emit_addon_fast_path_event(
+            {
+                "source": "addon_fast_path",
+                "entity_id": entity_id,
+                "old_state": old_state,
+                "new_state": new_state,
+                "status": 0,
+                "matched": False,
+                "path_taken": "none",
+                "reason": "task_exception",
+                "exception_type": exception_type,
+                "fail_closed": True,
+            }
+        )
 
     def _emit_listener_event(
         self,
@@ -1923,7 +2167,7 @@ class ListenersMixin:
             enqueue = getattr(self, "_enqueue_internal_event", None)
             if callable(enqueue):
                 try:
-                    event_time = datetime.now(timezone.utc).isoformat()
+                    event_time = self._ha_local_now().isoformat()
                     info = {}
                     device_info = getattr(self, "device_info", {})
                     if isinstance(device_info, dict):
@@ -1967,6 +2211,17 @@ class ListenersMixin:
         old_state: str,
     ) -> None:
         should_fail_closed = True
+        if str(new_state or "").strip().lower() in {
+            "on",
+            "open",
+            "home",
+            "occupied",
+            "present",
+            "detected",
+            "motion",
+            "person",
+        }:
+            self._cancel_presence_temporal_recheck(entity_id)
         addon_client = getattr(self, "_addon_client", None)
         if addon_client is not None:
             await self._refresh_correction_suppressions_cache(addon_client)
@@ -2018,7 +2273,16 @@ class ListenersMixin:
                     status = int(response.get("__status") or 0)
                     result = response.get("result")
                     matched = response.get("matched") is True
+                    arbitration_validation = validate_auto_execution_arbitration(response)
+                    arbitration_fail_closed = matched and not arbitration_validation.allowed
                     details = response.get("details") if isinstance(response.get("details"), dict) else {}
+                    presence_details = details.get("presence") if isinstance(details.get("presence"), dict) else {}
+                    self._schedule_presence_temporal_recheck(
+                        entity_id,
+                        old_state=old_state,
+                        new_state=new_state,
+                        presence=presence_details,
+                    )
                     path_taken = str(response.get("path_taken") or details.get("path_taken") or "none")
                     reason = str(response.get("reason") or details.get("reason") or response.get("error") or "")
                     confirm_required = response.get("confirm_required") is True or details.get("confirm_required") is True
@@ -2028,12 +2292,23 @@ class ListenersMixin:
                     execution_suppressed_reason = (
                         "learning_mode" if matched and addon_learning_mode is True else ""
                     )
+                    if arbitration_fail_closed:
+                        matched = False
+                        confirm_required = False
+                        reason = arbitration_validation.reason
+                        execution_suppressed_reason = arbitration_validation.reason
                     if confirm_required and confirm_suppressed_reason:
                         confirm_required = False
-                    confidence_auto = details.get("confidence_auto")
-                    confidence_notify = details.get("confidence_notify")
+                    confidence_auto = response.get("confidence_auto", details.get("confidence_auto"))
+                    confidence_notify = response.get("confidence_notify", details.get("confidence_notify"))
+                    threshold = response.get("threshold", details.get("threshold"))
+                    arbitration_result = str(
+                        response.get("arbitration_result")
+                        or details.get("arbitration_result")
+                        or ""
+                    )
                     scene = ""
-                    confidence = details.get("confidence")
+                    confidence = response.get("confidence", details.get("confidence"))
                     action_count = 0
                     actions: list[Any] = []
                     decision_trace = response.get("decision_trace") if isinstance(response.get("decision_trace"), dict) else {}
@@ -2085,6 +2360,9 @@ class ListenersMixin:
                             "confidence": confidence,
                             "confidence_auto": confidence_auto,
                             "confidence_notify": confidence_notify,
+                            "threshold": threshold,
+                            "auto_execute": arbitration_validation.allowed,
+                            "arbitration_result": arbitration_result,
                             "confirm_required": confirm_required,
                             "confirm_suppressed_reason": confirm_suppressed_reason,
                             "action_count": action_count,
@@ -2098,7 +2376,7 @@ class ListenersMixin:
                             "audit_pending": audit_pending,
                             "rollback_allowed": audit_pending,
                             "execution_suppressed_reason": execution_suppressed_reason,
-                            "fail_closed": not (200 <= status < 300),
+                            "fail_closed": arbitration_fail_closed or not (200 <= status < 300),
                             "snapshot": snapshot_diag,
                         }
                     )
@@ -2154,22 +2432,29 @@ class ListenersMixin:
                                 f"[自触发保护] FastPath 可控设备触发: {entity_id}，AI 不可反向操作该设备",
                             )
                         try:
-                            await self._execute_fast_path_decision_result(
+                            execution_audit_context = await self._execute_fast_path_decision_result(
                                 result,
                                 entity_id=entity_id,
                                 source_label="AddonFastPath",
                                 transaction_id=transaction_id,
+                                correlation_id=correlation_id,
+                                world_snapshot_id=world_snapshot_id,
+                                decision_trace=decision_trace,
                                 trigger=f"{entity_id}: {old_state} -> {new_state}",
                             )
                         finally:
                             self._batch_trigger_controllable = previous_batch_trigger_controllable
-                        if audit_pending:
+                        if (
+                            audit_pending
+                            and execution_audit_context.get("final_outcome") == "succeeded"
+                        ):
                             self._schedule_inference(
                                 entity_id,
                                 f"{entity_id}: {old_state} -> {new_state}",
                                 new_state,
                                 one_off_prompt=self._fast_path_slow_audit_prompt(),
                                 _allow_learning_mode_inference=True,
+                                source_trace_context=execution_audit_context,
                             )
                         return
                     if 200 <= status < 300:
@@ -2367,7 +2652,7 @@ class ListenersMixin:
                 )
                 return
 
-            self._sys_log("INFO", f"[事件] {entity_id}: {old_s} → {new_s} (来源: {source_type})")
+            _LOGGER.debug("[事件] %s: %s -> %s (来源: %s)", entity_id, old_s, new_s, source_type)
             self._emit_listener_event(
                 listener_action="received",
                 entity_id=entity_id,
@@ -2513,16 +2798,37 @@ class ListenersMixin:
                 return
 
             info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}
-            sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
-            eid_lower = entity_id.lower()
-            name_lower = str((info or {}).get("name") or "").lower()
-            is_presence_sensor = (
-                domain == "binary_sensor"
-                and (
-                    sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}
-                    or any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
-                )
-            )
+            info = self._listener_entity_metadata(entity_id, info=info, state_obj=new)
+            is_presence_sensor = self._is_presence_listener_entity(entity_id, info)
+            if domain == "binary_sensor" and not is_presence_sensor:
+                if self._is_actionable_contact_arrival_for_slow_inference(entity_id, new_s):
+                    self._last_listener_filter_reason = "contact_slow_path_only"
+                    self._emit_listener_event(
+                        listener_action="slow_path_scheduled",
+                        entity_id=entity_id,
+                        old_state=old_s,
+                        new_state=new_s,
+                        filter_reason="contact_not_presence",
+                        source_type=source_type,
+                    )
+                    self._schedule_inference(
+                        entity_id,
+                        f"{entity_id}: {old_s} -> {new_s}",
+                        new_s,
+                    )
+                else:
+                    self._last_listener_filter_reason = "non_presence_binary_sensor"
+                    self._emit_listener_event(
+                        listener_action="filtered",
+                        entity_id=entity_id,
+                        old_state=old_s,
+                        new_state=new_s,
+                        filter_reason="non_presence_binary_sensor",
+                        source_type=source_type,
+                        device_class=str(info.get("device_class") or ""),
+                        sensor_type=str(info.get("sensor_type") or ""),
+                    )
+                return
             old_presence_state = str(old_s or "").strip().lower()
             new_presence_state = str(new_s or "").strip().lower()
             if (
@@ -2554,27 +2860,61 @@ class ListenersMixin:
                 new_state=new_s,
                 source_type=source_type,
             )
-            self.hass.async_create_task(
-                self._run_addon_fast_path_fail_closed(
-                    entity_id,
-                    new_s,
-                    old_s,
-                )
+            self._spawn_addon_fast_path_task(
+                self._run_addon_fast_path_fail_closed(entity_id, new_s, old_s),
+                entity_id=entity_id,
+                old_state=old_s,
+                new_state=new_s,
             )
             return
         return _state_changed
+
+    def _listener_entity_metadata(
+        self,
+        entity_id: str,
+        *,
+        info: dict[str, Any] | None = None,
+        state_obj: Any | None = None,
+    ) -> dict[str, Any]:
+        row = dict(info) if isinstance(info, dict) else {}
+        if not row:
+            device_info = getattr(self, "device_info", {})
+            stored = device_info.get(entity_id) if isinstance(device_info, dict) else None
+            if isinstance(stored, dict):
+                row.update(stored)
+        if state_obj is None:
+            states = getattr(getattr(self, "hass", None), "states", None)
+            get_state = getattr(states, "get", None)
+            state_obj = get_state(entity_id) if callable(get_state) else None
+        attributes = getattr(state_obj, "attributes", None)
+        if isinstance(attributes, dict):
+            for key in ("device_class", "friendly_name", "entity_category"):
+                if not row.get(key) and attributes.get(key) not in (None, ""):
+                    row[key] = attributes.get(key)
+        return row
 
     def _is_presence_listener_entity(self, entity_id: str, info: dict[str, Any] | None = None) -> bool:
         """Return True for managed entities that can represent human presence."""
         domain = str(entity_id or "").split(".", 1)[0]
         if domain != "binary_sensor":
             return False
-        row = info if isinstance(info, dict) else {}
+        row = self._listener_entity_metadata(entity_id, info=info)
         sensor_type = str(row.get("sensor_type") or "").strip().lower()
-        if sensor_type in {"pir", "mmwave", "presence", "occupancy", "motion", "frigate"}:
+        if sensor_type in self._ACTIONABLE_SENSOR_TYPES:
             return True
+        if sensor_type and sensor_type not in self._GENERIC_BINARY_CLASS_VALUES:
+            return False
+        device_class = str(row.get("device_class") or row.get("ha_device_class") or "").strip().lower()
+        capability = str(row.get("capability") or "").strip().lower()
+        specific_class = device_class or (
+            capability if capability not in self._GENERIC_BINARY_CLASS_VALUES else ""
+        )
+        if specific_class in self._PRESENCE_DEVICE_CLASSES:
+            return True
+        if specific_class:
+            return False
         eid_lower = str(entity_id or "").lower()
-        name_lower = str(row.get("name") or "").lower()
+        name_lower = str(row.get("name") or row.get("friendly_name") or "").lower()
         return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
 
     def _reconcile_active_listener_states(self, entity_ids: list[str]) -> None:
@@ -3002,13 +3342,14 @@ class ListenersMixin:
         execute = getattr(db, "execute", None)
         if not callable(execute):
             return
+        now = self._listener_db_now_text()
         try:
             execute(
                 "UPDATE devices SET ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
                 (
                     str(info.get("ha_unique_id") or ""),
                     str(info.get("ha_device_id") or ""),
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    now,
                     entity_id,
                 ),
             )
@@ -3020,7 +3361,7 @@ class ListenersMixin:
         execute = getattr(db, "execute", None)
         if not callable(execute):
             return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._listener_db_now_text()
         try:
             execute(
                 "UPDATE devices SET entity_id=?, updated=? WHERE entity_id=?",

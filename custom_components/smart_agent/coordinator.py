@@ -18,6 +18,7 @@ import html as _html
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import threading
@@ -30,6 +31,33 @@ from typing import Any
 # 与 manifest.json 的 version 字段保持一致，两者同步更新。
 _SA_VERSION: str = "unknown"
 _ROOM_INFERENCE_LOCKS_HARD_LIMIT = 256
+_ADDON_REPAIR_ISSUE_ID = "addon_unreachable"
+_ADDON_REPAIR_NOTIFICATION_ID = "smart_agent_addon_unreachable"
+_ADDON_REPAIR_HEALTH_CHECK_INTERVAL = 60
+_ADDON_REPAIR_MIN_FAILURE_SECONDS = 300
+_PRESENCE_SNAPSHOT_CACHE_TTL_SECONDS = 15.0
+_ADDON_REPAIR_UNREACHABLE_CODES = frozenset(
+    {
+        "addon_unreachable",
+        "dependency_unreachable",
+        "upstream_unreachable",
+    }
+)
+_FILE_LOG_LEVELS = {
+    logging.DEBUG,
+    logging.INFO,
+    logging.WARNING,
+    logging.ERROR,
+    logging.CRITICAL,
+}
+
+
+def _coerce_file_log_level(value: Any) -> int:
+    text = str(value or DEFAULT_FILE_LOG_LEVEL).strip().upper()
+    if text == "WARN":
+        text = "WARNING"
+    level = getattr(logging, text, logging.INFO)
+    return level if isinstance(level, int) and level in _FILE_LOG_LEVELS else logging.INFO
 
 
 from homeassistant.config_entries import ConfigEntry
@@ -39,11 +67,14 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
     async_track_utc_time_change,
 )
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .actions import ActionsMixin
 from .database import DatabaseMixin
 from .devices import DevicesMixin
+from .confidence_arbitration_contract import validate_auto_execution_arbitration
+from .execution_gate import evaluate_priority_arbitration
 from .frigate import FrigateMixin
 from .ha_adapter import async_call_service
 from .license import LicenseMixin
@@ -112,6 +143,8 @@ from .const import (
     ESCALATION_GUARD_SEC,
     ESCALATION_WINDOW_MIN,
     CONF_LOG_RETENTION,
+    CONF_FILE_LOG_LEVEL,
+    DEFAULT_FILE_LOG_LEVEL,
     CONF_ADDON_AUTH_TOKEN,
     CONF_ADDON_BASE_URL,
     DB_FILENAME,
@@ -216,15 +249,17 @@ class SmartAgentCoordinator(
         self._config_dir = hass.config.config_dir
         self._memory_db = os.path.join(self._config_dir, DB_FILENAME)
         self._pattern_file = os.path.join(self._config_dir, PATTERN_FILENAME)
+        # Merge entry.data and entry.options (options override)
+        data = {**(entry.data or {}), **(entry.options or {})}
+        self._file_log_level = _coerce_file_log_level(data.get(CONF_FILE_LOG_LEVEL, DEFAULT_FILE_LOG_LEVEL))
+        self._file_log_level_name = logging.getLevelName(self._file_log_level)
         
         # 文件日志记录器（handler 延迟到 async_start_listeners 中在 executor 里初始化，避免阻塞事件循环）
         self._file_logger = logging.getLogger(f"{DOMAIN}.system")
-        self._file_logger.setLevel(logging.INFO)
+        self._file_logger.setLevel(self._file_log_level)
         self._file_logger.handlers.clear()
         self._file_logger.propagate = False
 
-        # Merge entry.data and entry.options (options override)
-        data = {**(entry.data or {}), **(entry.options or {})}
         self.engine = data.get(CONF_ENGINE, "local")
         self.ollama_url = data.get(CONF_OLLAMA_URL, "http://127.0.0.1:11434")
         self.ollama_model = data.get(CONF_OLLAMA_MODEL, "qwen3-smarthome")
@@ -280,6 +315,7 @@ class SmartAgentCoordinator(
         self._terminal_logs: list[str] = []
         self._action_history_structured: list[str] = [] # 结构化动作历史
         self._sys_logs: list[str] = []
+        self._sys_log_html_rows: list[str] = []
         self._sys_log_lock = threading.Lock()  # P1修复：保护 _sys_logs 跨线程读写
         self._log_retention_days: int = int(data.get(CONF_LOG_RETENTION, LOG_RETENTION_DAYS))
         self._pattern_summary = ""
@@ -293,6 +329,7 @@ class SmartAgentCoordinator(
         self._sensors_muted = bool(data.get(CONF_SENSORS_MUTED, False))
         self._learning_mode = bool(data.get(CONF_LEARNING_MODE, False))
         self._habit_proactive = bool(data.get(CONF_HABIT_PROACTIVE, False))
+        self._patrol_enabled = False
         self._frigate_enabled = bool(data.get(CONF_FRIGATE_ENABLED, False))  # 默认关闭，需手动启用
         # Phase 5: 联网工具与知识库
         from .tools import ToolRegistry
@@ -313,10 +350,16 @@ class SmartAgentCoordinator(
             _addon_base_url = derive_addon_gateway_base_url(self._get_ha_url())
         _addon_port = int(data.get(CONF_ADDON_PORT) or DEFAULT_ADDON_PORT)
         self._addon_client = AddOnClient(base_url=_addon_base_url, port=_addon_port, auth_token=_addon_token)
+        self._addon_repair_issue_active = False
+        self._addon_repair_first_failure_at: float | None = None
+        self._addon_repair_failure_count = 0
+        self._addon_repair_last_check_at = 0.0
+        self._addon_repair_last_error = ""
         from .internal_event_bridge import InternalEventBridge
         self._internal_event_bridge = InternalEventBridge(
             self._addon_client,
             log_callback=self._sys_log,
+            now_provider=self._ha_local_now,
         )
         # TTS 配置
         self._tts_service: str = (data.get(CONF_TTS_SERVICE) or "").strip()
@@ -344,6 +387,12 @@ class SmartAgentCoordinator(
         self._room_topology_cache: dict[str, set[str]] = {}  # P1-2: room → {adjacent rooms}
         self._room_topology_cache_updated_at: float = 0.0
         self._room_topology_refresh_pending: bool = False
+        self._presence_snapshot_cache: dict[str, dict[str, Any]] = {}
+        self._presence_snapshot_cache_updated_at: float = 0.0
+        self._presence_snapshot_cache_record: tuple[
+            dict[str, dict[str, Any]],
+            float,
+        ] = ({}, 0.0)
         self._energy_stats: list[dict] = []
         self._mode = data.get(CONF_MODE, MODE_HOME)
         _saved_scene = data.get(CONF_SHOWROOM_SCENE, "") or ""
@@ -441,6 +490,7 @@ class SmartAgentCoordinator(
         self.terminal_log_html = ""
         self.sys_log_html = ""
         self.sys_log_html_short = ""  # 最新 30 条，用于 sensor 属性（避免超 16KB）
+        self._sys_log_html_rows = []
 
         self.device_info: dict[str, dict] = {}
         self._habits: list[tuple[str, bool]] = []
@@ -482,8 +532,8 @@ class SmartAgentCoordinator(
         self._load_config()
         # Phase 4: 加载 AI 场景缓存
         self._ai_scenes_cache = self._query_ai_scenes()
-        # Layer 2: 加载近期事务缓存（最近 30 条）
-        self._transactions_cache = self._query_recent_transactions(30)
+        # Layer 2: 事务读面由 add-on 单一属主提供；启动阶段不再预读 HA 本地事务表。
+        self._transactions_cache = []
         # 能耗分析：启动时执行一次，加载缓存
         try:
             self._energy_stats = self._get_device_usage_stats(days=7)
@@ -533,26 +583,47 @@ class SmartAgentCoordinator(
 
     def _sys_log(self, level: str, msg: str) -> None:
         """Append a system-level log entry and write to daily rotating file."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        level = str(level or "INFO").upper()
+        local_now = self._ha_local_now()
+        ts = local_now.strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{ts}] [{level}] {msg}"
         if level == "ERROR":
             self._file_logger.error(msg)
-        elif level == "WARN":
+            _LOGGER.error("SysLog %s: %s", level, msg)
+        elif level in {"WARN", "WARNING"}:
             self._file_logger.warning(msg)
+            _LOGGER.warning("SysLog %s: %s", level, msg)
         else:
             self._file_logger.info(msg)
-        _LOGGER.debug("SysLog %s: %s", level, msg)
+            _LOGGER.debug("SysLog %s: %s", level, msg)
         # P1修复：_sys_log 同时从事件循环和 executor 线程调用，需要 threading.Lock 保护
         # asyncio.Lock 不适用于 executor 线程，必须使用 threading.Lock
+        html_row = self._format_log_row(entry)
         with self._sys_log_lock:
             self._sys_logs.insert(0, entry)
+            dropped_html = ""
             if len(self._sys_logs) > LOG_MEM_MAX:
                 self._sys_logs = self._sys_logs[:LOG_MEM_MAX]
-            _snapshot = self._sys_logs[:30]
-            _full_snapshot = self._sys_logs[:]
-        self.sys_log_html = "".join(self._format_log_row(r) for r in _full_snapshot)
-        # 供 sensor 属性使用的短版本（最新 30 条），避免 HA 16KB 属性超限
-        self.sys_log_html_short = "".join(self._format_log_row(r) for r in _snapshot)
+            html_rows = getattr(self, "_sys_log_html_rows", [])
+            html_cache_rebuilt = False
+            if not isinstance(html_rows, list) or len(html_rows) != len(self._sys_logs) - 1:
+                html_rows = [self._format_log_row(r) for r in self._sys_logs[1:]]
+                html_cache_rebuilt = True
+            html_rows.insert(0, html_row)
+            if len(html_rows) > LOG_MEM_MAX:
+                dropped_html = html_rows.pop()
+            previous_full_html = str(getattr(self, "sys_log_html", "") or "")
+            if html_cache_rebuilt:
+                self.sys_log_html = "".join(html_rows)
+            elif dropped_html and previous_full_html.endswith(dropped_html):
+                self.sys_log_html = html_row + previous_full_html[: -len(dropped_html)]
+            elif dropped_html:
+                self.sys_log_html = "".join(html_rows)
+            else:
+                self.sys_log_html = html_row + previous_full_html
+            self._sys_log_html_rows = html_rows
+            # 供 sensor 属性使用的短版本（最新 30 条），避免 HA 16KB 属性超限
+            self.sys_log_html_short = "".join(html_rows[:30])
 
     @staticmethod
     def _format_log_row(r: str) -> str:
@@ -591,7 +662,10 @@ class SmartAgentCoordinator(
 
     async def _async_update_status(self, status: str, last_action: str = "") -> None:
         """Update UI state (status, last_action, terminal_log)."""
-        ts = datetime.now().strftime("%H:%M:%S")
+        try:
+            ts = self._ha_local_now().strftime("%H:%M:%S")
+        except Exception:
+            ts = dt_util.now().strftime("%H:%M:%S")
         if last_action:
             self._terminal_logs.insert(0, f"[{ts}] {_html.escape(last_action)}")
             self._terminal_logs = self._terminal_logs[:TERMINAL_LOGS_MAX]
@@ -612,14 +686,224 @@ class SmartAgentCoordinator(
         if now - self._last_notify.get(key, 0) < NOTIFY_DEDUP_SECONDS:
             return
         self._last_notify[key] = now
-        self.hass.async_create_task(
+        self._spawn_background_task(
             async_call_service(
                 self.hass,
                 "persistent_notification",
                 "create",
                 {"message": message, "title": title},
-            )
+            ),
+            "notify_dedup_persistent_notification",
         )
+
+    def _handle_background_task_done(self, task: Any, *, label: str) -> None:
+        try:
+            if hasattr(task, "cancelled") and task.cancelled():
+                return
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as err:
+            _LOGGER.warning(
+                "[StartupTask] background task exception retrieval failed | task=%s exception_type=%s: %s",
+                label,
+                type(err).__name__,
+                err,
+                exc_info=True,
+            )
+            return
+        if exc is None:
+            return
+        _LOGGER.warning(
+            "[StartupTask] background task failed | task=%s exception_type=%s: %s",
+            label,
+            type(exc).__name__,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        logger = getattr(self, "_sys_log", None)
+        if callable(logger):
+            try:
+                logger(
+                    "WARN",
+                    f"[StartupTask] background task failed | task={label} exception_type={type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+
+    def _observe_background_task(self, task: Any, label: str) -> Any:
+        try:
+            if hasattr(task, "add_done_callback"):
+                task.add_done_callback(
+                    lambda done: self._handle_background_task_done(done, label=label)
+                )
+        except Exception as exc:
+            _LOGGER.debug("[StartupTask] failed to attach task observer | task=%s: %s", label, exc)
+        return task
+
+    def _spawn_background_task(self, coro: Any, label: str) -> Any | None:
+        try:
+            task = self.hass.async_create_task(coro)
+        except Exception as exc:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            _LOGGER.warning(
+                "[StartupTask] background task create failed | task=%s exception_type=%s: %s",
+                label,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            logger = getattr(self, "_sys_log", None)
+            if callable(logger):
+                try:
+                    logger(
+                        "WARN",
+                        f"[StartupTask] background task create failed | task={label} "
+                        f"reason=task_create_failed exception_type={type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    pass
+            return None
+        return self._observe_background_task(task, label)
+
+    def _addon_status_is_unreachable(self, status: Any) -> bool:
+        if not isinstance(status, dict):
+            return False
+        if status.get("ok") is True:
+            return False
+        error = str(status.get("error") or "").strip().lower()
+        error_type = str(status.get("error_type") or "").strip().lower()
+        try:
+            status_code = int(status.get("__status") or status.get("status_code") or 0)
+        except (TypeError, ValueError):
+            status_code = 0
+        if error in _ADDON_REPAIR_UNREACHABLE_CODES or error_type in _ADDON_REPAIR_UNREACHABLE_CODES:
+            return True
+        return status_code in (502, 503, 504) and bool(status.get("retryable", True))
+
+    def _addon_repair_error_summary(self, status: Any) -> str:
+        if not isinstance(status, dict):
+            return "addon_unreachable"
+        raw = status.get("error") or status.get("error_type") or status.get("__status") or "addon_unreachable"
+        summary = re.sub(r"\s+", " ", str(raw)).strip()
+        return summary[:120] or "addon_unreachable"
+
+    async def _async_poll_addon_repair_issue(self) -> None:
+        now = time.time()
+        if now - self._addon_repair_last_check_at < _ADDON_REPAIR_HEALTH_CHECK_INTERVAL:
+            return
+        self._addon_repair_last_check_at = now
+
+        addon_client = getattr(self, "_addon_client", None)
+        get_status = getattr(addon_client, "get_status", None)
+        if not callable(get_status):
+            await self._async_update_addon_repair_issue(
+                {
+                    "ok": False,
+                    "error": "addon_unreachable",
+                    "error_type": "dependency_unreachable",
+                    "retryable": True,
+                    "__status": 502,
+                }
+            )
+            return
+
+        try:
+            status = await get_status()
+        except Exception as exc:
+            _LOGGER.warning("[Repair] add-on health check failed: %s", exc, exc_info=True)
+            status = {
+                "ok": False,
+                "error": "addon_unreachable",
+                "error_type": "dependency_unreachable",
+                "retryable": True,
+                "__status": 502,
+                "exception_type": exc.__class__.__name__,
+            }
+        await self._async_update_addon_repair_issue(status)
+
+    async def _async_update_addon_repair_issue(self, status: Any) -> None:
+        now = time.time()
+        if self._addon_status_is_unreachable(status):
+            self._addon_repair_failure_count += 1
+            self._addon_repair_last_error = self._addon_repair_error_summary(status)
+            if self._addon_repair_first_failure_at is None:
+                self._addon_repair_first_failure_at = now
+            elapsed = now - self._addon_repair_first_failure_at
+            if elapsed < _ADDON_REPAIR_MIN_FAILURE_SECONDS:
+                return
+            if not self._addon_repair_issue_active:
+                await self._async_create_addon_repair_issue(status, elapsed)
+            return
+
+        if self._addon_repair_issue_active:
+            await self._async_delete_addon_repair_issue()
+        self._addon_repair_first_failure_at = None
+        self._addon_repair_failure_count = 0
+        self._addon_repair_last_error = ""
+
+    async def _async_create_addon_repair_issue(self, status: Any, elapsed: float) -> None:
+        error_summary = self._addon_repair_error_summary(status)
+        addon_base = str(getattr(getattr(self, "_addon_client", None), "_base", "") or "")
+        minutes = str(max(1, int(elapsed // 60)))
+        try:
+            from homeassistant.helpers import issue_registry as ir
+
+            severity = getattr(getattr(ir, "IssueSeverity", object), "ERROR", "error")
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                _ADDON_REPAIR_ISSUE_ID,
+                is_fixable=False,
+                severity=severity,
+                translation_key="addon_unreachable",
+                translation_placeholders={
+                    "base_url": addon_base,
+                    "error": error_summary,
+                    "minutes": minutes,
+                },
+            )
+        except Exception as exc:
+            _LOGGER.warning("[Repair] create add-on unreachable issue failed: %s", exc, exc_info=True)
+
+        self._addon_repair_issue_active = True
+        try:
+            await async_call_service(
+                self.hass,
+                "persistent_notification",
+                "create",
+                {
+                    "title": "SmartAgent add-on unreachable",
+                    "message": (
+                        f"SmartAgent add-on has been unreachable for {minutes} minutes. "
+                        f"base_url={addon_base or '-'} error={error_summary}"
+                    ),
+                    "notification_id": _ADDON_REPAIR_NOTIFICATION_ID,
+                },
+            )
+        except Exception as exc:
+            _LOGGER.warning("[Repair] create add-on notification failed: %s", exc, exc_info=True)
+
+    async def _async_delete_addon_repair_issue(self) -> None:
+        try:
+            from homeassistant.helpers import issue_registry as ir
+
+            ir.async_delete_issue(self.hass, DOMAIN, _ADDON_REPAIR_ISSUE_ID)
+        except Exception as exc:
+            _LOGGER.warning("[Repair] delete add-on unreachable issue failed: %s", exc, exc_info=True)
+
+        try:
+            await async_call_service(
+                self.hass,
+                "persistent_notification",
+                "dismiss",
+                {"notification_id": _ADDON_REPAIR_NOTIFICATION_ID},
+            )
+        except Exception as exc:
+            _LOGGER.warning("[Repair] dismiss add-on notification failed: %s", exc, exc_info=True)
+        self._addon_repair_issue_active = False
 
     async def _tts_speak(self, text: str, min_level: int = 1) -> None:
         """通用 TTS 播报接口。
@@ -859,12 +1143,6 @@ class SmartAgentCoordinator(
         self._enforce_priority_storage_limits()
         return record
 
-    def _is_reverse_op(self, current_state: str, service: str) -> bool:
-        is_off = current_state in self._OFF_STATES
-        ai_turning_on = "turn_on" in service or "open" in service
-        ai_turning_off = "turn_off" in service or "close" in service
-        return (is_off and ai_turning_on) or (not is_off and ai_turning_off)
-
     def _arbitrate(
         self,
         entity_id: str,
@@ -876,19 +1154,17 @@ class SmartAgentCoordinator(
         if now < self._global_suppress_until:
             remaining = int(self._global_suppress_until - now)
             return False, f"[P0 全局抑制] {self._global_suppress_reason}（剩余 {remaining}s）"
-        existing = self._device_priority_map.get(entity_id)
-        if not existing or now > existing.get("guard_until", 0):
-            return True, ""
-        ai_priority = SOURCE_PRIORITY_MAP.get(ai_source, PRIORITY_AI_LEARNED)
-        if ai_priority < int(existing.get("priority", PRIORITY_AI_LEARNED)):
-            return True, ""
-        if self._is_reverse_op(str(existing.get("state") or ""), ai_service):
-            remaining = int(existing["guard_until"] - now)
-            return False, (
-                f"[优先级仲裁] AI 尝试反向操作 {entity_id}"
-                f"（当前由 {existing.get('source_label', 'unknown')} 控制，保护剩余 {remaining}s）"
-            )
-        return True, ""
+        arbitration = evaluate_priority_arbitration(
+            entity_id=entity_id,
+            ai_source=ai_source,
+            ai_service=ai_service,
+            existing=self._device_priority_map.get(entity_id),
+            now_ts=now,
+            source_priority_map=SOURCE_PRIORITY_MAP,
+            default_priority=PRIORITY_AI_LEARNED,
+            off_states=self._OFF_STATES,
+        )
+        return arbitration.allowed, arbitration.msg
 
     def _build_priority_prompt_section(self) -> str:
         active = self._get_priority_summary()
@@ -957,6 +1233,8 @@ class SmartAgentCoordinator(
     async def _async_update_data(self) -> dict[str, Any]:
         """DataUpdateCoordinator: return current UI state."""
         self._cleanup_expired_priorities()
+        await self._async_refresh_presence_snapshot_cache()
+        await self._async_poll_addon_repair_issue()
         return {"status": self.status_text, "last_action": self.last_action_text,
                 "terminal_log": self.terminal_log_html}
 
@@ -1155,6 +1433,11 @@ class SmartAgentCoordinator(
             if new_value != self._habit_proactive:
                 self._habit_proactive = new_value
                 applied.append(f"habit_proactive={new_value}")
+        if "patrol_enabled" in payload:
+            new_value = bool(payload.get("patrol_enabled"))
+            if new_value != self._patrol_enabled:
+                self._patrol_enabled = new_value
+                applied.append(f"patrol_enabled={new_value}")
         if "vision_enabled" in payload:
             new_value = bool(payload.get("vision_enabled"))
             if new_value != self._vision_enabled:
@@ -1330,7 +1613,10 @@ class SmartAgentCoordinator(
         # Frigate MQTT 深度集成（Phase 7A）
         await self._async_start_frigate_mqtt()
         # License 首次验证（不阻塞启动，异步后台执行）
-        self.hass.async_create_task(self._async_license_startup_check())
+        self._spawn_background_task(
+            self._async_license_startup_check(),
+            "license_startup_check",
+        )
 
         async def _startup_state_refresh() -> None:
             await asyncio.sleep(10)
@@ -1351,7 +1637,10 @@ class SmartAgentCoordinator(
             self._refresh_ha_resources()
             await self._async_update_status("正在监控", "系统初始化完成")
 
-        self.hass.async_create_task(_startup_state_refresh())
+        self._spawn_background_task(
+            _startup_state_refresh(),
+            "startup_state_refresh",
+        )
 
         async def _startup_unavail_check() -> None:
             """DEV-01: 启动冷却结束后额外等待 30s，扫描仍处于 unavailable 的托管设备并告警。
@@ -1379,7 +1668,10 @@ class SmartAgentCoordinator(
                     f"[DEV-01] 设备健康检查通过：{len(self.device_info)} 个托管设备全部在线",
                 )
 
-        self.hass.async_create_task(_startup_unavail_check())
+        self._spawn_background_task(
+            _startup_unavail_check(),
+            "startup_unavail_check",
+        )
 
     async def async_shutdown(self) -> None:
         for remove in getattr(self, "_state_listener_removers", []):
@@ -1608,6 +1900,177 @@ class SmartAgentCoordinator(
     def _is_fast_path_audit_prompt(one_off_prompt: str) -> bool:
         return "[fast_path_audit]" in str(one_off_prompt or "")
 
+    @staticmethod
+    def _normalize_fast_path_execution_audit(
+        source_trace_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not isinstance(source_trace_context, dict):
+            return {}
+        if str(source_trace_context.get("source") or "").strip() != "addon_fast_path_execution_audit":
+            return {}
+        if str(source_trace_context.get("final_outcome") or "").strip() != "succeeded":
+            return {}
+
+        sensitive_keys = {
+            "api_key",
+            "apikey",
+            "authorization",
+            "cookie",
+            "credential",
+            "credentials",
+            "password",
+            "refresh_token",
+            "secret",
+            "token",
+            "access_token",
+        }
+
+        def _is_sensitive_key(value: Any) -> bool:
+            key = str(value or "").strip().lower().replace("-", "_")
+            return key in sensitive_keys or key.endswith(
+                ("_api_key", "_password", "_secret", "_token")
+            )
+
+        def _sanitize_nested(value: Any, *, depth: int = 0) -> Any:
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+            if isinstance(value, str):
+                return value[:512]
+            if depth >= 3:
+                if isinstance(value, dict):
+                    return {}
+                if isinstance(value, (list, tuple)):
+                    return []
+                return str(value)[:512]
+            if isinstance(value, dict):
+                cleaned: dict[str, Any] = {}
+                for raw_key, raw_value in list(value.items())[:24]:
+                    key = str(raw_key or "")[:128]
+                    if not key or _is_sensitive_key(key):
+                        continue
+                    nested = _sanitize_nested(raw_value, depth=depth + 1)
+                    if nested is not None:
+                        cleaned[key] = nested
+                return cleaned
+            if isinstance(value, (list, tuple)):
+                return [
+                    nested
+                    for item in list(value)[:16]
+                    if (nested := _sanitize_nested(item, depth=depth + 1)) is not None
+                ]
+            return str(value)[:512]
+
+        def _sanitize_row(value: Any, allowed_keys: tuple[str, ...]) -> dict[str, Any]:
+            if not isinstance(value, dict):
+                return {}
+            row: dict[str, Any] = {}
+            for key in allowed_keys:
+                if key not in value:
+                    continue
+                cleaned = _sanitize_nested(value.get(key))
+                if cleaned is not None:
+                    row[key] = cleaned
+            return row
+
+        audit: dict[str, Any] = {}
+        for key in (
+            "source",
+            "transaction_id",
+            "decision_id",
+            "execution_transaction_id",
+            "correlation_id",
+            "world_snapshot_id",
+            "trigger",
+            "scene",
+            "final_outcome",
+        ):
+            value = source_trace_context.get(key)
+            if value not in (None, ""):
+                audit[key] = str(value)[:512]
+        for key in ("planned_count", "executed_count"):
+            try:
+                audit[key] = max(0, int(source_trace_context.get(key) or 0))
+            except (TypeError, ValueError):
+                audit[key] = 0
+        confidence = source_trace_context.get("confidence")
+        if confidence is not None:
+            audit["confidence"] = _sanitize_nested(confidence)
+
+        decision_trace = _sanitize_row(
+            source_trace_context.get("decision_trace"),
+            ("available", "transaction_id", "url", "correlation_id", "world_snapshot_id"),
+        )
+        if decision_trace:
+            audit["decision_trace"] = decision_trace
+
+        pre_states: dict[str, Any] = {}
+        raw_pre_states = source_trace_context.get("pre_states")
+        if isinstance(raw_pre_states, dict):
+            for raw_entity_id, raw_state in list(raw_pre_states.items())[:64]:
+                entity_id = str(raw_entity_id or "").strip()[:255]
+                if not entity_id or "." not in entity_id or _is_sensitive_key(entity_id):
+                    continue
+                if isinstance(raw_state, (str, bool, int, float)):
+                    pre_states[entity_id] = _sanitize_nested(raw_state)
+        if pre_states:
+            audit["pre_states"] = pre_states
+
+        action_fields = (
+            "domain",
+            "service",
+            "entity_id",
+            "entity",
+            "action",
+            "command",
+            "target",
+            "params",
+            "data",
+            "service_data",
+            "reason",
+            "delay_seconds",
+            "is_global",
+            "runtime_hints",
+            "learning_evidence",
+        )
+        result_fields = (
+            "domain",
+            "service",
+            "entity_id",
+            "status",
+            "reason",
+            "ha_status",
+            "error",
+            "error_type",
+            "msg",
+            "params",
+            "action_reason",
+            "scene_desc",
+            "trigger_summary",
+            "ha_command_status",
+            "exception_type",
+            "execution_transaction_id",
+            "parent_transaction_id",
+            "decision_trace",
+            "presence_source",
+            "presence_evidence",
+            "scheduled",
+            "delay_seconds",
+        )
+        for source_key, allowed_fields in (
+            ("actions", action_fields),
+            ("action_results", result_fields),
+        ):
+            raw_rows = source_trace_context.get(source_key)
+            if not isinstance(raw_rows, list):
+                continue
+            rows = [
+                row
+                for item in raw_rows[:32]
+                if (row := _sanitize_row(item, allowed_fields))
+            ]
+            audit[source_key] = rows
+        return audit
+
     def _build_addon_slow_decision_bundle(
         self,
         trigger: str,
@@ -1619,9 +2082,33 @@ class SmartAgentCoordinator(
         """Build the rich bundle used by add-on slow decisions."""
         parsed = self._parse_addon_decision_trigger(trigger)
         audit_pending = self._is_fast_path_audit_prompt(one_off_prompt)
-        if not isinstance(source_trace_context, dict):
+        raw_source_trace_context = (
+            dict(source_trace_context)
+            if isinstance(source_trace_context, dict)
+            else {}
+        )
+        fast_path_execution_audit = self._normalize_fast_path_execution_audit(
+            raw_source_trace_context
+        )
+        if fast_path_execution_audit:
+            source_trace_context = dict(fast_path_execution_audit)
+        elif str(raw_source_trace_context.get("source") or "").strip() == "addon_fast_path_409":
+            source_trace_context = {
+                key: json.loads(json.dumps(value, ensure_ascii=False, default=str))
+                if isinstance(value, (dict, list))
+                else value
+                for key in (
+                    "source",
+                    "transaction_id",
+                    "correlation_id",
+                    "world_snapshot_id",
+                    "reason",
+                    "decision_trace",
+                )
+                if (value := raw_source_trace_context.get(key)) not in (None, "")
+            }
+        else:
             source_trace_context = {}
-        source_trace_context = dict(source_trace_context or {})
         entity_id = parsed.get("trigger_entity_id", "")
         snapshot: dict[str, Any] = {}
         if entity_id:
@@ -1637,6 +2124,12 @@ class SmartAgentCoordinator(
         device_info = dict(raw_device_info or {}) if isinstance(raw_device_info, dict) else {}
         raw_states = snapshot.get("states") if isinstance(snapshot.get("states"), dict) else {}
         states = dict(raw_states or {}) if isinstance(raw_states, dict) else {}
+        raw_environment_context = (
+            snapshot.get("environment_context")
+            if isinstance(snapshot.get("environment_context"), dict)
+            else {}
+        )
+        environment_context = dict(raw_environment_context or {}) if isinstance(raw_environment_context, dict) else {}
         trigger_info = device_info.get(entity_id, {}) if entity_id else {}
         if not isinstance(trigger_info, dict):
             trigger_info = {}
@@ -1681,7 +2174,16 @@ class SmartAgentCoordinator(
                 f"{fast_path_audit_marker} Fast path already executed a provisional low-risk action. "
                 "Audit the action, do not repeat identical light actions, and return approve/adjust/observe_only."
             )
-        if source_trace_context:
+        if fast_path_execution_audit:
+            context_parts.append(
+                "[fast_path_execution_audit] "
+                + json.dumps(
+                    fast_path_execution_audit,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        elif source_trace_context.get("source") == "addon_fast_path_409":
             context_parts.append(
                 "[fast_path_409_trace] "
                 f"transaction_id={source_trace_context.get('transaction_id') or '-'} "
@@ -1728,6 +2230,7 @@ class SmartAgentCoordinator(
             "audit_source": "fast_path" if audit_pending else "",
             "device_info": device_info,
             "states": states,
+            "environment_context": environment_context,
             "presence_snapshot": presence_snapshot,
             "space_snapshot": snapshot.get("space_snapshot") if isinstance(snapshot.get("space_snapshot"), dict) else {},
             "device_capability_snapshot": snapshot.get("device_capability_snapshot") if isinstance(snapshot.get("device_capability_snapshot"), dict) else {},
@@ -1736,7 +2239,9 @@ class SmartAgentCoordinator(
             "occupancy_section": occupancy_section,
             "automation_policy_section": automation_policy_section,
             "source_trace_context": source_trace_context,
+            "fast_path_execution_audit": fast_path_execution_audit,
             "parent_transaction_id": str(source_trace_context.get("transaction_id") or ""),
+            "parent_execution_transaction_id": str(source_trace_context.get("execution_transaction_id") or ""),
             "parent_decision_trace": source_trace_context.get("decision_trace") if isinstance(source_trace_context.get("decision_trace"), dict) else {},
             "parent_correlation_id": str(source_trace_context.get("correlation_id") or ""),
             "parent_world_snapshot_id": str(source_trace_context.get("world_snapshot_id") or ""),
@@ -1769,7 +2274,13 @@ class SmartAgentCoordinator(
                         return datetime.now(tz)
                     except Exception:
                         pass
-        return datetime.now()
+        return dt_util.now()
+
+    def _ha_log_today(self) -> str:
+        try:
+            return self._ha_local_now().strftime("%Y-%m-%d")
+        except Exception:
+            return dt_util.now().strftime("%Y-%m-%d")
 
     def _enqueue_decision_cache_write(
         self,
@@ -1779,6 +2290,13 @@ class SmartAgentCoordinator(
         actions: list[dict[str, Any]],
         confidence: int,
         scene: str,
+        final_outcome: str,
+        planned_count: int,
+        executed_count: int,
+        action_results: list[dict[str, Any]],
+        decision_id: str = "unknown",
+        transaction_id: str = "unknown",
+        world_snapshot_id: str = "unknown",
     ) -> None:
         trigger_room = str(bundle.get("trigger_room") or result.get("trigger_room") or "").strip()
         if not trigger_room or not actions:
@@ -1800,67 +2318,20 @@ class SmartAgentCoordinator(
             "intent": str(result.get("intent") or ""),
             "scene_candidate": str(result.get("scene_candidate") or result.get("scene") or ""),
             "season": season,
+            "origin": "smartagent",
+            "actor": "smartagent:ha_slow_decision",
+            "decision_id": str(decision_id or "unknown"),
+            "transaction_id": str(transaction_id or "unknown"),
+            "world_snapshot_id": str(world_snapshot_id or "unknown"),
+            "execution_status": str(final_outcome or ""),
+            "final_outcome": str(final_outcome or ""),
+            "planned_count": int(planned_count or 0),
+            "executed_count": int(executed_count or 0),
+            "action_results": [dict(item) for item in action_results if isinstance(item, dict)],
         }
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue) or not enqueue("cache_invalidate", payload):
             _LOGGER.debug("[DecisionCache] write_decision enqueue skipped room=%s", trigger_room)
-
-    def _behavior_expected_state_from_action(self, action: dict[str, Any]) -> str:
-        service = str(action.get("service") or action.get("action") or "").strip().lower()
-        service_name = service.rsplit(".", 1)[-1]
-        service_state = {
-            "turn_on": "on",
-            "open_cover": "open",
-            "open": "open",
-            "turn_off": "off",
-            "close_cover": "off",
-            "close": "off",
-        }
-        if service_name in service_state:
-            return service_state[service_name]
-        expected = str(action.get("expected_state") or action.get("state") or "").strip().lower()
-        return expected if expected in {"on", "off", "open", "closed", "close"} else ""
-
-    def _enqueue_behavior_pattern_write(
-        self,
-        *,
-        bundle: dict[str, Any],
-        result: dict[str, Any],
-        actions: list[dict[str, Any]],
-        confidence: int,
-    ) -> None:
-        trigger_room = str(bundle.get("trigger_room") or result.get("trigger_room") or "").strip()
-        if not trigger_room or not actions:
-            return
-        now = self._ha_local_now()
-        hour_start = (now.hour - 1) % 24
-        hour_end = (now.hour + 1) % 24
-        weekday_mask = str(now.strftime("%w"))
-        enqueue = getattr(self, "_enqueue_internal_event", None)
-        if not callable(enqueue):
-            return
-        normalized_confidence = max(55, min(95, int(confidence or result.get("confidence") or 70)))
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            entity_id = str(action.get("entity_id") or "").strip()
-            expected_state = self._behavior_expected_state_from_action(action)
-            if not entity_id or not expected_state:
-                continue
-            payload = {
-                "action": "upsert",
-                "entity_id": entity_id,
-                "expected_state": expected_state,
-                "room": trigger_room,
-                "hour_start": hour_start,
-                "hour_end": hour_end,
-                "weekday_mask": weekday_mask,
-                "confidence": normalized_confidence,
-                "hit_count": 1,
-                "lifecycle_state": "active",
-            }
-            if not enqueue("behavior", payload, ts=now.strftime("%Y-%m-%d %H:%M:%S")):
-                _LOGGER.debug("[BehaviorPattern] upsert enqueue skipped entity=%s", entity_id)
 
     def _build_training_sample_payload(
         self,
@@ -1869,6 +2340,9 @@ class SmartAgentCoordinator(
         actions: list[dict[str, Any]],
         confidence: int,
         final_outcome: str,
+        decision_id: str = "unknown",
+        transaction_id: str = "unknown",
+        world_snapshot_id: str = "unknown",
     ) -> dict[str, Any] | None:
         if final_outcome != "succeeded" or not actions:
             return None
@@ -1917,12 +2391,17 @@ class SmartAgentCoordinator(
                 "season_encoding": season,
             },
             "decision_json": {"actions": sample_actions},
-            "label": 1,
+            "preference_label": "unknown",
             "quality_score": quality_score,
-            "is_verified": True,
-            "lifecycle_state": "active",
+            "is_verified": False,
+            "lifecycle_state": "observe_only",
             "privacy_tier": "derived_private",
             "model_schema_version": "system1_v1",
+            "origin": "smartagent",
+            "actor": "smartagent:ha_slow_decision",
+            "decision_id": str(decision_id or "unknown"),
+            "transaction_id": str(transaction_id or "unknown"),
+            "world_snapshot_id": str(world_snapshot_id or "unknown"),
         }
 
     async def _run_addon_decision(
@@ -1947,6 +2426,12 @@ class SmartAgentCoordinator(
             f"room={bundle.get('trigger_room') or '-'} "
             f"state={bundle.get('old_state') or '?'}->{bundle.get('new_state') or '?'} "
             f"devices={len(bundle.get('device_info') or {})}",
+        )
+        trigger_public_summary = self._trigger_public_summary(
+            trigger,
+            entity_id=str(bundle.get("trigger_entity_id") or ""),
+            old_state=str(bundle.get("old_state") or ""),
+            new_state=str(bundle.get("new_state") or ""),
         )
 
         def _emit_slow_decision_bubble(
@@ -1982,13 +2467,20 @@ class SmartAgentCoordinator(
                 "trigger_entity_id": str(bundle.get("trigger_entity_id") or ""),
                 "old_state": str(bundle.get("old_state") or ""),
                 "new_state": str(bundle.get("new_state") or ""),
-                "trigger": str(trigger or ""),
+                "trigger": trigger_public_summary,
+                "trigger_summary": trigger_public_summary,
                 "status": status_code,
                 "matched": matched,
                 "path_taken": path_taken,
                 "reason": reason_value,
                 "scene": scene_value,
                 "confidence": confidence_value,
+                "confidence_auto": result_payload.get("confidence_auto"),
+                "confidence_notify": result_payload.get("confidence_notify"),
+                "threshold": result_payload.get("threshold"),
+                "auto_execute": result_payload.get("auto_execute") is True,
+                "confirm_required": result_payload.get("confirm_required") is True,
+                "arbitration_result": str(result_payload.get("arbitration_result") or ""),
                 "action_count": len(actions_payload),
                 "actions": actions_payload,
                 "transaction_id": transaction_id_value,
@@ -2013,16 +2505,24 @@ class SmartAgentCoordinator(
                 log_result.setdefault("reason", reason_value)
                 log_result.setdefault("scene", scene_value)
                 log_result.setdefault("actions", actions_payload)
-                log_result["trigger"] = str(trigger or "")
+                log_result["trigger"] = trigger_public_summary
+                log_result["trigger_summary"] = trigger_public_summary
                 log_result["matched"] = bool(matched)
                 log_result["final_outcome"] = final_outcome_value
                 log_result["fail_closed"] = bool(fail_closed)
                 log_payload: dict[str, Any] = {
-                    "trigger": str(trigger or ""),
+                    "trigger": trigger_public_summary,
+                    "trigger_summary": trigger_public_summary,
                     "scene": scene_value,
                     "source": "ha_slow_decision",
                     "path_taken": path_taken,
                     "confidence": confidence_value,
+                    "confidence_auto": result_payload.get("confidence_auto"),
+                    "confidence_notify": result_payload.get("confidence_notify"),
+                    "threshold": result_payload.get("threshold"),
+                    "auto_execute": result_payload.get("auto_execute") is True,
+                    "confirm_required": result_payload.get("confirm_required") is True,
+                    "arbitration_result": str(result_payload.get("arbitration_result") or ""),
                     "matched": bool(matched),
                     "action_count": len(actions_payload),
                     "reason": reason_value,
@@ -2035,7 +2535,7 @@ class SmartAgentCoordinator(
                 if not callable(enqueue) or not enqueue("decision_log", log_payload):
                     self._sys_log(
                         "WARN",
-                        f"[决策] decision_log 回写入队失败 reason={reason_value or '-'} trigger={trigger or '-'}",
+                        f"[决策] decision_log 回写入队失败 reason={reason_value or '-'} trigger={trigger_public_summary or '-'}",
                     )
 
         if addon_client is None:
@@ -2137,6 +2637,13 @@ class SmartAgentCoordinator(
                 or result.get("id")
                 or ""
             ).strip()
+            decision_id = str(result.get("decision_id") or transaction_id or "unknown").strip() or "unknown"
+            nested_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+            world_snapshot_id = str(
+                result.get("world_snapshot_id")
+                or nested_result.get("world_snapshot_id")
+                or "unknown"
+            ).strip() or "unknown"
             try:
                 confidence = int(float(result.get("confidence") or 0))
             except (TypeError, ValueError):
@@ -2145,6 +2652,126 @@ class SmartAgentCoordinator(
             executed = 0
             final_outcome = "no_actions"
             if valid_actions:
+                arbitration_result = str(result.get("arbitration_result") or "").strip()
+                arbitration_validation = validate_auto_execution_arbitration(result)
+                auto_execute = arbitration_validation.allowed
+                confirm_required = (
+                    arbitration_validation.reason == "confidence_below_auto_threshold"
+                    and result.get("confirm_required") is True
+                    and arbitration_result == "pending_confirmation"
+                )
+                if not auto_execute:
+                    decision_reason = str(result.get("reason") or "").strip()
+                    if arbitration_validation.reason in {
+                        "confidence_arbitration_missing",
+                        "confidence_arbitration_invalid",
+                    }:
+                        suppressed_reason = arbitration_validation.reason
+                        if decision_reason and decision_reason != suppressed_reason:
+                            result.setdefault("decision_reason", decision_reason)
+                    else:
+                        suppressed_reason = arbitration_validation.reason
+                    final_outcome = "pending_confirmation" if confirm_required else "observe_only"
+                    result["executed_count"] = 0
+                    result["execution_suppressed_reason"] = suppressed_reason
+                    result["final_outcome"] = final_outcome
+                    result["execution_status"] = final_outcome
+                    action_results = [
+                        {
+                            "domain": str(action.get("domain") or ""),
+                            "service": str(action.get("service") or ""),
+                            "entity_id": str(action.get("entity_id") or ""),
+                            "status": "not_executed",
+                            "reason": suppressed_reason,
+                        }
+                        for action in valid_actions
+                    ]
+                    if transaction_id:
+                        execution_event_enqueued = self._enqueue_internal_event(
+                            "decision_execution",
+                            {
+                                "transaction_id": transaction_id,
+                                "trigger": str(trigger or ""),
+                                "scene": scene,
+                                "confidence": confidence,
+                                "confidence_auto": result.get("confidence_auto"),
+                                "confidence_notify": result.get("confidence_notify"),
+                                "threshold": result.get("threshold"),
+                                "auto_execute": False,
+                                "confirm_required": confirm_required,
+                                "arbitration_result": arbitration_result or "missing",
+                                "reason": suppressed_reason,
+                                "planned_count": len(valid_actions),
+                                "executed_count": 0,
+                                "final_outcome": final_outcome,
+                                "actions": valid_actions,
+                                "action_results": action_results,
+                                "training_sample": None,
+                                "source": "ha_slow_decision",
+                                "origin": "smartagent",
+                                "actor": "smartagent:ha_slow_decision",
+                                "decision_id": decision_id,
+                                "world_snapshot_id": world_snapshot_id,
+                            },
+                        )
+                        if not execution_event_enqueued:
+                            self._sys_log(
+                                "WARN",
+                                f"[决策] decision_execution 回写入队失败 transaction_id={transaction_id}",
+                            )
+                    if confirm_required:
+                        try:
+                            self.hass.bus.async_fire(
+                                "smart_agent_confirm_required",
+                                {
+                                    "source": "ha_slow_decision",
+                                    "trigger": trigger_public_summary,
+                                    "scene": scene,
+                                    "confidence": confidence,
+                                    "confidence_auto": result.get("confidence_auto"),
+                                    "confidence_notify": result.get("confidence_notify"),
+                                    "threshold": result.get("threshold"),
+                                    "arbitration_result": arbitration_result,
+                                    "confirm_required": True,
+                                    "reason": suppressed_reason,
+                                    "actions": valid_actions,
+                                    "action_count": len(valid_actions),
+                                    "transaction_id": transaction_id,
+                                    "result": result,
+                                },
+                            )
+                        except Exception as exc:
+                            _LOGGER.debug("[Coordinator] slow confirmation emit failed: %s", exc)
+                    self._sys_log(
+                        "INFO",
+                        f"[决策] 置信度仲裁禁止自动执行 result={arbitration_result or 'missing'} "
+                        f"confidence={confidence} threshold={result.get('threshold')} reason={suppressed_reason}",
+                    )
+                    _emit_slow_decision_bubble(
+                        result_payload=result,
+                        status_code=status,
+                        matched=False,
+                        reason=suppressed_reason,
+                        scene_desc=scene,
+                        confidence_value=confidence,
+                        actions_payload=valid_actions,
+                        transaction_id_value=transaction_id,
+                        executed_count=0,
+                        final_outcome_value=final_outcome,
+                        fail_closed=arbitration_validation.reason in {
+                            "confidence_arbitration_missing",
+                            "confidence_arbitration_invalid",
+                        },
+                        record_decision_log=not bool(transaction_id),
+                    )
+                    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+                    result.setdefault(
+                        "reply",
+                        nested.get("reply")
+                        or ("等待用户确认" if confirm_required else "置信度不足，仅记录未执行"),
+                    )
+                    result.setdefault("status", "ok")
+                    return result
                 if learning_observe_only:
                     result["executed_count"] = 0
                     result["execution_suppressed_reason"] = "learning_mode"
@@ -2171,6 +2798,13 @@ class SmartAgentCoordinator(
                                 "trigger": str(trigger or ""),
                                 "scene": scene,
                                 "confidence": confidence,
+                                "confidence_auto": result.get("confidence_auto"),
+                                "confidence_notify": result.get("confidence_notify"),
+                                "threshold": result.get("threshold"),
+                                "auto_execute": False,
+                                "confirm_required": False,
+                                "arbitration_result": "observe_only",
+                                "reason": "learning_mode_observe_only",
                                 "planned_count": len(valid_actions),
                                 "executed_count": 0,
                                 "final_outcome": final_outcome,
@@ -2178,6 +2812,10 @@ class SmartAgentCoordinator(
                                 "action_results": action_results,
                                 "training_sample": None,
                                 "source": "ha_slow_decision",
+                                "origin": "smartagent",
+                                "actor": "smartagent:ha_slow_decision",
+                                "decision_id": decision_id,
+                                "world_snapshot_id": world_snapshot_id,
                             },
                         )
                         if not execution_event_enqueued:
@@ -2214,8 +2852,12 @@ class SmartAgentCoordinator(
                     confidence=confidence,
                     trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
                     parent_transaction_id=transaction_id,
+                    world_snapshot_id=world_snapshot_id,
                 )
                 executed = int(execution_result)
+                execution_transaction_id = str(
+                    getattr(execution_result, "transaction_id", "") or "unknown"
+                ).strip() or "unknown"
                 result["executed_count"] = executed
                 final_outcome = (
                     "succeeded"
@@ -2261,6 +2903,9 @@ class SmartAgentCoordinator(
                     actions=valid_actions,
                     confidence=confidence,
                     final_outcome=final_outcome,
+                    decision_id=decision_id,
+                    transaction_id=execution_transaction_id,
+                    world_snapshot_id=world_snapshot_id,
                 )
                 if transaction_id:
                     execution_event_enqueued = self._enqueue_internal_event(
@@ -2270,6 +2915,13 @@ class SmartAgentCoordinator(
                             "trigger": str(trigger or ""),
                             "scene": scene,
                             "confidence": confidence,
+                            "confidence_auto": result.get("confidence_auto"),
+                            "confidence_notify": result.get("confidence_notify"),
+                            "threshold": result.get("threshold"),
+                            "auto_execute": True,
+                            "confirm_required": False,
+                            "arbitration_result": arbitration_result,
+                            "reason": str(result.get("reason") or "confidence_threshold_met"),
                             "planned_count": len(valid_actions),
                             "executed_count": executed,
                             "final_outcome": final_outcome,
@@ -2277,6 +2929,11 @@ class SmartAgentCoordinator(
                             "action_results": action_results,
                             "training_sample": training_sample_payload,
                             "source": "ha_slow_decision",
+                            "origin": "smartagent",
+                            "actor": "smartagent:ha_slow_decision",
+                            "decision_id": decision_id,
+                            "execution_transaction_id": execution_transaction_id,
+                            "world_snapshot_id": world_snapshot_id,
                         },
                     )
                     if not execution_event_enqueued:
@@ -2291,12 +2948,13 @@ class SmartAgentCoordinator(
                         actions=valid_actions,
                         confidence=confidence,
                         scene=scene,
-                    )
-                    self._enqueue_behavior_pattern_write(
-                        bundle=bundle,
-                        result=result,
-                        actions=valid_actions,
-                        confidence=confidence,
+                        final_outcome=final_outcome,
+                        planned_count=len(valid_actions),
+                        executed_count=executed,
+                        action_results=action_results,
+                        decision_id=decision_id,
+                        transaction_id=execution_transaction_id,
+                        world_snapshot_id=world_snapshot_id,
                     )
                 self._sys_log("INFO", f"[决策] add-on 返回 {len(valid_actions)} 个动作，已执行 {executed} 个")
             else:
@@ -2614,6 +3272,7 @@ class SmartAgentCoordinator(
             # ── 其他配置 ──
             "license_key": (self._license_key[:6] + "****" + self._license_key[-4:]) if len(self._license_key) > 10 else "****",
             "log_retention_days": self._log_retention_days,
+            "file_log_level": getattr(self, "_file_log_level_name", DEFAULT_FILE_LOG_LEVEL),
             "mcp_enabled": bool(getattr(self, "_mcp_enabled", True)),
             # ── 品牌化配置 ──
             "brand_name": self.brand_name,
@@ -2825,7 +3484,10 @@ class SmartAgentCoordinator(
                 self.last_correction_text = ""
                 self.async_set_updated_data({})
 
-            self.hass.async_create_task(_clear_fail())
+            self._spawn_background_task(
+                _clear_fail(),
+                "correction_clear_failure_prompt",
+            )
             return
 
         # 更新 UI 状态让前端感知
@@ -2843,7 +3505,10 @@ class SmartAgentCoordinator(
             await asyncio.sleep(5)
             self.last_correction_text = ""
             self.async_set_updated_data({})
-        self.hass.async_create_task(_clear())
+        self._spawn_background_task(
+            _clear(),
+            "correction_clear_success_prompt",
+        )
 
     async def async_svc_dismiss_ai_action(self, call) -> None:
         """HA 服务：忽略 AI 近期操作（不纠错，仅从列表移除）。"""
@@ -2900,7 +3565,7 @@ class SmartAgentCoordinator(
         log_dir = getattr(self, "_log_dir", "")
         if not log_dir or not os.path.isdir(log_dir):
             return []
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._ha_log_today()
         base = LOG_FILENAME
         for f in os.listdir(log_dir):
             if f == base:
@@ -2919,7 +3584,7 @@ class SmartAgentCoordinator(
             return ""
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
             return ""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._ha_log_today()
         if date == today:
             path = os.path.join(log_dir, LOG_FILENAME)
         else:
@@ -2950,7 +3615,7 @@ class SmartAgentCoordinator(
         if not dates:
             return []
         log_dir = getattr(self, "_log_dir", "")
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._ha_log_today()
         result = []
         for date in dates:
             if date == today:
@@ -2965,6 +3630,194 @@ class SmartAgentCoordinator(
                 pass
             result.append(info)
         return result
+
+    async def _async_refresh_presence_snapshot_cache(self) -> None:
+        """Refresh the add-on-owned Presence projection for synchronous guards."""
+        addon_client = getattr(self, "_addon_client", None)
+        get_rooms = getattr(addon_client, "get_rooms", None)
+        if not callable(get_rooms):
+            return
+
+        try:
+            payload = await get_rooms()
+        except Exception:
+            return
+
+        def _is_error_payload(value: dict[str, Any]) -> bool:
+            if value.get("ok") is False:
+                return True
+            try:
+                return int(value.get("__status", 200) or 200) >= 400
+            except (TypeError, ValueError):
+                return True
+
+        rows: Any = payload
+        if isinstance(payload, dict):
+            if _is_error_payload(payload):
+                return
+            if isinstance(payload.get("data"), list):
+                rows = payload.get("data")
+            elif isinstance(payload.get("rooms"), list):
+                rows = payload.get("rooms")
+            else:
+                return
+        if not isinstance(rows, (list, tuple)):
+            return
+
+        def _unknown_room_payload(
+            localized_spaces: list[str],
+            reason: str,
+        ) -> dict[str, Any]:
+            return {
+                "state": "unknown",
+                "confidence": 0.0,
+                "reasons": [reason],
+                "enter_qualified": False,
+                "leave_qualified": False,
+                "localized_spaces": localized_spaces,
+                "blocked_actions": ["turn_off"],
+                "occupied_evidence_ids": [],
+                "vacant_evidence_ids": [],
+                "evidence_ids": [],
+                "metadata": {"presence_contract_source": "addon_presence_engine"},
+            }
+
+        normalized_rooms: dict[str, dict[str, Any]] = {}
+        alias_owners: dict[str, set[str]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            room_id = str(
+                row.get("id")
+                or row.get("space_id")
+                or row.get("room_id")
+                or row.get("area_id")
+                or row.get("name")
+                or ""
+            ).strip()
+            if not room_id:
+                continue
+
+            localized_spaces: list[str] = []
+
+            def _add_localized(value: Any) -> None:
+                if isinstance(value, (list, tuple, set)):
+                    for item in value:
+                        _add_localized(item)
+                    return
+                text = str(value or "").strip()
+                if text and text not in localized_spaces:
+                    localized_spaces.append(text)
+
+            for key in ("id", "space_id", "room_id", "area_id", "room", "name", "localized_spaces"):
+                _add_localized(row.get(key))
+            _add_localized(room_id)
+            for localized in localized_spaces:
+                alias_owners.setdefault(localized.casefold(), set()).add(room_id)
+
+            source = str(row.get("presence_source") or "").strip()
+            state = str(
+                row.get("presence_state")
+                or row.get("occupancy_state")
+                or ""
+            ).strip().lower()
+            canonical = source == "addon_presence_engine" and state in {
+                "occupied",
+                "vacant",
+                "unknown",
+            }
+            reason = str(row.get("presence_reason") or "").strip()
+            evidence_raw = row.get("presence_evidence_ids")
+            if isinstance(evidence_raw, str):
+                evidence_values = [evidence_raw]
+            elif isinstance(evidence_raw, (list, tuple, set)):
+                evidence_values = list(evidence_raw)
+            else:
+                evidence_values = []
+            evidence_ids: list[str] = []
+            for raw_id in evidence_values:
+                evidence_id = str(raw_id or "").strip()
+                if evidence_id and evidence_id not in evidence_ids:
+                    evidence_ids.append(evidence_id)
+
+            confidence = 0.0
+            if canonical:
+                raw_confidence = (
+                    row.get("presence_confidence")
+                    if row.get("presence_confidence") is not None
+                    else row.get("occupancy_confidence", 0.0)
+                )
+                try:
+                    confidence = float(raw_confidence)
+                except (TypeError, ValueError):
+                    canonical = False
+                if (
+                    isinstance(raw_confidence, bool)
+                    or not math.isfinite(confidence)
+                    or not 0.0 <= confidence <= 1.0
+                ):
+                    canonical = False
+
+            if canonical:
+                reason = reason or f"canonical_presence_{state}"
+            else:
+                state = "unknown"
+                confidence = 0.0
+                reason = "canonical_presence_contract_invalid"
+                evidence_ids = []
+
+            room_payload = {
+                "state": state,
+                "confidence": confidence,
+                "reasons": [reason],
+                "enter_qualified": False,
+                "leave_qualified": False,
+                "localized_spaces": localized_spaces,
+                "blocked_actions": ["turn_off"] if state != "vacant" else [],
+                "occupied_evidence_ids": evidence_ids if state == "occupied" else [],
+                "vacant_evidence_ids": evidence_ids if state == "vacant" else [],
+                "evidence_ids": evidence_ids,
+                "metadata": {"presence_contract_source": "addon_presence_engine"},
+            }
+            previous_payload = normalized_rooms.get(room_id)
+            if previous_payload is not None:
+                merged_spaces: list[str] = []
+                for values in (
+                    previous_payload.get("localized_spaces", []),
+                    localized_spaces,
+                ):
+                    if not isinstance(values, list):
+                        continue
+                    for localized in values:
+                        if localized and localized not in merged_spaces:
+                            merged_spaces.append(localized)
+                room_payload = _unknown_room_payload(
+                    merged_spaces,
+                    "canonical_presence_duplicate_room",
+                )
+            normalized_rooms[room_id] = room_payload
+
+        conflicting_room_ids = {
+            room_id
+            for owners in alias_owners.values()
+            if len(owners) > 1
+            for room_id in owners
+        }
+        for room_id in conflicting_room_ids:
+            payload = normalized_rooms.get(room_id)
+            if not isinstance(payload, dict):
+                continue
+            localized_spaces = payload.get("localized_spaces")
+            normalized_rooms[room_id] = _unknown_room_payload(
+                list(localized_spaces) if isinstance(localized_spaces, list) else [room_id],
+                "canonical_presence_room_alias_conflict",
+            )
+
+        updated_at = time.monotonic()
+        self._presence_snapshot_cache_record = (normalized_rooms, updated_at)
+        # Compatibility mirrors for diagnostics and existing host read models.
+        self._presence_snapshot_cache = normalized_rooms
+        self._presence_snapshot_cache_updated_at = updated_at
 
     async def _async_refresh_room_topology_cache(self) -> None:
         """Refresh room topology from add-on without exposing failures to callers."""
@@ -3049,6 +3902,7 @@ class SmartAgentCoordinator(
             }
         return {
             "source": source,
+            "scope": "safety_net",
             "mode": "safety_net",
             "device_capability_snapshot": capability_snapshot,
             "states": states,
@@ -3063,6 +3917,8 @@ class SmartAgentCoordinator(
         if not self._is_enabled():
             return None
         if bool(getattr(self, "_learning_mode", False)):
+            return None
+        if not bool(getattr(self, "_patrol_enabled", False)):
             return None
         addon_client = getattr(self, "_addon_client", None)
         if addon_client is None:
@@ -3083,17 +3939,53 @@ class SmartAgentCoordinator(
             self._last_patrol_snapshot = fingerprint
             self._patrol_no_change_count = 0
 
-        result = await addon_client.post_patrol_trigger(payload)
-        if isinstance(result, dict):
-            status = int(result.get("__status") or 0)
-            plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
-            safety = plan.get("safety_net") if isinstance(plan.get("safety_net"), dict) else {}
-            candidate_count = int(safety.get("candidate_count") or 0) if safety else 0
-            self._sys_log(
-                "INFO",
-                f"[PatrolSafetyNet] plan submitted | status={status} candidates={candidate_count} source={source}",
-            )
-        return result if isinstance(result, dict) else None
+        plan_request = {
+            "domain": "patrol",
+            "action": "trigger",
+            "payload": payload,
+            "reason": "low frequency vacant lighting safety net",
+            "requested_by": "ha_patrol_scheduler",
+            "dry_run": True,
+        }
+        result = await addon_client.post_operations_action_plan(plan_request)
+        if not isinstance(result, dict):
+            return None
+
+        status = int(result.get("__status") or 0)
+        plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
+        safety = plan.get("safety_net") if isinstance(plan.get("safety_net"), dict) else {}
+        candidate_count = int(safety.get("candidate_count") or 0) if safety else 0
+        gate = result.get("execution_gate") if isinstance(result.get("execution_gate"), dict) else {}
+        blockers = [str(item) for item in list(gate.get("blockers") or []) if str(item)]
+        confirmation = result.get("confirmation") if isinstance(result.get("confirmation"), dict) else {}
+        token = str(confirmation.get("token") or "").strip()
+        token_issued = confirmation.get("token_issued") is True and bool(token)
+        executable_blockers = [item for item in blockers if item != "confirmation_token_required"]
+        self._sys_log(
+            "INFO",
+            f"[PatrolSafetyNet] plan submitted | status={status} candidates={candidate_count} source={source}",
+        )
+        if candidate_count <= 0 or not token_issued or executable_blockers:
+            return result
+
+        execute_request = {
+            **plan_request,
+            "dry_run": False,
+            "confirmation_token": token,
+        }
+        execution = await addon_client.post_operations_action_execute(execute_request)
+        if not isinstance(execution, dict):
+            return result
+        execution_status = int(execution.get("__status") or 0)
+        transaction_id = str(execution.get("transaction_id") or "")
+        provider_result = execution.get("result") if isinstance(execution.get("result"), dict) else {}
+        executed_count = int(provider_result.get("executed_count") or 0)
+        self._sys_log(
+            "INFO",
+            "[PatrolSafetyNet] controlled execution | "
+            f"status={execution_status} executed={executed_count} transaction_id={transaction_id or '-'} source={source}",
+        )
+        return execution
 
     def get_space_runtime_snapshot(self) -> dict[str, Any]:
         """返回空间运行时快照（只读内存态，不触发 DB 热路径）。"""
@@ -3158,41 +4050,114 @@ class SmartAgentCoordinator(
         }
 
     def get_presence_snapshot(self) -> dict[str, Any]:
-        """Return a fail-closed compatibility snapshot.
+        """Return the latest add-on Presence projection without blocking I/O."""
 
-        Presence semantics are produced by the add-on PresenceEngine. HA keeps
-        this adapter only so older callers can fail closed while the add-on owns
-        occupied/vacant/enter/leave decisions.
-        """
+        record = getattr(self, "_presence_snapshot_cache_record", None)
+        if isinstance(record, tuple) and len(record) == 2 and isinstance(record[0], dict):
+            cached = record[0]
+            updated_at_raw = record[1]
+        else:
+            cached = getattr(self, "_presence_snapshot_cache", {}) or {}
+            updated_at_raw = getattr(self, "_presence_snapshot_cache_updated_at", 0.0)
+        if not isinstance(cached, dict):
+            cached = {}
+        try:
+            updated_at = float(updated_at_raw or 0.0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        now_value = time.monotonic()
+        cache_age = now_value - updated_at if updated_at > 0 else None
+        cache_fresh = (
+            cache_age is not None
+            and cache_age >= 0.0
+            and cache_age <= _PRESENCE_SNAPSHOT_CACHE_TTL_SECONDS
+        )
 
-        rooms: dict[str, dict[str, Any]] = {}
+        known_rooms = {
+            str(room or "").strip()
+            for room in cached
+            if str(room or "").strip()
+        }
         device_info = getattr(self, "device_info", {}) or {}
         if isinstance(device_info, dict):
             for info in device_info.values():
                 if not isinstance(info, dict):
                     continue
-                room = str(info.get("space_id") or info.get("room") or info.get("area") or "").strip()
-                if not room or room in rooms:
-                    continue
-                rooms[room] = {
-                    "state": "unknown",
-                    "confidence": 0.0,
-                    "reasons": ["presence_decision_owned_by_addon"],
-                    "enter_qualified": False,
-                    "leave_qualified": False,
-                    "localized_spaces": [room],
-                    "blocked_actions": ["turn_off"],
-                    "occupied_evidence_ids": [],
-                    "vacant_evidence_ids": [],
-                    "metadata": {"presence_contract_source": "addon_presence_engine"},
-                }
+                room = str(
+                    info.get("space_id")
+                    or info.get("room")
+                    or info.get("area")
+                    or ""
+                ).strip()
+                if room:
+                    known_rooms.add(room)
+
+        def _unknown_payload(room: str, reason: str) -> dict[str, Any]:
+            return {
+                "state": "unknown",
+                "confidence": 0.0,
+                "reasons": [reason],
+                "enter_qualified": False,
+                "leave_qualified": False,
+                "localized_spaces": [room],
+                "blocked_actions": ["turn_off"],
+                "occupied_evidence_ids": [],
+                "vacant_evidence_ids": [],
+                "evidence_ids": [f"presence.{room}"],
+                "metadata": {"presence_contract_source": "addon_presence_engine"},
+            }
+
+        def _copy_payload(payload: Any) -> dict[str, Any] | None:
+            if not isinstance(payload, dict):
+                return None
+            copied = dict(payload)
+            for key in (
+                "reasons",
+                "localized_spaces",
+                "blocked_actions",
+                "occupied_evidence_ids",
+                "vacant_evidence_ids",
+                "evidence_ids",
+            ):
+                value = copied.get(key)
+                if isinstance(value, (list, tuple, set)):
+                    copied[key] = list(value)
+            metadata = copied.get("metadata")
+            if isinstance(metadata, dict):
+                copied["metadata"] = dict(metadata)
+            return copied
+
+        rooms: dict[str, dict[str, Any]] = {}
+        if cache_fresh:
+            for room in sorted(known_rooms):
+                payload = _copy_payload(cached.get(room))
+                rooms[room] = payload or _unknown_payload(
+                    room,
+                    "canonical_presence_room_missing",
+                )
+            source = "addon_presence_engine"
+            reason = "canonical_presence_snapshot_fresh"
+        else:
+            reason = (
+                "canonical_presence_snapshot_stale"
+                if updated_at > 0
+                else "canonical_presence_snapshot_unavailable"
+            )
+            rooms = {
+                room: _unknown_payload(room, reason)
+                for room in sorted(known_rooms)
+            }
+            source = "ha_presence_snapshot_fail_closed"
 
         return {
             "version": "1.0",
-            "source": "ha_presence_snapshot_adapter_disabled",
+            "source": source,
             "rooms": rooms,
             "metadata": {
                 "presence_contract_source": "addon_presence_engine",
-                "reason": "presence_decision_owned_by_addon",
+                "reason": reason,
+                "cache_fresh": cache_fresh,
+                "cache_age_secs": round(cache_age, 3) if cache_age is not None else None,
+                "cache_ttl_secs": _PRESENCE_SNAPSHOT_CACHE_TTL_SECONDS,
             },
         }

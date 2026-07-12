@@ -34,8 +34,9 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +56,25 @@ MEDIA_ACTIVE_STATES = frozenset(("playing", "paused"))
 
 # 只有人工交互可以作为在场证据，AI/自动化动作必须过滤，避免自强化。
 HUMAN_DEVICE_TRACE_SOURCES = frozenset(("user", "manual", "physical", "dashboard", "voice"))
+
+
+def _presence_inference_timezone(configured_timezone: str):
+    normalized_tz = configured_timezone.lower()
+    fixed_offset_hours = {
+        "asia/shanghai": 8,
+        "asia/chongqing": 8,
+        "asia/harbin": 8,
+        "asia/hong_kong": 8,
+        "hongkong": 8,
+        "prc": 8,
+        "utc": 0,
+    }.get(normalized_tz)
+    try:
+        return ZoneInfo(configured_timezone)
+    except ZoneInfoNotFoundError:
+        if fixed_offset_hours is not None:
+            return timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
+        raise
 
 
 @dataclass
@@ -148,6 +168,26 @@ class PresenceInference:
         self.device_info = device_info
         # 设备操作痕迹缓存: {entity_id: {"time": ts, "state": s, "source": src}}
         self._device_traces: dict[str, dict] = {}
+
+    def _ha_local_now(self) -> datetime:
+        config = getattr(self.hass, "config", None)
+        configured_timezone = str(getattr(config, "time_zone", "") or "").strip()
+        if configured_timezone:
+            try:
+                return datetime.now(_presence_inference_timezone(configured_timezone))
+            except ZoneInfoNotFoundError:
+                _LOGGER.debug(
+                    "[PresenceInference] invalid HA timezone for local clock: %s",
+                    configured_timezone,
+                )
+            except Exception as exc:
+                _LOGGER.debug("[PresenceInference] HA timezone read failed for local clock: %s", exc)
+        try:
+            from homeassistant.util import dt as dt_util
+
+            return dt_util.now()
+        except Exception:
+            return datetime.now(timezone.utc)
 
     # ── 外部接口 ────────────────────────────────────────────────────────────────
 
@@ -577,7 +617,7 @@ class PresenceInference:
         - 卫生间/厨房：早晨/傍晚（7-9, 17-20）概率较高
         - 客厅：傍晚/晚间（18-23）概率较高
         """
-        now = datetime.now()
+        now = self._ha_local_now()
         h = now.hour
         is_weekend = now.weekday() >= 5
         room_lower = room.lower()

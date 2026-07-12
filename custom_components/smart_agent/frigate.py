@@ -8,6 +8,7 @@ FrigateMixin — Frigate NVR 深度集成层。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -177,6 +178,51 @@ class FrigateMixin:
     def _discard_frigate_visual_description(self, event_id: str) -> None:
         if event_id:
             self._frigate_visual_descriptions.pop(event_id, None)
+
+    def _observe_frigate_task_failure(self, task: Any, *, context: str) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            self._sys_log("WARN", f"[Frigate] {context} task cancelled: task_cancelled")
+            return
+        except Exception as err:
+            self._sys_log("WARN", f"[Frigate] {context} task failed: {err}")
+            return
+        if exc is None:
+            if hasattr(task, "cancelled") and task.cancelled():
+                self._sys_log("WARN", f"[Frigate] {context} task cancelled: task_cancelled")
+            return
+        self._sys_log("WARN", f"[Frigate] {context} task failed: {exc}")
+
+    def _spawn_frigate_task(self, coro: Any, *, context: str) -> Any | None:
+        try:
+            task = self.hass.async_create_task(coro)
+        except Exception as exc:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            _LOGGER.warning(
+                "[Frigate] %s task create failed | exception_type=%s: %s",
+                context,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            self._sys_log(
+                "WARN",
+                f"[Frigate] {context} task create failed: task_create_failed "
+                f"exception_type={type(exc).__name__}: {exc}",
+            )
+            return None
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(
+                lambda done_task: self._observe_frigate_task_failure(
+                    done_task,
+                    context=context,
+                )
+            )
+        return task
 
     def _expire_critical_frigate_event(self, now: float | None = None, *, notify: bool = True) -> bool:
         event = getattr(self, "_critical_frigate_event", None)
@@ -469,7 +515,9 @@ class FrigateMixin:
 
         # 更新 zone 占用统计（按 event_id 记住实际计入的 zone，避免 end 误扣其他追踪目标）
         occ_zones = entered_zones if event_type == "end" else current_zones
-        self._update_zone_occupancy(camera, event_type, occ_zones, event_id)
+        presence_zones = self._update_zone_occupancy(camera, event_type, occ_zones, event_id)
+        self._frigate_events_cache[event_id]["presence_zones"] = presence_zones
+        self._record_frigate_observation(snap, zone_ids=presence_zones)
 
         # ── 关键视觉事件识别 (Critical Event Recognition) ──
         is_critical = False
@@ -513,8 +561,9 @@ class FrigateMixin:
                 if now - last_analyzed >= _ACTIVITY_ANALYSIS_COOLDOWN:
                     self._frigate_activity_last_analyzed[camera] = now
                     # 非门禁摄像头：立即分析（无需等待），不阻塞推理调度
-                    self.hass.async_create_task(
-                        self._async_analyze_visual_event(event_id, camera)
+                    self._spawn_frigate_task(
+                        self._async_analyze_visual_event(event_id, camera),
+                        context="Frigate visual analysis",
                     )
                     if is_critical:
                         # 门禁摄像头：增加延迟让视觉分析有时间完成，供触发文本拼接
@@ -550,9 +599,136 @@ class FrigateMixin:
                 label, sub_label, top_score, "end", _MQTT_DEBOUNCE_END
             )
 
+    def _record_frigate_observation(
+        self,
+        snapshot: VisionEventSnapshot,
+        *,
+        zone_ids: list[str] | None = None,
+    ) -> None:
+        """Persist a redacted, structured Frigate observation through the add-on bridge."""
+        record_event = getattr(self, "_record_event", None)
+        if not callable(record_event):
+            return
+        if zone_ids is None:
+            zone_ids = list(
+                snapshot.entered_zones
+                if snapshot.event_type == "end"
+                else (snapshot.current_zones or snapshot.entered_zones)
+            )
+        context = self._frigate_presence_context(
+            snapshot.camera_id,
+            zone_ids,
+            snapshot.label,
+            snapshot.event_type,
+        )
+        metadata = {
+            "provider": snapshot.provider,
+            "event_id": snapshot.event_id,
+            "event_type": snapshot.event_type,
+            "camera_id": snapshot.camera_id,
+            "label": snapshot.label,
+            "confidence": max(0.0, min(float(snapshot.score or 0.0), 1.0)),
+            "has_snapshot": bool(snapshot.has_snapshot),
+            **context,
+        }
+        try:
+            record_event(
+                "vision_observation",
+                f"Frigate {snapshot.event_type}: {snapshot.camera_id}",
+                entity_id=f"camera.{snapshot.camera_id}",
+                new_state=str(context["state"]),
+                source="frigate_mqtt",
+                confidence=int(round(metadata["confidence"] * 100)),
+                metadata=metadata,
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                "[Frigate] structured observation enqueue failed: %s",
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+
+    def _frigate_presence_context(
+        self,
+        camera_id: str,
+        zone_ids: list[str],
+        label: str,
+        event_type: str,
+    ) -> dict[str, Any]:
+        normalized_zones = list(dict.fromkeys(str(item) for item in zone_ids if str(item)))
+        space_ids: list[str] = []
+        for zone_id in normalized_zones:
+            room = str(self._vision_provider.get_trigger_room(camera_id, zone_id) or "").strip()
+            if room and room not in space_ids:
+                space_ids.append(room)
+        if not space_ids:
+            room = str(self._vision_provider.get_trigger_room(camera_id) or "").strip()
+            if room:
+                space_ids.append(room)
+
+        is_person = str(label or "").strip().lower() == "person"
+        all_zone_counts = getattr(self, "_frigate_zone_occupancy", {})
+        zone_counts = all_zone_counts.get(camera_id, {})
+        event_zone_sets = [
+            (event_key.split(":", 1)[0], zones)
+            for event_key, zones in getattr(self, "_frigate_event_counted_zones", {}).items()
+            if ":" in event_key
+        ]
+        if space_ids and event_zone_sets:
+            people_count = sum(
+                1
+                for event_camera, event_zones in event_zone_sets
+                if any(
+                    str(
+                        self._vision_provider.get_trigger_room(
+                            event_camera, zone_id or None
+                        )
+                        or ""
+                    ).strip()
+                    in space_ids
+                    for zone_id in event_zones
+                )
+            )
+        elif space_ids:
+            people_count = sum(
+                max(0, int(count or 0))
+                for observed_camera, observed_zones in all_zone_counts.items()
+                for zone_id, count in observed_zones.items()
+                if str(
+                    self._vision_provider.get_trigger_room(observed_camera, zone_id or None)
+                    or ""
+                ).strip()
+                in space_ids
+            )
+        else:
+            people_count = sum(
+                max(0, int(zone_counts.get(zone_id, 0) or 0))
+                for zone_id in normalized_zones
+            )
+        if not is_person:
+            state = "observed_non_person"
+            people_count = 0
+        elif not space_ids:
+            state = "observed_unlocalized"
+        elif event_type == "end" and not normalized_zones:
+            state = "observed_end_unconfirmed"
+        elif event_type == "end":
+            state = "occupied" if people_count > 0 else "vacant"
+        else:
+            people_count = max(1, people_count)
+            state = "occupied"
+        occupied = state == "occupied"
+        return {
+            "state": state,
+            "zone_ids": normalized_zones,
+            "space_ids": space_ids,
+            "occupied": occupied,
+            "people_count": people_count,
+        }
+
     def _update_zone_occupancy(
         self, camera: str, event_type: str, zones: list[str], event_id: str
-    ) -> None:
+    ) -> list[str]:
         """
         维护每个 zone 的实时占用状态（camera → zone → person count）。
 
@@ -563,7 +739,7 @@ class FrigateMixin:
         if not hasattr(self, "_frigate_event_counted_zones"):
             self._frigate_event_counted_zones = {}
         normalized_zones = list(dict.fromkeys(str(zone) for zone in zones if zone))
-        target_zones = set(normalized_zones)
+        target_zones = set(normalized_zones) or {""}
         event_key = self._frigate_event_zone_key(camera, event_id)
         previous_zones = (
             set(self._frigate_event_counted_zones.get(event_key, set()))
@@ -571,14 +747,16 @@ class FrigateMixin:
         )
 
         changed_zones: set[str] = set()
+        event_zones = set(target_zones)
 
         if event_type == "end":
-            zones_to_decrement = previous_zones or target_zones
+            zones_to_decrement = previous_zones
             for zone in zones_to_decrement:
                 cam_zones[zone] = max(0, cam_zones.get(zone, 0) - 1)
             if event_key:
                 self._frigate_event_counted_zones.pop(event_key, None)
             changed_zones = zones_to_decrement
+            event_zones = set(zones_to_decrement)
         elif event_type in ("new", "update"):
             if event_key:
                 zones_to_decrement = previous_zones - target_zones
@@ -609,6 +787,7 @@ class FrigateMixin:
                 "INFO",
                 f"[Frigate/人数] {cam_name} 区域人数更新({event_type}): {zone_counts}  ·  摄像头合计={total}人",
             )
+        return sorted(event_zones)
 
     def _schedule_frigate_inference(
         self, event_id: str, camera: str,
@@ -653,6 +832,9 @@ class FrigateMixin:
             cached = self._frigate_events_cache.get(event_id, {})
             final_zones = cached.get("current_zones", current_zones)
             final_entered = cached.get("entered_zones", entered_zones)
+            presence_zones = cached.get("presence_zones")
+            if not isinstance(presence_zones, list):
+                presence_zones = list(final_entered if event_type == "end" else (final_zones or final_entered))
 
             # 构建结构化触发文本
             trigger = self._build_frigate_trigger(
@@ -660,10 +842,29 @@ class FrigateMixin:
                 label, sub_label, score, event_type,
                 event_id=event_id
             )
+            presence_context = self._frigate_presence_context(
+                camera,
+                presence_zones,
+                label,
+                event_type,
+            )
 
             entity_id = f"camera.{camera}"
             try:
-                self._schedule_inference(entity_id, trigger, new_state="person_detected")
+                self._schedule_inference(
+                    entity_id,
+                    trigger,
+                    new_state=str(presence_context["state"]),
+                    source_trace_context={
+                        "provider": "frigate",
+                        "event_id": event_id,
+                        "event_type": event_type,
+                        "camera_id": camera,
+                        "label": label,
+                        "confidence": max(0.0, min(float(score or 0.0), 1.0)),
+                        **presence_context,
+                    },
+                )
             except Exception as exc:
                 self._sys_log("ERROR", f"[Frigate/MQTT] 调度推理失败: {exc}")
 
@@ -872,6 +1073,46 @@ class FrigateMixin:
 
         return "【Frigate 视觉区域占用】\n" + "\n".join(parts)
 
+    def _restore_frigate_occupancy_snapshot(
+        self, active_events: list[dict[str, Any]]
+    ) -> dict[str, dict[str, int]]:
+        """Restore zone totals and per-event ownership from active Frigate events."""
+        recovered: dict[str, dict[str, int]] = {}
+        recovered_event_zones: dict[str, set[str]] = {}
+        for event in active_events:
+            if not isinstance(event, dict) or event.get("label") != "person":
+                continue
+            camera = str(event.get("camera") or "").strip()
+            event_id = str(event.get("id") or "").strip()
+            current_zones = {
+                str(zone).strip().lower()
+                for zone in (event.get("zones") or [])
+                if str(zone or "").strip()
+            }
+            if not camera:
+                continue
+            camera_counts = recovered.setdefault(camera, {})
+            if current_zones:
+                for zone in current_zones:
+                    camera_counts[zone] = camera_counts.get(zone, 0) + 1
+                event_key = self._frigate_event_zone_key(camera, event_id)
+                if event_key:
+                    recovered_event_zones[event_key] = current_zones
+            else:
+                camera_counts[""] = camera_counts.get("", 0) + 1
+                event_key = self._frigate_event_zone_key(camera, event_id)
+                if event_key:
+                    recovered_event_zones[event_key] = {""}
+
+        for camera, zones in recovered.items():
+            camera_counts = self._frigate_zone_occupancy.setdefault(camera, {})
+            for zone, count in zones.items():
+                if camera_counts.get(zone, 0) == 0:
+                    camera_counts[zone] = count
+        for event_key, zones in recovered_event_zones.items():
+            self._frigate_event_counted_zones.setdefault(event_key, zones)
+        return recovered
+
     async def _async_recover_frigate_occupancy(self) -> None:
         """
         从 Frigate HTTP API 恢复当前活跃事件的 zone 人数统计。
@@ -916,35 +1157,10 @@ class FrigateMixin:
                 _LOGGER.debug("[Frigate] 占用恢复: 无活跃事件，zone 人数维持 0")
                 return
 
-            # 统计各 camera/zone 的当前人数
-            recovered: dict[str, dict[str, int]] = {}
-            for evt in active_events:
-                if not isinstance(evt, dict):
-                    continue
-                if evt.get("label") != "person":
-                    continue
-                camera = evt.get("camera", "")
-                current_zones = [z.lower() for z in (evt.get("zones") or [])]
-                if not camera:
-                    continue
-                cam_dict = recovered.setdefault(camera, {})
-                if current_zones:
-                    for z in current_zones:
-                        cam_dict[z] = cam_dict.get(z, 0) + 1
-                else:
-                    # 无 zone 信息时记录摄像头级别计数（key = ""）
-                    cam_dict[""] = cam_dict.get("", 0) + 1
+            recovered = self._restore_frigate_occupancy_snapshot(active_events)
 
             if not recovered:
                 return
-
-            # 写入 _frigate_zone_occupancy（不覆盖 MQTT 后续写入，仅补初始值）
-            for camera, zones in recovered.items():
-                cam_existing = self._frigate_zone_occupancy.get(camera, {})
-                for zone, count in zones.items():
-                    # 只在当前值为 0 时写入（避免覆盖 MQTT 已经更新的计数）
-                    if cam_existing.get(zone, 0) == 0:
-                        self._frigate_zone_occupancy.setdefault(camera, {})[zone] = count
 
             # 日志汇报
             summary_parts = []

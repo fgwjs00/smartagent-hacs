@@ -45,6 +45,62 @@ _GITHUB_RELEASES_URL = "https://api.github.com/repos/fgwjs00/smart_agent/release
 #: 版本检查间隔
 _CHECK_INTERVAL = timedelta(hours=24)
 
+
+def _handle_update_task_done(task: Any, *, label: str) -> None:
+    try:
+        if hasattr(task, "cancelled") and task.cancelled():
+            return
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception as err:
+        _LOGGER.warning(
+            "[Update] background task exception retrieval failed | task=%s exception_type=%s: %s",
+            label,
+            type(err).__name__,
+            err,
+            exc_info=True,
+        )
+        return
+    if exc is None:
+        return
+    _LOGGER.warning(
+        "[Update] background task failed | task=%s exception_type=%s: %s",
+        label,
+        type(exc).__name__,
+        exc,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
+def _observe_update_task(task: Any, label: str) -> Any:
+    try:
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(lambda done: _handle_update_task_done(done, label=label))
+    except Exception as exc:
+        _LOGGER.debug("[Update] failed to attach task observer | task=%s: %s", label, exc)
+    return task
+
+
+def _spawn_update_task(hass: HomeAssistant, coro: Any, label: str) -> Any | None:
+    try:
+        task = hass.async_create_task(coro)
+    except Exception as exc:
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        _LOGGER.warning(
+            "[Update] background task create failed | task=%s exception_type=%s: %s",
+            label,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        return None
+    return _observe_update_task(task, label)
+
+
 # 在模块导入时（HA 事件循环启动前）读取 manifest.json，避免在异步上下文中执行阻塞 I/O
 def _read_manifest_version() -> str:
     """从 manifest.json 读取当前版本号（模块级同步调用，在事件循环外执行）。"""
@@ -71,7 +127,7 @@ async def async_setup_entry(
     async_add_entities([entity])
 
     # 立即检查一次
-    hass.async_create_task(entity.async_check_for_update())
+    _spawn_update_task(hass, entity.async_check_for_update(), "initial_update_check")
     # 每 24 小时定时检查，返回值是取消函数；存入实体以便卸载时注销
     entity._cancel_interval = async_track_time_interval(
         hass, entity._scheduled_check, _CHECK_INTERVAL

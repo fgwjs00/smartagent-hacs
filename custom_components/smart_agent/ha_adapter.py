@@ -6,9 +6,14 @@ plain command envelope.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 from homeassistant.core import HomeAssistant
+
+
+_POST_STATE_VERIFY_TIMEOUT_SECONDS = 2.0
+_POST_STATE_VERIFY_INTERVAL_SECONDS = 0.1
 
 
 def async_get_state(hass: HomeAssistant, entity_id: str) -> Any:
@@ -75,6 +80,45 @@ def _command_already_in_target_state(command: dict[str, Any], snapshot: dict[str
         current_pct = _brightness_pct_from_snapshot(snapshot)
         return current_pct is not None and current_pct == requested_pct
     return True
+
+
+def _expected_post_state(command: dict[str, Any]) -> str | None:
+    if str(command.get("domain") or "") != "light":
+        return None
+    service = str(command.get("service") or "")
+    if service == "turn_on":
+        return "on"
+    if service == "turn_off":
+        return "off"
+    return None
+
+
+def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any] | None:
+    expected = _expected_post_state(command)
+    if expected is None:
+        return None
+    snapshot = _state_snapshot(hass, str(command.get("entity_id") or ""))
+    actual = str(snapshot.get("state") or "").strip().lower()
+    return {
+        "expected": expected,
+        "actual": actual,
+        "verified": bool(snapshot.get("available")) and actual == expected,
+        "post_state_snapshot": snapshot,
+    }
+
+
+async def _wait_for_post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any] | None:
+    verification = _post_state_verification(hass, command)
+    if verification is None or verification.get("verified"):
+        return verification
+    deadline = time.monotonic() + max(0.0, float(_POST_STATE_VERIFY_TIMEOUT_SECONDS))
+    interval = max(0.0, float(_POST_STATE_VERIFY_INTERVAL_SECONDS))
+    while time.monotonic() < deadline:
+        await asyncio.sleep(interval)
+        verification = _post_state_verification(hass, command)
+        if verification is None or verification.get("verified"):
+            return verification
+    return verification
 
 
 def async_get_entity_registry(hass: HomeAssistant) -> Any:
@@ -560,15 +604,19 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
         snapshot = _state_snapshot(hass, command["entity_id"])
         pre_state_snapshot.append(snapshot)
         if _command_already_in_target_state(command, snapshot):
+            verification = _post_state_verification(hass, command) or {}
             results.append({
                 **command,
                 "ok": True,
+                "executed": False,
+                "service_call_succeeded": None,
                 "error": "",
                 "error_type": "",
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "status": "skipped",
                 "reason": "already_in_target_state",
+                **verification,
             })
             continue
         try:
@@ -578,24 +626,35 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 {"entity_id": command["entity_id"], **command["data"]},
                 blocking=True,
             )
+            verification = await _wait_for_post_state_verification(hass, command)
+            verified = verification is None or bool(verification.get("verified"))
             results.append({
                 **command,
-                "ok": True,
-                "error": "",
-                "error_type": "",
+                "ok": verified,
+                "executed": True,
+                "service_call_succeeded": True,
+                "error": "" if verified else "post_state_not_converged",
+                "error_type": "" if verified else "state_verification_failed",
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
-                "status": "succeeded",
+                "status": "succeeded" if verified else "verification_failed",
+                **(verification or {}),
             })
+            if not verified and stop_on_first_error:
+                stopped_after_error = True
         except Exception as exc:
+            verification = _post_state_verification(hass, command) or {}
             results.append({
                 **command,
                 "ok": False,
+                "executed": False,
+                "service_call_succeeded": False,
                 "error": str(exc) or exc.__class__.__name__,
                 "error_type": "ha_service_error",
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "status": "failed",
+                **verification,
             })
             if stop_on_first_error:
                 stopped_after_error = True

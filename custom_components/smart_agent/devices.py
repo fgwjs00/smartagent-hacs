@@ -8,11 +8,9 @@ from __future__ import annotations
 import logging
 import threading
 import json as _json
-from datetime import datetime
 
 from .action_mapping import entities_to_actions, normalize_raw_actions
 from .entity_naming import name_to_entity_id
-from .scene_attribution import ai_scene_space_attribution
 from typing import Any
 from .const import (
     DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF,
@@ -87,6 +85,12 @@ class DevicesMixin:
     """Mixin: 设备管理 — 发现/CRUD/区域/管辖域/习惯/规则。"""
 
     # ── 工具方法 ──────────────────────────────────────────────────────────────
+
+    def _ha_db_now_text(self) -> str:
+        """Delegate HA-local DB timestamp generation for standalone mixin use."""
+        from .database import DatabaseMixin
+
+        return DatabaseMixin._ha_db_now_text(self)
 
     def get_device_name(self, entity_id: str) -> str:
         """Return device friendly name with room prefix if available, fallback to entity_id."""
@@ -360,7 +364,7 @@ class DevicesMixin:
         """Add multiple devices from the discovery results to device_info and DB."""
         from .const import SKIP_KEYWORDS, SKIP_NAME_KEYWORDS, TARGET_DOMAINS
         count = 0
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         for domain in TARGET_DOMAINS:
             for state in self.hass.states.async_all(domain):
                 eid = state.entity_id
@@ -468,7 +472,7 @@ class DevicesMixin:
             info["capability"] = normalized_capability
             info["type"] = normalized_capability
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         _ok = await self._async_db_exec(
             "UPDATE devices SET name=?, area=?, type=?, ops=?, sensor_type=?, updated=? WHERE entity_id=?",
             (info["name"], info["room"], info["type"], info["ops"], info.get("sensor_type", ""), now, entity_id),
@@ -511,7 +515,7 @@ class DevicesMixin:
             "control_mode": existing_mode,
             **registry_meta,
         }
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         _ok = await self._async_db_exec(
             "INSERT INTO devices (entity_id, name, area, type, ops, control_mode, sensor_type, ha_unique_id, ha_device_id, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(entity_id) DO UPDATE SET name=excluded.name, area=excluded.area, type=excluded.type, ops=excluded.ops, sensor_type=excluded.sensor_type, ha_unique_id=excluded.ha_unique_id, ha_device_id=excluded.ha_device_id, updated=excluded.updated",
@@ -553,7 +557,7 @@ class DevicesMixin:
     async def async_refresh_device_areas(self) -> int:
         """仅刷新仍处于「待填写区域」的设备区域信息（通过 HA 注册表查找）。"""
         updated = 0
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         for eid, info in self.device_info.items():
             if info.get("room") and info["room"] != "待填写区域":
                 continue
@@ -743,7 +747,7 @@ class DevicesMixin:
             info["entity_id"] = target_entity_id
             info.update(registry_meta)
             self.device_info[target_entity_id] = info
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         await self._async_db_exec(
             "UPDATE devices SET entity_id=?, name=?, ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
             (
@@ -780,7 +784,7 @@ class DevicesMixin:
         async def _apply_local_capability(active_entity_id: str) -> None:
             if not capability_name:
                 return
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = self._ha_db_now_text()
             info = dict(self.device_info.get(active_entity_id, {}) or {})
             if info:
                 info["capability"] = capability_name
@@ -837,7 +841,7 @@ class DevicesMixin:
         if entity_id not in self.device_info:
             self._sys_log("WARN", f"[管辖域] {entity_id} 不在已配置设备中")
             return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         _ok = await self._async_db_exec(
             "UPDATE devices SET control_mode=?, updated=? WHERE entity_id=?",
             (mode, now, entity_id),
@@ -855,7 +859,7 @@ class DevicesMixin:
         if mode not in self._VALID_CONTROL_MODES:
             return 0
         labels = {"ai": "AI 全权", "ha": "HA 优先", "shared": "共享"}
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         count = 0
         for eid, info in self.device_info.items():
             if room and info.get("room", "") != room:
@@ -887,7 +891,7 @@ class DevicesMixin:
     # ── 习惯 CRUD ─────────────────────────────────────────────────────────────
 
     async def async_svc_add_habit(self, content: str) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         _ok = await self._async_db_exec("INSERT INTO habits (content, locked, created) VALUES (?,0,?)", (content, now))
         if not _ok:
             self._sys_log("WARN", "[习惯] 新增失败，未更新内存态")
@@ -935,7 +939,7 @@ class DevicesMixin:
     async def async_habit_add(self, text: str, selected: str) -> None:
         if not text:
             return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         idx = self._find_habit_idx(selected) if selected and selected != "(无)" else -1
         if idx >= 0:
             _, locked = self._habits[idx]
@@ -1005,7 +1009,7 @@ class DevicesMixin:
     # ── 规则 CRUD ─────────────────────────────────────────────────────────────
 
     async def async_svc_add_rule(self, content: str) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         _ok = await self._async_db_exec("INSERT INTO rules (content, locked, created) VALUES (?,0,?)", (content, now))
         if not _ok:
             self._sys_log("WARN", "[规则] 新增失败，未更新内存态")
@@ -1053,7 +1057,7 @@ class DevicesMixin:
     async def async_rule_add(self, text: str, selected: str) -> None:
         if not text:
             return
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = self._ha_db_now_text()
         idx = self._find_rule_idx(selected) if selected and selected != "(无)" else -1
         if idx >= 0:
             _, locked = self._rules[idx]
@@ -1165,7 +1169,6 @@ class DevicesMixin:
                  或 {"success": False, "error": str}
         """
         import json as _json
-        from datetime import datetime as _dt
 
         if not text or not text.strip():
             return {"success": False, "error": "描述不能为空"}
@@ -1186,7 +1189,7 @@ class DevicesMixin:
         existing_names = {s.get("name", "") for s in getattr(self, "_ai_scenes_cache", [])}
         scene_name = base_name
         if scene_name in existing_names:
-            scene_name = f"{base_name}_{_dt.now().strftime('%H%M')}"
+            scene_name = f"{base_name}_{self._ha_local_now().strftime('%H%M')}"
 
         # Step 3: 构建 entities_json / actions_json
         entities_json = _json.dumps(parsed["entities"], ensure_ascii=False)
@@ -1246,40 +1249,20 @@ class DevicesMixin:
         confidence: int,
         actions_json: str = "[]",
     ) -> bool:
-        """写入手动创建的场景（source='manual'，直接插入，不走 auto 去重逻辑）。"""
-        from datetime import datetime as _dt
-        from .const import AI_SCENE_STATUS_PENDING
-        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-        space_id, room, explain_bundle = ai_scene_space_attribution(
+        """Delegate manual scene persistence to the DB bridge event owner."""
+        from .database import DatabaseMixin
+
+        return DatabaseMixin._upsert_ai_scene_manual(self,
+            name,
+            description,
             entities_json,
+            trigger_context,
+            hour_start,
+            hour_end,
+            weekday_mask,
+            confidence,
             actions_json,
-            getattr(self, "device_info", {}),
-            source="ha_manual_ai_scene",
         )
-        explain_bundle_json = _json.dumps(explain_bundle, ensure_ascii=False)
-        _ok = self._db_exec(
-            "INSERT INTO ai_scenes "
-            "(name, description, entities_json, actions_json, trigger_context, "
-            "hour_start, hour_end, weekday_mask, confidence, hit_count, "
-            "status, source, space_id, room, explain_bundle_json, created, updated) "
-            "VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?) "
-            "ON CONFLICT(name) DO UPDATE SET "
-            "description=excluded.description, entities_json=excluded.entities_json, "
-            "actions_json=excluded.actions_json, trigger_context=excluded.trigger_context, "
-            "hour_start=excluded.hour_start, hour_end=excluded.hour_end, "
-            "weekday_mask=excluded.weekday_mask, confidence=excluded.confidence, "
-            "space_id=excluded.space_id, room=excluded.room, "
-            "explain_bundle_json=excluded.explain_bundle_json, updated=excluded.updated",
-            (
-                name, description, entities_json, actions_json, trigger_context,
-                hour_start, hour_end, weekday_mask, confidence,
-                AI_SCENE_STATUS_PENDING, "manual", space_id, room, explain_bundle_json, ts, ts,
-            ),
-        )
-        if not _ok:
-            _LOGGER.warning("[AiScenes] Manual upsert write failed: name=%s", name)
-            return False
-        return True
 
     async def async_approve_ai_scene(self, scene_id: int) -> None:
         """用户确认候选场景 → 状态置为 active，写入 smart_agent_scenes.yaml 并调用 scene.reload。

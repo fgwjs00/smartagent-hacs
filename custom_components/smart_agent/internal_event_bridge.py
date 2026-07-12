@@ -2,17 +2,25 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
 
 LogCallback = Callable[[str, str], None]
+_ENVELOPE_VERSION = 1
+_TRANSPORT = "ha_internal_event_bridge"
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    try:
+        from homeassistant.util import dt as dt_util
+
+        return dt_util.now().isoformat()
+    except Exception:
+        return datetime.now(UTC).isoformat()
 
 
 class InternalEventBridge:
@@ -26,9 +34,11 @@ class InternalEventBridge:
         maxsize: int = 1000,
         warn_threshold: int = 100,
         monitor_interval: float = 60.0,
+        now_provider: Callable[[], Any] | None = None,
     ) -> None:
         self._addon_client = addon_client
         self._log_callback = log_callback
+        self._now_provider = now_provider
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, int(maxsize)))
         self._warn_threshold = max(1, int(warn_threshold))
         self._monitor_interval = max(1.0, float(monitor_interval))
@@ -37,6 +47,7 @@ class InternalEventBridge:
         self._posted = 0
         self._failed = 0
         self._dropped = 0
+        self._seq = 0
 
     @property
     def stats(self) -> dict[str, int]:
@@ -46,6 +57,34 @@ class InternalEventBridge:
             "failed": self._failed,
             "dropped": self._dropped,
         }
+
+    def _default_ts(self) -> str:
+        provider = self._now_provider
+        if callable(provider):
+            try:
+                value = provider()
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if hasattr(value, "isoformat"):
+                    return value.isoformat()
+            except Exception:
+                pass
+        return _now_iso()
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _client_accepts_envelope_headers(self) -> bool:
+        method = getattr(self._addon_client, "post_internal_event", None)
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return True
+        parameters = signature.parameters
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+            return True
+        return "envelope_version" in parameters and "transport" in parameters and "seq" in parameters
 
     def start(self) -> None:
         if self._worker_task and not self._worker_task.done():
@@ -68,7 +107,10 @@ class InternalEventBridge:
         item = {
             "kind": str(kind or "").strip(),
             "payload": dict(payload or {}),
-            "ts": str(ts or _now_iso()),
+            "ts": str(ts or self._default_ts()),
+            "envelope_version": _ENVELOPE_VERSION,
+            "transport": _TRANSPORT,
+            "seq": self._next_seq(),
             "attempts": 0,
         }
         try:
@@ -113,10 +155,19 @@ class InternalEventBridge:
                 self._queue.task_done()
 
     async def _post_item(self, item: dict[str, Any]) -> bool:
+        kwargs: dict[str, Any] = {"ts": str(item.get("ts") or self._default_ts())}
+        if self._client_accepts_envelope_headers():
+            kwargs.update(
+                {
+                    "envelope_version": int(item.get("envelope_version") or _ENVELOPE_VERSION),
+                    "transport": str(item.get("transport") or _TRANSPORT),
+                    "seq": int(item.get("seq") or 0),
+                }
+            )
         result = await self._addon_client.post_internal_event(
             str(item.get("kind") or ""),
             dict(item.get("payload") or {}),
-            ts=str(item.get("ts") or _now_iso()),
+            **kwargs,
         )
         if not isinstance(result, dict):
             return False
@@ -127,7 +178,24 @@ class InternalEventBridge:
         attempts = int(item.get("attempts") or 0) + 1
         item["attempts"] = attempts
         await asyncio.sleep(min(30.0, float(attempts)))
-        self.enqueue(str(item.get("kind") or ""), dict(item.get("payload") or {}), ts=str(item.get("ts") or ""))
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                self._dropped += 1
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._queue.put_nowait(item)
+                self._warn(
+                    f"[P1] internal event queue full; dropped oldest event "
+                    f"(dropped={self._dropped}, queued={self._queue.qsize()})"
+                )
+            except asyncio.QueueFull:
+                self._dropped += 1
+                self._warn("[P1] internal event queue full; failed to enqueue retry event")
 
     async def _monitor_loop(self) -> None:
         while True:

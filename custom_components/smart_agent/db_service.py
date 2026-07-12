@@ -18,11 +18,33 @@ DatabaseService — SmartAgent 统一数据库访问服务 (Phase P4)。
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _sql_snippet(sql: str) -> str:
+    return str(sql or "").strip()[:120].replace("\n", " ")
+
+
+def _sql_target(sql: str) -> str:
+    text = str(sql or "").strip()
+    patterns = (
+        r"(?is)^\s*insert\s+(?:or\s+\w+\s+)?into\s+([`\"\[]?[\w.]+[`\"\]]?)",
+        r"(?is)^\s*update\s+([`\"\[]?[\w.]+[`\"\]]?)",
+        r"(?is)^\s*delete\s+from\s+([`\"\[]?[\w.]+[`\"\]]?)",
+        r"(?is)^\s*replace\s+into\s+([`\"\[]?[\w.]+[`\"\]]?)",
+        r"(?is)^\s*select\b.+?\bfrom\s+([`\"\[]?[\w.]+[`\"\]]?)",
+        r"(?is)^\s*create\s+(?:unique\s+)?index\s+\S+\s+on\s+([`\"\[]?[\w.]+[`\"\]]?)",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text)
+        if match:
+            return match.group(1).strip("`\"[]")
+    return ""
 
 
 class DatabaseService:
@@ -129,7 +151,14 @@ class DatabaseService:
                 # isolation_level=None 时已自动提交，无需显式 commit
                 return True
             except Exception as exc:
-                _LOGGER.warning("[DB Service] Write failed: %s", exc)
+                _LOGGER.warning(
+                    "[DB Service] Write failed: %s | table=%s | SQL: %s | params=%s",
+                    exc,
+                    _sql_target(sql) or "-",
+                    _sql_snippet(sql),
+                    params,
+                    exc_info=True,
+                )
                 return False
 
     def execute_many(self, sql: str, params_list: list[tuple]) -> bool:
@@ -161,7 +190,15 @@ class DatabaseService:
                     conn.execute("ROLLBACK")
                 except Exception:
                     pass
-                _LOGGER.warning("[DB Service] Batch write failed (rolled back): %s", exc)
+                _LOGGER.warning(
+                    "[DB Service] Batch write failed (rolled back): %s | table=%s | SQL: %s | batch_size=%s | first_params=%s",
+                    exc,
+                    _sql_target(sql) or "-",
+                    _sql_snippet(sql),
+                    len(params_list),
+                    params_list[0] if params_list else (),
+                    exc_info=True,
+                )
                 return False
 
     def execute_script(self, statements: list[tuple[str, tuple]]) -> bool:
@@ -176,11 +213,16 @@ class DatabaseService:
         """
         conn = self._ensure_open()
         with self._write_lock:
+            current_index = -1
+            current_sql = ""
+            current_params: tuple = ()
             try:
                 # isolation_level=None（自动提交）下必须显式 BEGIN；
                 # 此时连接处于 autocommit 状态，不存在隐式事务冲突
                 conn.execute("BEGIN")
-                for sql, params in statements:
+                for current_index, (sql, params) in enumerate(statements):
+                    current_sql = sql
+                    current_params = params
                     conn.execute(sql, params)
                 conn.execute("COMMIT")
                 return True
@@ -189,7 +231,15 @@ class DatabaseService:
                     conn.execute("ROLLBACK")
                 except Exception:
                     pass
-                _LOGGER.error("[DB Service] Transaction failed (rolled back): %s", exc)
+                _LOGGER.error(
+                    "[DB Service] Transaction failed (rolled back): %s | statement_index=%s | table=%s | SQL: %s | params=%s",
+                    exc,
+                    current_index,
+                    _sql_target(current_sql) or "-",
+                    _sql_snippet(current_sql),
+                    current_params,
+                    exc_info=True,
+                )
                 return False
 
     # ── 读操作（持 _write_lock，与写操作全局串行） ────────────────────────────
@@ -216,8 +266,14 @@ class DatabaseService:
                 rows = conn.execute(sql, params).fetchall()
                 return [dict(r) for r in rows]
             except Exception as exc:
-                _sql_snippet = sql.strip()[:120].replace("\n", " ")
-                _LOGGER.warning("[DB Service] Query failed: %s | SQL: %s | params=%s", exc, _sql_snippet, params)
+                _LOGGER.warning(
+                    "[DB Service] Query failed: %s | table=%s | SQL: %s | params=%s",
+                    exc,
+                    _sql_target(sql) or "-",
+                    _sql_snippet(sql),
+                    params,
+                    exc_info=True,
+                )
                 return []
 
     def query_scalar(self, sql: str, params: tuple = ()) -> Any:
@@ -239,7 +295,14 @@ class DatabaseService:
                 row = conn.execute(sql, params).fetchone()
                 return row[0] if row else None
             except Exception as exc:
-                _LOGGER.warning("[DB Service] Scalar query failed: %s", exc)
+                _LOGGER.warning(
+                    "[DB Service] Scalar query failed: %s | table=%s | SQL: %s | params=%s",
+                    exc,
+                    _sql_target(sql) or "-",
+                    _sql_snippet(sql),
+                    params,
+                    exc_info=True,
+                )
                 return None
 
     # ── DDL / 迁移（初始化阶段使用） ──────────────────────────────────────────
@@ -256,7 +319,13 @@ class DatabaseService:
             # isolation_level=None（自动提交）下 DDL 自动提交，无需显式 commit
             conn.execute(sql)
         except Exception as exc:
-            _LOGGER.warning("[DB Service] DDL failed: %s | SQL: %s", exc, sql[:60])
+            _LOGGER.warning(
+                "[DB Service] DDL failed: %s | table=%s | SQL: %s",
+                exc,
+                _sql_target(sql) or "-",
+                _sql_snippet(sql),
+                exc_info=True,
+            )
 
     def get_raw_connection(self) -> sqlite3.Connection:
         """

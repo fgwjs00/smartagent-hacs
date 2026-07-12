@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from typing import Any
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from urllib.parse import quote
 
 import voluptuous as vol
@@ -22,9 +22,10 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import entity_registry
 from homeassistant.helpers import config_validation as cv
+from homeassistant.util import dt as dt_util
 
 from .const import CONF_CLEANUP_LEGACY_PAIR_TOKENS, DOMAIN, MODE_HOME, MODE_SHOWROOM
-from .coordinator import SmartAgentCoordinator
+from .coordinator import SmartAgentCoordinator, _coerce_file_log_level
 from .host_read_models import (
     build_presence_sensors_payload as _build_presence_sensors_payload,
     local_device_rows as _local_device_rows,
@@ -138,6 +139,10 @@ def _read_proc_memory_percent() -> float | None:
     return _clamp_percent(((total - available) * 100.0) / total)
 
 
+def _ha_host_now_iso() -> str:
+    return dt_util.now().isoformat()
+
+
 def _collect_system_resource_metrics() -> dict[str, Any]:
     cpu: float | None = None
     memory: float | None = None
@@ -162,7 +167,7 @@ def _collect_system_resource_metrics() -> dict[str, Any]:
             "source": source,
             "cpu_available": cpu is not None,
             "memory_available": memory is not None,
-            "sampled_at": datetime.now().isoformat(),
+            "sampled_at": _ha_host_now_iso(),
         },
     }
 
@@ -826,6 +831,8 @@ class SmartAgentEventsWSView(HomeAssistantView):
         )
         managed_event_entity_ids: set[str] = set()
         managed_event_entity_ids_updated_at = 0.0
+        forward_send_failures = 0
+        forward_send_last_warn = 0.0
 
         def _refresh_managed_event_entity_ids() -> set[str]:
             nonlocal managed_event_entity_ids, managed_event_entity_ids_updated_at
@@ -867,6 +874,7 @@ class SmartAgentEventsWSView(HomeAssistantView):
                 return default
 
         async def _forward(event):
+            nonlocal forward_send_failures, forward_send_last_warn
             evt_type = getattr(event, "event_type", "")
             if evt_type not in forward_events:
                 return
@@ -924,8 +932,17 @@ class SmartAgentEventsWSView(HomeAssistantView):
             }
             try:
                 await ws.send_json(payload)
-            except Exception:
-                pass
+            except Exception as exc:
+                forward_send_failures += 1
+                now_monotonic = time.monotonic()
+                if forward_send_failures == 1 or now_monotonic - forward_send_last_warn >= 60:
+                    forward_send_last_warn = now_monotonic
+                    _LOGGER.warning(
+                        "[EventsWS] send_json failed event_type=%s failures=%s error=%s",
+                        evt_type,
+                        forward_send_failures,
+                        exc.__class__.__name__,
+                    )
 
         unsubscribers = [hass.bus.async_listen(evt, _forward) for evt in forward_events]
 
@@ -1018,10 +1035,6 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
 
         device_info = getattr(coord, "device_info", {}) or {}
         managed_entity_ids = _sorted_str_list(device_info)
-        if not managed_entity_ids:
-            managed_getter = getattr(coord, "_managed_listener_entity_ids", None)
-            if callable(managed_getter):
-                managed_entity_ids = _sorted_str_list(managed_getter())
 
         listener_entity_ids = _sorted_str_list(getattr(coord, "_listener_entity_ids", set()) or set())
         unmanaged_warned_entity_ids = _sorted_str_list(
@@ -2533,10 +2546,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_rollback_transaction(int(call.data["id"]))
 
     async def svc_refresh_transactions(call: ServiceCall) -> None:
-        """刷新事务缓存（强制重新从 DB 加载近期记录）。"""
-        coordinator._transactions_cache = await hass.async_add_executor_job(
-            coordinator._query_recent_transactions, 30
-        )
+        """刷新事务缓存（优先从 add-on 单一事务属主加载近期记录）。"""
+        _addon_client = getattr(coordinator, "_addon_client", None)
+        if _addon_client is None:
+            coordinator._sys_log("WARN", "[Transaction] refresh unavailable: add-on client missing")
+            return
+        try:
+            payload = await _addon_client.get_transactions()
+        except Exception as exc:
+            coordinator._sys_log("WARN", f"[Transaction] add-on transaction refresh failed: {exc}")
+            return
+        rows: list[dict[str, Any]] = []
+        if isinstance(payload, list):
+            rows = [dict(item) for item in payload if isinstance(item, dict)]
+        elif isinstance(payload, dict):
+            try:
+                status = int(payload.get("__status") or payload.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status >= 400 or payload.get("ok") is False:
+                error = payload.get("error") or payload.get("error_type") or f"http_{status}"
+                coordinator._sys_log("WARN", f"[Transaction] add-on transaction refresh failed: {error}")
+                return
+            for key in ("transactions", "items", "data"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    rows = [dict(item) for item in value if isinstance(item, dict)]
+                    break
+        else:
+            coordinator._sys_log("WARN", "[Transaction] add-on transaction refresh returned empty result")
+            return
+        coordinator._transactions_cache = rows
         coordinator.async_set_updated_data({})
 
     _txn_schema = vol.Schema({vol.Required("id"): vol.Coerce(int)})
@@ -2578,7 +2618,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_CLOUD_FALLBACK, CONF_VISION_ENABLED, CONF_VISION_ENGINE,
             CONF_VISION_MODEL,
             CONF_BRAND_NAME, CONF_BRAND_PRIMARY_COLOR, CONF_BRAND_LOGO_URL, CONF_DEPLOY_NAME,
-            CONF_LICENSE_KEY, CONF_LOG_RETENTION,
+            CONF_LICENSE_KEY, CONF_LOG_RETENTION, CONF_FILE_LOG_LEVEL,
             CONF_CLEANUP_LEGACY_PAIR_TOKENS,
             CONF_PRESENCE_FUSION,
             CONF_CIRCADIAN_ENABLED, CONF_CIRCADIAN_WAKE_TIME,
@@ -2615,6 +2655,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "vision_model": (CONF_VISION_MODEL, str),
             "license_key": (CONF_LICENSE_KEY, str),
             "log_retention_days": (CONF_LOG_RETENTION, int),
+            "file_log_level": (CONF_FILE_LOG_LEVEL, str),
             "cleanup_legacy_pair_tokens": (CONF_CLEANUP_LEGACY_PAIR_TOKENS, bool),
             "mcp_enabled": ("mcp_enabled", bool),
             # 品牌化/白标
@@ -2694,6 +2735,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     opts[conf_key] = val
                     # 同步更新 coordinator 内存中的值（JSON 字段保持运行态结构类型）
                     sync_val = val
+                    if key == "file_log_level":
+                        sync_val = _coerce_file_log_level(val)
+                        coordinator._file_log_level_name = logging.getLevelName(sync_val)
+                        coordinator._file_logger.setLevel(sync_val)
                     if key in _JSON_OBJ_KEYS and isinstance(val, str):
                         try:
                             _obj = _json.loads(val) if val else {}

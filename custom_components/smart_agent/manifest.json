@@ -16,9 +16,16 @@
   "integration_type": "device",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/fgwjs00/smartagent-hacs/issues",
+  "loggers": [
+    "custom_components.smart_agent",
+    "custom_components.smart_agent.addon_client",
+    "custom_components.smart_agent.coordinator",
+    "custom_components.smart_agent.listeners",
+    "custom_components.smart_agent.actions"
+  ],
   "requirements": [
     "aiohttp>=3.8.0",
     "cryptography>=41.0.0"
   ],
-  "version": "0.0.160"
+  "version": "0.0.161"
 }

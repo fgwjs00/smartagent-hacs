@@ -3,22 +3,23 @@ AddOnClient — SmartAgent Add-on 内部 API 客户端。
 
 架构角色：
     thin 集成（coordinator）
-        ↓  ContextBuilder 采集数据 → InferenceBundle
-        ↓  调用 AddOnClient.infer(bundle)
+        ↓  ContextBuilder / fast-path snapshot 采集数据
+        ↓  调用 AddOnClient.decision_fast_path(...) 或 run_decision(...)
     此模块
-        ↓  HTTP POST /infer  传入完整 InferenceBundle（含 X-SA-Token 认证头）
+        ↓  HTTP POST /decision/fast-path 或 /decision/run（含 X-SA-Token 认证头）
     smartagent-addon（Docker 容器，端口 18099，可通过 CONF_ADDON_PORT 配置）
-        ↓  inference_engine.py 构建 Prompt + 调用 LLM（受 Cython 保护）
+        ↓  快脑/慢脑决策、Planner 与执行守卫
 
-接口约定（v4.10.10）：
-  - /infer  接受 InferenceBundle（完整上下文字典），返回决策 JSON（需 X-SA-Token）
+接口约定：
+  - /decision/fast-path  接受 System1 快路输入，返回快脑决策或降级原因
+  - /decision/run  接受慢脑决策 bundle，返回决策 JSON（需 X-SA-Token）
   - /health 健康检查（无需认证）
   - /status 运行状态摘要（需 X-SA-Token）
 
 Fail-safe 设计：
   - Add-on 未安装 / 容器未启动时，`is_available()` 返回 False
   - 调用方检测到不可用时必须 fail-closed，不再回退到 HA 本地推理
-  - infer() 使用较长超时（LLM 调用可能需要较长时间）
+  - run_decision() 使用较长超时（LLM 调用可能需要较长时间）
   - auth_token 为空时不发送认证头（向后兼容未配置令牌的环境）
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 import time
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -77,11 +79,10 @@ _AVAIL_CACHE_FAIL = 10.0
 class AddOnClient:
     """SmartAgent Add-on HTTP 客户端。
 
-    使用方式（v4.10.10 Bundle 模式）：
+    使用方式：
         client = AddOnClient(port=18099, auth_token="your-secret")
         if await client.is_available():
-            bundle = await ContextBuilder(coordinator).build(trigger)
-            result = await client.infer(bundle)
+            result = await client.run_decision(bundle)
         else:
             result = None  # fail-closed upstream
     """
@@ -112,6 +113,17 @@ class AddOnClient:
         if self._auth_token:
             return {"X-SA-Token": self._auth_token}
         return {}
+
+    def _new_request_id(self) -> str:
+        return f"ha-{int(time.time() * 1000):x}-{secrets.token_hex(6)}"
+
+    def _request_headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """Return per-request headers for legacy hand-written HTTP calls."""
+        headers = dict(self._auth_headers)
+        headers.setdefault("X-Request-ID", self._new_request_id())
+        if extra:
+            headers.update(extra)
+        return headers
 
     @property
     def auth_headers(self) -> dict[str, str]:
@@ -196,8 +208,9 @@ class AddOnClient:
         """统一 JSON 请求能力，返回 status_code + body 供上层状态码感知透传。"""
         m = str(method or "GET").upper()
         p = path if str(path or "").startswith("/") else f"/{path}"
+        headers = self._request_headers()
         kwargs: dict[str, Any] = {
-            "headers": self._auth_headers,
+            "headers": headers,
             "timeout": timeout or _HEALTH_TIMEOUT,
         }
         if body is not None:
@@ -276,16 +289,21 @@ class AddOnClient:
         payload: dict[str, Any],
         *,
         ts: str | None = None,
+        envelope_version: int | None = None,
+        transport: str | None = None,
+        seq: int | None = None,
     ) -> dict[str, Any] | None:
         """Post a P1 HA-bridge event into add-on owned storage."""
         body: dict[str, Any] = {
             "kind": str(kind or ""),
+            "envelope_version": int(envelope_version or 1),
+            "transport": str(transport or "ha_internal_event_bridge"),
+            "seq": int(seq or 0),
             "payload": dict(payload or {}),
         }
         if ts:
             body["ts"] = str(ts)
-        headers = dict(self._auth_headers)
-        headers["X-SA-Internal"] = "ha-bridge"
+        headers = self._request_headers({"X-SA-Internal": "ha-bridge"})
         try:
             session = await self._get_session()
             async with session.request(
@@ -336,7 +354,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/capabilities",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -358,7 +376,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/core/status",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -380,7 +398,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/addon/system-status",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -396,82 +414,13 @@ class AddOnClient:
         except Exception as exc:
             return self._handle_request_exception(exc)
 
-    async def infer(self, bundle: dict[str, Any]) -> dict[str, Any] | None:
-        """委托 Add-on 执行 AI 推理（Bundle 模式，v4.10.10+）。
-
-        传入由 ContextBuilder 生成的完整 InferenceBundle，
-        Add-on 负责构建 Prompt + 调用 LLM + 解析响应。
-
-        :param bundle: InferenceBundle 字典（含 trigger、context_text、rules、LLM 配置等）
-        :return: 决策字典（含 scene/confidence/actions/reply/speak），失败时返回 None
-        """
-        try:
-            session = await self._get_session()
-            bundle_payload = dict(bundle)
-            online_api_key = str(bundle_payload.pop("online_api_key", "") or "")
-            infer_headers = dict(self._auth_headers)
-            if online_api_key:
-                infer_headers["X-SA-Online-Key"] = online_api_key
-            async with session.post(
-                f"{self._base}/infer",
-                json=bundle_payload,
-                headers=infer_headers,
-                timeout=_INFER_TIMEOUT,
-            ) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
-                    # 基本有效性检查：必须有 actions 字段
-                    if isinstance(result, dict) and "actions" in result:
-                        return result
-                    _LOGGER.warning("[AddOnClient] 推理响应格式无效: %s", self._redact_sensitive(str(result)[:200]))
-                elif resp.status == 401:
-                    # 401 是配置错误（令牌不一致），不是可用性问题：
-                    # 不重置 _avail_cache，避免下次 is_available() → /health(200) → True
-                    # → infer() → 401 的无效循环。Add-on 确实在运行，只是令牌配对错误。
-                    _LOGGER.error(
-                        "[AddOnClient] 认证失败（401）: X-SA-Token 不匹配，"
-                        "请确认 HA 集成 Options 中的 addon_auth_token 与 Add-on 的 SA_AUTH_TOKEN 环境变量一致"
-                    )
-                elif resp.status in (429, 503):
-                    try:
-                        payload = await resp.json()
-                    except Exception:
-                        payload = {}
-                    err = payload.get("error") or ("service_unavailable" if resp.status == 503 else "rate_limited")
-                    err = self._redact_sensitive(str(err))
-                    retryable = bool(payload.get("retryable", True))
-                    _LOGGER.info(
-                        "[AddOnClient] Add-on 推理不可用（HTTP %s, error=%s, retryable=%s），返回 None 由上游 fail-closed",
-                        resp.status,
-                        err,
-                        retryable,
-                    )
-                    self._avail_cache = False
-                    self._avail_checked_at = 0.0
-                else:
-                    _LOGGER.warning("[AddOnClient] 推理请求失败: HTTP %s", resp.status)
-        except aiohttp.ClientConnectorError:
-            _LOGGER.debug("[AddOnClient] Add-on 未启动（连接拒绝），返回 None 由上游 fail-closed")
-            self._avail_cache = False          # 让下次立即重新检查
-            self._avail_checked_at = 0.0
-        except asyncio.TimeoutError:
-            _LOGGER.warning(
-                "[AddOnClient] 推理超时（>%ss），返回 None 由上游 fail-closed",
-                int(_INFER_TIMEOUT.total or 0),
-            )
-            self._avail_cache = False
-            self._avail_checked_at = 0.0
-        except Exception as exc:
-            _LOGGER.debug("[AddOnClient] 推理请求异常: %s", self._redact_sensitive(str(exc)))
-        return None
-
     async def get_log_dates(self) -> list[str] | dict[str, Any] | None:
         """获取日志日期列表（优先 add-on canonical 服务面）。"""
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/logs/dates",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 try:
@@ -519,7 +468,7 @@ class AddOnClient:
             params["max_bytes"] = str(max_bytes)
         if tail_lines not in (None, ""):
             params["tail_lines"] = str(tail_lines)
-        headers = self._auth_headers
+        headers = self._request_headers()
         if raw:
             params["raw"] = "true"
             headers = {**headers, "X-SA-Log-Raw": "1"}
@@ -554,7 +503,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/logs/info",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -582,7 +531,7 @@ class AddOnClient:
             async with session.get(
                 f"{self._base}/scenes/export-yaml",
                 params={"scene_id": sid},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -610,7 +559,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/scenes/export-yaml",
                 json=payload,
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -638,7 +587,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/auth/login",
                 json=payload,
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -661,7 +610,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/auth/me",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -685,7 +634,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/auth/logout",
                 json={},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -709,7 +658,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json={},
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -734,7 +683,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -757,7 +706,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/voice/interrupt",
                 json={},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -781,7 +730,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/status",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -791,8 +740,20 @@ class AddOnClient:
                 except Exception:
                     data = {}
                 return self._build_status_result(resp.status, data)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.warning("[AddOnClient] get_status failed: %s", self._redact_sensitive(str(exc)))
+            handled = self._handle_request_exception(exc)
+            if isinstance(handled, dict):
+                return handled
+            return self._build_status_result(
+                502,
+                {
+                    "ok": False,
+                    "error": "addon_unreachable",
+                    "error_type": "dependency_unreachable",
+                    "retryable": True,
+                },
+            )
         return {}
 
     async def get_system_status(self) -> dict[str, Any]:
@@ -854,7 +815,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/devices",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -880,7 +841,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/rooms",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -907,7 +868,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/devices/discover",
                 json={},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -934,7 +895,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -960,7 +921,7 @@ class AddOnClient:
             async with session.patch(
                 f"{self._base}/devices/{eid}",
                 json=body if isinstance(body, dict) else {},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -985,7 +946,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.delete(
                 f"{self._base}/devices/{eid}",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1008,7 +969,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/rooms/sync",
                 json={},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1030,7 +991,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/rooms/topology",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -1058,7 +1019,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/rooms/topology",
                 json=body,
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 try:
@@ -1078,7 +1039,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/learning/stats",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1100,7 +1061,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/behavior-patterns",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1124,7 +1085,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/behavior-patterns/{int(pattern_id)}/{normalized}",
                 json={},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1145,7 +1106,7 @@ class AddOnClient:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -1176,7 +1137,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1204,7 +1165,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1232,7 +1193,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/transactions",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -1260,7 +1221,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/decision-trace/{encoded_tid}",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1292,7 +1253,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1320,7 +1281,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/memory/profiles",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -1345,7 +1306,7 @@ class AddOnClient:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -1369,7 +1330,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/corrections",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -1405,7 +1366,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1440,7 +1401,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1475,7 +1436,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1498,7 +1459,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/license/status",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1522,7 +1483,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/license/verify",
                 json=payload,
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1544,7 +1505,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/backups",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -1572,7 +1533,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/backups/{act}",
                 json=body,
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1595,7 +1556,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/patrol/trigger",
                 json=payload if isinstance(payload, dict) else {},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1611,13 +1572,35 @@ class AddOnClient:
             return self._handle_request_exception(exc)
         return None
 
+    async def _post_operations_action(
+        self,
+        path: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        result = await self.request_json("POST", path, body=body, timeout=_HEALTH_TIMEOUT)
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        payload = result.get("body")
+        response = dict(payload) if isinstance(payload, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
+    async def post_operations_action_plan(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """提交受控 Operations 计划请求。"""
+        return await self._post_operations_action("/operations/actions/plan", body)
+
+    async def post_operations_action_execute(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """提交带确认令牌的受控 Operations 执行请求。"""
+        return await self._post_operations_action("/operations/actions/execute", body)
+
     async def get_energy(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取能耗统计（优先 add-on 服务面）。"""
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/energy",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
@@ -1649,7 +1632,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}/{suffix}",
                 json=body if isinstance(body, dict) else {},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1677,7 +1660,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1703,7 +1686,7 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}{path}",
                 json={"id": sid},
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 try:
@@ -1724,7 +1707,7 @@ class AddOnClient:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -1757,7 +1740,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1788,7 +1771,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -1815,7 +1798,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1837,7 +1820,7 @@ class AddOnClient:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/system/brand",
-                headers=self._auth_headers,
+                headers=self._request_headers(),
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
@@ -1860,7 +1843,7 @@ class AddOnClient:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -1888,7 +1871,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -1914,7 +1897,7 @@ class AddOnClient:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -1944,7 +1927,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -1972,7 +1955,7 @@ class AddOnClient:
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
@@ -2001,7 +1984,7 @@ class AddOnClient:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._auth_headers,
+                    headers=self._request_headers(),
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
@@ -2022,5 +2005,3 @@ class AddOnClient:
         """关闭 HTTP Session，在 HA 卸载集成时调用。"""
         if self._session and not self._session.closed:
             await self._session.close()
-
-

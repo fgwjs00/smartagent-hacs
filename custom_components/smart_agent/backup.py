@@ -33,7 +33,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -53,6 +53,16 @@ _MAGIC = b"SMAGB01"  # 备份文件魔数（SmartAgent Backup v01）
 BACKUP_LEVEL_BASIC = "basic"
 BACKUP_LEVEL_STANDARD = "standard"
 BACKUP_LEVEL_FULL = "full"
+
+_FIXED_TIMEZONE_OFFSETS = {
+    "Asia/Shanghai": 8,
+    "Asia/Chongqing": 8,
+    "Asia/Harbin": 8,
+    "Asia/Hong_Kong": 8,
+    "Hongkong": 8,
+    "PRC": 8,
+    "UTC": 0,
+}
 
 
 def _restore_text(value: Any, default: Any = "", limit: int = 0) -> str:
@@ -100,6 +110,51 @@ class BackupManager:
                 return json.load(f).get("version", "unknown")
         except Exception:
             return "unknown"
+
+    def _ha_backup_now(self) -> datetime:
+        local_now = getattr(self._coord, "_ha_local_now", None)
+        if callable(local_now):
+            try:
+                value = local_now()
+                if isinstance(value, datetime):
+                    return value
+            except Exception:
+                pass
+
+        configured_timezone = str(
+            getattr(getattr(getattr(self, "_hass", None), "config", None), "time_zone", "") or ""
+        ).strip()
+        if configured_timezone:
+            try:
+                from zoneinfo import ZoneInfo
+
+                return datetime.now(ZoneInfo(configured_timezone))
+            except Exception:
+                offset = _FIXED_TIMEZONE_OFFSETS.get(configured_timezone)
+                if offset is not None:
+                    return datetime.now(timezone(timedelta(hours=offset), configured_timezone))
+
+        from homeassistant.util import dt as dt_util
+
+        return dt_util.now()
+
+    def _ha_backup_now_iso(self) -> str:
+        return self._ha_backup_now().isoformat()
+
+    def _ha_backup_file_timestamp(self) -> str:
+        return self._ha_backup_now().strftime("%Y%m%d_%H%M%S")
+
+    def _ha_backup_datetime_text(self) -> str:
+        return self._ha_backup_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _ha_backup_timestamp_iso(self, timestamp: float) -> str:
+        try:
+            tzinfo = self._ha_backup_now().tzinfo
+            if tzinfo is not None:
+                return datetime.fromtimestamp(float(timestamp), timezone.utc).astimezone(tzinfo).isoformat()
+        except Exception:
+            pass
+        return datetime.fromtimestamp(timestamp).isoformat()
 
     @staticmethod
     def _sanitize_backup_id(backup_id: str) -> str:
@@ -462,7 +517,7 @@ class BackupManager:
         payload: dict[str, Any] = {
             "version": "1.0",
             "level": level,
-            "exported_at": datetime.now().isoformat(),
+            "exported_at": self._ha_backup_now_iso(),
             "integration_version": self._integration_version,
         }
 
@@ -505,7 +560,7 @@ class BackupManager:
             db = getattr(self._coord, "_db", None)
             if db and db.is_open:
                 try:
-                    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+                    cutoff = (self._ha_backup_now() - timedelta(days=30)).strftime("%Y-%m-%d")
                     payload["events"] = db.query(
                         "SELECT time, type, detail, entity, state FROM events "
                         "WHERE time >= ? ORDER BY id DESC LIMIT 5000",
@@ -550,7 +605,7 @@ class BackupManager:
                 with db._write_lock:
                     try:
                         conn.execute("BEGIN EXCLUSIVE")
-                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        now_str = self._ha_backup_datetime_text()
 
                         # ── 1. 设备配置（device_info → devices 表）────────────────
                         if "device_info" in payload and isinstance(payload["device_info"], dict):
@@ -632,7 +687,7 @@ class BackupManager:
                                 if not isinstance(r, dict):
                                     continue
                                 # P0修复：time 为 NOT NULL，备份时已包含；老备份缺失时用 ISO 当前时间补全
-                                _time = r.get("time") or datetime.now().isoformat()
+                                _time = r.get("time") or self._ha_backup_now_iso()
                                 conn.execute(
                                     "INSERT OR IGNORE INTO corrections "
                                     "(time, entity_id, ai_service, ai_state, user_state, "
@@ -759,11 +814,12 @@ class BackupManager:
 
     async def _save_local(self, encrypted: bytes, level: str) -> dict:
         """保存到 HA 配置目录下的本地文件。"""
+        ts = self._ha_backup_file_timestamp()
+        backup_id = f"bkp_{ts}_{level}"
+
         def _write():
             backup_dir = os.path.join(self._hass.config.config_dir, "smart_agent_backups")
             os.makedirs(backup_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_id = f"bkp_{ts}_{level}"
             fpath = os.path.join(backup_dir, f"{backup_id}.enc")
             with open(fpath, "wb") as f:
                 f.write(encrypted)
@@ -794,7 +850,7 @@ class BackupManager:
                 backup_id = fname[:-4]
                 result.append({
                     "backup_id": backup_id,
-                    "timestamp": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "timestamp": self._ha_backup_timestamp_iso(stat.st_mtime),
                     "level": backup_id.split("_")[-1] if "_" in backup_id else "unknown",
                     "size_bytes": stat.st_size,
                 })

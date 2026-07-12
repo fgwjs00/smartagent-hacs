@@ -128,5 +128,11 @@
       "biz_time_invalid":  "营业时间格式错误或开始时间不早于结束时间，请使用 HH:MM 格式",
       "invalid_json":      "区域角色映射不是合法的 JSON 格式，请检查语法"
     }
+  },
+  "issues": {
+    "addon_unreachable": {
+      "title": "SmartAgent add-on 不可达",
+      "description": "Home Assistant 无法访问 SmartAgent add-on：{base_url}。最近错误：{error}。该问题已持续约 {minutes} 分钟。请检查 add-on 是否正在运行，以及 add-on URL/token 是否正确。"
+    }
   }
 }

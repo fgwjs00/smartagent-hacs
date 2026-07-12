@@ -340,6 +340,8 @@ LOG_RETENTION_DAYS = 30          # 默认保留 30 天
 LOG_MEM_MAX = 500                 # 内存实时日志最大条数
 
 CONF_LOG_RETENTION = "log_retention_days"   # 可配置日志保留天数
+CONF_FILE_LOG_LEVEL = "file_log_level"      # HA 侧 SmartAgent system 文件日志级别
+DEFAULT_FILE_LOG_LEVEL = "INFO"
 
 # ── Wave 0：共享语义契约（冻结键名，不引入行为变更）────────────────────────────
 SEMANTIC_CONTRACT_VERSION = "wave0-v1"

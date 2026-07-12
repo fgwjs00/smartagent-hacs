@@ -183,12 +183,12 @@ class DataSyncMixin:
             stats["decision_cache_size"] = self._db.query_scalar(
                 "SELECT COUNT(*) FROM decision_cache"
             ) or 0
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = self._data_sync_db_now_text().split(" ", 1)[0]
             stats["ai_calls_today"] = self._db.query_scalar(
                 "SELECT COUNT(*) FROM training_data WHERE time >= ?", (today,)
             ) or 0
             if hasattr(self, "_start_time"):
-                elapsed = (datetime.now() - self._start_time).total_seconds()
+                elapsed = (self._data_sync_now() - self._start_time).total_seconds()
                 stats["uptime_hours"] = round(elapsed / 3600, 1)
         except Exception as exc:
             _LOGGER.debug("[DataSync] 统计采集失败: %s", exc)
@@ -323,7 +323,7 @@ class DataSyncMixin:
         """将已上传的训练样本打上 synced_at 时间戳。"""
         if not ids:
             return
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = self._data_sync_db_now_text()
         placeholders = ",".join("?" * len(ids))
         _ok = self._db_exec(
             f"UPDATE training_data SET synced_at = ? WHERE id IN ({placeholders})",
@@ -336,7 +336,7 @@ class DataSyncMixin:
         """将已上传的修正记录打上 synced_at 时间戳。"""
         if not ids:
             return
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = self._data_sync_db_now_text()
         placeholders = ",".join("?" * len(ids))
         _ok = self._db_exec(
             f"UPDATE corrections SET synced_at = ? WHERE id IN ({placeholders})",
@@ -346,6 +346,35 @@ class DataSyncMixin:
             _LOGGER.debug("[DataSync] 标记修正记录同步状态失败: ids=%s", len(ids))
 
     # ── 工具方法 ─────────────────────────────────────────────────────────────
+
+    def _data_sync_now(self) -> datetime:
+        try:
+            clock = getattr(self, "_ha_local_now", None)
+            now_value = clock() if callable(clock) else None
+            if isinstance(now_value, datetime):
+                return now_value
+        except Exception:
+            pass
+        try:
+            return datetime.fromisoformat(self._data_sync_db_now_text())
+        except Exception:
+            from homeassistant.util import dt as dt_util
+
+            return dt_util.now()
+
+    def _data_sync_db_now_text(self) -> str:
+        now_text = ""
+        try:
+            clock = getattr(self, "_ha_db_now_text", None)
+            if callable(clock):
+                now_text = str(clock() or "").strip()
+        except Exception:
+            now_text = ""
+        if now_text:
+            return now_text
+        from homeassistant.util import dt as dt_util
+
+        return dt_util.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _get_current_version(self) -> str:
         """读取 manifest.json 中的版本号。"""

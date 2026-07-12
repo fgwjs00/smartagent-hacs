@@ -17,8 +17,9 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -40,6 +41,15 @@ _LOGGER = logging.getLogger(__name__)
 
 # 本地缓存文件名
 _LICENSE_CACHE_FILE = "smart_agent_license.json"
+_FIXED_TIMEZONE_OFFSETS = {
+    "Asia/Shanghai": 8,
+    "Asia/Chongqing": 8,
+    "Asia/Harbin": 8,
+    "Asia/Hong_Kong": 8,
+    "Hongkong": 8,
+    "PRC": 8,
+    "UTC": 0,
+}
 
 
 class LicenseMixin:
@@ -55,6 +65,25 @@ class LicenseMixin:
         self._license_valid: bool = False         # 当前 License 是否有效
         # 每日推理计数器：{date_str: count}，如 {"2026-03-15": 42}
         self._license_daily_count: dict[str, int] = {}
+
+    def _license_local_now(self) -> datetime:
+        """Return current time in HA configured timezone."""
+        configured_timezone = str(
+            getattr(getattr(getattr(self, "hass", None), "config", None), "time_zone", "") or ""
+        ).strip()
+        if configured_timezone:
+            try:
+                return datetime.now(ZoneInfo(configured_timezone))
+            except Exception:
+                offset = _FIXED_TIMEZONE_OFFSETS.get(configured_timezone)
+                if offset is not None:
+                    return datetime.now(timezone(timedelta(hours=offset), configured_timezone))
+        from homeassistant.util import dt as dt_util
+
+        return dt_util.now()
+
+    def _license_today(self) -> str:
+        return self._license_local_now().strftime("%Y-%m-%d")
 
     # ── 对外接口 ──────────────────────────────────────────────────────────────
 
@@ -74,7 +103,7 @@ class LicenseMixin:
 
     def check_daily_quota(self) -> tuple[bool, str]:
         """检查今日是否还有推理配额。"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._license_today()
         tier = self._license_tier if self._license_valid else LICENSE_TIER_FREE
         limit = LICENSE_DAILY_LIMITS.get(tier, 30)
         used = self._license_daily_count.get(today, 0)
@@ -86,12 +115,12 @@ class LicenseMixin:
 
     def increment_daily_count(self) -> None:
         """推理成功执行后调用，增加今日计数。"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._license_today()
         self._license_daily_count[today] = int(self._license_daily_count.get(today, 0) or 0) + 1
 
     def get_license_status(self) -> dict:
         """返回当前 License 状态（供面板展示）。"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._license_today()
         used = self._license_daily_count.get(today, 0)
         tier = self._license_tier if self._license_valid else LICENSE_TIER_FREE
         limit = LICENSE_DAILY_LIMITS.get(tier, 30)
@@ -171,7 +200,7 @@ class LicenseMixin:
 
     def _build_result(self, valid: bool, tier: str, expires: str, message: str) -> dict:
         """构建统一返回结构。"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._license_today()
         used = self._license_daily_count.get(today, 0)
         limit = LICENSE_DAILY_LIMITS.get(tier, 30)
         if not valid:
@@ -187,13 +216,12 @@ class LicenseMixin:
             "daily_used": used,
         }
 
-    @staticmethod
-    def _is_license_expired(expires: str) -> bool:
+    def _is_license_expired(self, expires: str) -> bool:
         """检查到期日期是否已过（空字符串视为永久有效）。"""
         if not expires:
             return False
         try:
-            return datetime.strptime(expires, "%Y-%m-%d").date() < datetime.now().date()
+            return datetime.strptime(expires, "%Y-%m-%d").date() < self._license_local_now().date()
         except ValueError:
             return False
 

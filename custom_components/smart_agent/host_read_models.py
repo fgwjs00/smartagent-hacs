@@ -236,6 +236,110 @@ def local_ha_area_room_rows(hass: HomeAssistant | None) -> list[dict[str, Any]]:
     return rows
 
 
+def _presence_snapshot_room_payload(
+    snapshot: dict[str, Any] | None,
+    room: str,
+    aliases: dict[str, str],
+) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    rooms = snapshot.get("rooms")
+    if isinstance(rooms, dict):
+        raw_items = rooms.items()
+    elif isinstance(rooms, list):
+        raw_items = (
+            (
+                str(item.get("space") or item.get("space_id") or item.get("room") or item.get("id") or ""),
+                item,
+            )
+            for item in rooms
+            if isinstance(item, dict)
+        )
+    else:
+        return None
+
+    wanted = str(room or "").strip()
+    for raw_key, raw_payload in raw_items:
+        key = str(raw_key or "").strip()
+        if not key or not isinstance(raw_payload, dict):
+            continue
+        if key == wanted or aliases.get(key) == wanted:
+            return raw_payload
+    return None
+
+
+def _presence_snapshot_confidence(value: Any) -> float | None:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if confidence > 1.0:
+        confidence = confidence / 100.0
+    return max(0.0, min(1.0, confidence))
+
+
+def _apply_presence_snapshot_to_room_row(row: dict[str, Any], payload: dict[str, Any] | None) -> None:
+    if not isinstance(payload, dict):
+        return
+    state = str(
+        payload.get("presence_state")
+        or payload.get("occupancy_state")
+        or payload.get("state")
+        or ""
+    ).strip()
+    confidence = _presence_snapshot_confidence(
+        payload.get("presence_confidence")
+        if payload.get("presence_confidence") is not None
+        else payload.get("occupancy_confidence")
+        if payload.get("occupancy_confidence") is not None
+        else payload.get("confidence")
+    )
+    if state:
+        row["presence_state"] = state
+        row["occupancy_state"] = state
+    if confidence is not None:
+        row["presence_confidence"] = confidence
+        row["occupancy_confidence"] = confidence
+
+    reasons = payload.get("reasons")
+    if isinstance(reasons, (list, tuple)) and reasons:
+        row["presence_reason"] = str(reasons[0] or "").strip()
+    elif payload.get("reason"):
+        row["presence_reason"] = str(payload.get("reason") or "").strip()
+
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        source = str(
+            metadata.get("source")
+            or metadata.get("presence_contract_source")
+            or ""
+        ).strip()
+        if source:
+            row["presence_source"] = source
+
+    for key in ("occupied_evidence_ids", "vacant_evidence_ids", "presence_evidence_ids"):
+        raw_ids = payload.get(key)
+        if isinstance(raw_ids, (list, tuple)) and raw_ids:
+            row["presence_evidence_ids"] = [str(item) for item in raw_ids if str(item or "").strip()]
+            break
+
+
+def _apply_missing_presence_snapshot_to_room_row(row: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    if str(row.get("presence_state") or row.get("occupancy_state") or "").strip():
+        return
+    row["presence_state"] = "unknown"
+    row["occupancy_state"] = "unknown"
+    row["presence_confidence"] = 0.0
+    row["occupancy_confidence"] = 0.0
+    source = str(snapshot.get("source") or "").strip()
+    metadata = snapshot.get("metadata")
+    if not source and isinstance(metadata, dict):
+        source = str(metadata.get("presence_contract_source") or "").strip()
+    if source:
+        row["presence_source"] = source
+    row["presence_reason"] = "no_presence_snapshot_payload"
+
+
 def local_room_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dict[str, Any]]:
     rooms: dict[str, dict[str, Any]] = {}
     room_aliases: dict[str, str] = {}
@@ -264,6 +368,17 @@ def local_room_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dict[
         if row is None:
             continue
         row["device_count"] = int(row.get("device_count", 0)) + 1
+
+    getter = getattr(coord, "get_presence_snapshot", None)
+    try:
+        presence_snapshot = getter() if callable(getter) else None
+    except Exception:
+        presence_snapshot = None
+    for room_key, row in rooms.items():
+        payload = _presence_snapshot_room_payload(presence_snapshot, room_key, room_aliases)
+        _apply_presence_snapshot_to_room_row(row, payload)
+        if isinstance(presence_snapshot, dict):
+            _apply_missing_presence_snapshot_to_room_row(row, presence_snapshot)
     return sorted(rooms.values(), key=lambda row: str(row.get("name", "")))
 
 

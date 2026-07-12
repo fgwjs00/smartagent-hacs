@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import date, timedelta
 import logging
 from typing import Any
 
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import SmartAgentCoordinator
@@ -28,6 +30,28 @@ def build_smart_agent_websocket_commands(
     _build_presence_sensors_payload: Callable[[HomeAssistant, SmartAgentCoordinator], dict[str, Any]],
 ) -> tuple[Any, ...]:
     # ── WebSocket API：大数据列表通过 WS 按需下发，绕过 sensor 属性 16KB 上限 ──
+
+    def _ws_ha_now_iso(coord: SmartAgentCoordinator | None) -> str:
+        try:
+            local_now = getattr(coord, "_ha_local_now", None)
+            if callable(local_now):
+                value = local_now()
+                if hasattr(value, "isoformat"):
+                    return value.isoformat()
+        except Exception:
+            pass
+        return dt_util.now().isoformat()
+
+    def _ws_ha_today(coord: SmartAgentCoordinator | None) -> date:
+        try:
+            local_now = getattr(coord, "_ha_local_now", None)
+            if callable(local_now):
+                value = local_now()
+                if hasattr(value, "date"):
+                    return value.date()
+        except Exception:
+            pass
+        return dt_util.now().date()
 
     def _get_coord(hass: HomeAssistant) -> SmartAgentCoordinator | None:
         """从 hass.data 取出第一个 coordinator 实例（单实例部署常用）。"""
@@ -58,6 +82,32 @@ def build_smart_agent_websocket_commands(
         """Return True when add-on explicitly returned an error-shaped payload."""
         status = _addon_status_code(payload)
         return payload.get("ok") is False or status >= 400
+
+    def _transaction_rows_from_payload(payload: Any) -> list[dict[str, Any]] | None:
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        if not isinstance(payload, dict) or _is_addon_failure_payload(payload):
+            return None
+        rows = payload.get("transactions") or payload.get("items") or payload.get("data")
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+        return None
+
+    def _today_blocked_from_transactions(rows: Any, today_str: str) -> int:
+        if not isinstance(rows, list):
+            return 0
+        total = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            time_text = str(row.get("time") or row.get("created_at") or row.get("updated_at") or "")
+            if not time_text or time_text < today_str:
+                continue
+            try:
+                total += int(row.get("blocked_count") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_devices"})
     @websocket_api.async_response
@@ -211,11 +261,10 @@ def build_smart_agent_websocket_commands(
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
 
-        from datetime import date as _date, timedelta as _td
-
-        today_str = _date.today().isoformat()
+        today = _ws_ha_today(coord)
+        today_str = today.isoformat()
         # P2 fix: 近30天截止日期（原代码误用了今天）
-        cutoff_30 = (_date.today() - _td(days=30)).strftime("%Y-%m-%d")
+        cutoff_30 = (today - timedelta(days=30)).strftime("%Y-%m-%d")
 
         def _fetch():
             # P1 fix: 整体 try/except，避免任何 SQL 异常导致 WS 处理函数崩溃
@@ -227,13 +276,6 @@ def build_smart_agent_websocket_commands(
                     (today_str,),
                 )
                 today_inferences = inf_rows[0]["cnt"] if inf_rows else 0
-
-                # 今日拦截动作数（action_transactions 中 blocked_count 合计）
-                blk_rows = db.query(
-                    "SELECT COALESCE(SUM(blocked_count),0) AS cnt FROM action_transactions WHERE time >= ?",
-                    (today_str,),
-                )
-                today_blocked = blk_rows[0]["cnt"] if blk_rows else 0
 
                 # 今日用户修正次数（corrections 表 time 今日）
                 cor_rows = db.query(
@@ -267,14 +309,15 @@ def build_smart_agent_websocket_commands(
                     rate = round(cors / infs * 100, 1) if infs > 0 else 0.0
                     room_overturn_rates.append({"room": room, "inferences": infs, "corrections": cors, "rate": rate})
 
-                return today_inferences, today_blocked, today_corrections, room_overturn_rates
+                return today_inferences, today_corrections, room_overturn_rates
             except Exception as _exc:
                 _LOGGER.warning("[DecisionStats] DB 查询失败: %s", _exc)
-                return 0, 0, 0, []
+                return 0, 0, []
 
-        ti, tb, tc, rates = await hass.async_add_executor_job(_fetch)
+        ti, tc, rates = await hass.async_add_executor_job(_fetch)
 
         addon_diagnostics: dict[str, Any] = {}
+        transaction_rows: list[dict[str, Any]] | None = None
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is not None:
             try:
@@ -289,7 +332,15 @@ def build_smart_agent_websocket_commands(
                 }
 
         # 最近 5 条事务（from cache）
-        txns = coord._transactions_cache if isinstance(coord._transactions_cache, list) else []
+        if _addon_client is not None:
+            try:
+                transaction_rows = _transaction_rows_from_payload(await _addon_client.get_transactions())
+            except Exception as _txn_exc:
+                _LOGGER.debug("[DecisionStats] add-on transactions fetch failed: %s", _txn_exc)
+        if transaction_rows is None:
+            transaction_rows = get_transactions_cache_snapshot(coord)
+        tb = _today_blocked_from_transactions(transaction_rows, today_str)
+        txns = transaction_rows if isinstance(transaction_rows, list) else []
         _DROP = {"pre_states_json", "actions_json", "results_json"}
         recent = [
             {k: v for k, v in t.items() if k not in _DROP}
@@ -569,9 +620,7 @@ def build_smart_agent_websocket_commands(
         friendly_name = msg.get("friendly_name", "")
         room = msg.get("room", "")
 
-        from datetime import datetime as _dt_now
-
-        now_str = _dt_now.now().isoformat()
+        now_str = _ws_ha_now_iso(coord)
         enqueue = getattr(coord, "_enqueue_internal_event", None)
         if not callable(enqueue) or not enqueue(
             "frigate_zone",
