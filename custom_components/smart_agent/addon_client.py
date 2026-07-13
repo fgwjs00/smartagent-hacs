@@ -25,6 +25,10 @@ Fail-safe 设计：
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import re
 import secrets
@@ -141,13 +145,46 @@ class AddOnClient:
         return base + p
 
     def _redact_sensitive(self, text: str) -> str:
-        """脱敏日志中的令牌与常见密钥片段。"""
-        out = text
+        """Redact tokens plus password/bluetooth_password exception text."""
+        out = str(text or "")
+        try:
+            structured = json.loads(out)
+
+            def redact(value: Any) -> Any:
+                if isinstance(value, dict):
+                    result: dict[str, Any] = {}
+                    for key, item in value.items():
+                        normalized = "".join(character for character in str(key).lower() if character.isalnum())
+                        sensitive = any(
+                            marker in normalized
+                            for marker in ("password", "token", "secret", "credential", "authorization", "apikey")
+                        ) and normalized != "passwordconfigured"
+                        result[str(key)] = "***" if sensitive else redact(item)
+                    return result
+                if isinstance(value, list):
+                    return [redact(item) for item in value]
+                return value
+
+            out = json.dumps(redact(structured), ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
         if self._auth_token and self._auth_token in out:
             token_mask = "***" if len(self._auth_token) <= 16 else self._auth_token[:4] + "***" + self._auth_token[-4:]
             out = out.replace(self._auth_token, token_mask)
         out = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1***", out)
         out = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[\w\-]{8,}", r"\1***", out)
+        # LD2410 passwords are exactly six printable ASCII characters. Consume
+        # the complete unquoted protocol value before the generic delimiter rule.
+        out = re.sub(
+            r'''(?i)(["']?(?:bluetooth[_-]?)?password["']?\s*[:=]\s*)(?!["'])([\x20-\x7e]{6})''',
+            r"\1***",
+            out,
+        )
+        out = re.sub(
+            r'''(?i)(["']?(?:bluetooth[_-]?)?password["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}\]\s;]+)''',
+            r"\1***",
+            out,
+        )
         return out
 
     def _http_retryable(self, status: int) -> bool:
@@ -204,11 +241,12 @@ class AddOnClient:
         *,
         body: dict[str, Any] | None = None,
         timeout: aiohttp.ClientTimeout | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         """统一 JSON 请求能力，返回 status_code + body 供上层状态码感知透传。"""
         m = str(method or "GET").upper()
         p = path if str(path or "").startswith("/") else f"/{path}"
-        headers = self._request_headers()
+        headers = self._request_headers(extra_headers)
         kwargs: dict[str, Any] = {
             "headers": headers,
             "timeout": timeout or _HEALTH_TIMEOUT,
@@ -1593,6 +1631,310 @@ class AddOnClient:
     async def post_operations_action_execute(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """提交带确认令牌的受控 Operations 执行请求。"""
         return await self._post_operations_action("/operations/actions/execute", body)
+
+    async def _ld2410_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        result = await self.request_json(method, path, body=body, timeout=_HEALTH_TIMEOUT)
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        payload = result.get("body")
+        response = dict(payload) if isinstance(payload, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
+    def _ld2410_radar_path(self, entity_id: str) -> str:
+        return f"/api/v1/devices/{quote(entity_id, safe='')}/radar"
+
+    async def get_ld2410_radar(self, entity_id: str) -> dict[str, Any] | None:
+        """Read the add-on-owned LD2410 maintenance snapshot."""
+        return await self._ld2410_request("GET", self._ld2410_radar_path(entity_id))
+
+    async def refresh_ld2410_radar(self, entity_id: str) -> dict[str, Any] | None:
+        """Queue a typed refresh; no UART passthrough is exposed to HA."""
+        return await self._ld2410_request("POST", f"{self._ld2410_radar_path(entity_id)}/refresh", {})
+
+    async def patch_ld2410_radar_config(
+        self,
+        entity_id: str,
+        config: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        return await self._ld2410_request("PATCH", f"{self._ld2410_radar_path(entity_id)}/config", dict(config))
+
+    async def start_ld2410_radar_diagnostics(
+        self,
+        entity_id: str,
+        timeout_seconds: int = 600,
+    ) -> dict[str, Any] | None:
+        return await self._ld2410_request(
+            "POST",
+            f"{self._ld2410_radar_path(entity_id)}/diagnostics/start",
+            {"timeout_seconds": int(timeout_seconds)},
+        )
+
+    async def stop_ld2410_radar_diagnostics(self, entity_id: str) -> dict[str, Any] | None:
+        return await self._ld2410_request(
+            "POST",
+            f"{self._ld2410_radar_path(entity_id)}/diagnostics/stop",
+            {},
+        )
+
+    async def run_ld2410_radar_action(
+        self,
+        entity_id: str,
+        action: str,
+        body: dict[str, Any] | None = None,
+        *,
+        confirmation_token: str = "",
+    ) -> dict[str, Any] | None:
+        allowed = {
+            "auto-calibrate",
+            "restart",
+            "factory-reset",
+            "set-bluetooth",
+            "set-bluetooth-password",
+        }
+        clean_action = str(action or "").strip().lower()
+        if clean_action not in allowed:
+            return {"ok": False, "error": "unsupported_radar_action", "__status": 404}
+        request_body = dict(body or {})
+        if confirmation_token:
+            request_body["confirmation_token"] = str(confirmation_token)
+        return await self._ld2410_request(
+            "POST",
+            f"{self._ld2410_radar_path(entity_id)}/actions/{quote(clean_action, safe='')}",
+            request_body,
+        )
+
+    async def _environment_calibration_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        actor_headers = self._signed_actor_headers(method, path, actor) if body is not None else None
+        result = await self.request_json(
+            method,
+            path,
+            body=body,
+            timeout=_HEALTH_TIMEOUT,
+            extra_headers=actor_headers,
+        )
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        payload = result.get("body")
+        response = dict(payload) if isinstance(payload, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
+    def _signed_actor_headers(
+        self, method: str, path: str, actor: dict[str, Any] | None
+    ) -> dict[str, str]:
+        if not self._auth_token:
+            return {}
+        raw = actor if isinstance(actor, dict) else {
+            "mode": "system",
+            "actor_id": "smartagent-ha-internal",
+            "actor_name": "",
+            "is_admin": False,
+        }
+        claims = {
+            "mode": str(raw.get("mode") or "system"),
+            "actor_id": str(raw.get("actor_id") or "smartagent-ha-internal"),
+            "actor_name": str(raw.get("actor_name") or ""),
+            "is_admin": bool(raw.get("is_admin", False)),
+            "iat": int(time.time()),
+            "nonce": secrets.token_hex(16),
+        }
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(claims, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        signature = hmac.new(
+            self._auth_token.encode("utf-8"),
+            f"{str(method).upper()}\n{path}\n{encoded}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return {"X-SA-Actor": encoded, "X-SA-Actor-Signature": signature}
+
+    def _environment_calibration_path(self, entity_id: str) -> str:
+        return f"/api/v1/devices/{quote(entity_id, safe='')}/environment-calibration"
+
+    async def get_environment_calibration(self, entity_id: str) -> dict[str, Any] | None:
+        """Read the add-on-owned environment calibration state."""
+        return await self._environment_calibration_request(
+            "GET", self._environment_calibration_path(entity_id)
+        )
+
+    async def post_environment_calibration_samples(
+        self,
+        entity_id: str,
+        samples: list[dict[str, Any]],
+        *,
+        actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        return await self._environment_calibration_request(
+            "POST",
+            f"{self._environment_calibration_path(entity_id)}/samples",
+            {"samples": list(samples)},
+            actor=actor,
+        )
+
+    async def create_environment_calibration_suggestion(
+        self,
+        entity_id: str,
+        body: dict[str, Any],
+        *,
+        actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        return await self._environment_calibration_request(
+            "POST",
+            f"{self._environment_calibration_path(entity_id)}/suggestions",
+            dict(body),
+            actor=actor,
+        )
+
+    async def apply_environment_calibration(
+        self,
+        entity_id: str,
+        suggestion_id: str,
+        expected_version: int,
+        *,
+        confirmation_token: str = "",
+        actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        body: dict[str, Any] = {
+            "suggestion_id": str(suggestion_id),
+            "expected_version": int(expected_version),
+        }
+        if confirmation_token:
+            body["confirmation_token"] = str(confirmation_token)
+        return await self._environment_calibration_request(
+            "POST", f"{self._environment_calibration_path(entity_id)}/apply", body, actor=actor
+        )
+
+    async def rollback_environment_calibration(
+        self,
+        entity_id: str,
+        expected_version: int,
+        *,
+        confirmation_token: str = "",
+        actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        body: dict[str, Any] = {"expected_version": int(expected_version)}
+        if confirmation_token:
+            body["confirmation_token"] = str(confirmation_token)
+        return await self._environment_calibration_request(
+            "POST", f"{self._environment_calibration_path(entity_id)}/rollback", body, actor=actor
+        )
+
+    async def _firmware_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        actor_headers = self._signed_actor_headers(method, path, actor) if body is not None else None
+        result = await self.request_json(
+            method,
+            path,
+            body=body,
+            timeout=_HEALTH_TIMEOUT,
+            extra_headers=actor_headers,
+        )
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        payload = result.get("body")
+        response = dict(payload) if isinstance(payload, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
+    @staticmethod
+    def _firmware_path(entity_id: str) -> str:
+        return f"/api/v1/devices/{quote(entity_id, safe='')}/firmware"
+
+    async def list_firmware_images(self) -> dict[str, Any] | None:
+        return await self._firmware_request("GET", "/api/v1/firmware/images")
+
+    async def upload_firmware_image(
+        self,
+        image: bytes,
+        manifest: dict[str, Any],
+        *,
+        actor: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        path = "/api/v1/firmware/images"
+        try:
+            manifest_header = base64.urlsafe_b64encode(
+                json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "firmware_manifest_invalid", "__status": 400}
+        headers = self._request_headers(self._signed_actor_headers("POST", path, actor))
+        headers.update({"Content-Type": "application/octet-stream", "X-SA-Firmware-Manifest": manifest_header})
+        try:
+            session = await self._get_session()
+            async with session.post(
+                f"{self._base}{path}", data=bytes(image), headers=headers, timeout=_HEALTH_TIMEOUT
+            ) as resp:
+                try:
+                    payload = await resp.json(content_type=None)
+                except Exception:
+                    payload = {}
+                response = dict(payload) if isinstance(payload, dict) else {"ok": 200 <= resp.status < 300}
+                response["__status"] = int(resp.status)
+                return response
+        except Exception as exc:
+            _LOGGER.debug("[AddOnClient] firmware upload failed: %s", self._redact_sensitive(str(exc)))
+            handled = self._handle_request_exception(exc)
+            return handled if isinstance(handled, dict) else None
+
+    async def get_device_firmware(self, entity_id: str) -> dict[str, Any] | None:
+        return await self._firmware_request("GET", self._firmware_path(entity_id))
+
+    async def plan_device_firmware(
+        self, entity_id: str, image_sha256: str, *, actor: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        return await self._firmware_request(
+            "POST", f"{self._firmware_path(entity_id)}/plan", {"image_sha256": str(image_sha256)}, actor=actor
+        )
+
+    async def execute_device_firmware(
+        self, entity_id: str, body: dict[str, Any], *, actor: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        return await self._firmware_request(
+            "POST", f"{self._firmware_path(entity_id)}/execute", dict(body), actor=actor
+        )
+
+    async def retry_device_firmware(
+        self, entity_id: str, transaction_id: str, *, actor: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        return await self._firmware_request(
+            "POST", f"{self._firmware_path(entity_id)}/retry", {"transaction_id": str(transaction_id)}, actor=actor
+        )
+
+    async def cancel_device_firmware(
+        self, entity_id: str, transaction_id: str, *, actor: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        return await self._firmware_request(
+            "POST", f"{self._firmware_path(entity_id)}/cancel", {"transaction_id": str(transaction_id)}, actor=actor
+        )
+
+    async def get_device_firmware_transaction(
+        self, entity_id: str, transaction_id: str
+    ) -> dict[str, Any] | None:
+        return await self._firmware_request(
+            "GET", f"{self._firmware_path(entity_id)}/transactions/{quote(str(transaction_id), safe='')}"
+        )
 
     async def get_energy(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取能耗统计（优先 add-on 服务面）。"""

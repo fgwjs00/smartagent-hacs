@@ -25,6 +25,22 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_CLEANUP_LEGACY_PAIR_TOKENS, DOMAIN, MODE_HOME, MODE_SHOWROOM
+from .environment_calibration_views import (
+    SmartAgentEnvironmentCalibrationApplyView,
+    SmartAgentEnvironmentCalibrationRollbackView,
+    SmartAgentEnvironmentCalibrationSamplesView,
+    SmartAgentEnvironmentCalibrationSuggestionsView,
+    SmartAgentEnvironmentCalibrationView,
+)
+from .device_firmware_views import (
+    SmartAgentDeviceFirmwareCancelView,
+    SmartAgentDeviceFirmwareExecuteView,
+    SmartAgentDeviceFirmwarePlanView,
+    SmartAgentDeviceFirmwareRetryView,
+    SmartAgentDeviceFirmwareTransactionView,
+    SmartAgentDeviceFirmwareView,
+    SmartAgentFirmwareImagesView,
+)
 from .coordinator import SmartAgentCoordinator, _coerce_file_log_level
 from .host_read_models import (
     build_presence_sensors_payload as _build_presence_sensors_payload,

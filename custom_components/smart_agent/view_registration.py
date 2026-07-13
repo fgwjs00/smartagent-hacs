@@ -27,6 +27,18 @@ V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentMcpStatusView",
     "SmartAgentDevicePairStartView",
     "SmartAgentDevicePairConfirmView",
+    "SmartAgentEnvironmentCalibrationView",
+    "SmartAgentEnvironmentCalibrationSamplesView",
+    "SmartAgentEnvironmentCalibrationSuggestionsView",
+    "SmartAgentEnvironmentCalibrationApplyView",
+    "SmartAgentEnvironmentCalibrationRollbackView",
+    "SmartAgentFirmwareImagesView",
+    "SmartAgentDeviceFirmwareView",
+    "SmartAgentDeviceFirmwarePlanView",
+    "SmartAgentDeviceFirmwareExecuteView",
+    "SmartAgentDeviceFirmwareRetryView",
+    "SmartAgentDeviceFirmwareCancelView",
+    "SmartAgentDeviceFirmwareTransactionView",
 )
 
 POST_V1_HOST_VIEW_CLASS_NAMES: tuple[str, ...] = (
@@ -36,6 +48,10 @@ HASS_BOUND_VIEW_CLASS_NAMES: tuple[str, ...] = (
 )
 
 _HASS_BOUND_VIEW_CLASSES: Mapping[str, Any] = {}
+
+# Device-maintenance HTTP ownership remains in the add-on. HA callers use the
+# typed AddOnClient methods and never register a second LD2410 truth surface.
+ADDON_OWNED_DEVICE_MAINTENANCE_DOMAINS: tuple[str, ...] = ("ld2410", "environment_calibration", "firmware")
 
 
 def register_v1_views(hass: Any, view_namespace: Mapping[str, Any]) -> None:
