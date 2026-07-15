@@ -242,11 +242,13 @@ class AddOnClient:
         body: dict[str, Any] | None = None,
         timeout: aiohttp.ClientTimeout | None = None,
         extra_headers: dict[str, str] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any] | None:
         """统一 JSON 请求能力，返回 status_code + body 供上层状态码感知透传。"""
         m = str(method or "GET").upper()
         p = path if str(path or "").startswith("/") else f"/{path}"
-        headers = self._request_headers(extra_headers)
+        normalized_request_id = str(request_id or "").strip() or self._new_request_id()
+        headers = self._request_headers({**dict(extra_headers or {}), "X-Request-ID": normalized_request_id})
         kwargs: dict[str, Any] = {
             "headers": headers,
             "timeout": timeout or _HEALTH_TIMEOUT,
@@ -282,22 +284,33 @@ class AddOnClient:
         new_state: str,
         old_state: str = "",
         snapshot: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Run add-on Core fast-path decision orchestration."""
+        provided_request_id = str(request_id or "").strip()
+        normalized_request_id = provided_request_id or self._new_request_id()
         payload: dict[str, Any] = {
             "entity_id": str(entity_id or ""),
             "new_state": str(new_state or ""),
             "old_state": str(old_state or ""),
+            "request_id": normalized_request_id,
         }
         if snapshot is not None:
-            payload["snapshot"] = snapshot
+            payload["snapshot"] = {**dict(snapshot), "request_id": normalized_request_id}
 
-        result = await self.request_json("POST", "/decision/fast-path", body=payload)
+        result = await self.request_json(
+            "POST",
+            "/decision/fast-path",
+            body=payload,
+            request_id=normalized_request_id,
+        )
         if not isinstance(result, dict):
             return None
         status = int(result.get("status_code") or 0)
         body = result.get("body")
         response = body if isinstance(body, dict) else {"ok": 200 <= status < 300}
+        if provided_request_id:
+            response["request_id"] = normalized_request_id
         response["__status"] = status
         return response
 
@@ -306,18 +319,32 @@ class AddOnClient:
         *,
         trigger: str,
         bundle: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Run the add-on owned full decision path and return executable actions."""
-        payload: dict[str, Any] = {"trigger": str(trigger or "")}
+        provided_request_id = str(request_id or "").strip()
+        normalized_request_id = provided_request_id or self._new_request_id()
+        payload: dict[str, Any] = {
+            "trigger": str(trigger or ""),
+            "request_id": normalized_request_id,
+        }
         if bundle is not None:
-            payload["bundle"] = dict(bundle)
+            payload["bundle"] = {**dict(bundle), "request_id": normalized_request_id}
 
-        result = await self.request_json("POST", "/decision/run", body=payload, timeout=_INFER_TIMEOUT)
+        result = await self.request_json(
+            "POST",
+            "/decision/run",
+            body=payload,
+            timeout=_INFER_TIMEOUT,
+            request_id=normalized_request_id,
+        )
         if not isinstance(result, dict):
             return None
         status = int(result.get("status_code") or 0)
         body = result.get("body")
         response = body if isinstance(body, dict) else {"ok": 200 <= status < 300}
+        if provided_request_id:
+            response["request_id"] = normalized_request_id
         response["__status"] = status
         return response
 
@@ -506,10 +533,9 @@ class AddOnClient:
             params["max_bytes"] = str(max_bytes)
         if tail_lines not in (None, ""):
             params["tail_lines"] = str(tail_lines)
+        # Compatibility only: add-on public log responses are always redacted.
+        _ = raw
         headers = self._request_headers()
-        if raw:
-            params["raw"] = "true"
-            headers = {**headers, "X-SA-Log-Raw": "1"}
         try:
             session = await self._get_session()
             async with session.get(

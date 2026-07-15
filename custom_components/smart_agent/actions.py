@@ -102,8 +102,17 @@ class ActionsMixin:
         transaction_id: int = 0,
         results: list[dict[str, Any]] | None = None,
         pre_states: dict[str, str] | None = None,
+        correlation_id: str = "",
     ) -> int:
-        raw_results = [dict(item) for item in results or [] if isinstance(item, dict)]
+        normalized_correlation_id = str(correlation_id or "").strip()
+        raw_results = [
+            {
+                **dict(item),
+                **({"correlation_id": normalized_correlation_id} if normalized_correlation_id else {}),
+            }
+            for item in results or []
+            if isinstance(item, dict)
+        ]
         action_results = [
             cls._decision_action_result_from_ha_result(item)
             for item in raw_results
@@ -169,6 +178,9 @@ class ActionsMixin:
         parent_transaction_id = str(item.get("parent_transaction_id") or "").strip()
         if parent_transaction_id:
             result["parent_transaction_id"] = parent_transaction_id
+        correlation_id = str(item.get("correlation_id") or "").strip()
+        if correlation_id:
+            result["correlation_id"] = correlation_id
         decision_trace = item.get("decision_trace")
         if isinstance(decision_trace, dict) and decision_trace:
             result["decision_trace"] = dict(decision_trace)
@@ -1359,12 +1371,15 @@ class ActionsMixin:
         cmd_source: str = "",
         parent_transaction_id: str = "",
         world_snapshot_id: str = "",
+        correlation_id: str = "",
     ) -> int:
         """Execute a list of AI actions with transaction tracking."""
         import json as _json
 
+        correlation_id = str(correlation_id or "").strip()
+
         if not actions:
-            return self._action_execution_result(0)
+            return self._action_execution_result(0, correlation_id=correlation_id)
 
         original_actions = list(actions)
         action_positions: dict[int, list[int]] = {}
@@ -1386,6 +1401,8 @@ class ActionsMixin:
             return len(original_actions) + len(claimed_positions)
 
         def _remember_result(position: int, result: dict[str, Any]) -> None:
+            if correlation_id:
+                result["correlation_id"] = correlation_id
             ordered_result_slots[position] = result
 
         def _ordered_results() -> list[dict[str, Any]]:
@@ -1489,6 +1506,7 @@ class ActionsMixin:
                             0,
                             results=ordered_guard_results,
                             pre_states=guard_pre_states,
+                            correlation_id=correlation_id,
                         )
                     await self.hass.async_add_executor_job(
                         self._complete_transaction_db,
@@ -1503,10 +1521,11 @@ class ActionsMixin:
                         transaction_id=txn_id,
                         results=ordered_guard_results,
                         pre_states=guard_pre_states,
+                        correlation_id=correlation_id,
                     )
 
         if not actions:
-            return self._action_execution_result(0)
+            return self._action_execution_result(0, correlation_id=correlation_id)
 
         # ── 自触发保护快速预过滤 ────────────────────────────────────────────────
         # 在动作执行前提前过滤掉触发了本次推理的可控设备，避免浪费完整 LLM 推理后才在
@@ -1567,6 +1586,7 @@ class ActionsMixin:
                         0,
                         results=ordered_guard_results,
                         pre_states=guard_pre_states,
+                        correlation_id=correlation_id,
                     )
                 await self.hass.async_add_executor_job(
                     self._complete_transaction_db,
@@ -1581,6 +1601,7 @@ class ActionsMixin:
                     transaction_id=_txn_id,
                     results=ordered_guard_results,
                     pre_states=guard_pre_states,
+                    correlation_id=correlation_id,
                 )
 
         # ── 1. 执行前：快照目标设备当前状态 ─────────────────────────────────
@@ -1635,6 +1656,7 @@ class ActionsMixin:
                 0,
                 results=ordered_failure_results,
                 pre_states=pre_states,
+                correlation_id=correlation_id,
             )
 
         # ── 3. 执行所有动作，收集结果 ────────────────────────────────────────
@@ -1748,6 +1770,8 @@ class ActionsMixin:
                 "service": service,
                 "entity_id": entity_id,
             }
+            if correlation_id:
+                action_result_context["correlation_id"] = correlation_id
             if parent_transaction_id:
                 action_result_context["execution_transaction_id"] = txn_id
                 action_result_context["parent_transaction_id"] = parent_transaction_id
@@ -2174,7 +2198,7 @@ class ActionsMixin:
                 async def _run_delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
                     sc: str, trig: str, txid: int, aseq: int, parent_txid: str,
-                    result: dict,
+                    corr_id: str, result: dict,
                 ) -> None:
                     try:
                         state = self.hass.states.get(eid)
@@ -2207,6 +2231,7 @@ class ActionsMixin:
                             aseq,
                             parent_txid,
                             world_snapshot_id,
+                            corr_id,
                         )
                     except Exception as exc:
                         _LOGGER.debug("[Actions] 延迟动作执行失败 %s.%s(%s): %s", d, s, eid, exc)
@@ -2230,9 +2255,9 @@ class ActionsMixin:
 
                 def _delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
-                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str, result: dict, _: datetime,
+                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str, corr_id: str, result: dict, _: datetime,
                 ) -> None:
-                    coro = _run_delayed(d, s, eid, p, r, sc, trig, txid, aseq, parent_txid, result)
+                    coro = _run_delayed(d, s, eid, p, r, sc, trig, txid, aseq, parent_txid, corr_id, result)
                     try:
                         self.hass.async_create_task(coro)
                     except Exception as exc:
@@ -2274,14 +2299,15 @@ class ActionsMixin:
                     lambda dt, d=domain, s=service, e=entity_id, p=params, r=reason,
                            sc=scene_desc, trig=trigger_summary, txid=txn_id, aseq=action_seq,
                            parent_txid=parent_transaction_id,
+                           corr_id=correlation_id,
                            result=result_entry:
-                        _delayed(d, s, e, p, r, sc, trig, txid, aseq, parent_txid, result, dt),
+                        _delayed(d, s, e, p, r, sc, trig, txid, aseq, parent_txid, corr_id, result, dt),
                 )
                 self._active_timers[entity_id] = handle
             else:
                 ok = await self._do_call_service(
                     domain, service, entity_id, params, reason, scene_desc, trigger_summary, txn_id, action_seq,
-                    parent_transaction_id, world_snapshot_id,
+                    parent_transaction_id, world_snapshot_id, correlation_id,
                 )
                 if ok:
                     executed += 1
@@ -2297,6 +2323,8 @@ class ActionsMixin:
         ):
             _remember_result(original_position, result)
         results[:] = _ordered_results()
+        if correlation_id:
+            results[:] = [{**item, "correlation_id": correlation_id} for item in results]
 
         # ── 4. 提交事务结果 ────────────────────────────────────────────────────
         if txn_id:
@@ -2313,6 +2341,7 @@ class ActionsMixin:
             transaction_id=txn_id,
             results=results,
             pre_states=pre_states,
+            correlation_id=correlation_id,
         )
 
     # ── 服务调用 + 保护机制 ───────────────────────────────────────────────────
@@ -2331,8 +2360,15 @@ class ActionsMixin:
         from .ha_adapter import async_execute_command_envelope
 
         payload = call_params if isinstance(call_params, dict) else {}
+        active_correlations = getattr(self, "_active_service_correlation_ids", {})
+        active_correlation_id = (
+            active_correlations.get(asyncio.current_task(), "")
+            if isinstance(active_correlations, dict)
+            else ""
+        )
+        request_id = str(active_correlation_id or "").strip() or f"legacy-action:{transaction_id}:{action_seq}:{entity_id}"
         result = await async_execute_command_envelope(self.hass, {
-            "request_id": f"legacy-action:{transaction_id}:{action_seq}:{entity_id}",
+            "request_id": request_id,
             "commands": [{
                 "entity_id": entity_id,
                 "domain": domain,
@@ -2388,6 +2424,7 @@ class ActionsMixin:
         action_seq: int = 0,
         parent_transaction_id: str = "",
         world_snapshot_id: str = "",
+        correlation_id: str = "",
     ) -> bool:
         """Call HA service and record AI action for override detection. Returns True if executed.
 
@@ -2396,6 +2433,7 @@ class ActionsMixin:
                           并发推理时通过参数传递，避免多房间竞争 self._current_scene_desc。
             trigger_text: 本次推理的触发文本，同上。
         """
+        correlation_id = str(correlation_id or "").strip()
         state = self.hass.states.get(entity_id)
         is_presence_departure_turnoff = (
             service == "turn_off"
@@ -2625,10 +2663,33 @@ class ActionsMixin:
             text = str(exc).lower()
             return "extra keys" in text or "not allowed" in text or "unexpected" in text
 
+        async def _call_enveloped_service(call_data: dict[str, Any]) -> None:
+            active_correlations = getattr(self, "_active_service_correlation_ids", None)
+            if not isinstance(active_correlations, dict):
+                active_correlations = {}
+                self._active_service_correlation_ids = active_correlations
+            task = asyncio.current_task()
+            previous = active_correlations.get(task)
+            if correlation_id:
+                active_correlations[task] = correlation_id
+            try:
+                await self._execute_enveloped_service(
+                    domain,
+                    service,
+                    entity_id,
+                    call_data,
+                    reason,
+                    transaction_id,
+                    action_seq,
+                )
+            finally:
+                if previous:
+                    active_correlations[task] = previous
+                else:
+                    active_correlations.pop(task, None)
+
         try:
-            await self._execute_enveloped_service(
-                domain, service, entity_id, safe_params, reason, transaction_id, action_seq
-            )
+            await _call_enveloped_service(safe_params)
             if domain in ("scene", "script") and service == "turn_on":
                 self._scene_last_exec[entity_id] = time.time()
         except Exception as call_err:
@@ -2644,9 +2705,7 @@ class ActionsMixin:
                     self._sys_log("WARN", f"[动作] {entity_id} 不支持色温参数 {color_keys_present}，"
                                   f"保留亮度重试: {non_color_params}")
                     try:
-                        await self._execute_enveloped_service(
-                            domain, service, entity_id, non_color_params, reason, transaction_id, action_seq
-                        )
+                        await _call_enveloped_service(non_color_params)
                     except ServiceNotFound:
                         raise
                     except Exception as retry_err:
@@ -2660,9 +2719,7 @@ class ActionsMixin:
                         # 再退一步：去除全部扩展参数
                         self._sys_log("WARN", f"[动作] {entity_id} 亮度参数也失败，去除全部扩展参数重试")
                         try:
-                            await self._execute_enveloped_service(
-                                domain, service, entity_id, {}, reason, transaction_id, action_seq
-                            )
+                            await _call_enveloped_service({})
                         except ServiceNotFound:
                             raise
                         except Exception as bare_retry_err:
@@ -2676,9 +2733,7 @@ class ActionsMixin:
                     # 没有可保留的参数，直接裸调用
                     self._sys_log("WARN", f"[动作] {entity_id} 不支持参数 {extra_keys}，去除后重试")
                     try:
-                        await self._execute_enveloped_service(
-                            domain, service, entity_id, {}, reason, transaction_id, action_seq
-                        )
+                        await _call_enveloped_service({})
                     except ServiceNotFound:
                         raise
                     except Exception as retry_err:
@@ -2706,6 +2761,7 @@ class ActionsMixin:
             "decision_id": str(parent_transaction_id or "unknown"),
             "transaction_id": str(transaction_id or "unknown"),
             "world_snapshot_id": str(world_snapshot_id or "unknown"),
+            "correlation_id": correlation_id,
         }
         # AI 成功执行时清除该设备的用户覆盖记录，并记录后续仲裁状态。
         with self._user_overrides_lock:
@@ -2736,6 +2792,8 @@ class ActionsMixin:
                 "transaction_id": parent_transaction_id,
                 "url": f"/decision-trace/{parent_transaction_id}",
             }
+        if correlation_id:
+            event_metadata["correlation_id"] = correlation_id
         self.hass.async_add_executor_job(
             self._record_event, "AI_Action", event_detail,
             entity_id, "on" if "turn_on" in service else "off", "ai", None,
@@ -2763,6 +2821,7 @@ class ActionsMixin:
                 "action_seq": action_seq,
                 "parent_transaction_id": str(parent_transaction_id or "unknown"),
                 "world_snapshot_id": str(world_snapshot_id or "unknown"),
+                "correlation_id": correlation_id,
             })
 
         # ── 注册环境效果反馈检查（climate 设备：10 分钟后检验温度变化）──
@@ -2912,6 +2971,7 @@ class ActionsMixin:
                             action_seq=item.get("action_seq", 0),
                             parent_transaction_id=item.get("parent_transaction_id", ""),
                             world_snapshot_id=item.get("world_snapshot_id", ""),
+                            correlation_id=item.get("correlation_id", ""),
                         )
                         # 删除 _do_call_service 追加的重复验证条目
                         if len(self._pending_verifications) > q_len_before:

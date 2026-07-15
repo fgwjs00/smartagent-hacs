@@ -1482,6 +1482,22 @@ class ListenersMixin:
                     snapshot[key] = value
         return snapshot
 
+    @staticmethod
+    def _new_addon_fast_path_request_id(
+        entity_id: str,
+        old_state: str,
+        new_state: str,
+    ) -> str:
+        seed = "|".join(
+            (
+                str(entity_id or "").strip(),
+                str(old_state or "").strip(),
+                str(new_state or "").strip(),
+                str(time.time_ns()),
+            )
+        )
+        return f"ha-fast-path-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:20]}"
+
     async def _execute_fast_path_decision_result(
         self,
         result: dict[str, Any],
@@ -1520,6 +1536,7 @@ class ListenersMixin:
             cmd_source=_CMD_SOURCE_SENSOR,
             parent_transaction_id=transaction_id,
             world_snapshot_id=world_snapshot_id,
+            correlation_id=correlation_id,
         )
         return self._enqueue_fast_path_execution_audit(
             transaction_id=transaction_id,
@@ -2226,11 +2243,14 @@ class ListenersMixin:
         if addon_client is not None:
             await self._refresh_correction_suppressions_cache(addon_client)
         snapshot = self._build_addon_fast_path_snapshot(entity_id)
+        request_id = self._new_addon_fast_path_request_id(entity_id, old_state, new_state)
+        snapshot["request_id"] = request_id
         snapshot_diag = self._addon_fast_path_snapshot_diagnostics(snapshot, entity_id)
         self._sys_log(
             "INFO",
             "[Add-on FastPath] request "
             f"entity={entity_id} old={old_state} new={new_state} "
+            f"request_id={request_id} "
             f"active_space={snapshot_diag.get('active_space') or '-'} "
             f"capability_rows={snapshot_diag.get('capability_rows', 0)} "
             f"device_info_count={snapshot_diag.get('device_info_count', 0)} "
@@ -2243,6 +2263,7 @@ class ListenersMixin:
                     new_state=new_state,
                     old_state=old_state,
                     snapshot=snapshot,
+                    request_id=request_id,
                 )
             except Exception as exc:
                 response = None
@@ -2250,7 +2271,7 @@ class ListenersMixin:
                 self._sys_log(
                     "ERROR",
                     f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} "
-                    f"reason=exception exception_type={type(exc).__name__}",
+                    f"reason=exception exception_type={type(exc).__name__} request_id={request_id}",
                 )
                 self._emit_addon_fast_path_event(
                     {
@@ -2263,6 +2284,7 @@ class ListenersMixin:
                         "path_taken": "none",
                         "reason": "exception",
                         "exception_type": type(exc).__name__,
+                        "correlation_id": request_id,
                         "fail_closed": True,
                         "snapshot": snapshot_diag,
                     }
@@ -2318,8 +2340,24 @@ class ListenersMixin:
                         or (decision_trace.get("transaction_id") if isinstance(decision_trace, dict) else "")
                         or ""
                     )
-                    correlation_id = str(response.get("correlation_id") or details.get("correlation_id") or "")
+                    correlation_id = str(
+                        response.get("correlation_id")
+                        or details.get("correlation_id")
+                        or response.get("request_id")
+                        or request_id
+                    )
                     world_snapshot_id = str(response.get("world_snapshot_id") or details.get("world_snapshot_id") or "")
+
+                    def _fast_path_handoff_context(source: str) -> dict[str, Any]:
+                        return {
+                            "source": source,
+                            "transaction_id": transaction_id,
+                            "correlation_id": correlation_id,
+                            "world_snapshot_id": world_snapshot_id,
+                            "reason": reason or "",
+                            "decision_trace": dict(decision_trace) if isinstance(decision_trace, dict) else {},
+                        }
+
                     if isinstance(result, dict):
                         scene = str(result.get("scene") or result.get("source") or "")
                         if confidence is None:
@@ -2344,7 +2382,7 @@ class ListenersMixin:
                         f"confirm_suppressed_reason={confirm_suppressed_reason or '-'} "
                         f"learning_mode={addon_learning_mode if addon_learning_mode is not None else '-'} "
                         f"habit_proactive={addon_habit_proactive if addon_habit_proactive is not None else '-'} "
-                        f"action_count={action_count} entity={entity_id}",
+                        f"action_count={action_count} entity={entity_id} correlation_id={correlation_id}",
                     )
                     self._emit_addon_fast_path_event(
                         {
@@ -2468,6 +2506,7 @@ class ListenersMixin:
                                 entity_id,
                                 f"{entity_id}: {old_state} -> {new_state}",
                                 new_state,
+                                source_trace_context=_fast_path_handoff_context("addon_fast_path_disabled"),
                             )
                             return
                         if reason == "no_match":
@@ -2481,6 +2520,7 @@ class ListenersMixin:
                                     entity_id,
                                     f"{entity_id}: {old_state} -> {new_state}",
                                     new_state,
+                                    source_trace_context=_fast_path_handoff_context("addon_fast_path_no_match"),
                                 )
                                 return
                             info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
@@ -2514,6 +2554,7 @@ class ListenersMixin:
                                     f"{entity_id}: {old_state} -> {new_state}",
                                     new_state,
                                     _allow_learning_mode_inference=(confirm_suppressed_reason == "learning_mode"),
+                                    source_trace_context=_fast_path_handoff_context("addon_fast_path_low_confidence"),
                                 )
                                 return
                             info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}

@@ -330,6 +330,13 @@ class SmartAgentCoordinator(
         self._learning_mode = bool(data.get(CONF_LEARNING_MODE, False))
         self._habit_proactive = bool(data.get(CONF_HABIT_PROACTIVE, False))
         self._patrol_enabled = False
+        self._patrol_interval_minutes = 15
+        self._patrol_scope_space_ids: tuple[str, ...] = ()
+        self._patrol_excluded_space_ids: tuple[str, ...] = ()
+        self._patrol_quiet_hours_start = ""
+        self._patrol_quiet_hours_end = ""
+        self._patrol_low_risk_entity_ids: tuple[str, ...] = ()
+        self._patrol_last_automatic_submit_monotonic = 0.0
         self._frigate_enabled = bool(data.get(CONF_FRIGATE_ENABLED, False))  # 默认关闭，需手动启用
         # Phase 5: 联网工具与知识库
         from .tools import ToolRegistry
@@ -1438,6 +1445,65 @@ class SmartAgentCoordinator(
             if new_value != self._patrol_enabled:
                 self._patrol_enabled = new_value
                 applied.append(f"patrol_enabled={new_value}")
+        if "patrol_interval_minutes" in payload:
+            try:
+                new_value = int(float(payload.get("patrol_interval_minutes")))
+            except (TypeError, ValueError):
+                new_value = self._patrol_interval_minutes
+            if not 5 <= new_value <= 1440:
+                new_value = self._patrol_interval_minutes
+            if new_value != self._patrol_interval_minutes:
+                self._patrol_interval_minutes = new_value
+                applied.append(f"patrol_interval_minutes={new_value}")
+
+        def _patrol_identifiers(key: str) -> tuple[str, ...] | None:
+            if key not in payload:
+                return None
+            raw_values = payload.get(key)
+            if not isinstance(raw_values, (list, tuple, set)):
+                return ()
+            return tuple(
+                dict.fromkeys(
+                    str(value or "").strip()
+                    for value in raw_values
+                    if str(value or "").strip()
+                )
+            )
+
+        def _patrol_hhmm(key: str) -> str | None:
+            if key not in payload:
+                return None
+            value = str(payload.get(key) or "").strip()
+            if not value:
+                return ""
+            parts = value.split(":", 1)
+            if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                return ""
+            hour, minute = (int(part) for part in parts)
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                return ""
+            return f"{hour:02d}:{minute:02d}"
+
+        scope_space_ids = _patrol_identifiers("patrol_scope_space_ids")
+        if scope_space_ids is not None and scope_space_ids != self._patrol_scope_space_ids:
+            self._patrol_scope_space_ids = scope_space_ids
+            applied.append(f"patrol_scope_space_ids={len(scope_space_ids)}")
+        excluded_space_ids = _patrol_identifiers("patrol_excluded_space_ids")
+        if excluded_space_ids is not None and excluded_space_ids != self._patrol_excluded_space_ids:
+            self._patrol_excluded_space_ids = excluded_space_ids
+            applied.append(f"patrol_excluded_space_ids={len(excluded_space_ids)}")
+        quiet_hours_start = _patrol_hhmm("patrol_quiet_hours_start")
+        if quiet_hours_start is not None and quiet_hours_start != self._patrol_quiet_hours_start:
+            self._patrol_quiet_hours_start = quiet_hours_start
+            applied.append(f"patrol_quiet_hours_start={bool(quiet_hours_start)}")
+        quiet_hours_end = _patrol_hhmm("patrol_quiet_hours_end")
+        if quiet_hours_end is not None and quiet_hours_end != self._patrol_quiet_hours_end:
+            self._patrol_quiet_hours_end = quiet_hours_end
+            applied.append(f"patrol_quiet_hours_end={bool(quiet_hours_end)}")
+        low_risk_entity_ids = _patrol_identifiers("patrol_low_risk_entity_ids")
+        if low_risk_entity_ids is not None and low_risk_entity_ids != self._patrol_low_risk_entity_ids:
+            self._patrol_low_risk_entity_ids = low_risk_entity_ids
+            applied.append(f"patrol_low_risk_entity_ids={len(low_risk_entity_ids)}")
         if "vision_enabled" in payload:
             new_value = bool(payload.get("vision_enabled"))
             if new_value != self._vision_enabled:
@@ -1508,7 +1574,7 @@ class SmartAgentCoordinator(
                 async_track_time_interval(
                     self.hass,
                     _patrol_safety_net_periodic,
-                    timedelta(minutes=15),
+                    timedelta(minutes=1),
                 )
             )
         except Exception as exc:
@@ -2092,7 +2158,12 @@ class SmartAgentCoordinator(
         )
         if fast_path_execution_audit:
             source_trace_context = dict(fast_path_execution_audit)
-        elif str(raw_source_trace_context.get("source") or "").strip() == "addon_fast_path_409":
+        elif str(raw_source_trace_context.get("source") or "").strip() in {
+            "addon_fast_path_409",
+            "addon_fast_path_disabled",
+            "addon_fast_path_low_confidence",
+            "addon_fast_path_no_match",
+        }:
             source_trace_context = {
                 key: json.loads(json.dumps(value, ensure_ascii=False, default=str))
                 if isinstance(value, (dict, list))
@@ -2189,6 +2260,16 @@ class SmartAgentCoordinator(
                 f"transaction_id={source_trace_context.get('transaction_id') or '-'} "
                 f"correlation_id={source_trace_context.get('correlation_id') or '-'} "
                 f"world_snapshot_id={source_trace_context.get('world_snapshot_id') or '-'} "
+                f"reason={source_trace_context.get('reason') or '-'}"
+            )
+        elif str(source_trace_context.get("source") or "").strip() in {
+            "addon_fast_path_disabled",
+            "addon_fast_path_low_confidence",
+            "addon_fast_path_no_match",
+        }:
+            context_parts.append(
+                "[fast_path_handoff] "
+                f"correlation_id={source_trace_context.get('correlation_id') or '-'} "
                 f"reason={source_trace_context.get('reason') or '-'}"
             )
         if automation_policy_section:
@@ -2583,7 +2664,11 @@ class SmartAgentCoordinator(
             self._sys_log("INFO", f"[决策] 同空间推理进行中，等待: {room_lock_key or 'global'}")
         async with inference_lock:
             try:
-                result = await addon_client.run_decision(trigger=str(trigger or ""), bundle=bundle)
+                result = await addon_client.run_decision(
+                    trigger=str(trigger or ""),
+                    bundle=bundle,
+                    request_id=str(bundle.get("parent_correlation_id") or "") or None,
+                )
             except Exception as exc:
                 self._sys_log("WARN", f"[决策] add-on decision provider 调用失败: {exc}")
                 _emit_slow_decision_bubble(
@@ -2845,6 +2930,13 @@ class SmartAgentCoordinator(
                     result.setdefault("reply", nested.get("reply") or "learning_mode_observe_only")
                     result.setdefault("status", "ok")
                     return result
+                response_details = result.get("details") if isinstance(result.get("details"), dict) else {}
+                execution_correlation_id = str(
+                    result.get("correlation_id")
+                    or response_details.get("correlation_id")
+                    or bundle.get("parent_correlation_id")
+                    or ""
+                ).strip()
                 execution_result = await self._execute_actions(
                     valid_actions,
                     trigger_summary=str(trigger or ""),
@@ -2853,6 +2945,7 @@ class SmartAgentCoordinator(
                     trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
                     parent_transaction_id=transaction_id,
                     world_snapshot_id=world_snapshot_id,
+                    correlation_id=execution_correlation_id,
                 )
                 executed = int(execution_result)
                 execution_transaction_id = str(
@@ -2884,6 +2977,8 @@ class SmartAgentCoordinator(
                             merged["params"] = dict(params)
                         if action_reason and not str(merged.get("action_reason") or "").strip():
                             merged["action_reason"] = action_reason
+                        if execution_correlation_id:
+                            merged["correlation_id"] = execution_correlation_id
                         action_results[index] = merged
                         continue
                     fallback_result = {
@@ -2897,6 +2992,8 @@ class SmartAgentCoordinator(
                         fallback_result["params"] = dict(params)
                     if action_reason:
                         fallback_result["action_reason"] = action_reason
+                    if execution_correlation_id:
+                        fallback_result["correlation_id"] = execution_correlation_id
                     action_results.append(fallback_result)
                 training_sample_payload = self._build_training_sample_payload(
                     bundle=bundle,
@@ -2934,6 +3031,7 @@ class SmartAgentCoordinator(
                             "decision_id": decision_id,
                             "execution_transaction_id": execution_transaction_id,
                             "world_snapshot_id": world_snapshot_id,
+                            "correlation_id": execution_correlation_id,
                         },
                     )
                     if not execution_event_enqueued:
@@ -3887,7 +3985,66 @@ class SmartAgentCoordinator(
         self._room_topology_cache_updated_at = time.monotonic()
 
     def _build_patrol_safety_net_payload(self, *, source: str) -> dict[str, Any]:
-        capability_snapshot = self.get_device_capability_snapshot()
+        raw_capability_snapshot = self.get_device_capability_snapshot()
+        scope_space_ids = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in getattr(self, "_patrol_scope_space_ids", ())
+                if str(value or "").strip()
+            )
+        )
+        excluded_space_ids = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in getattr(self, "_patrol_excluded_space_ids", ())
+                if str(value or "").strip()
+            )
+        )
+        low_risk_entity_ids = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in getattr(self, "_patrol_low_risk_entity_ids", ())
+                if str(value or "").strip()
+            )
+        )
+        scope_set = set(scope_space_ids)
+        excluded_set = set(excluded_space_ids)
+        low_risk_set = set(low_risk_entity_ids)
+
+        capability_snapshot: dict[str, dict[str, Any]] = {}
+        for entity_id, capability in raw_capability_snapshot.items():
+            if not isinstance(capability, dict):
+                continue
+            canonical_entity_id = str(capability.get("entity_id") or entity_id or "").strip()
+            if not canonical_entity_id:
+                continue
+
+            coverage_spaces: list[str] = []
+            raw_coverage_spaces = capability.get(DEVICE_CAP_KEY_COVERAGE_SPACES)
+            if isinstance(raw_coverage_spaces, (list, tuple, set)):
+                for raw_space in raw_coverage_spaces:
+                    space_id = str(raw_space or "").strip()
+                    if space_id and space_id not in coverage_spaces:
+                        coverage_spaces.append(space_id)
+            for key in ("space_id", "room"):
+                space_id = str(capability.get(key) or "").strip()
+                if space_id and space_id not in coverage_spaces:
+                    coverage_spaces.append(space_id)
+
+            coverage_set = set(coverage_spaces)
+            if (scope_set or excluded_set) and not coverage_set:
+                continue
+            if scope_set and not coverage_set.intersection(scope_set):
+                continue
+            if excluded_set and coverage_set.intersection(excluded_set):
+                continue
+            if low_risk_set:
+                risk_level = str(capability.get("risk_level") or "").strip().lower()
+                if canonical_entity_id not in low_risk_set or risk_level not in {"safe", "low"}:
+                    continue
+
+            capability_snapshot[entity_id] = capability
+
         states: dict[str, dict[str, str]] = {}
         for entity_id in capability_snapshot:
             state_obj = self.hass.states.get(entity_id)
@@ -3907,6 +4064,16 @@ class SmartAgentCoordinator(
             "device_capability_snapshot": capability_snapshot,
             "states": states,
             "presence_snapshot": self.get_presence_snapshot(),
+            "patrol_policy": {
+                "interval_minutes": int(getattr(self, "_patrol_interval_minutes", 15) or 15),
+                "scope_space_ids": list(scope_space_ids),
+                "excluded_space_ids": list(excluded_space_ids),
+                "quiet_hours": {
+                    "start": str(getattr(self, "_patrol_quiet_hours_start", "") or ""),
+                    "end": str(getattr(self, "_patrol_quiet_hours_end", "") or ""),
+                },
+                "low_risk_entity_ids": list(low_risk_entity_ids),
+            },
         }
 
     async def _async_submit_patrol_safety_net_plan(
@@ -3923,6 +4090,43 @@ class SmartAgentCoordinator(
         addon_client = getattr(self, "_addon_client", None)
         if addon_client is None:
             return None
+        automatic_submit_at: float | None = None
+        if source == "ha_low_frequency_patrol":
+            def _quiet_minutes(value: Any) -> int | None:
+                parts = str(value or "").strip().split(":", 1)
+                if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                    return None
+                hour, minute = (int(part) for part in parts)
+                if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                    return None
+                return hour * 60 + minute
+
+            quiet_start = _quiet_minutes(getattr(self, "_patrol_quiet_hours_start", ""))
+            quiet_end = _quiet_minutes(getattr(self, "_patrol_quiet_hours_end", ""))
+            if quiet_start is not None and quiet_end is not None and quiet_start != quiet_end:
+                now = self._ha_local_now()
+                now_minutes = int(now.hour) * 60 + int(now.minute)
+                in_quiet_hours = (
+                    quiet_start <= now_minutes < quiet_end
+                    if quiet_start < quiet_end
+                    else now_minutes >= quiet_start or now_minutes < quiet_end
+                )
+                if in_quiet_hours:
+                    return None
+            try:
+                interval_minutes = int(getattr(self, "_patrol_interval_minutes", 15) or 15)
+            except (TypeError, ValueError):
+                interval_minutes = 15
+            interval_seconds = max(5, min(interval_minutes, 1440)) * 60
+            automatic_submit_at = time.monotonic()
+            try:
+                last_submit_at = float(
+                    getattr(self, "_patrol_last_automatic_submit_monotonic", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                last_submit_at = 0.0
+            if last_submit_at > 0 and automatic_submit_at - last_submit_at < interval_seconds:
+                return None
 
         payload = self._build_patrol_safety_net_payload(source=source)
         fingerprint = json.dumps(
@@ -3950,6 +4154,8 @@ class SmartAgentCoordinator(
         result = await addon_client.post_operations_action_plan(plan_request)
         if not isinstance(result, dict):
             return None
+        if automatic_submit_at is not None:
+            self._patrol_last_automatic_submit_monotonic = automatic_submit_at
 
         status = int(result.get("__status") or 0)
         plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}

@@ -52,10 +52,12 @@ from .ha_adapter import (
     async_delete_ha_area,
     async_ensure_ha_area,
     async_execute_command_envelope,
+    async_rename_ha_area,
     get_ai_scenes_cache_snapshot,
     get_room_topology_cache_snapshot,
     get_transactions_cache_snapshot,
 )
+from .room_merge_view import RoomMergeViewMixin
 from .service_registration import register_smart_agent_services, remove_smart_agent_services, ServiceRegistration
 from .websocket_handlers import build_smart_agent_websocket_commands
 from .websocket_registration import register_smart_agent_websocket_commands
@@ -572,14 +574,6 @@ async def _resolve_request_user(request: web.Request, *, allow_query_token: bool
         return session_user
     return await _resolve_user_from_token(hass, token)
 
-
-
-
-
-
-
-
-
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -589,38 +583,6 @@ def _get_first_coordinator(hass: HomeAssistant) -> SmartAgentCoordinator | None:
         if isinstance(value, SmartAgentCoordinator):
             return value
     return None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 def _build_presence_fusion_summary(coord) -> list[dict]:
     """汇总 PresenceFusion 域状态，供 diagnostics/UI 使用。"""
@@ -678,12 +640,6 @@ def _build_topology_summary(coord) -> dict[str, Any]:
         "edge_count": 0,
         "isolated_rooms": [],
     }
-
-
-
-
-
-
 
 class SmartAgentAuthLoginView(HomeAssistantView):
     """迁移期登录接口：校验来源 token 后签发管理端会话 token。"""
@@ -800,8 +756,6 @@ class SmartAgentAuthLogoutView(HomeAssistantView):
         if session_token:
             _mark_auth_token_revoked(hass, session_token)
         return self.json({"ok": True})
-
-
 
 class SmartAgentEventsWSView(HomeAssistantView):
     """最小可用事件流端点（迁移期）。"""
@@ -977,46 +931,6 @@ class SmartAgentEventsWSView(HomeAssistantView):
                     pass
 
         return ws
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class SmartAgentListenerDiagnosticsView(HomeAssistantView):
@@ -1361,6 +1275,27 @@ class SmartAgentRoomDetailView(HomeAssistantView):
                 status_code = 500
             return self.json(dict(result, scope="rooms_delete"), status_code=status_code)
         return self.json(result, status_code=200)
+
+    async def patch(self, request: web.Request, room_id: str) -> web.Response:
+        if (err := _view_admin_check(request)):
+            return err
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json(_json_error_payload("invalid_json", "bad_request", False, scope="rooms_rename"), status_code=400)
+        if not isinstance(body, dict) or not str(body.get("name") or "").strip():
+            return self.json(_json_error_payload("area_name_required", "bad_request", False, scope="rooms_rename"), status_code=400)
+        result = await async_rename_ha_area(request.app["hass"], room_id, str(body["name"]).strip())
+        if not bool(result.get("ok")):
+            error_type = str(result.get("error_type") or "internal_error")
+            status_code = 400 if error_type == "bad_request" else 404 if error_type == "not_found" else 500
+            return self.json(dict(result, scope="rooms_rename"), status_code=status_code)
+        return self.json(result, status_code=200)
+
+class SmartAgentRoomMergeView(RoomMergeViewMixin, HomeAssistantView):
+    url = "/api/v1/rooms/{room_id}/merge"
+    name = "api:smart_agent:v1:rooms:merge"
+    requires_auth = True
 
 
 class SmartAgentManagedDevicesView(HomeAssistantView):
@@ -1913,30 +1848,6 @@ class SmartAgentDevicePairStartView(HomeAssistantView):
             "status": "pairing_started",
             "expires_in": 60,
         })
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # 极速配对临时存储 key（存于 hass.data）
 _PAIR_KEY = "smart_agent_pairing_token"
 _AUTH_SESSION_KEY = "smart_agent_auth_sessions"

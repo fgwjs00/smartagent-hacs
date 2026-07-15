@@ -228,6 +228,150 @@ async def async_delete_ha_area(hass: Any, area_id_or_name: str) -> dict[str, Any
     return {"ok": True, "deleted": True, **row}
 
 
+async def async_rename_ha_area(hass: Any, area_id_or_name: str, name: str) -> dict[str, Any]:
+    """Rename one HA Area without changing its stable registry identifier."""
+    target = str(area_id_or_name or "").strip()
+    next_name = str(name or "").strip()
+    if not target or not next_name:
+        return {"ok": False, "error": "area_id_and_name_required", "error_type": "bad_request", "retryable": False}
+    area_reg = async_get_area_registry(hass)
+    area = _find_area(area_reg, target)
+    if area is None:
+        return {"ok": False, "error": "area_not_found", "error_type": "not_found", "retryable": False, "area_id": target}
+    before = _area_entry_to_row(area)
+    area_id = str(before.get("area_id") or before.get("id") or target).strip()
+    if str(before.get("name") or "").strip() == next_name:
+        return {"ok": True, "status": "verified", "changed": False, "area": before}
+    try:
+        updated = area_reg.async_update(area_id, name=next_name)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "area_rename_failed",
+            "error_type": "internal_error",
+            "retryable": False,
+            "area_id": area_id,
+            "exception_type": type(exc).__name__,
+        }
+    after = _area_entry_to_row(updated)
+    return {"ok": True, "status": "verified", "changed": True, "previous_name": before["name"], "area": after}
+
+
+def _registry_entries(registry: Any, attribute: str) -> tuple[Any, ...]:
+    rows = getattr(registry, attribute, None)
+    if isinstance(rows, dict):
+        return tuple(rows.values())
+    if isinstance(rows, (list, tuple)):
+        return tuple(rows)
+    return ()
+
+
+async def async_merge_ha_area(hass: Any, source_area_id: str, target_area_id: str) -> dict[str, Any]:
+    """Move direct HA assignments to a target Area, then delete the source Area.
+
+    The add-on owns SmartAgent configuration migration. This adapter is restricted
+    to HA registry changes and returns a verified receipt only after all direct
+    entity/device assignments have moved and the source Area is deleted.
+    """
+    source_key = str(source_area_id or "").strip()
+    target_key = str(target_area_id or "").strip()
+    if not source_key or not target_key:
+        return {
+            "ok": False,
+            "error": "source_and_target_area_required",
+            "error_type": "bad_request",
+            "retryable": False,
+        }
+
+    area_registry = async_get_area_registry(hass)
+    source_area = _find_area(area_registry, source_key)
+    target_area = _find_area(area_registry, target_key)
+    if source_area is None or target_area is None:
+        missing = source_key if source_area is None else target_key
+        return {
+            "ok": False,
+            "error": "area_not_found",
+            "error_type": "not_found",
+            "retryable": False,
+            "area_id": missing,
+        }
+
+    source = _area_entry_to_row(source_area)
+    target = _area_entry_to_row(target_area)
+    source_id = str(source.get("area_id") or source.get("id") or source_key).strip()
+    target_id = str(target.get("area_id") or target.get("id") or target_key).strip()
+    if not source_id or not target_id or source_id == target_id:
+        return {
+            "ok": False,
+            "error": "source_and_target_area_must_differ",
+            "error_type": "bad_request",
+            "retryable": False,
+            "source_area_id": source_id or source_key,
+            "target_area_id": target_id or target_key,
+        }
+
+    entity_registry = async_get_entity_registry(hass)
+    device_registry = async_get_device_registry(hass)
+    entity_ids = [
+        str(getattr(entry, "entity_id", "") or "").strip()
+        for entry in _registry_entries(entity_registry, "entities")
+        if str(getattr(entry, "area_id", "") or "").strip() == source_id
+        and str(getattr(entry, "entity_id", "") or "").strip()
+    ]
+    device_ids = [
+        str(getattr(entry, "id", "") or getattr(entry, "device_id", "") or "").strip()
+        for entry in _registry_entries(device_registry, "devices")
+        if str(getattr(entry, "area_id", "") or "").strip() == source_id
+        and str(getattr(entry, "id", "") or getattr(entry, "device_id", "") or "").strip()
+    ]
+
+    moved_entities: list[str] = []
+    moved_devices: list[str] = []
+    try:
+        for entity_id in entity_ids:
+            entity_registry.async_update_entity(entity_id, area_id=target_id)
+            moved_entities.append(entity_id)
+        for device_id in device_ids:
+            device_registry.async_update_device(device_id, area_id=target_id)
+            moved_devices.append(device_id)
+        area_registry.async_delete(source_id)
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for device_id in reversed(moved_devices):
+            try:
+                device_registry.async_update_device(device_id, area_id=source_id)
+            except Exception as rollback_exc:  # pragma: no cover - defensive HA registry failure path
+                rollback_errors.append(f"device:{device_id}:{rollback_exc.__class__.__name__}")
+        for entity_id in reversed(moved_entities):
+            try:
+                entity_registry.async_update_entity(entity_id, area_id=source_id)
+            except Exception as rollback_exc:  # pragma: no cover - defensive HA registry failure path
+                rollback_errors.append(f"entity:{entity_id}:{rollback_exc.__class__.__name__}")
+        return {
+            "ok": False,
+            "error": "area_merge_failed",
+            "error_type": "internal_error",
+            "retryable": False,
+            "source_area_id": source_id,
+            "target_area_id": target_id,
+            "exception_type": exc.__class__.__name__,
+            "rollback": "restored" if not rollback_errors else "restore_failed",
+            "rollback_errors": rollback_errors,
+        }
+
+    return {
+        "ok": True,
+        "status": "verified",
+        "source_area": source,
+        "target_area": target,
+        "source_area_id": source_id,
+        "target_area_id": target_id,
+        "migrated_entity_ids": moved_entities,
+        "migrated_device_ids": moved_devices,
+        "deleted_source_area": True,
+    }
+
+
 def get_device_info_snapshot(coord: Any) -> dict[str, Any]:
     """最小只读读取面：返回 coord.device_info 的安全 dict 视图。
 

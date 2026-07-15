@@ -8,7 +8,7 @@ HOST_VIEW_CLASS_NAMES: tuple[str, ...] = (
 )
 
 
-V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
+V1_HOST_BRIDGE_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentAuthLoginView",
     "SmartAgentAuthMeView",
     "SmartAgentAuthLogoutView",
@@ -18,6 +18,7 @@ V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentRoomsView",
     "SmartAgentRoomsSyncView",
     "SmartAgentRoomDetailView",
+    "SmartAgentRoomMergeView",
     "SmartAgentManagedDevicesView",
     "SmartAgentDeviceDetailView",
     "SmartAgentEntityStateView",
@@ -27,6 +28,12 @@ V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentMcpStatusView",
     "SmartAgentDevicePairStartView",
     "SmartAgentDevicePairConfirmView",
+)
+
+# These views authenticate in HA, but their calibration and firmware truth is
+# owned by the add-on through typed AddOnClient calls. Keep that boundary
+# visible instead of treating them as additional HASS-bound host views.
+ADDON_OWNED_MAINTENANCE_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentEnvironmentCalibrationView",
     "SmartAgentEnvironmentCalibrationSamplesView",
     "SmartAgentEnvironmentCalibrationSuggestionsView",
@@ -39,6 +46,11 @@ V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentDeviceFirmwareRetryView",
     "SmartAgentDeviceFirmwareCancelView",
     "SmartAgentDeviceFirmwareTransactionView",
+)
+
+V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
+    *V1_HOST_BRIDGE_VIEW_CLASS_NAMES,
+    *ADDON_OWNED_MAINTENANCE_VIEW_CLASS_NAMES,
 )
 
 POST_V1_HOST_VIEW_CLASS_NAMES: tuple[str, ...] = (
