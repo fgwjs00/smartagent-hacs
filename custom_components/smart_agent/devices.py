@@ -10,7 +10,6 @@ import threading
 import json as _json
 
 from .action_mapping import entities_to_actions, normalize_raw_actions
-from .entity_naming import name_to_entity_id
 from typing import Any
 from .const import (
     DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF,
@@ -672,11 +671,16 @@ class DevicesMixin:
             self.async_set_updated_data({})
         return result
 
-    async def async_sync_device_identity_to_ha(self, entity_id: str, name: str) -> dict:
-        """Mirror a SmartAgent display name into HA Entity Registry entity_id."""
+    async def async_sync_device_identity_to_ha(
+        self,
+        entity_id: str,
+        name: str,
+        new_entity_id: str = "",
+    ) -> dict:
+        """Mirror a display name and an optional explicit entity-id rename into HA."""
         eid = str(entity_id or "").strip()
         target_name = str(name or "").strip()
-        target_entity_id = name_to_entity_id(eid, target_name)
+        target_entity_id = str(new_entity_id or "").strip() or eid
         result = {
             "ok": True,
             "old_entity_id": eid,
@@ -690,8 +694,8 @@ class DevicesMixin:
         if not eid:
             result.update({"ok": False, "error": "entity_id_required", "error_type": "bad_request", "status": 400, "errors": 1})
             return result
-        if not target_name:
-            result.update({"skipped": True, "reason": "name_not_provided", "entity_id": eid, "new_entity_id": eid})
+        if not target_name and target_entity_id == eid:
+            result.update({"skipped": True, "reason": "identity_not_provided", "entity_id": eid, "new_entity_id": eid})
             return result
         if not target_entity_id:
             result.update({"ok": False, "error": "target_entity_id_required", "error_type": "bad_request", "status": 400, "errors": 1})
@@ -702,7 +706,10 @@ class DevicesMixin:
         if entry is None:
             result.update({"ok": False, "error": "entity_not_found", "error_type": "not_found", "status": 404, "errors": 1})
             return result
-        if target_entity_id != eid and entity_reg.async_get(target_entity_id) is not None:
+        target_info = self.device_info.get(target_entity_id) if target_entity_id != eid else None
+        if target_entity_id != eid and (
+            entity_reg.async_get(target_entity_id) is not None or isinstance(target_info, dict)
+        ):
             result.update(
                 {
                     "ok": False,
@@ -718,7 +725,9 @@ class DevicesMixin:
             return result
 
         try:
-            update_kwargs: dict[str, Any] = {"name": target_name}
+            update_kwargs: dict[str, Any] = {}
+            if target_name:
+                update_kwargs["name"] = target_name
             if target_entity_id != eid:
                 update_kwargs["new_entity_id"] = target_entity_id
             entity_reg.async_update_entity(eid, **update_kwargs)
@@ -743,22 +752,11 @@ class DevicesMixin:
         info = self.device_info.pop(eid, None) if target_entity_id != eid else self.device_info.get(eid)
         registry_meta = self._get_entity_registry_metadata(target_entity_id)
         if isinstance(info, dict):
-            info["name"] = target_name
+            if target_name:
+                info["name"] = target_name
             info["entity_id"] = target_entity_id
             info.update(registry_meta)
             self.device_info[target_entity_id] = info
-        now = self._ha_db_now_text()
-        await self._async_db_exec(
-            "UPDATE devices SET entity_id=?, name=?, ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
-            (
-                target_entity_id,
-                target_name,
-                registry_meta.get("ha_unique_id", ""),
-                registry_meta.get("ha_device_id", ""),
-                now,
-                eid,
-            ),
-        )
         renamed = target_entity_id != eid
         result.update({"entity_id": target_entity_id, "new_entity_id": target_entity_id, "renamed": renamed})
         self.async_set_updated_data({})
@@ -771,6 +769,7 @@ class DevicesMixin:
         eid = str(entity_id or "").strip()
         body = dict(patch) if isinstance(patch, dict) else {}
         name = str(body.get("name") or body.get("friendly_name") or "").strip()
+        requested_entity_id = str(body.get("new_entity_id") or body.get("target_entity_id") or "").strip()
         room = str(body.get("room") or body.get("area") or body.get("space") or "").strip()
         capability_name = str(body.get("capability") or body.get("device_class") or "").strip().lower()
         result: dict[str, Any] = {
@@ -799,34 +798,139 @@ class DevicesMixin:
                 result.setdefault("warnings", []).append("capability_persist_failed")
             result["capability"] = capability_name
 
-        if not name and not room:
+        if not name and not requested_entity_id and not room:
             await _apply_local_capability(eid)
             result.update({"skipped": True, "reason": "patch_has_no_ha_registry_fields"})
             return result
 
-        active_entity_id = eid
-        if name:
-            identity_result = await self.async_sync_device_identity_to_ha(active_entity_id, name)
-            result["ha_entity_sync"] = identity_result
-            if not identity_result.get("ok", True):
-                result.update(identity_result)
-                result.setdefault("source", "ha_entity_registry_mirror")
-                return result
-            active_entity_id = str(identity_result.get("new_entity_id") or identity_result.get("entity_id") or active_entity_id)
-            result["entity_id"] = active_entity_id
-            result["new_entity_id"] = active_entity_id
+        active_entity_id = requested_entity_id or eid
+        entity_reg = er.async_get(self.hass)
+        entry = entity_reg.async_get(eid)
+        if entry is None:
+            result.update(
+                {
+                    "ok": False,
+                    "error": "entity_not_found",
+                    "error_type": "not_found",
+                    "status": 404,
+                    "errors": 1,
+                }
+            )
+            return result
 
-        if room:
-            area_result = await self.async_sync_device_room_to_ha(active_entity_id, room)
-            result["ha_area_sync"] = area_result
-            if not area_result.get("ok", True):
-                result.update(area_result)
-                result["old_entity_id"] = eid
-                result["entity_id"] = active_entity_id
-                result["new_entity_id"] = active_entity_id
-                result.setdefault("source", "ha_entity_registry_mirror")
+        if active_entity_id != eid:
+            target_info = self.device_info.get(active_entity_id)
+            if entity_reg.async_get(active_entity_id) is not None or isinstance(target_info, dict):
+                result.update(
+                    {
+                        "ok": False,
+                        "error": "entity_id_conflict",
+                        "error_type": "conflict",
+                        "status": 409,
+                        "target_entity_id": active_entity_id,
+                        "errors": 1,
+                    }
+                )
                 return result
+
+        area = None
+        area_id = ""
+        area_name = ""
+        if room:
+            area = _find_ha_area_by_id_or_name(ar.async_get(self.hass), room)
+            if area is None:
+                result.update(
+                    {
+                        "ok": False,
+                        "error": "area_not_found",
+                        "error_type": "not_found",
+                        "status": 404,
+                        "errors": 1,
+                    }
+                )
+                return result
+            area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()
+            area_name = str(getattr(area, "name", "") or room).strip()
+
+        update_kwargs: dict[str, Any] = {}
+        if name:
+            update_kwargs["name"] = name
+        if active_entity_id != eid:
+            update_kwargs["new_entity_id"] = active_entity_id
+        if area is not None:
+            update_kwargs["area_id"] = area_id
+
+        old_area_id = str(getattr(entry, "area_id", "") or "").strip()
+        try:
+            if update_kwargs:
+                entity_reg.async_update_entity(eid, **update_kwargs)
+        except ValueError as exc:
+            result.update(
+                {
+                    "ok": False,
+                    "error": "entity_id_conflict",
+                    "error_type": "conflict",
+                    "status": 409,
+                    "details": str(exc),
+                    "target_entity_id": active_entity_id,
+                    "errors": 1,
+                }
+            )
+            return result
+        except Exception as exc:
+            self._sys_log("ERROR", f"[EntityRegistry] patch {eid} failed: {exc}")
+            result.update(
+                {
+                    "ok": False,
+                    "error": "entity_registry_update_failed",
+                    "error_type": "internal_error",
+                    "status": 500,
+                    "errors": 1,
+                }
+            )
+            return result
+
+        renamed = active_entity_id != eid
+        info = self.device_info.pop(eid, None) if renamed else self.device_info.get(eid)
+        if isinstance(info, dict):
+            if name:
+                info["name"] = name
+            if room:
+                info["room"] = room
+            info["entity_id"] = active_entity_id
+            info.update(self._get_entity_registry_metadata(active_entity_id))
+            self.device_info[active_entity_id] = info
+
+        if name or requested_entity_id:
+            result["ha_entity_sync"] = {
+                "ok": True,
+                "old_entity_id": eid,
+                "entity_id": active_entity_id,
+                "new_entity_id": active_entity_id,
+                "name": name,
+                "renamed": renamed,
+                "errors": 0,
+                "source": "ha_entity_registry_mirror",
+            }
+        if room:
+            result["ha_area_sync"] = {
+                "ok": True,
+                "entity_id": active_entity_id,
+                "room": room,
+                "area_id": area_id,
+                "area_name": area_name,
+                "created_areas": 0,
+                "updated_entities": int(old_area_id != area_id),
+                "errors": 0,
+                "source": "ha_area_registry_mirror",
+            }
             result["room"] = room
+
+        result["entity_id"] = active_entity_id
+        result["new_entity_id"] = active_entity_id
+        self.async_set_updated_data({})
+        if renamed:
+            self._refresh_listeners()
 
         await _apply_local_capability(active_entity_id)
         return result
