@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.166
-display_version: Beta 0.0.166
+release_version: 0.0.167
+display_version: Beta 0.0.167
 channel: beta
 release_date: '2026-07-15'
 public_release_ready: true
@@ -8,6 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.166 add-on 启动修复：cryptography 进入正式 Python runtime rootfs，并在镜像构建阶段实际导入远程网关身份模块，阻断缺依赖镜像发布。G13
-    继续默认关闭且 hard-off 为 true；MCP 暂缓。HA-L、Frigate 配置应用和日志现场验收尚未完成，不得视为生产绿灯。
-  customer_visible_version: Beta 0.0.166
+  summary: Beta 0.0.167 V3 交互修复：刷新保留当前路由，统一弹窗与抽屉错误归属，补齐日志、设备 OTA/远程维护入口和空间拓扑编辑，并同步正式
+    add-on 资产。G13 继续默认关闭且 hard-off 为 true；MCP 暂缓。HA-L、Frigate 配置应用和日志现场验收尚未完成，不得视为生产绿灯。
+  customer_visible_version: Beta 0.0.167
