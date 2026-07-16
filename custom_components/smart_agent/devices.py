@@ -351,9 +351,11 @@ class DevicesMixin:
                     continue
                 domain_label, ops = DOMAIN_LABELS.get(domain, (domain, ""))
                 area_name = self._get_entity_area(eid) or "未知区域"
+                registry_meta = self._get_entity_registry_metadata(eid)
                 candidates.append({
                     "entity_id": eid, "name": name, "domain": domain,
                     "domain_label": domain_label, "area": area_name, "ops": ops,
+                    **registry_meta,
                 })
         self._sys_log("INFO", f"[发现] 扫描到 {len(candidates)} 个候选设备（未录入）")
         self.async_set_updated_data({})
