@@ -58,10 +58,12 @@ from .ha_adapter import (
     get_transactions_cache_snapshot,
 )
 from .room_merge_view import RoomMergeViewMixin
+from .sensor_event_filter import EnvironmentTelemetryFilter
 from .service_registration import register_smart_agent_services, remove_smart_agent_services, ServiceRegistration
 from .websocket_handlers import build_smart_agent_websocket_commands
 from .websocket_registration import register_smart_agent_websocket_commands
 from .view_registration import register_host_views
+from .ld2410_maintenance_bridge import LD2410MaintenanceMQTTBridge
 
 
 # AI Scene snake_case/legacy 仅作为迁移兼容入口，统一集中管理。
@@ -803,6 +805,7 @@ class SmartAgentEventsWSView(HomeAssistantView):
         managed_event_entity_ids_updated_at = 0.0
         forward_send_failures = 0
         forward_send_last_warn = 0.0
+        environment_event_filter = EnvironmentTelemetryFilter()
 
         def _refresh_managed_event_entity_ids() -> set[str]:
             nonlocal managed_event_entity_ids, managed_event_entity_ids_updated_at
@@ -862,6 +865,22 @@ class SmartAgentEventsWSView(HomeAssistantView):
                     return
                 managed_event_entity_ids = _refresh_managed_event_entity_ids()
                 if entity_id not in managed_event_entity_ids:
+                    return
+                environment_metadata: dict[str, Any] = {}
+                for state_payload in (old_state, new_state):
+                    if not isinstance(state_payload, dict):
+                        continue
+                    attributes = state_payload.get("attributes")
+                    if isinstance(attributes, dict):
+                        environment_metadata.update(attributes)
+                environment_decision = environment_event_filter.evaluate(
+                    entity_id,
+                    (old_state or {}).get("state") if isinstance(old_state, dict) else "",
+                    (new_state or {}).get("state") if isinstance(new_state, dict) else "",
+                    metadata=environment_metadata,
+                    now=time.monotonic(),
+                )
+                if environment_decision.tracked and not environment_decision.forward:
                     return
                 event_data = {
                     "entity_id": entity_id,
@@ -2249,6 +2268,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     register_host_views(hass, globals())
+
+    maintenance_bridge = LD2410MaintenanceMQTTBridge(hass)
+    await maintenance_bridge.async_start()
+    coordinator._ld2410_maintenance_bridge = maintenance_bridge
+    entry.async_on_unload(maintenance_bridge.stop)
 
     entry.async_create_background_task(
         hass, coordinator.async_start_listeners(), "smart_agent_listeners"

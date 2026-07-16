@@ -11,6 +11,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -19,6 +20,7 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 
 from .ha_adapter import async_call_service
 from .confidence_arbitration_contract import validate_auto_execution_arbitration
+from .sensor_event_filter import EnvironmentTelemetryFilter, environment_sensor_kind
 from .const import (
     FRIGATE_PERSON_COUNT_KW as _FRIGATE_PERSON_COUNT_KW,
     AI_ACTION_SKIP_WINDOW, URGENT_MERGE_WINDOW, NORMAL_MERGE_WINDOW,
@@ -1190,46 +1192,39 @@ class ListenersMixin:
         if not isinstance(trigger_info, dict):
             trigger_info = {}
         trigger_room = _entity_room(trigger_entity_id, trigger_info) if trigger_entity_id else ""
-        lux_values: list[tuple[float, str]] = []
         trigger_room_lux_values: list[tuple[float, str]] = []
-        for eid, raw_info in device_info.items():
+        environment_device_info = getattr(self, "_environment_context_device_info", {}) or {}
+        evidence_device_info = dict(device_info)
+        if isinstance(environment_device_info, dict):
+            evidence_device_info.update(environment_device_info)
+        for eid, raw_info in evidence_device_info.items():
             entity_id = str(eid or "")
             if not entity_id.startswith("sensor."):
                 continue
             info = raw_info if isinstance(raw_info, dict) else {}
-            text = " ".join(
-                str(value or "").lower()
-                for value in (
-                    entity_id,
-                    info.get("name"),
-                    info.get("sensor_type"),
-                    info.get("device_class"),
-                    info.get("unit_of_measurement"),
-                )
-            )
-            if not any(token in text for token in ("illuminance", "lux", "light_level", "照度", "光照")):
+            if environment_sensor_kind(entity_id, info) != "illuminance":
+                continue
+            if not trigger_room or _entity_room(entity_id, info) != trigger_room:
                 continue
             try:
                 state_obj = get_state(entity_id)
                 lux = float(str(getattr(state_obj, "state", "") or "").strip())
-                lux_values.append((lux, entity_id))
-                if trigger_room and _entity_room(entity_id, info) == trigger_room:
+                if isfinite(lux):
                     trigger_room_lux_values.append((lux, entity_id))
             except (TypeError, ValueError):
                 continue
             except Exception as exc:
                 _LOGGER.debug("[Listeners] illuminance read failed for %s: %s", entity_id, exc)
-        selected_lux_values = trigger_room_lux_values or lux_values
-        if selected_lux_values:
-            min_lux = min(lux for lux, _entity_id in selected_lux_values)
+        if trigger_room_lux_values:
+            min_lux = min(lux for lux, _entity_id in trigger_room_lux_values)
             min_lux_entities = [
                 entity_id
-                for lux, entity_id in selected_lux_values
+                for lux, entity_id in trigger_room_lux_values
                 if lux == min_lux
             ]
             context["illuminance_lux_min"] = min_lux
             context["illuminance_lux"] = min_lux
-            context["illuminance_scope"] = "trigger_room" if trigger_room_lux_values else "global"
+            context["illuminance_scope"] = "trigger_room"
             if min_lux_entities:
                 context["illuminance_entity_id"] = min_lux_entities[0]
                 context["illuminance_evidence_ids"] = min_lux_entities
@@ -2693,6 +2688,39 @@ class ListenersMixin:
                 )
                 return
 
+            if domain == "sensor":
+                environment_metadata = self._listener_entity_metadata(
+                    entity_id,
+                    info=device_info_snapshot.get(entity_id),
+                    state_obj=new,
+                )
+                environment_filter = getattr(self, "_environment_telemetry_event_filter", None)
+                if not isinstance(environment_filter, EnvironmentTelemetryFilter):
+                    environment_filter = EnvironmentTelemetryFilter()
+                    self._environment_telemetry_event_filter = environment_filter
+                environment_decision = environment_filter.evaluate(
+                    entity_id,
+                    old_s,
+                    new_s,
+                    metadata=environment_metadata,
+                    now=time.monotonic(),
+                )
+                if environment_decision.tracked and not environment_decision.forward:
+                    self._last_listener_filter_reason = (
+                        f"environment_telemetry_{environment_decision.reason}"
+                    )
+                    _LOGGER.debug(
+                        "[ListenerFilter] environment telemetry sampled entity=%s kind=%s "
+                        "reason=%s delta=%s threshold=%s elapsed=%s",
+                        entity_id,
+                        environment_decision.sensor_kind,
+                        environment_decision.reason,
+                        environment_decision.delta,
+                        environment_decision.threshold,
+                        environment_decision.elapsed,
+                    )
+                    return
+
             _LOGGER.debug("[事件] %s: %s -> %s (来源: %s)", entity_id, old_s, new_s, source_type)
             self._emit_listener_event(
                 listener_action="received",
@@ -2724,7 +2752,12 @@ class ListenersMixin:
                     is_person_count = frigate_on and any(kw in eid_lower for kw in self._PERSON_COUNT_KW)
                     threshold = 1 if is_person_count else 5
                     if delta < threshold:
-                        self._sys_log("INFO", f"[过滤] 传感器变化 {delta:.1f} < {threshold}，跳过: {entity_id}")
+                        _LOGGER.debug(
+                            "[ListenerFilter] numeric deadband entity=%s delta=%.3f threshold=%s",
+                            entity_id,
+                            delta,
+                            threshold,
+                        )
                         self._emit_listener_event(
                             listener_action="filtered",
                             entity_id=entity_id,
@@ -3073,24 +3106,34 @@ class ListenersMixin:
             return False
 
         next_device_info: dict[str, dict[str, Any]] = {}
+        next_environment_context_info: dict[str, dict[str, Any]] = {}
         skipped = 0
         for row in rows:
             if not isinstance(row, dict):
                 skipped += 1
                 continue
-            mapped = self._device_info_row_from_addon_device(row)
+            mapped = self._managed_device_info_row_from_addon_device(row)
             if mapped is None:
                 skipped += 1
                 continue
             entity_id, info = mapped
-            next_device_info[entity_id] = info
+            if self._is_listener_runtime_entity(entity_id, info):
+                next_device_info[entity_id] = info
+            else:
+                skipped += 1
+            if environment_sensor_kind(entity_id, info):
+                next_environment_context_info[entity_id] = info
 
         current = getattr(self, "device_info", {}) or {}
         if not isinstance(current, dict):
             current = {}
-        changed = current != next_device_info
+        current_environment = getattr(self, "_environment_context_device_info", {}) or {}
+        if not isinstance(current_environment, dict):
+            current_environment = {}
+        changed = current != next_device_info or current_environment != next_environment_context_info
+        self.device_info = next_device_info
+        self._environment_context_device_info = next_environment_context_info
         if changed:
-            self.device_info = next_device_info
             reconciled = getattr(self, "_listener_active_state_reconciled", None)
             if isinstance(reconciled, dict):
                 for entity_id in list(reconciled):
@@ -3114,6 +3157,7 @@ class ListenersMixin:
                 "ok": True,
                 "reason": str(reason or "manual"),
                 "count": len(next_device_info),
+                "environment_context_count": len(next_environment_context_info),
                 "skipped": skipped,
                 "changed": changed,
             }
@@ -3141,7 +3185,10 @@ class ListenersMixin:
             return True
         return self._is_actionable_sensor_runtime_entity(entity_id, info)
 
-    def _device_info_row_from_addon_device(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    def _managed_device_info_row_from_addon_device(
+        self,
+        row: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]] | None:
         if row.get("managed") is False or row.get("in_sa") is False:
             return None
         entity_id = str(row.get("entity_id") or row.get("id") or "").strip()
@@ -3192,9 +3239,18 @@ class ListenersMixin:
             "ops": ops,
             "control_mode": mode,
             "sensor_type": str(row.get("sensor_type") or ""),
+            "device_class": str(row.get("device_class") or ""),
+            "unit_of_measurement": str(row.get("unit_of_measurement") or row.get("unit") or ""),
             "ha_unique_id": str(row.get("ha_unique_id") or row.get("unique_id") or ""),
             "ha_device_id": str(row.get("ha_device_id") or row.get("device_id") or ""),
         }
+        return entity_id, info
+
+    def _device_info_row_from_addon_device(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        mapped = self._managed_device_info_row_from_addon_device(row)
+        if mapped is None:
+            return None
+        entity_id, info = mapped
         if not self._is_listener_runtime_entity(entity_id, info):
             return None
         return entity_id, info
