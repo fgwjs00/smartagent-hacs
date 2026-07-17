@@ -9,7 +9,9 @@ from typing import Any
 
 
 _LOGGER = logging.getLogger(__name__)
-_TOPIC_RE = re.compile(r"^zigbee2mqtt/(0x[0-9a-f]{16})$", re.IGNORECASE)
+_STATE_TOPIC_RE = re.compile(r"^zigbee2mqtt/([^/]+)$", re.IGNORECASE)
+_IEEE_RE = re.compile(r"^0x[0-9a-f]{16}$", re.IGNORECASE)
+_DEVICE_INVENTORY_TOPIC = "zigbee2mqtt/bridge/devices"
 _BRIDGE_VERSION = 1
 
 # This list mirrors the public 0xFC10 maintenance contract. Password material
@@ -48,12 +50,36 @@ def _json_safe(value: Any) -> bool:
     return False
 
 
-def build_maintenance_snapshot(topic: str, payload: Any) -> tuple[str, str, dict[str, Any]] | None:
+def build_device_identifier_map(payload: Any) -> dict[str, str]:
+    """Build a Zigbee2MQTT friendly-name to IEEE map from bridge/devices."""
+    if not isinstance(payload, list):
+        return {}
+    identifiers: dict[str, str] = {}
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        friendly_name = str(row.get("friendly_name") or "").strip()
+        ieee_address = str(row.get("ieee_address") or "").strip().lower()
+        if friendly_name and _IEEE_RE.fullmatch(ieee_address):
+            identifiers[friendly_name] = ieee_address
+    return identifiers
+
+
+def build_maintenance_snapshot(
+    topic: str,
+    payload: Any,
+    device_identifiers: dict[str, str] | None = None,
+) -> tuple[str, str, dict[str, Any]] | None:
     """Normalize one Zigbee2MQTT state message without inventing maintenance capability."""
-    match = _TOPIC_RE.fullmatch(str(topic or ""))
+    match = _STATE_TOPIC_RE.fullmatch(str(topic or ""))
     if match is None or not isinstance(payload, dict):
         return None
-    ieee_address = match.group(1).lower()
+    topic_name = match.group(1)
+    ieee_address = topic_name.lower() if _IEEE_RE.fullmatch(topic_name) else str(
+        (device_identifiers or {}).get(topic_name) or ""
+    ).lower()
+    if not _IEEE_RE.fullmatch(ieee_address):
+        return None
     contract_value = payload.get("maintenance_contract_version")
     if isinstance(contract_value, bool):
         return None
@@ -80,7 +106,9 @@ class LD2410MaintenanceMQTTBridge:
 
     def __init__(self, hass: Any) -> None:
         self._hass = hass
-        self._unsubscribe: Callable[[], None] | None = None
+        self._unsubscribes: list[Callable[[], None]] = []
+        self._device_identifiers: dict[str, str] = {}
+        self._pending_states: dict[str, dict[str, Any]] = {}
 
     async def async_start(self) -> None:
         try:
@@ -89,20 +117,46 @@ class LD2410MaintenanceMQTTBridge:
             _LOGGER.warning("LD2410 maintenance bridge is unavailable because MQTT is not loaded")
             return
         try:
-            self._unsubscribe = await async_subscribe(
+            self._unsubscribes.append(await async_subscribe(
+                self._hass,
+                _DEVICE_INVENTORY_TOPIC,
+                self._async_handle_message,
+            ))
+            self._unsubscribes.append(await async_subscribe(
                 self._hass,
                 "zigbee2mqtt/+",
                 self._async_handle_message,
-            )
+            ))
         except Exception:
             _LOGGER.exception("LD2410 maintenance MQTT bridge subscription failed")
             return
         _LOGGER.info("LD2410 maintenance MQTT bridge subscribed to Zigbee2MQTT state topics")
 
     def stop(self) -> None:
-        unsubscribe, self._unsubscribe = self._unsubscribe, None
-        if unsubscribe is not None:
+        unsubscribes, self._unsubscribes = self._unsubscribes, []
+        for unsubscribe in unsubscribes:
             unsubscribe()
+
+    def _set_snapshot(self, snapshot: tuple[str, str, dict[str, Any]]) -> None:
+        entity_id, state, attributes = snapshot
+        self._hass.states.async_set(entity_id, state, attributes)
+
+    def _apply_device_inventory(self, payload: Any) -> None:
+        identifiers = build_device_identifier_map(payload)
+        if not identifiers:
+            return
+        self._device_identifiers.update(identifiers)
+        for friendly_name, state_payload in list(self._pending_states.items()):
+            if friendly_name not in self._device_identifiers:
+                continue
+            snapshot = build_maintenance_snapshot(
+                f"zigbee2mqtt/{friendly_name}",
+                state_payload,
+                self._device_identifiers,
+            )
+            if snapshot is not None:
+                self._set_snapshot(snapshot)
+            self._pending_states.pop(friendly_name, None)
 
     async def _async_handle_message(self, message: Any) -> None:
         try:
@@ -110,10 +164,22 @@ class LD2410MaintenanceMQTTBridge:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             payload = json.loads(raw) if isinstance(raw, str) else raw
-            snapshot = build_maintenance_snapshot(getattr(message, "topic", ""), payload)
+            topic = str(getattr(message, "topic", "") or "")
         except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
             return
-        if snapshot is None:
+        if topic == _DEVICE_INVENTORY_TOPIC:
+            self._apply_device_inventory(payload)
             return
-        entity_id, state, attributes = snapshot
-        self._hass.states.async_set(entity_id, state, attributes)
+        snapshot = build_maintenance_snapshot(topic, payload, self._device_identifiers)
+        if snapshot is None:
+            match = _STATE_TOPIC_RE.fullmatch(topic)
+            if match is not None and isinstance(payload, dict):
+                contract = payload.get("maintenance_contract_version")
+                try:
+                    capable = not isinstance(contract, bool) and int(contract) >= 1
+                except (TypeError, ValueError):
+                    capable = False
+                if capable and not _IEEE_RE.fullmatch(match.group(1)):
+                    self._pending_states[match.group(1)] = payload
+            return
+        self._set_snapshot(snapshot)
