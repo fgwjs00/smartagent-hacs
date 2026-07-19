@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.176 - 2026-07-19
+## Beta 0.0.177 - 2026-07-19
 
-Beta 0.0.176 修复 V3 本地 OTA 上传授权链：有效本地管理员 token 会携带明确的 local_gateway 执行身份，Add-on 在 token 门禁通过后允许 BIN 入库、计划与执行；403 权限拒绝只在当前固件弹窗显示，不再清除有效会话或跳转登录，真正的 401 仍全局注销。继承 0.0.175 的主动 AI 完整性整改与 shadow 默认门禁，以及 0.0.174 的设备绑定 ESP-IDF BIN 本地 OTA 和 `.safw + Ed25519` 严格路径。真实设备 OTA 结果仍需现场验收。
+Beta 0.0.177 修复真实 Stage A 暴露的 Presence clear 语义边界：非语义 entity id 通过 canonical capability 与 Presence evidence 识别；在 leave_qualified=false 时拒绝模型错误生成的离开关电源 DesiredState，真实合格离开保持原规划。API split/prebuilt 聚合哈希与 hash-based pyc 改用 LF canonical source bytes，消除 Windows/Linux checkout 换行漂移。主动 AI 继续默认 shadow，canary 范围为空，两个真实执行开关默认 false；部署后必须重新起算 7 天且至少 300 次 Stage A 决策。继承 0.0.176 的 V3 本地 OTA 上传授权链修复。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.176`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.177`，用于 Home Assistant 更新检测。
