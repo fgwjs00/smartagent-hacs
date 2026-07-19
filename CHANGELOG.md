@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.175 - 2026-07-19
+## Beta 0.0.176 - 2026-07-19
 
-Beta 0.0.175 完成主动 AI 决策、执行与学习边界整改：模型输出先收敛为有限 DesiredState，再由确定性 Planner 生成 CommandEnvelope；服务参数合同、持久化世界快照、rollout、最终 HA 执行守卫、执行后验证和纠错晋升形成可追踪闭环。修复 switch 亮度非法参数、观影窗帘方向、离开多设备覆盖、重复命令，以及真实 shadow 阶段发现的 departure 边误入 arrival 照明。主动 AI 默认 shadow，canary 范围为空，两个真实执行开关默认 false；发布不代表阶段 A 通过，真实家庭需重新累计 7 天且至少 300 次决策。0.0.174 的设备绑定 ESP-IDF BIN 本地 OTA 与 `.safw + Ed25519` 严格路径继续保留。G13 默认关闭且 hard-off=true；MCP 暂缓。
+Beta 0.0.176 修复 V3 本地 OTA 上传授权链：有效本地管理员 token 会携带明确的 local_gateway 执行身份，Add-on 在 token 门禁通过后允许 BIN 入库、计划与执行；403 权限拒绝只在当前固件弹窗显示，不再清除有效会话或跳转登录，真正的 401 仍全局注销。继承 0.0.175 的主动 AI 完整性整改与 shadow 默认门禁，以及 0.0.174 的设备绑定 ESP-IDF BIN 本地 OTA 和 `.safw + Ed25519` 严格路径。真实设备 OTA 结果仍需现场验收。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.175`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.176`，用于 Home Assistant 更新检测。
