@@ -71,10 +71,20 @@ from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .actions import ActionsMixin
+from .active_ai_rollout import (
+    ActiveAiRolloutConfig,
+    enrich_active_ai_action_spaces,
+    evaluate_active_ai_execution_gate,
+    evaluate_active_ai_model_gate,
+    normalize_active_ai_mode,
+)
 from .database import DatabaseMixin
 from .devices import DevicesMixin
 from .confidence_arbitration_contract import validate_auto_execution_arbitration
-from .execution_gate import evaluate_priority_arbitration
+from .execution_gate import (
+    evaluate_priority_arbitration,
+    evaluate_slow_brain_confidence_gate,
+)
 from .frigate import FrigateMixin
 from .ha_adapter import async_call_service
 from .license import LicenseMixin
@@ -84,6 +94,7 @@ from .api import SmartAgentPairingView, SmartAgentAuthPageView, SmartAgentPairCo
 
 from .const import (
     ACTION_PARAM_KEYS_COMMON,
+    CONF_ACTIVE_AI_MODE,
     CONF_AI_ENABLED,
     CONF_COOLDOWN,
     CONF_ENGINE,
@@ -111,6 +122,7 @@ from .const import (
     CONF_CONFIDENCE_AUTO,
     CONF_CONFIDENCE_NOTIFY,
     CONF_CLOUD_FALLBACK,
+    DEFAULT_ACTIVE_AI_MODE,
     DEFAULT_CONFIDENCE_AUTO,
     DEFAULT_CONFIDENCE_NOTIFY,
     CONF_VISION_ENABLED,
@@ -300,6 +312,8 @@ class SmartAgentCoordinator(
         self._last_inference: dict[str, float] = {}
         self._active_timers: dict[str, Any] = {}
         self._last_ai_actions: dict[str, dict] = {}
+        self._recent_ai_action_results: list[dict[str, Any]] = []
+        self._recent_ai_action_results_lock = threading.Lock()
         self._user_overrides: dict[str, dict] = {}
         self._user_overrides_lock = threading.Lock()
         self._user_manual_actions: dict[str, dict] = {}
@@ -326,6 +340,9 @@ class SmartAgentCoordinator(
         self._state_listener_removers: list = []
         self._listener_entity_ids: set[str] = set()
         self._enabled = bool(data.get(CONF_AI_ENABLED, True))
+        self._active_ai_mode = normalize_active_ai_mode(
+            data.get(CONF_ACTIVE_AI_MODE, DEFAULT_ACTIVE_AI_MODE)
+        )
         self._sensors_muted = bool(data.get(CONF_SENSORS_MUTED, False))
         self._learning_mode = bool(data.get(CONF_LEARNING_MODE, False))
         self._habit_proactive = bool(data.get(CONF_HABIT_PROACTIVE, False))
@@ -462,10 +479,6 @@ class SmartAgentCoordinator(
             DOMAIN, "authorize_pairing", self.async_svc_authorize_pairing
         )
 
-        # 注册 AI 纠错服务（Phase 7B）
-        self.hass.services.async_register(
-            DOMAIN, "report_correction", self.async_svc_report_correction
-        )
         # 注册忽略服务：从近期操作列表移除条目（不记入学习）
         self.hass.services.async_register(
             DOMAIN, "dismiss_ai_action",
@@ -2210,6 +2223,13 @@ class SmartAgentCoordinator(
             or snapshot.get("trigger_room")
             or ""
         ).strip()
+        trigger_space_id = str(
+            trigger_info.get("space_id")
+            or trigger_info.get("room_id")
+            or trigger_info.get("area_id")
+            or trigger_room
+            or ""
+        ).strip()
         if not trigger_room and entity_id:
             area_lookup = getattr(self, "_get_entity_area", None)
             if callable(area_lookup):
@@ -2306,6 +2326,7 @@ class SmartAgentCoordinator(
             "old_state": parsed.get("old_state", ""),
             "new_state": parsed.get("new_state", ""),
             "trigger_room": trigger_room,
+            "trigger_space_id": trigger_space_id,
             "audit_pending": audit_pending,
             "provisional_execution": audit_pending,
             "audit_source": "fast_path" if audit_pending else "",
@@ -2363,56 +2384,101 @@ class SmartAgentCoordinator(
         except Exception:
             return dt_util.now().strftime("%Y-%m-%d")
 
-    def _enqueue_decision_cache_write(
-        self,
+    @staticmethod
+    def _build_decision_trace_lineage(
         *,
         bundle: dict[str, Any],
         result: dict[str, Any],
         actions: list[dict[str, Any]],
-        confidence: int,
-        scene: str,
-        final_outcome: str,
-        planned_count: int,
-        executed_count: int,
-        action_results: list[dict[str, Any]],
-        decision_id: str = "unknown",
-        transaction_id: str = "unknown",
-        world_snapshot_id: str = "unknown",
-    ) -> None:
-        trigger_room = str(bundle.get("trigger_room") or result.get("trigger_room") or "").strip()
-        if not trigger_room or not actions:
-            return
-        new_state = str(bundle.get("new_state") or "").strip().lower()
-        trigger_type = "departure" if new_state in {"off", "closed", "not_home", "away", "idle", "clear"} else "arrival"
-        now = self._ha_local_now()
-        season = _ha_season_for_datetime(now)
-        payload = {
-            "action": "write_decision",
-            "trigger_room": trigger_room,
-            "room": trigger_room,
-            "hour_bucket": now.hour,
-            "weekday": int(now.strftime("%w")),
-            "trigger_type": trigger_type,
-            "actions": actions,
-            "confidence": confidence,
-            "scene": scene,
-            "intent": str(result.get("intent") or ""),
-            "scene_candidate": str(result.get("scene_candidate") or result.get("scene") or ""),
-            "season": season,
-            "origin": "smartagent",
-            "actor": "smartagent:ha_slow_decision",
-            "decision_id": str(decision_id or "unknown"),
-            "transaction_id": str(transaction_id or "unknown"),
-            "world_snapshot_id": str(world_snapshot_id or "unknown"),
-            "execution_status": str(final_outcome or ""),
-            "final_outcome": str(final_outcome or ""),
-            "planned_count": int(planned_count or 0),
-            "executed_count": int(executed_count or 0),
-            "action_results": [dict(item) for item in action_results if isinstance(item, dict)],
+    ) -> dict[str, Any]:
+        nested_result = result.get("result") if isinstance(result.get("result"), dict) else {}
+        details = result.get("details") if isinstance(result.get("details"), dict) else {}
+        source_context = (
+            bundle.get("source_trace_context")
+            if isinstance(bundle.get("source_trace_context"), dict)
+            else {}
+        )
+        context_snapshot = (
+            result.get("context_snapshot")
+            if isinstance(result.get("context_snapshot"), dict)
+            else nested_result.get("context_snapshot")
+            if isinstance(nested_result.get("context_snapshot"), dict)
+            else {}
+        )
+        llm_request = (
+            result.get("llm_request")
+            if isinstance(result.get("llm_request"), dict)
+            else nested_result.get("llm_request")
+            if isinstance(nested_result.get("llm_request"), dict)
+            else details.get("llm_request")
+            if isinstance(details.get("llm_request"), dict)
+            else {}
+        )
+
+        raw_evidence_ids = (
+            result.get("source_evidence_ids")
+            or nested_result.get("source_evidence_ids")
+            or context_snapshot.get("source_evidence_ids")
+            or bundle.get("source_evidence_ids")
+            or source_context.get("source_evidence_ids")
+        )
+        if isinstance(raw_evidence_ids, str):
+            raw_evidence_ids = [raw_evidence_ids]
+        source_evidence_ids: list[str] = []
+        if isinstance(raw_evidence_ids, (list, tuple, set)):
+            for item in raw_evidence_ids:
+                evidence_id = str(item or "").strip()
+                if evidence_id and evidence_id not in source_evidence_ids:
+                    source_evidence_ids.append(evidence_id)
+        trigger_entity_id = str(bundle.get("trigger_entity_id") or "").strip()
+        if not source_evidence_ids and trigger_entity_id:
+            source_evidence_ids.append(trigger_entity_id)
+
+        action_sequences: list[int] = []
+        for index, action in enumerate(actions, start=1):
+            raw_sequence = (
+                action.get("sequence")
+                or action.get("action_sequence")
+                or action.get("sequence_id")
+                or index
+            )
+            try:
+                sequence = int(raw_sequence)
+            except (TypeError, ValueError, OverflowError):
+                sequence = index
+            action_sequences.append(sequence)
+
+        return {
+            "world_snapshot_id": str(
+                result.get("world_snapshot_id")
+                or nested_result.get("world_snapshot_id")
+                or context_snapshot.get("world_snapshot_id")
+                or bundle.get("world_snapshot_id")
+                or bundle.get("parent_world_snapshot_id")
+                or "unknown"
+            ).strip()
+            or "unknown",
+            "source_evidence_ids": source_evidence_ids,
+            "parent_transaction_id": str(
+                bundle.get("parent_transaction_id")
+                or result.get("parent_transaction_id")
+                or nested_result.get("parent_transaction_id")
+                or ""
+            ).strip(),
+            "action_sequences": action_sequences,
+            "llm_provider": str(
+                result.get("llm_provider")
+                or nested_result.get("llm_provider")
+                or llm_request.get("provider")
+                or ""
+            ).strip(),
+            "llm_model": str(
+                result.get("llm_model")
+                or nested_result.get("llm_model")
+                or llm_request.get("model")
+                or ""
+            ).strip(),
         }
-        enqueue = getattr(self, "_enqueue_internal_event", None)
-        if not callable(enqueue) or not enqueue("cache_invalidate", payload):
-            _LOGGER.debug("[DecisionCache] write_decision enqueue skipped room=%s", trigger_room)
 
     def _build_training_sample_payload(
         self,
@@ -2423,9 +2489,21 @@ class SmartAgentCoordinator(
         final_outcome: str,
         decision_id: str = "unknown",
         transaction_id: str = "unknown",
+        execution_transaction_id: str = "unknown",
         world_snapshot_id: str = "unknown",
+        planned_count: int | None = None,
+        executed_count: int | None = None,
+        action_results: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
-        if final_outcome != "succeeded" or not actions:
+        if final_outcome not in {"succeeded", "partial"} or not actions:
+            return None
+
+        planned = max(0, int(len(actions) if planned_count is None else planned_count))
+        executed = max(
+            0,
+            int(planned if executed_count is None and final_outcome == "succeeded" else executed_count or 0),
+        )
+        if executed == 0:
             return None
 
         sample_actions: list[dict[str, Any]] = []
@@ -2437,11 +2515,29 @@ class SmartAgentCoordinator(
             if not entity_id or not service:
                 continue
             domain = str(action.get("domain") or entity_id.split(".", 1)[0]).strip()
+            normalized_service = service.lower()
+            if normalized_service == "turn_on":
+                desired_state = "on"
+            elif normalized_service == "turn_off":
+                desired_state = "off"
+            elif normalized_service in {"open_cover", "open"}:
+                desired_state = "open"
+            elif normalized_service in {"close_cover", "close"}:
+                desired_state = "closed"
+            else:
+                params = action.get("params") if isinstance(action.get("params"), dict) else {}
+                desired_state = str(
+                    params.get("hvac_mode")
+                    or params.get("temperature")
+                    or params.get("position")
+                    or normalized_service
+                ).strip().lower()
             sample_actions.append(
                 {
                     "domain": domain,
                     "service": service,
                     "entity_id": entity_id,
+                    "desired_state": desired_state,
                     "confidence": max(0.0, min(float(confidence or 0) / 100.0, 1.0)),
                 }
             )
@@ -2452,6 +2548,14 @@ class SmartAgentCoordinator(
         trigger_entity = str(bundle.get("trigger_entity_id") or "").strip()
         trigger_domain = trigger_entity.split(".", 1)[0] if "." in trigger_entity else ""
         trigger_room = str(bundle.get("trigger_room") or "").strip()
+        old_state = str(bundle.get("old_state") or "").strip().lower()
+        new_state = str(bundle.get("new_state") or "").strip().lower()
+        if trigger_domain == "binary_sensor" and old_state == "off" and new_state == "on":
+            trigger_type = "arrival"
+        elif trigger_domain == "binary_sensor" and old_state == "on" and new_state == "off":
+            trigger_type = "departure"
+        else:
+            trigger_type = "state_change"
         presence_snapshot = bundle.get("presence_snapshot") if isinstance(bundle.get("presence_snapshot"), dict) else {}
         room_presence = {}
         rooms = presence_snapshot.get("rooms") if isinstance(presence_snapshot, dict) else {}
@@ -2461,21 +2565,45 @@ class SmartAgentCoordinator(
         room_person_count = 1 if room_state in {"occupied", "present", "on", "home"} else 0
         season = _ha_season_for_datetime(now)
         quality_score = max(0.0, min(float(confidence or 0) / 100.0, 1.0))
+        source_id = str(transaction_id or "unknown")
         return {
             "source": "ha_slow_decision",
+            "source_id": source_id,
             "feature_json": {
                 "time_hour": now.hour,
                 "is_weekend": now.weekday() >= 5,
                 "trigger_domain": trigger_domain or "unknown",
+                "space": trigger_room or "unknown",
+                "trigger_room": trigger_room or "unknown",
+                "trigger_type": trigger_type,
+                "local_date": now.strftime("%Y-%m-%d"),
+                "weekday": now.weekday(),
+                "confidence_auto": int(bundle.get("confidence_auto") or getattr(self, "confidence_auto", 0) or 0),
                 "room_person_count": room_person_count,
                 "outdoor_temp": None,
                 "season_encoding": season,
             },
             "decision_json": {"actions": sample_actions},
+            "label": None,
             "preference_label": "unknown",
             "quality_score": quality_score,
             "is_verified": False,
             "lifecycle_state": "observe_only",
+            "evidence": {
+                "service_acknowledged": True,
+                "post_state_verified": False,
+                "stable_seconds": 0,
+                "confidence": int(confidence or 0),
+                "confidence_auto": int(bundle.get("confidence_auto") or getattr(self, "confidence_auto", 0) or 0),
+                "world_snapshot_id": str(world_snapshot_id or "unknown"),
+                "execution_transaction_id": str(execution_transaction_id or "unknown"),
+                "partial_execution": final_outcome == "partial" or executed < planned,
+                "planned_count": planned,
+                "executed_count": executed,
+                "action_results": [
+                    dict(item) for item in (action_results or []) if isinstance(item, dict)
+                ],
+            },
             "privacy_tier": "derived_private",
             "model_schema_version": "system1_v1",
             "origin": "smartagent",
@@ -2484,6 +2612,81 @@ class SmartAgentCoordinator(
             "transaction_id": str(transaction_id or "unknown"),
             "world_snapshot_id": str(world_snapshot_id or "unknown"),
         }
+
+    def _record_learning_post_state_verification(
+        self,
+        item: dict[str, Any],
+        actual_state: str,
+    ) -> None:
+        """Emit immediate proof, then re-check the same action after 60 seconds."""
+
+        entity_id = str(item.get("entity_id") or "").strip()
+        transaction_id = str(item.get("parent_transaction_id") or "").strip()
+        world_snapshot_id = str(item.get("world_snapshot_id") or "unknown").strip() or "unknown"
+        if not entity_id or not transaction_id or transaction_id in {"unknown", "not_applicable"}:
+            return
+
+        last_ai = self._last_ai_actions.get(entity_id)
+        if not isinstance(last_ai, dict) or str(last_ai.get("transaction_id") or "") != transaction_id:
+            return
+        last_ai["post_state_verified"] = True
+        last_ai["post_state_verified_at"] = self._ha_local_now().isoformat()
+        last_ai["learning_stability_deadline"] = time.time() + 60
+        last_ai["reverse_user_action"] = False
+
+        def _enqueue(*, stable_seconds: int, current_state: str, reverse_user_action: bool) -> bool:
+            return self._enqueue_internal_event(
+                "behavior",
+                {
+                    "action": "promotion_evidence",
+                    "entity_id": entity_id,
+                    "actual_state": current_state,
+                    "post_state_verified": not reverse_user_action,
+                    "stable_seconds": stable_seconds,
+                    "reverse_user_action": reverse_user_action,
+                    "origin": "smartagent",
+                    "actor": "smartagent:post_state_verification",
+                    "decision_id": str(item.get("parent_transaction_id") or "unknown"),
+                    "transaction_id": transaction_id,
+                    "world_snapshot_id": world_snapshot_id,
+                    "correlation_id": str(item.get("correlation_id") or ""),
+                },
+            )
+
+        _enqueue(
+            stable_seconds=0,
+            current_state=str(actual_state or "unknown").strip().lower(),
+            reverse_user_action=False,
+        )
+
+        async def _verify_stability() -> None:
+            await asyncio.sleep(60)
+            current_ai = self._last_ai_actions.get(entity_id)
+            if not isinstance(current_ai, dict):
+                return
+            if str(current_ai.get("transaction_id") or "") != transaction_id:
+                return
+            reverse_user_action = current_ai.get("reverse_user_action") is True
+            state_obj = self.hass.states.get(entity_id)
+            current_state = str(state_obj.state if state_obj is not None else "unknown").strip().lower()
+            expected_state = str(item.get("expected_state") or "").strip().lower()
+            off_states = set(getattr(self, "_OFF_STATES", {"off", "closed", "idle"}))
+            if expected_state == "on":
+                stable = current_state not in off_states and current_state not in {"unknown", "unavailable"}
+            elif expected_state == "off":
+                stable = current_state in off_states
+            else:
+                stable = current_state == expected_state
+            _enqueue(
+                stable_seconds=60,
+                current_state=current_state,
+                reverse_user_action=reverse_user_action or not stable,
+            )
+
+        self._spawn_background_task(
+            _verify_stability(),
+            f"learning_stability_{entity_id}_{transaction_id}",
+        )
 
     async def _run_addon_decision(
         self,
@@ -2619,6 +2822,57 @@ class SmartAgentCoordinator(
                         f"[决策] decision_log 回写入队失败 reason={reason_value or '-'} trigger={trigger_public_summary or '-'}",
                     )
 
+        def _rollout_public_reason(reason: str) -> str:
+            if reason == "active_ai_shadow":
+                return "主动 AI 当前处于影子模式，仅记录决策，不执行设备"
+            if reason in {"active_ai_global_disabled", "active_ai_off"}:
+                return "主动 AI 已关闭，本次不执行设备"
+            if reason in {
+                "active_ai_canary_space_not_allowed",
+                "active_ai_canary_domain_not_allowed",
+            }:
+                return "本次动作不在主动 AI 灰度范围内，已阻止执行"
+            if reason in {
+                "active_ai_domain_execution_disabled",
+                "active_ai_lighting_execution_disabled",
+            }:
+                return "主动 AI 真实执行开关未开启，本次仅记录决策"
+            return "主动 AI 灰度门禁未允许执行"
+
+        pre_rollout_config = ActiveAiRolloutConfig.from_values(
+            mode=getattr(self, "_active_ai_mode", DEFAULT_ACTIVE_AI_MODE)
+        )
+        pre_rollout = evaluate_active_ai_model_gate(
+            ai_enabled=bool(getattr(self, "_enabled", False)),
+            config=pre_rollout_config,
+        )
+        if not pre_rollout.allow_model:
+            public_reason = _rollout_public_reason(pre_rollout.reason)
+            rollout_trace = pre_rollout.as_trace()
+            _emit_slow_decision_bubble(
+                result_payload={
+                    "path_taken": "active_ai_rollout_gate",
+                    "rollout": rollout_trace,
+                    "rollout_reason": pre_rollout.reason,
+                },
+                status_code=200,
+                matched=False,
+                reason=public_reason,
+                scene_desc="主动 AI 灰度门禁",
+                final_outcome_value="blocked",
+                fail_closed=True,
+                record_decision_log=True,
+            )
+            return {
+                "status": "ok",
+                "matched": False,
+                "actions": [],
+                "executed_count": 0,
+                "reason": pre_rollout.reason,
+                "rollout": rollout_trace,
+                "final_outcome": "blocked",
+            }
+
         if addon_client is None:
             self._sys_log("WARN", "[决策] add-on decision provider unavailable")
             _emit_slow_decision_bubble(
@@ -2729,25 +2983,155 @@ class SmartAgentCoordinator(
                 or nested_result.get("world_snapshot_id")
                 or "unknown"
             ).strip() or "unknown"
+            decision_lineage = self._build_decision_trace_lineage(
+                bundle=bundle,
+                result=result,
+                actions=valid_actions,
+            )
             try:
                 confidence = int(float(result.get("confidence") or 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 confidence = 0
             learning_observe_only = bool(getattr(self, "_learning_mode", False)) and source == "listener"
             executed = 0
             final_outcome = "no_actions"
             if valid_actions:
+                rollout_payload = (
+                    result.get("active_ai_rollout")
+                    if isinstance(result.get("active_ai_rollout"), dict)
+                    else {}
+                )
+                rollout_config = ActiveAiRolloutConfig.from_mapping(rollout_payload)
+                execution_flags = (
+                    rollout_payload.get("execution_flags")
+                    if isinstance(rollout_payload.get("execution_flags"), dict)
+                    else {}
+                )
+                rollout_actions = enrich_active_ai_action_spaces(
+                    valid_actions,
+                    bundle.get("device_info")
+                    if isinstance(bundle.get("device_info"), dict)
+                    else {},
+                )
+                rollout_decision = evaluate_active_ai_execution_gate(
+                    ai_enabled=bool(getattr(self, "_enabled", False)),
+                    config=rollout_config,
+                    trigger_space_id=str(
+                        bundle.get("trigger_space_id")
+                        or result.get("trigger_space_id")
+                        or bundle.get("trigger_room")
+                        or result.get("trigger_room")
+                        or ""
+                    ),
+                    actions=rollout_actions,
+                    execution_flags=execution_flags,
+                )
+                rollout_trace = rollout_decision.as_trace()
+                result["rollout"] = rollout_trace
+                result["rollout_reason"] = rollout_decision.reason
+                if not rollout_decision.allow_execution:
+                    is_shadow = rollout_decision.reason == "active_ai_shadow"
+                    final_outcome = "observe_only" if is_shadow else "blocked"
+                    action_status = "not_executed" if is_shadow else "blocked"
+                    public_reason = _rollout_public_reason(rollout_decision.reason)
+                    result["matched"] = True
+                    result["executed_count"] = 0
+                    result["auto_execute"] = False
+                    result["confirm_required"] = False
+                    result["arbitration_result"] = "blocked_by_rollout"
+                    result["execution_suppressed_reason"] = public_reason
+                    result["final_outcome"] = final_outcome
+                    result["execution_status"] = final_outcome
+                    action_results = [
+                        {
+                            "domain": str(action.get("domain") or ""),
+                            "service": str(action.get("service") or ""),
+                            "entity_id": str(action.get("entity_id") or ""),
+                            "status": action_status,
+                            "reason": rollout_decision.reason,
+                        }
+                        for action in valid_actions
+                    ]
+                    if transaction_id:
+                        execution_event_enqueued = self._enqueue_internal_event(
+                            "decision_execution",
+                            {
+                                "transaction_id": transaction_id,
+                                "trigger": str(trigger or ""),
+                                "scene": scene,
+                                "confidence": confidence,
+                                "confidence_auto": result.get("confidence_auto"),
+                                "confidence_notify": result.get("confidence_notify"),
+                                "threshold": result.get("threshold"),
+                                "auto_execute": False,
+                                "confirm_required": False,
+                                "arbitration_result": "blocked_by_rollout",
+                                "reason": rollout_decision.reason,
+                                "planned_count": len(valid_actions),
+                                "executed_count": 0,
+                                "final_outcome": final_outcome,
+                                "actions": valid_actions,
+                                "action_results": action_results,
+                                "training_sample": None,
+                                "source": "ha_slow_decision",
+                                "origin": "smartagent",
+                                "actor": "smartagent:ha_slow_decision",
+                                "decision_id": decision_id,
+                                "world_snapshot_id": world_snapshot_id,
+                                "lineage": decision_lineage,
+                                "rollout": rollout_trace,
+                            },
+                        )
+                        if not execution_event_enqueued:
+                            self._sys_log(
+                                "WARN",
+                                f"[决策] rollout decision_execution 回写入队失败 transaction_id={transaction_id}",
+                            )
+                    self._sys_log(
+                        "INFO",
+                        f"[决策] 主动 AI 灰度门禁阻止执行 mode={rollout_decision.mode} "
+                        f"reason={rollout_decision.reason} transaction_id={transaction_id or '-'}",
+                    )
+                    _emit_slow_decision_bubble(
+                        result_payload=result,
+                        status_code=status,
+                        matched=True,
+                        reason=public_reason,
+                        scene_desc=scene,
+                        confidence_value=confidence,
+                        actions_payload=valid_actions,
+                        transaction_id_value=transaction_id,
+                        executed_count=0,
+                        final_outcome_value=final_outcome,
+                        fail_closed=not is_shadow,
+                        record_decision_log=not bool(transaction_id),
+                    )
+                    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+                    result.setdefault("reply", nested.get("reply") or public_reason)
+                    result.setdefault("status", "ok")
+                    return result
+
                 arbitration_result = str(result.get("arbitration_result") or "").strip()
-                arbitration_validation = validate_auto_execution_arbitration(result)
-                auto_execute = arbitration_validation.allowed
+                confidence_gate = evaluate_slow_brain_confidence_gate(
+                    confidence=result.get("confidence"),
+                    threshold=self.confidence_auto,
+                )
+                arbitration_validation = validate_auto_execution_arbitration(
+                    result if confidence_gate.log_code != "confidence_invalid" else {}
+                )
+                local_confidence_block = not confidence_gate.allowed
+                auto_execute = arbitration_validation.allowed and confidence_gate.allowed
                 confirm_required = (
-                    arbitration_validation.reason == "confidence_below_auto_threshold"
+                    not local_confidence_block
+                    and arbitration_validation.reason == "confidence_below_auto_threshold"
                     and result.get("confirm_required") is True
                     and arbitration_result == "pending_confirmation"
                 )
                 if not auto_execute:
                     decision_reason = str(result.get("reason") or "").strip()
-                    if arbitration_validation.reason in {
+                    if local_confidence_block:
+                        suppressed_reason = confidence_gate.log_code or "confidence_invalid"
+                    elif arbitration_validation.reason in {
                         "confidence_arbitration_missing",
                         "confidence_arbitration_invalid",
                     }:
@@ -2756,17 +3140,36 @@ class SmartAgentCoordinator(
                             result.setdefault("decision_reason", decision_reason)
                     else:
                         suppressed_reason = arbitration_validation.reason
-                    final_outcome = "pending_confirmation" if confirm_required else "observe_only"
+                    public_reason = (
+                        "置信度未达到自动执行阈值"
+                        if local_confidence_block
+                        else suppressed_reason
+                    )
+                    if local_confidence_block:
+                        final_outcome = "blocked"
+                    elif confirm_required:
+                        final_outcome = "pending_confirmation"
+                    else:
+                        final_outcome = "observe_only"
+                    result["matched"] = True
                     result["executed_count"] = 0
-                    result["execution_suppressed_reason"] = suppressed_reason
+                    result["execution_suppressed_reason"] = public_reason
                     result["final_outcome"] = final_outcome
                     result["execution_status"] = final_outcome
+                    if local_confidence_block:
+                        result["confidence_auto"] = self.confidence_auto
+                        result["threshold"] = self.confidence_auto
+                        result["auto_execute"] = False
+                        result["confirm_required"] = False
+                        result["arbitration_result"] = "blocked"
+                        result["reason"] = public_reason
+                        arbitration_result = "blocked"
                     action_results = [
                         {
                             "domain": str(action.get("domain") or ""),
                             "service": str(action.get("service") or ""),
                             "entity_id": str(action.get("entity_id") or ""),
-                            "status": "not_executed",
+                            "status": "blocked" if local_confidence_block else "not_executed",
                             "reason": suppressed_reason,
                         }
                         for action in valid_actions
@@ -2797,6 +3200,7 @@ class SmartAgentCoordinator(
                                 "actor": "smartagent:ha_slow_decision",
                                 "decision_id": decision_id,
                                 "world_snapshot_id": world_snapshot_id,
+                                "lineage": decision_lineage,
                             },
                         )
                         if not execution_event_enqueued:
@@ -2835,33 +3239,43 @@ class SmartAgentCoordinator(
                     _emit_slow_decision_bubble(
                         result_payload=result,
                         status_code=status,
-                        matched=False,
-                        reason=suppressed_reason,
+                        matched=True,
+                        reason=public_reason,
                         scene_desc=scene,
                         confidence_value=confidence,
                         actions_payload=valid_actions,
                         transaction_id_value=transaction_id,
                         executed_count=0,
                         final_outcome_value=final_outcome,
-                        fail_closed=arbitration_validation.reason in {
-                            "confidence_arbitration_missing",
-                            "confidence_arbitration_invalid",
-                        },
+                        fail_closed=(
+                            confidence_gate.log_code == "confidence_invalid"
+                            if local_confidence_block
+                            else arbitration_validation.reason in {
+                                "confidence_arbitration_missing",
+                                "confidence_arbitration_invalid",
+                            }
+                        ),
                         record_decision_log=not bool(transaction_id),
                     )
                     nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-                    result.setdefault(
-                        "reply",
-                        nested.get("reply")
-                        or ("等待用户确认" if confirm_required else "置信度不足，仅记录未执行"),
-                    )
+                    if local_confidence_block:
+                        result["reply"] = public_reason
+                    else:
+                        result.setdefault(
+                            "reply",
+                            nested.get("reply")
+                            or ("等待用户确认" if confirm_required else "置信度不足，仅记录未执行"),
+                        )
                     result.setdefault("status", "ok")
                     return result
                 if learning_observe_only:
+                    result["matched"] = True
                     result["executed_count"] = 0
                     result["execution_suppressed_reason"] = "learning_mode"
                     result.setdefault("reason", "learning_mode_observe_only")
                     final_outcome = "observe_only"
+                    result["final_outcome"] = final_outcome
+                    result["execution_status"] = final_outcome
                     action_results = []
                     for action in valid_actions:
                         if not isinstance(action, dict):
@@ -2901,6 +3315,7 @@ class SmartAgentCoordinator(
                                 "actor": "smartagent:ha_slow_decision",
                                 "decision_id": decision_id,
                                 "world_snapshot_id": world_snapshot_id,
+                                "lineage": decision_lineage,
                             },
                         )
                         if not execution_event_enqueued:
@@ -2946,6 +3361,15 @@ class SmartAgentCoordinator(
                     parent_transaction_id=transaction_id,
                     world_snapshot_id=world_snapshot_id,
                     correlation_id=execution_correlation_id,
+                    active_space_id=str(
+                        bundle.get("trigger_space_id")
+                        or result.get("trigger_space_id")
+                        or bundle.get("trigger_room")
+                        or result.get("trigger_room")
+                        or ""
+                    ),
+                    decision_time=datetime.now(timezone.utc).isoformat(),
+                    require_world_snapshot_guard=True,
                 )
                 executed = int(execution_result)
                 execution_transaction_id = str(
@@ -3001,8 +3425,12 @@ class SmartAgentCoordinator(
                     confidence=confidence,
                     final_outcome=final_outcome,
                     decision_id=decision_id,
-                    transaction_id=execution_transaction_id,
+                    transaction_id=transaction_id,
+                    execution_transaction_id=execution_transaction_id,
                     world_snapshot_id=world_snapshot_id,
+                    planned_count=len(valid_actions),
+                    executed_count=executed,
+                    action_results=action_results,
                 )
                 if transaction_id:
                     execution_event_enqueued = self._enqueue_internal_event(
@@ -3032,6 +3460,7 @@ class SmartAgentCoordinator(
                             "execution_transaction_id": execution_transaction_id,
                             "world_snapshot_id": world_snapshot_id,
                             "correlation_id": execution_correlation_id,
+                            "lineage": decision_lineage,
                         },
                     )
                     if not execution_event_enqueued:
@@ -3039,21 +3468,6 @@ class SmartAgentCoordinator(
                             "WARN",
                             f"[决策] decision_execution 回写入队失败 transaction_id={transaction_id}",
                         )
-                if executed == len(valid_actions):
-                    self._enqueue_decision_cache_write(
-                        bundle=bundle,
-                        result=result,
-                        actions=valid_actions,
-                        confidence=confidence,
-                        scene=scene,
-                        final_outcome=final_outcome,
-                        planned_count=len(valid_actions),
-                        executed_count=executed,
-                        action_results=action_results,
-                        decision_id=decision_id,
-                        transaction_id=execution_transaction_id,
-                        world_snapshot_id=world_snapshot_id,
-                    )
                 self._sys_log("INFO", f"[决策] add-on 返回 {len(valid_actions)} 个动作，已执行 {executed} 个")
             else:
                 self._sys_log("INFO", f"[决策] add-on 未返回可执行动作: {result.get('reason') or 'no_actions'}")
@@ -3530,25 +3944,40 @@ class SmartAgentCoordinator(
         self._sys_log("WARN", f"[配对] 授权失败：未找到匹配的配对码 {code}")
 
     async def async_svc_report_correction(self, call) -> None:
-        """HA 服务：上报并记录 AI 的错误决策。"""
-        entity_id = call.data.get("entity_id")
-        reason = call.data.get("reason", "用户手动纠正")
-        
+        """HA 服务：上报用户对最近一次 AI 动作的接受或纠正。"""
+        entity_id = str(call.data.get("entity_id") or "").strip()
+        outcome = str(call.data.get("outcome", "rejected")).strip().lower()
+        reason = str(call.data.get("reason", "用户手动纠正") or "").strip()
         if not entity_id:
             return
+        if outcome not in {"accepted", "rejected"}:
+            self._sys_log("WARN", f"[修正] 不支持的反馈结果: {outcome}")
+            return
 
-        # 检查是否在 AI 近期操作列表中
         last_ai = self._last_ai_actions.get(entity_id)
         if not last_ai:
             self._sys_log("INFO", f"[修正] {entity_id} 不在 AI 近期操作窗口内，视为普通手动操作")
             return
 
+        transaction_id = str(call.data.get("transaction_id") or "").strip()
+        if outcome == "accepted" and not transaction_id:
+            self._sys_log("WARN", f"[反馈] 接受 {entity_id} 必须引用 transaction_id")
+            return
+        linked_transaction_id = str(last_ai.get("transaction_id") or "unknown").strip() or "unknown"
+        if transaction_id and transaction_id != linked_transaction_id:
+            self._sys_log("WARN", f"[反馈] {entity_id} 的 transaction_id 与最近 AI 动作不一致")
+            return
+        if outcome == "accepted" and last_ai.get("post_state_verified") is not True:
+            self._sys_log("WARN", f"[反馈] {entity_id} 尚未完成执行后状态验证，不能接受为学习证据")
+            return
+        transaction_id = transaction_id or linked_transaction_id
+
         ai_target = last_ai.get("state", "")
-        # 推断用户期望状态：前端会先执行反向操作再调用此服务，若 HA 状态已更新则直接读取；
-        # 否则根据 AI 目标状态取反，作为兜底，避免 ai_state == user_state 的错误记录。
         now_state = self.hass.states.get(entity_id)
         now_value = now_state.state if now_state else ""
-        if now_value and now_value != ai_target:
+        if outcome == "accepted":
+            user_state = str(ai_target or now_value or "unknown")
+        elif now_value and now_value != ai_target:
             user_state = now_value
         elif ai_target in ("on", "open", "heat", "cool"):
             user_state = "off"
@@ -3557,9 +3986,12 @@ class SmartAgentCoordinator(
         else:
             user_state = now_value or "unknown"
         
-        # 记录修正
+        context = getattr(call, "context", None)
+        user_id = str(getattr(context, "user_id", "") or "").strip()
+        actor = f"ha_user:{user_id}" if user_id else "ha_user:service"
         correction_payload = {
-            "action": "record",
+            "action": "report",
+            "outcome": outcome,
             "entity_id": entity_id,
             "ai_service": last_ai.get("service", ""),
             "ai_state": last_ai.get("state", ""),
@@ -3568,10 +4000,13 @@ class SmartAgentCoordinator(
             "scene": last_ai.get("scene", ""),
             "trigger": last_ai.get("trigger", ""),
             "reason": reason,
+            "origin": "explicit_user_approval" if outcome == "accepted" else "user_correction",
+            "actor": actor,
+            "decision_id": str(last_ai.get("decision_id") or transaction_id or "unknown"),
+            "transaction_id": transaction_id,
+            "world_snapshot_id": str(last_ai.get("world_snapshot_id") or "unknown"),
         }
         name = self.get_device_name(entity_id)
-        # fail-closed：入队是该纠错的唯一持久路径。写失败时不得输出"已记录"成功语义，
-        # 也不得 pop 源记录（否则无法重试），让用户/后续重试有机会重新提交。
         if not self._enqueue_internal_event("correction", correction_payload):
             self._sys_log("WARN", f"[Correction] add-on correction enqueue failed: {entity_id}")
             self.last_correction_text = f"记录失败: {name}（add-on 不可达，请稍后重试）"
@@ -3588,21 +4023,21 @@ class SmartAgentCoordinator(
             )
             return
 
-        # 更新 UI 状态让前端感知
-        self.last_correction_text = f"已记录: {name} (AI建议{last_ai.get('state')} -> 用户改为{user_state})"
-        self._sys_log("WARN", f"[修正学习] 🎯 用户显式纠正了 AI 对 {name} 的操作")
+        if outcome == "accepted":
+            self.last_correction_text = f"已接受: {name}（事务 {transaction_id}）"
+            self._sys_log("INFO", f"[反馈学习] 用户接受了 AI 对 {name} 的操作")
+        else:
+            self.last_correction_text = f"已记录: {name} (AI建议{last_ai.get('state')} -> 用户改为{user_state})"
+            self._sys_log("WARN", f"[修正学习] 用户显式纠正了 AI 对 {name} 的操作")
 
-        # 清除记录，防止重复触发
         self._last_ai_actions.pop(entity_id, None)
-        
-        # 强制更新传感器
         self.async_set_updated_data({})
-        
-        # 5秒后清除修正提示
+
         async def _clear():
             await asyncio.sleep(5)
             self.last_correction_text = ""
             self.async_set_updated_data({})
+
         self._spawn_background_task(
             _clear(),
             "correction_clear_success_prompt",

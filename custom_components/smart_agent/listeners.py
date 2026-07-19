@@ -19,6 +19,13 @@ from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
 from .ha_adapter import async_call_service
+from .active_ai_rollout import (
+    ActiveAiRolloutConfig,
+    DEFAULT_ACTIVE_AI_MODE,
+    enrich_active_ai_action_spaces,
+    evaluate_active_ai_execution_gate,
+    normalize_active_ai_mode,
+)
 from .confidence_arbitration_contract import validate_auto_execution_arbitration
 from .sensor_event_filter import EnvironmentTelemetryFilter, environment_sensor_kind
 from .const import (
@@ -31,6 +38,7 @@ from .const import (
     FRIGATE_COUNT_OFF_HOLD, FRIGATE_COUNT_COOLDOWN,
     SENSOR_DEADBAND_PCT,
     SOURCE_AUTOMATION, SOURCE_DASHBOARD, SOURCE_PHYSICAL, SOURCE_VOICE,
+    DEVICE_VACANT_ACTIONS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,6 +65,7 @@ class ListenersMixin:
 
     # AI 操作后 N 秒内的同向状态变化视为 AI 自身引起，不再触发
     _AI_ACTION_SKIP_WINDOW = AI_ACTION_SKIP_WINDOW
+    _ARRIVAL_CAUSAL_WINDOW_SECONDS = 30.0
 
     # 触发合并窗口
     _URGENT_MERGE_WINDOW = URGENT_MERGE_WINDOW    # binary_sensor 类触发：1 秒
@@ -1504,11 +1513,15 @@ class ListenersMixin:
         world_snapshot_id: str = "",
         decision_trace: dict[str, Any] | None = None,
         trigger: str = "",
+        active_ai_rollout: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         actions = result.get("actions", [])
         scene = result.get("scene", source_label)
         confidence = result.get("confidence", 90)
-        room = result.get("trigger_room") or self.device_info.get(entity_id, {}).get("room", "")
+        device_info = getattr(self, "device_info", {})
+        if not isinstance(device_info, dict):
+            device_info = {}
+        room = result.get("trigger_room") or device_info.get(entity_id, {}).get("room", "")
         try:
             defer_seconds = int(result.get("defer_seconds", 0) or 0)
         except (TypeError, ValueError):
@@ -1518,9 +1531,57 @@ class ListenersMixin:
             await asyncio.sleep(defer_seconds)
 
         valid_actions = actions if isinstance(actions, list) else []
+        rollout_actions = enrich_active_ai_action_spaces(valid_actions, device_info)
+        trigger_info = device_info.get(entity_id, {})
+        if not isinstance(trigger_info, dict):
+            trigger_info = {}
+        trigger_space_id = str(
+            result.get("trigger_space_id")
+            or trigger_info.get("space_id")
+            or trigger_info.get("room_id")
+            or trigger_info.get("area_id")
+            or room
+            or ""
+        ).strip()
+        rollout_payload = (
+            active_ai_rollout if isinstance(active_ai_rollout, dict) else {}
+        )
+        execution_flags = (
+            rollout_payload.get("execution_flags")
+            if isinstance(rollout_payload.get("execution_flags"), dict)
+            else {}
+        )
+        is_enabled = getattr(self, "_is_enabled", None)
+        rollout_decision = evaluate_active_ai_execution_gate(
+            ai_enabled=bool(is_enabled()) if callable(is_enabled) else False,
+            config=ActiveAiRolloutConfig.from_mapping(rollout_payload),
+            trigger_space_id=trigger_space_id,
+            actions=rollout_actions,
+            execution_flags=execution_flags,
+        )
         trigger_summary = f"{source_label}[{scene}]"
         if trigger:
             trigger_summary = f"{trigger_summary} {trigger}"
+        if not rollout_decision.allow_execution:
+            self._sys_log(
+                "INFO",
+                f"[Add-on FastPath] rollout gate blocked execution "
+                f"mode={rollout_decision.mode} reason={rollout_decision.reason} "
+                f"transaction_id={transaction_id or '-'}",
+            )
+            return self._enqueue_fast_path_execution_audit(
+                transaction_id=transaction_id,
+                correlation_id=correlation_id,
+                world_snapshot_id=world_snapshot_id,
+                decision_trace=decision_trace,
+                trigger=trigger or f"{entity_id}: state_changed",
+                scene=str(scene),
+                confidence=confidence,
+                actions=valid_actions,
+                execution_result=0,
+                execution_suppressed_reason=rollout_decision.reason,
+                rollout=rollout_decision.as_trace(),
+            )
         execution_result = await self._execute_actions(
             valid_actions,
             trigger_summary=trigger_summary,
@@ -1532,6 +1593,9 @@ class ListenersMixin:
             parent_transaction_id=transaction_id,
             world_snapshot_id=world_snapshot_id,
             correlation_id=correlation_id,
+            active_space_id=trigger_space_id,
+            decision_time=datetime.now(timezone.utc).isoformat(),
+            require_world_snapshot_guard=True,
         )
         return self._enqueue_fast_path_execution_audit(
             transaction_id=transaction_id,
@@ -1557,6 +1621,8 @@ class ListenersMixin:
         confidence: Any,
         actions: list[Any],
         execution_result: Any,
+        execution_suppressed_reason: str = "",
+        rollout: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         transaction_id = str(transaction_id or "").strip()
         if not transaction_id:
@@ -1597,8 +1663,17 @@ class ListenersMixin:
                 "domain": str(action.get("domain") or ""),
                 "service": str(action.get("service") or ""),
                 "entity_id": str(action.get("entity_id") or ""),
-                "status": "executed" if index < executed else "not_executed",
-                "reason": "ha_fast_path_missing_structured_result",
+                "status": (
+                    "executed"
+                    if index < executed
+                    else "blocked"
+                    if execution_suppressed_reason
+                    else "not_executed"
+                ),
+                "reason": (
+                    execution_suppressed_reason
+                    or "ha_fast_path_missing_structured_result"
+                ),
             }
             if isinstance(params, dict) and params:
                 fallback_result["params"] = dict(params)
@@ -1606,7 +1681,11 @@ class ListenersMixin:
                 fallback_result["action_reason"] = action_reason
             action_results.append(fallback_result)
         final_outcome = (
-            "succeeded"
+            "observe_only"
+            if execution_suppressed_reason == "active_ai_shadow"
+            else "blocked"
+            if execution_suppressed_reason
+            else "succeeded"
             if valid_actions and executed >= len(valid_actions)
             else "partial"
             if executed > 0
@@ -1630,6 +1709,10 @@ class ListenersMixin:
             "action_results": action_results,
             "pre_states": pre_states,
         }
+        if execution_suppressed_reason:
+            audit_context["execution_suppressed_reason"] = execution_suppressed_reason
+        if isinstance(rollout, dict):
+            audit_context["rollout"] = dict(rollout)
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue):
             return audit_context
@@ -1897,13 +1980,62 @@ class ListenersMixin:
                 if callable(recorder):
                     sample_ended_at = time.time()
                     observed_light_states: dict[str, str | None] = {}
+                    state_change_evidence: dict[str, dict[str, Any]] = {}
                     smartagent_actions: list[dict[str, Any]] = []
-                    last_ai_actions = getattr(self, "_last_ai_actions", {})
                     for light_entity_id in pre_light_states:
                         light_state = states.get(light_entity_id) if states is not None and hasattr(states, "get") else None
                         observed_light_states[light_entity_id] = (
                             getattr(light_state, "state", None) if light_state is not None else None
                         )
+                        state_context = getattr(light_state, "context", None)
+                        last_changed = getattr(light_state, "last_changed", None)
+                        try:
+                            changed_at = float(last_changed.timestamp())
+                        except (AttributeError, TypeError, ValueError, OSError):
+                            changed_at = 0.0
+                        if sample_started_at <= changed_at <= sample_ended_at:
+                            user_id = str(getattr(state_context, "user_id", None) or "").strip()
+                            parent_id = str(getattr(state_context, "parent_id", None) or "").strip()
+                            context_id = str(getattr(state_context, "id", None) or "").strip()
+                            if user_id:
+                                origin = "user_action"
+                                actor = f"ha_user:{user_id}"
+                            elif parent_id:
+                                origin = "automation"
+                                actor = "homeassistant:automation"
+                            else:
+                                origin = "unknown"
+                                actor = "unknown"
+                            state_change_evidence[light_entity_id] = {
+                                "origin": origin,
+                                "actor": actor,
+                                "context_id": context_id or "not_applicable",
+                                "time": changed_at,
+                            }
+
+                    causal_since = max(
+                        sample_started_at,
+                        sample_ended_at - self._ARRIVAL_CAUSAL_WINDOW_SECONDS,
+                    )
+                    recent_query = getattr(self, "_recent_ai_action_entities", None)
+                    if callable(recent_query):
+                        try:
+                            recent_by_entity = recent_query(
+                                since=causal_since,
+                                until=sample_ended_at,
+                                statuses={"executed"},
+                            )
+                        except Exception as exc:
+                            _LOGGER.warning("[ArrivalBaseline] recent AI action query failed: %s", exc)
+                            recent_by_entity = {}
+                        if isinstance(recent_by_entity, dict):
+                            for rows in recent_by_entity.values():
+                                if isinstance(rows, list):
+                                    smartagent_actions.extend(
+                                        dict(item) for item in rows if isinstance(item, dict)
+                                    )
+
+                    last_ai_actions = getattr(self, "_last_ai_actions", {})
                     for action_entity_id, action in (
                         last_ai_actions.items() if isinstance(last_ai_actions, dict) else ()
                     ):
@@ -1913,14 +2045,33 @@ class ListenersMixin:
                             action_time = float(action.get("time") or 0)
                         except (TypeError, ValueError):
                             continue
-                        if sample_started_at <= action_time <= sample_ended_at:
+                        if causal_since <= action_time <= sample_ended_at:
                             smartagent_actions.append({"entity_id": str(action_entity_id), **dict(action)})
+                    deduplicated_actions: list[dict[str, Any]] = []
+                    seen_actions: set[tuple[str, str, int, float, str]] = set()
+                    for action in smartagent_actions:
+                        try:
+                            action_time = float(action.get("time") or 0)
+                        except (TypeError, ValueError):
+                            action_time = 0.0
+                        fingerprint = (
+                            str(action.get("entity_id") or ""),
+                            str(action.get("transaction_id") or ""),
+                            int(action.get("action_seq") or 0),
+                            action_time,
+                            str(action.get("status") or ""),
+                        )
+                        if fingerprint in seen_actions:
+                            continue
+                        seen_actions.add(fingerprint)
+                        deduplicated_actions.append(action)
                     recorder(
                         room,
                         entity_id,
                         observed_light_states,
                         pre_light_states=pre_light_states,
-                        smartagent_actions=smartagent_actions,
+                        smartagent_actions=deduplicated_actions,
+                        state_change_evidence=state_change_evidence,
                         sample_started_at=sample_started_at,
                         sample_ended_at=sample_ended_at,
                     )
@@ -2223,6 +2374,28 @@ class ListenersMixin:
         old_state: str,
     ) -> None:
         should_fail_closed = True
+        if normalize_active_ai_mode(
+            getattr(self, "_active_ai_mode", DEFAULT_ACTIVE_AI_MODE)
+        ) == "off":
+            self._sys_log(
+                "INFO",
+                f"[Add-on FastPath] active_ai_off | entity={entity_id}",
+            )
+            self._emit_addon_fast_path_event(
+                {
+                    "source": "addon_fast_path",
+                    "entity_id": entity_id,
+                    "old_state": old_state,
+                    "new_state": new_state,
+                    "status": 200,
+                    "matched": False,
+                    "path_taken": "active_ai_rollout_gate",
+                    "reason": "active_ai_off",
+                    "executed": False,
+                    "fail_closed": True,
+                }
+            )
+            return
         if str(new_state or "").strip().lower() in {
             "on",
             "open",
@@ -2291,7 +2464,10 @@ class ListenersMixin:
                     result = response.get("result")
                     matched = response.get("matched") is True
                     arbitration_validation = validate_auto_execution_arbitration(response)
-                    arbitration_fail_closed = matched and not arbitration_validation.allowed
+                    arbitration_fail_closed = matched and arbitration_validation.reason in {
+                        "confidence_arbitration_missing",
+                        "confidence_arbitration_invalid",
+                    }
                     details = response.get("details") if isinstance(response.get("details"), dict) else {}
                     presence_details = details.get("presence") if isinstance(details.get("presence"), dict) else {}
                     self._schedule_presence_temporal_recheck(
@@ -2309,8 +2485,9 @@ class ListenersMixin:
                     execution_suppressed_reason = (
                         "learning_mode" if matched and addon_learning_mode is True else ""
                     )
+                    if matched and not arbitration_validation.allowed and not execution_suppressed_reason:
+                        execution_suppressed_reason = arbitration_validation.reason
                     if arbitration_fail_closed:
-                        matched = False
                         confirm_required = False
                         reason = arbitration_validation.reason
                         execution_suppressed_reason = arbitration_validation.reason
@@ -2364,7 +2541,47 @@ class ListenersMixin:
                         elif result.get("action"):
                             action_count = 1
                         transaction_id = transaction_id or str(result.get("transaction_id") or result.get("txn_id") or "")
-                    audit_pending = bool(matched and self._fast_path_result_allows_slow_audit(actions))
+                    rollout_payload = (
+                        response.get("active_ai_rollout")
+                        if isinstance(response.get("active_ai_rollout"), dict)
+                        else {}
+                    )
+                    rollout_flags = (
+                        rollout_payload.get("execution_flags")
+                        if isinstance(rollout_payload.get("execution_flags"), dict)
+                        else {}
+                    )
+                    device_info = getattr(self, "device_info", {})
+                    if not isinstance(device_info, dict):
+                        device_info = {}
+                    is_enabled = getattr(self, "_is_enabled", None)
+                    rollout_actions = enrich_active_ai_action_spaces(actions, device_info)
+                    trigger_info = device_info.get(entity_id, {})
+                    if not isinstance(trigger_info, dict):
+                        trigger_info = {}
+                    rollout_decision = evaluate_active_ai_execution_gate(
+                        ai_enabled=bool(is_enabled()) if callable(is_enabled) else False,
+                        config=ActiveAiRolloutConfig.from_mapping(rollout_payload),
+                        trigger_space_id=str(
+                            (result.get("trigger_space_id") if isinstance(result, dict) else "")
+                            or trigger_info.get("space_id")
+                            or trigger_info.get("room_id")
+                            or trigger_info.get("area_id")
+                            or (result.get("trigger_room") if isinstance(result, dict) else "")
+                            or device_info.get(entity_id, {}).get("room", "")
+                        ),
+                        actions=rollout_actions,
+                        execution_flags=rollout_flags,
+                    )
+                    if matched and not rollout_decision.allow_execution and not execution_suppressed_reason:
+                        execution_suppressed_reason = rollout_decision.reason
+                    rollout_trace = rollout_decision.as_trace()
+                    audit_pending = bool(
+                        matched
+                        and arbitration_validation.allowed
+                        and not execution_suppressed_reason
+                        and self._fast_path_result_allows_slow_audit(actions)
+                    )
                     self._sys_log(
                         "INFO",
                         "[Add-on FastPath] result "
@@ -2404,16 +2621,18 @@ class ListenersMixin:
                             "decision_trace": decision_trace,
                             "correlation_id": correlation_id,
                             "world_snapshot_id": world_snapshot_id,
-                            "executed": matched and not execution_suppressed_reason,
+                            "executed": False,
+                            "execution_status": "pending" if audit_pending else "not_started",
                             "provisional_execution": audit_pending,
                             "audit_pending": audit_pending,
                             "rollback_allowed": audit_pending,
                             "execution_suppressed_reason": execution_suppressed_reason,
+                            "rollout": rollout_trace,
                             "fail_closed": arbitration_fail_closed or not (200 <= status < 300),
                             "snapshot": snapshot_diag,
                         }
                     )
-                    if 200 <= status < 300 and not matched and confirm_required and isinstance(result, dict):
+                    if 200 <= status < 300 and matched and confirm_required and isinstance(result, dict):
                         confirm_payload = {
                             "source": "addon_fast_path",
                             "entity_id": entity_id,
@@ -2448,8 +2667,20 @@ class ListenersMixin:
                         if execution_suppressed_reason:
                             self._sys_log(
                                 "INFO",
-                                f"[Add-on FastPath] execution suppressed | entity={entity_id} policy=learning_mode reason={execution_suppressed_reason}",
+                                f"[Add-on FastPath] execution suppressed | entity={entity_id} reason={execution_suppressed_reason}",
                             )
+                            if execution_suppressed_reason.startswith("active_ai_"):
+                                await self._execute_fast_path_decision_result(
+                                    result,
+                                    entity_id=entity_id,
+                                    source_label="AddonFastPath",
+                                    transaction_id=transaction_id,
+                                    correlation_id=correlation_id,
+                                    world_snapshot_id=world_snapshot_id,
+                                    decision_trace=decision_trace,
+                                    trigger=f"{entity_id}: {old_state} -> {new_state}",
+                                    active_ai_rollout=rollout_payload,
+                                )
                             return
                         self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
                         previous_batch_trigger_controllable = getattr(
@@ -2474,6 +2705,7 @@ class ListenersMixin:
                                 world_snapshot_id=world_snapshot_id,
                                 decision_trace=decision_trace,
                                 trigger=f"{entity_id}: {old_state} -> {new_state}",
+                                active_ai_rollout=rollout_payload,
                             )
                         finally:
                             self._batch_trigger_controllable = previous_batch_trigger_controllable
@@ -2828,6 +3060,20 @@ class ListenersMixin:
 
             last_ai_actions = getattr(self, "_last_ai_actions", {})
             last_ai = last_ai_actions.get(entity_id) if isinstance(last_ai_actions, dict) else None
+            if isinstance(last_ai, dict):
+                expected_ai_state = str(last_ai.get("state") or "").strip().lower()
+                try:
+                    stability_deadline = float(last_ai.get("learning_stability_deadline") or 0)
+                except (TypeError, ValueError):
+                    stability_deadline = 0
+                if (
+                    expected_ai_state
+                    and new_s != expected_ai_state
+                    and time.time() <= stability_deadline
+                ):
+                    last_ai["reverse_user_action"] = True
+                    last_ai["reverse_user_action_state"] = new_s
+                    last_ai["reverse_user_action_source"] = source_type
             if isinstance(last_ai, dict) and str(last_ai.get("state") or "") == new_s:
                 try:
                     ai_action_age = time.time() - float(last_ai.get("time") or 0)
@@ -3231,6 +3477,9 @@ class ListenersMixin:
             or row.get("domain")
             or domain
         )
+        vacant_action = str(row.get("vacant_action") or "preserve").strip().lower()
+        if vacant_action not in DEVICE_VACANT_ACTIONS:
+            vacant_action = "preserve"
         info = {
             "name": str(name or entity_id),
             "room": str(room or ""),
@@ -3238,6 +3487,8 @@ class ListenersMixin:
             "type": str(dev_type or domain),
             "ops": ops,
             "control_mode": mode,
+            "managed": True,
+            "vacant_action": vacant_action,
             "sensor_type": str(row.get("sensor_type") or ""),
             "device_class": str(row.get("device_class") or ""),
             "unit_of_measurement": str(row.get("unit_of_measurement") or row.get("unit") or ""),

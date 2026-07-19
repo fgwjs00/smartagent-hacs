@@ -7,9 +7,28 @@ plain command envelope.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import sys
 import time
+from pathlib import Path
 from typing import Any
 from homeassistant.core import HomeAssistant
+
+if __package__:
+    from .service_contracts import ServiceContractResult, validate_service_call
+else:
+    _contract_module_name = "_smart_agent_service_contracts_runtime"
+    _contract_module = sys.modules.get(_contract_module_name)
+    if _contract_module is None:
+        _contract_path = Path(__file__).with_name("service_contracts.py")
+        _contract_spec = importlib.util.spec_from_file_location(_contract_module_name, _contract_path)
+        if _contract_spec is None or _contract_spec.loader is None:
+            raise RuntimeError(f"unable to load HA service contract module: {_contract_path}")
+        _contract_module = importlib.util.module_from_spec(_contract_spec)
+        sys.modules[_contract_module_name] = _contract_module
+        _contract_spec.loader.exec_module(_contract_module)
+    ServiceContractResult = _contract_module.ServiceContractResult
+    validate_service_call = _contract_module.validate_service_call
 
 
 _POST_STATE_VERIFY_TIMEOUT_SECONDS = 2.0
@@ -562,25 +581,10 @@ async def async_run_in_executor(hass: HomeAssistant, func: Any, *args: Any) -> A
     return await hass.async_add_executor_job(func, *args)
 
 
-_ALLOWED_COMMAND_SERVICES: dict[str, set[str]] = {
-    "light": {"turn_on", "turn_off", "toggle"},
-    "switch": {"turn_on", "turn_off", "toggle"},
-    "input_boolean": {"turn_on", "turn_off", "toggle"},
-    "scene": {"turn_on"},
-    "cover": {"open_cover", "close_cover", "stop_cover", "set_cover_position"},
-    "fan": {"turn_on", "turn_off", "toggle", "set_percentage", "set_preset_mode", "oscillate"},
-    "climate": {"turn_on", "turn_off", "set_temperature", "set_hvac_mode", "set_preset_mode"},
-    "media_player": {
-        "turn_on",
-        "turn_off",
-        "toggle",
-        "media_play",
-        "media_pause",
-        "media_stop",
-        "volume_mute",
-        "volume_set",
-    },
-}
+class _ServiceContractError(ValueError):
+    def __init__(self, result: ServiceContractResult) -> None:
+        super().__init__(result.reason_code)
+        self.result = result
 
 
 def _json_error(
@@ -671,14 +675,14 @@ def _normalize_command(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"domain mismatch: {domain} != {inferred_domain}")
     if not service:
         raise ValueError("service required")
-    allowed_services = _ALLOWED_COMMAND_SERVICES.get(domain)
-    if allowed_services is None or service not in allowed_services:
-        raise ValueError(f"unsupported service: {domain}.{service}")
+    contract_result = validate_service_call(domain, service, data)
+    if not contract_result.allowed:
+        raise _ServiceContractError(contract_result)
     return {
         "entity_id": entity_id,
         "domain": domain,
         "service": service,
-        "data": data if isinstance(data, dict) else {},
+        "data": contract_result.normalized_data or {},
     }
 
 
@@ -728,6 +732,27 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
         started = time.monotonic()
         try:
             command = _normalize_command(raw)
+        except _ServiceContractError as exc:
+            contract_result = exc.result
+            results.append({
+                "entity_id": str(raw.get("entity_id", "") if isinstance(raw, dict) else ""),
+                "domain": str(raw.get("domain", "") if isinstance(raw, dict) else ""),
+                "service": str(raw.get("service", "") if isinstance(raw, dict) else ""),
+                "ok": False,
+                "error": contract_result.reason_code,
+                "error_type": "service_contract_rejected",
+                "retryable": False,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+                "data": {},
+                "status": "failed",
+                "details": {
+                    "service_key": contract_result.service_key,
+                    "invalid_fields": list(contract_result.invalid_fields),
+                },
+            })
+            if stop_on_first_error:
+                stopped_after_error = True
+            continue
         except ValueError as exc:
             results.append({
                 "entity_id": str(raw.get("entity_id", "") if isinstance(raw, dict) else ""),

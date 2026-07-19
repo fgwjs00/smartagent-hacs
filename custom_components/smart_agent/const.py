@@ -2,6 +2,10 @@
 
 DOMAIN = "smart_agent"
 
+DEVICE_VACANT_ACTIONS = frozenset(
+    {"preserve", "turn_off", "media_pause", "close_cover", "set_eco"}
+)
+
 # Config entry keys
 CONF_ENGINE = "engine"
 CONF_OLLAMA_URL = "ollama_url"
@@ -26,6 +30,8 @@ CONF_SHOWROOM_SCENE = "showroom_scene"
 CONF_SHOWROOM_CUSTOM_PROMPT = "showroom_custom_prompt"
 CONF_SHOWROOM_SCENE_OVERRIDES = "showroom_scene_overrides"
 CONF_AI_ENABLED = "ai_enabled"
+CONF_ACTIVE_AI_MODE = "active_ai_mode"
+DEFAULT_ACTIVE_AI_MODE = "shadow"
 CONF_SENSORS_MUTED = "sensors_muted"
 CONF_LEARNING_MODE = "learning_mode"
 CONF_HABIT_PROACTIVE = "habit_proactive"

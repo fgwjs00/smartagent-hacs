@@ -31,6 +31,7 @@ SERVICE_REGISTRATION_NAMES: tuple[str, ...] = (
     "toggle_rule_lock",
     "manual_inference",
     "clear_overrides",
+    "report_correction",
     "delete_behavior_pattern",
     "set_mode",
     "set_showroom_scene",
@@ -52,7 +53,6 @@ SERVICE_REGISTRATION_NAMES: tuple[str, ...] = (
 )
 SERVICE_UNLOAD_NAMES: tuple[str, ...] = (
     *SERVICE_REGISTRATION_NAMES,
-    "report_correction",
     "dismiss_ai_action",
 )
 

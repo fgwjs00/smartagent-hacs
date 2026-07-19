@@ -21,6 +21,7 @@ from .const import (
     DEVICE_CAP_KEY_RISK_LEVEL,
     DEVICE_CAP_KEY_SHARED_FIXTURE,
     DEVICE_CAP_KEY_SLEEP_SAFE,
+    DEVICE_VACANT_ACTIONS,
 )
 
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
@@ -275,6 +276,10 @@ class DevicesMixin:
             or "unknown"
         ).strip().lower()
 
+        vacant_action = str(info.get("vacant_action") or "preserve").strip().lower()
+        if vacant_action not in DEVICE_VACANT_ACTIONS:
+            vacant_action = "preserve"
+
         capability = {
             "entity_id": entity_id,
             "domain": domain,
@@ -282,6 +287,8 @@ class DevicesMixin:
             "room": room,
             "space_id": space_id,
             "control_mode": info.get("control_mode", "shared"),
+            "managed": _explicit_bool(info.get("managed")) is not False,
+            "vacant_action": vacant_action,
             "sensor_type": info.get("sensor_type", ""),
             "role": info.get("role", ""),
             "roles": roles,

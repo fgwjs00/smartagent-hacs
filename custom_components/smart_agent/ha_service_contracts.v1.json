@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "services": {
+    "light.turn_on": {
+      "required": [],
+      "properties": {
+        "brightness_pct": {"type": "integer", "minimum": 0, "maximum": 100},
+        "brightness": {"type": "integer", "minimum": 0, "maximum": 255},
+        "transition": {"type": "number", "minimum": 0, "maximum": 300},
+        "color_temp_kelvin": {"type": "integer", "minimum": 2000, "maximum": 6500},
+        "rgb_color": {"type": "integer_array", "length": 3, "minimum": 0, "maximum": 255},
+        "hs_color": {"type": "number_array", "length": 2},
+        "effect": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "light.turn_off": {
+      "required": [],
+      "properties": {"transition": {"type": "number", "minimum": 0, "maximum": 300}},
+      "additionalProperties": false
+    },
+    "light.toggle": {
+      "required": [],
+      "properties": {"transition": {"type": "number", "minimum": 0, "maximum": 300}},
+      "additionalProperties": false
+    },
+    "switch.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
+    "switch.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "switch.toggle": {"required": [], "properties": {}, "additionalProperties": false},
+    "input_boolean.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
+    "input_boolean.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "input_boolean.toggle": {"required": [], "properties": {}, "additionalProperties": false},
+    "scene.turn_on": {
+      "required": [],
+      "properties": {"transition": {"type": "number", "minimum": 0, "maximum": 300}},
+      "additionalProperties": false
+    },
+    "cover.open_cover": {"required": [], "properties": {}, "additionalProperties": false},
+    "cover.close_cover": {"required": [], "properties": {}, "additionalProperties": false},
+    "cover.stop_cover": {"required": [], "properties": {}, "additionalProperties": false},
+    "cover.set_cover_position": {
+      "required": ["position"],
+      "properties": {
+        "position": {"type": "integer", "minimum": 0, "maximum": 100},
+        "tilt_position": {"type": "integer", "minimum": 0, "maximum": 100}
+      },
+      "additionalProperties": false
+    },
+    "fan.turn_on": {
+      "required": [],
+      "properties": {
+        "percentage": {"type": "integer", "minimum": 0, "maximum": 100},
+        "preset_mode": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "fan.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "fan.toggle": {"required": [], "properties": {}, "additionalProperties": false},
+    "fan.set_percentage": {
+      "required": ["percentage"],
+      "properties": {"percentage": {"type": "integer", "minimum": 0, "maximum": 100}},
+      "additionalProperties": false
+    },
+    "fan.set_preset_mode": {
+      "required": ["preset_mode"],
+      "properties": {"preset_mode": {"type": "string", "minLength": 1}},
+      "additionalProperties": false
+    },
+    "fan.oscillate": {
+      "required": ["oscillating"],
+      "properties": {"oscillating": {"type": "boolean"}},
+      "additionalProperties": false
+    },
+    "climate.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
+    "climate.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "climate.set_temperature": {
+      "required": [],
+      "requiredOneOf": [["temperature"], ["target_temp_low", "target_temp_high"]],
+      "properties": {
+        "temperature": {"type": "number", "minimum": 5, "maximum": 35, "capabilityRange": "target_temp"},
+        "target_temp_low": {"type": "number", "minimum": 5, "maximum": 35, "capabilityRange": "target_temp"},
+        "target_temp_high": {"type": "number", "minimum": 5, "maximum": 35, "capabilityRange": "target_temp"}
+      },
+      "relations": [
+        {"left": "target_temp_low", "operator": "<=", "right": "target_temp_high"}
+      ],
+      "additionalProperties": false
+    },
+    "climate.set_hvac_mode": {
+      "required": ["hvac_mode"],
+      "properties": {
+        "hvac_mode": {"type": "string", "minLength": 1, "capabilityValues": "hvac_modes"}
+      },
+      "additionalProperties": false
+    },
+    "climate.set_preset_mode": {
+      "required": ["preset_mode"],
+      "properties": {
+        "preset_mode": {"type": "string", "minLength": 1, "capabilityValues": "preset_modes"}
+      },
+      "additionalProperties": false
+    },
+    "media_player.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.toggle": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.media_play": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.media_pause": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.media_stop": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.volume_mute": {
+      "required": ["is_volume_muted"],
+      "properties": {"is_volume_muted": {"type": "boolean"}},
+      "additionalProperties": false
+    },
+    "media_player.volume_set": {
+      "required": ["volume_level"],
+      "properties": {"volume_level": {"type": "number", "minimum": 0, "maximum": 1}},
+      "additionalProperties": false
+    }
+  }
+}

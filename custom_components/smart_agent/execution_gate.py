@@ -1,6 +1,7 @@
 """Portable thin execution gate for HA command dispatch."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,31 @@ class ThinExecutionGateResult:
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def evaluate_slow_brain_confidence_gate(
+    *,
+    confidence: Any,
+    threshold: Any,
+) -> ThinExecutionGateResult:
+    """Fail closed unless a finite 0-100 score reaches the local threshold."""
+
+    try:
+        score = float(confidence)
+        minimum = float(threshold)
+    except (TypeError, ValueError, OverflowError):
+        return ThinExecutionGateResult(allowed=False, log_code="confidence_invalid")
+
+    if not math.isfinite(score) or not math.isfinite(minimum):
+        return ThinExecutionGateResult(allowed=False, log_code="confidence_invalid")
+    if not 0 <= score <= 100 or not 0 <= minimum <= 100:
+        return ThinExecutionGateResult(allowed=False, log_code="confidence_invalid")
+    if score < minimum:
+        return ThinExecutionGateResult(
+            allowed=False,
+            log_code="confidence_below_auto_threshold",
+        )
+    return ThinExecutionGateResult(allowed=True)
 
 
 def evaluate_thin_execution_gate(

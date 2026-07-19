@@ -1171,6 +1171,27 @@ class SmartAgentHaExecuteView(HomeAssistantView):
                 status_code=400,
             )
 
+        safety = body.get("safety") if isinstance(body.get("safety"), dict) else {}
+        context = safety.get("context") if isinstance(safety.get("context"), dict) else {}
+        if context.get("active_ai_managed") is True:
+            coord = _get_first_coordinator(request.app["hass"])
+            is_enabled = getattr(coord, "_is_enabled", None) if coord is not None else None
+            ai_enabled = (
+                bool(is_enabled())
+                if callable(is_enabled)
+                else bool(getattr(coord, "_enabled", False))
+            )
+            if not ai_enabled:
+                return self.json(
+                    _json_error_payload(
+                        "active_ai_global_disabled",
+                        "policy_rejected",
+                        False,
+                        execution_path="ha_execute_adapter",
+                    ),
+                    status_code=409,
+                )
+
         result = await async_execute_command_envelope(request.app["hass"], body)
         status_code = 200 if bool(result.get("ok")) else 409
         error_type = str(result.get("error_type") or "")
@@ -2824,6 +2845,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 vol.Schema({vol.Optional("trigger", default="手动测试触发"): cv.string}),
             ),
             ServiceRegistration("clear_overrides", svc_clear_overrides, vol.Schema({})),
+            ServiceRegistration("report_correction", coordinator.async_svc_report_correction, vol.Schema({
+                vol.Required("entity_id"): cv.string,
+                vol.Optional("outcome", default="rejected"): vol.In(["accepted", "rejected"]),
+                vol.Optional("transaction_id", default=""): cv.string,
+                vol.Optional("reason", default="用户手动纠正"): cv.string,
+            })),
             ServiceRegistration(
                 "delete_behavior_pattern",
                 svc_delete_behavior_pattern,

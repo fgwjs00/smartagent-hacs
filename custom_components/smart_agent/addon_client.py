@@ -348,6 +348,27 @@ class AddOnClient:
         response["__status"] = status
         return response
 
+    async def execute_command_envelope(
+        self,
+        envelope: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Run the authoritative add-on preflight before HA execution."""
+        request_id = str(envelope.get("request_id") or "").strip() or None
+        result = await self.request_json(
+            "POST",
+            "/ha/execute",
+            body=dict(envelope),
+            timeout=aiohttp.ClientTimeout(total=25),
+            request_id=request_id,
+        )
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        body = result.get("body")
+        response = dict(body) if isinstance(body, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
     async def post_internal_event(
         self,
         kind: str,

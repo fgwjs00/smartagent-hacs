@@ -9,6 +9,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_ACTIVE_AI_MODE,
     CONF_COOLDOWN,
     CONF_ENGINE,
     CONF_ADDON_AUTH_TOKEN,
@@ -35,6 +36,7 @@ from .const import (
     CONF_MODE,
     TTS_LEVEL_OFF,
     DEFAULT_COOLDOWN,
+    DEFAULT_ACTIVE_AI_MODE,
     DEFAULT_CONFIDENCE_AUTO,
     DEFAULT_CONFIDENCE_NOTIFY,
     DEFAULT_SHOWROOM_BIZ_START,
@@ -128,6 +130,7 @@ def _url_to_provider(url: str) -> str:
 def _build_initial_entry_data(engine_data: dict) -> dict:
     """Build a complete first-install config entry from engine connection data."""
     data = dict(engine_data)
+    data.setdefault(CONF_ACTIVE_AI_MODE, DEFAULT_ACTIVE_AI_MODE)
     data.setdefault(CONF_CONFIDENCE_AUTO, DEFAULT_CONFIDENCE_AUTO)
     data.setdefault(CONF_CONFIDENCE_NOTIFY, DEFAULT_CONFIDENCE_NOTIFY)
     data.setdefault(CONF_COOLDOWN, DEFAULT_COOLDOWN)

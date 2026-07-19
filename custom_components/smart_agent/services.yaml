@@ -167,6 +167,39 @@ clear_overrides:
   name: 重置 AI 记忆
   description: 清除覆盖保护、历史事件等短期记忆，让 AI 以全新状态开始决策（不影响画像/规则/行为学习摘要）
 
+report_correction:
+  name: 反馈 AI 动作
+  description: 接受或纠正最近一次已验证的 AI 动作；接受时必须提供事务 ID
+  fields:
+    entity_id:
+      name: 实体 ID
+      required: true
+      selector:
+        entity:
+    outcome:
+      name: 反馈结果
+      required: false
+      default: rejected
+      selector:
+        select:
+          options:
+            - value: accepted
+              label: 接受
+            - value: rejected
+              label: 纠正
+    transaction_id:
+      name: 事务 ID
+      description: 接受反馈必填，纠正反馈可省略并使用最近一次 AI 动作事务
+      required: false
+      selector:
+        text:
+    reason:
+      name: 说明
+      required: false
+      default: 用户手动纠正
+      selector:
+        text:
+
 delete_behavior_pattern:
   name: 删除行为规律
   description: 删除指定 ID 的行为学习规律（P2 自学习）

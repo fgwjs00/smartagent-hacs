@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.174 - 2026-07-19
+## Beta 0.0.175 - 2026-07-19
 
-Beta 0.0.174 将设备绑定的 ESP-IDF `zigbee_app.bin` 设为 V3 本地 OTA 默认入口：SmartAgent 从镜像解析 ESP32-C6、工程名、版本与摘要，结合设备维护快照绑定产品、硬件、协议、Bootselect 和 Schema，并以 `local_sha256` 完成不可变存储、计划与一次性私网下载；设备未明确回报本地 SHA256 信任能力时失败关闭。`.safw + Ed25519` 保留为高级严格发行模式。8MB 双协议设备升级失败进入恢复模式，不宣称业务固件回滚；Matter 仍默认不可执行。G13 继续默认关闭且 hard-off 为 true；MCP 暂缓。真实设备 OTA、远程调试、HA-L、Frigate 和日志现场验收仍需部署后复验，不得视为生产绿灯。
+Beta 0.0.175 完成主动 AI 决策、执行与学习边界整改：模型输出先收敛为有限 DesiredState，再由确定性 Planner 生成 CommandEnvelope；服务参数合同、持久化世界快照、rollout、最终 HA 执行守卫、执行后验证和纠错晋升形成可追踪闭环。修复 switch 亮度非法参数、观影窗帘方向、离开多设备覆盖、重复命令，以及真实 shadow 阶段发现的 departure 边误入 arrival 照明。主动 AI 默认 shadow，canary 范围为空，两个真实执行开关默认 false；发布不代表阶段 A 通过，真实家庭需重新累计 7 天且至少 300 次决策。0.0.174 的设备绑定 ESP-IDF BIN 本地 OTA 与 `.safw + Ed25519` 严格路径继续保留。G13 默认关闭且 hard-off=true；MCP 暂缓。
 
 - 发布最新 SmartAgent Home Assistant 集成 包。
-- 同步公开版本 `0.0.174`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.175`，用于 Home Assistant 更新检测。

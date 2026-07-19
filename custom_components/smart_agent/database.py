@@ -10,9 +10,8 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
-from homeassistant.util import dt as dt_util
-
 from .db_service import DatabaseService
+from .database_learning_projection import DatabaseLearningProjectionMixin
 from .database_scenes import DatabaseSceneBridgeMixin
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,7 +50,7 @@ def _safe_add_column(conn: sqlite3.Connection, table: str, column_def: str) -> N
             raise
 
 
-class DatabaseMixin(DatabaseSceneBridgeMixin):
+class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
     _VALID_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
 
     def _init_memory_db(self) -> None:
@@ -298,6 +297,20 @@ class DatabaseMixin(DatabaseSceneBridgeMixin):
     ) -> None:
         """Forward action verification into add-on transaction storage."""
         timestamp = self._ha_db_now_text()
+        self._record_recent_ai_action_results(
+            transaction_id,
+            [
+                {
+                    "entity_id": entity_id,
+                    "domain": domain,
+                    "service": service,
+                    "status": "ok" if int(success) else "blocked_or_error",
+                    "verified": True,
+                    "success": bool(success),
+                    "action_seq": int(action_seq or 0),
+                }
+            ],
+        )
         payload = {
             "action": "action_result",
             "transaction_id": str(transaction_id or f"action-{self._ha_transaction_id_ms()}-{action_seq}"),
@@ -414,6 +427,7 @@ class DatabaseMixin(DatabaseSceneBridgeMixin):
                 )
         except Exception:
             has_scheduled = False
+        self._record_recent_ai_action_results(txn_id, action_results)
 
         if has_scheduled:
             status = "scheduled"
@@ -498,101 +512,3 @@ class DatabaseMixin(DatabaseSceneBridgeMixin):
                 item["on_count"] += 1
                 item["last_on"] = row.get("time") or item["last_on"]
         return sorted(stats.values(), key=lambda item: item["on_count"], reverse=True)
-
-    def _record_arrival_snapshot(
-        self,
-        room: str,
-        presence_entity_id: str,
-        light_states: dict[str, str | None] | None = None,
-        *,
-        pre_light_states: dict[str, str | None] | None = None,
-        smartagent_actions: list[dict[str, Any]] | None = None,
-        sample_started_at: float | None = None,
-        sample_ended_at: float | None = None,
-    ) -> None:
-        """Forward auditable arrival lighting samples to add-on owned memory."""
-        try:
-            local_now = getattr(self, "_ha_local_now", None)
-            now_value = local_now() if callable(local_now) else None
-            if hasattr(now_value, "strftime"):
-                now = now_value
-            else:
-                from homeassistant.util import dt as dt_util
-                now = dt_util.now()
-        except Exception:
-            try:
-                from homeassistant.util import dt as dt_util
-                now = dt_util.now()
-            except Exception:
-                from datetime import timezone
-                now = datetime.now(timezone.utc)
-        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        month = now.month
-        season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
-        if light_states is None:
-            light_states = {}
-            for entity_id, info in getattr(self, "device_info", {}).items():
-                if not entity_id.startswith("light.") or info.get("room") != room:
-                    continue
-                state = self.hass.states.get(entity_id)
-                light_states[entity_id] = state.state if state else None
-
-        pre_light_states = pre_light_states if isinstance(pre_light_states, dict) else {}
-        raw_actions = smartagent_actions if isinstance(smartagent_actions, list) else []
-
-        def _action_in_sample_window(action: dict[str, Any]) -> bool:
-            if sample_started_at is None or sample_ended_at is None:
-                return True
-            try:
-                action_time = float(action.get("time"))
-            except (TypeError, ValueError):
-                return False
-            return sample_started_at <= action_time <= sample_ended_at
-
-        window_actions = [
-            dict(action)
-            for action in raw_actions
-            if isinstance(action, dict) and _action_in_sample_window(action)
-        ]
-        sampled_entities = {str(entity_id) for entity_id in light_states}
-        room_wide_actions = [
-            action
-            for action in window_actions
-            if str(action.get("entity_id") or "").strip() not in sampled_entities
-        ]
-
-        for entity_id, state in light_states.items():
-            if state is None:
-                continue
-            observed_state = str(state or "").strip().lower() or "unknown"
-            entity_actions = [
-                dict(action)
-                for action in window_actions
-                if str(action.get("entity_id") or "").strip() == entity_id
-            ]
-            influencing_actions = [*entity_actions, *room_wide_actions]
-            linked_action = influencing_actions[-1] if influencing_actions else {}
-            payload = {
-                "action": "arrival_sample",
-                "time": timestamp,
-                "entity_id": entity_id,
-                "room": room,
-                "presence_entity_id": presence_entity_id,
-                "pre_state": str(pre_light_states.get(entity_id) or "unknown").strip().lower() or "unknown",
-                "observed_state": observed_state,
-                "is_on": observed_state == "on",
-                "baseline_eligible": not influencing_actions,
-                "smartagent_actions": window_actions,
-                "sample_started_at": sample_started_at,
-                "sample_ended_at": sample_ended_at,
-                "hour_bucket": now.hour,
-                "season": season,
-                "origin": "presence_arrival_observation",
-                "actor": presence_entity_id or "unknown",
-                "decision_id": str(linked_action.get("decision_id") or "not_applicable"),
-                "transaction_id": str(linked_action.get("transaction_id") or "not_applicable"),
-                "world_snapshot_id": str(linked_action.get("world_snapshot_id") or "not_applicable"),
-            }
-            enqueue = getattr(self, "_enqueue_internal_event", None)
-            if not callable(enqueue) or not enqueue("baseline", payload, ts=timestamp):
-                _LOGGER.debug("[ArrivalBaseline] sample enqueue failed: %s", entity_id)

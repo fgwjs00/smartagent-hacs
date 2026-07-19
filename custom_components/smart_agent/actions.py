@@ -1372,6 +1372,9 @@ class ActionsMixin:
         parent_transaction_id: str = "",
         world_snapshot_id: str = "",
         correlation_id: str = "",
+        active_space_id: str = "",
+        decision_time: str = "",
+        require_world_snapshot_guard: bool = False,
     ) -> int:
         """Execute a list of AI actions with transaction tracking."""
         import json as _json
@@ -1765,6 +1768,19 @@ class ActionsMixin:
             entity_id = action.get("entity_id")
             params = action.get("params", {})
             reason = action.get("reason", "")
+            target_info = self.device_info.get(entity_id, {}) if isinstance(self.device_info, dict) else {}
+            if not isinstance(target_info, dict):
+                target_info = {}
+            target_space_id = str(
+                action.get("target_space_id")
+                or action.get("space_id")
+                or target_info.get("space_id")
+                or target_info.get("room_id")
+                or target_info.get("area_id")
+                or target_info.get("room")
+                or target_info.get("area")
+                or ""
+            ).strip()
             action_result_context = {
                 "domain": domain,
                 "service": service,
@@ -2198,7 +2214,7 @@ class ActionsMixin:
                 async def _run_delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
                     sc: str, trig: str, txid: int, aseq: int, parent_txid: str,
-                    corr_id: str, result: dict,
+                    corr_id: str, target_sid: str, result: dict,
                 ) -> None:
                     try:
                         state = self.hass.states.get(eid)
@@ -2232,6 +2248,10 @@ class ActionsMixin:
                             parent_txid,
                             world_snapshot_id,
                             corr_id,
+                            active_space_id=active_space_id,
+                            decision_time=decision_time,
+                            target_space_id=target_sid,
+                            require_world_snapshot_guard=require_world_snapshot_guard,
                         )
                     except Exception as exc:
                         _LOGGER.debug("[Actions] 延迟动作执行失败 %s.%s(%s): %s", d, s, eid, exc)
@@ -2255,9 +2275,13 @@ class ActionsMixin:
 
                 def _delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
-                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str, corr_id: str, result: dict, _: datetime,
+                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str,
+                    corr_id: str, target_sid: str, result: dict, _: datetime,
                 ) -> None:
-                    coro = _run_delayed(d, s, eid, p, r, sc, trig, txid, aseq, parent_txid, corr_id, result)
+                    coro = _run_delayed(
+                        d, s, eid, p, r, sc, trig, txid, aseq, parent_txid,
+                        corr_id, target_sid, result,
+                    )
                     try:
                         self.hass.async_create_task(coro)
                     except Exception as exc:
@@ -2300,14 +2324,22 @@ class ActionsMixin:
                            sc=scene_desc, trig=trigger_summary, txid=txn_id, aseq=action_seq,
                            parent_txid=parent_transaction_id,
                            corr_id=correlation_id,
+                           target_sid=target_space_id,
                            result=result_entry:
-                        _delayed(d, s, e, p, r, sc, trig, txid, aseq, parent_txid, corr_id, result, dt),
+                        _delayed(
+                            d, s, e, p, r, sc, trig, txid, aseq, parent_txid,
+                            corr_id, target_sid, result, dt,
+                        ),
                 )
                 self._active_timers[entity_id] = handle
             else:
                 ok = await self._do_call_service(
                     domain, service, entity_id, params, reason, scene_desc, trigger_summary, txn_id, action_seq,
                     parent_transaction_id, world_snapshot_id, correlation_id,
+                    active_space_id=active_space_id,
+                    decision_time=decision_time,
+                    target_space_id=target_space_id,
+                    require_world_snapshot_guard=require_world_snapshot_guard,
                 )
                 if ok:
                     executed += 1
@@ -2355,6 +2387,12 @@ class ActionsMixin:
         reason: str,
         transaction_id: int = 0,
         action_seq: int = 0,
+        *,
+        world_snapshot_id: str = "",
+        active_space_id: str = "",
+        decision_time: str = "",
+        target_space_id: str = "",
+        require_world_snapshot_guard: bool = False,
     ) -> None:
         """Execute one HA command envelope and preserve structured failure detail."""
         from .ha_adapter import async_execute_command_envelope
@@ -2367,8 +2405,10 @@ class ActionsMixin:
             else ""
         )
         request_id = str(active_correlation_id or "").strip() or f"legacy-action:{transaction_id}:{action_seq}:{entity_id}"
-        result = await async_execute_command_envelope(self.hass, {
+        envelope = {
             "request_id": request_id,
+            "source": "smartagent_active_ai" if require_world_snapshot_guard else "smartagent_ha_host",
+            "scope": "home_control",
             "commands": [{
                 "entity_id": entity_id,
                 "domain": domain,
@@ -2380,8 +2420,87 @@ class ActionsMixin:
                 "risk_level": "safe",
                 "requires_confirmation": False,
                 "reason": reason,
+                "context": {
+                    **(
+                        {
+                            "active_ai_managed": True,
+                            "world_snapshot_id": str(world_snapshot_id or "").strip(),
+                            "active_space_id": str(active_space_id or "").strip(),
+                            "decision_time": str(decision_time or "").strip(),
+                            "target_space_ids": [str(target_space_id or "").strip()]
+                            if str(target_space_id or "").strip()
+                            else [],
+                        }
+                        if require_world_snapshot_guard
+                        else {}
+                    )
+                },
             },
-        })
+        }
+        result: dict[str, Any] | None
+        if require_world_snapshot_guard:
+            is_enabled = getattr(self, "_is_enabled", None)
+            ai_enabled = (
+                bool(is_enabled())
+                if callable(is_enabled)
+                else bool(getattr(self, "_enabled", False))
+            )
+            if not ai_enabled:
+                result = {
+                    "ok": False,
+                    "error": "active_ai_global_disabled",
+                    "error_type": "policy_rejected",
+                    "status": "blocked",
+                }
+            elif not str(world_snapshot_id or "").strip() or str(world_snapshot_id).strip() == "unknown":
+                result = {
+                    "ok": False,
+                    "error": "world_snapshot_id_missing",
+                    "error_type": "policy_rejected",
+                    "status": "blocked",
+                }
+            elif not str(active_space_id or "").strip():
+                result = {
+                    "ok": False,
+                    "error": "world_snapshot_space_mismatch",
+                    "error_type": "policy_rejected",
+                    "status": "blocked",
+                }
+            elif not str(decision_time or "").strip():
+                result = {
+                    "ok": False,
+                    "error": "world_snapshot_stale",
+                    "error_type": "policy_rejected",
+                    "status": "blocked",
+                }
+            elif not str(target_space_id or "").strip():
+                result = {
+                    "ok": False,
+                    "error": "active_ai_action_space_missing",
+                    "error_type": "policy_rejected",
+                    "status": "blocked",
+                }
+            else:
+                addon_client = getattr(self, "_addon_client", None)
+                execute = getattr(addon_client, "execute_command_envelope", None)
+                if not callable(execute):
+                    result = {
+                        "ok": False,
+                        "error": "active_ai_execute_provider_unavailable",
+                        "error_type": "upstream_unavailable",
+                        "status": "failed",
+                    }
+                else:
+                    result = await execute(envelope)
+                    if not isinstance(result, dict):
+                        result = {
+                            "ok": False,
+                            "error": "active_ai_execute_provider_unavailable",
+                            "error_type": "upstream_unavailable",
+                            "status": "failed",
+                        }
+        else:
+            result = await async_execute_command_envelope(self.hass, envelope)
         if isinstance(result, dict) and result.get("ok"):
             self._clear_service_call_error(transaction_id, action_seq, entity_id)
             return
@@ -2425,6 +2544,11 @@ class ActionsMixin:
         parent_transaction_id: str = "",
         world_snapshot_id: str = "",
         correlation_id: str = "",
+        *,
+        active_space_id: str = "",
+        decision_time: str = "",
+        target_space_id: str = "",
+        require_world_snapshot_guard: bool = False,
     ) -> bool:
         """Call HA service and record AI action for override detection. Returns True if executed.
 
@@ -2673,6 +2797,17 @@ class ActionsMixin:
             if correlation_id:
                 active_correlations[task] = correlation_id
             try:
+                active_execution_kwargs = (
+                    {
+                        "world_snapshot_id": world_snapshot_id,
+                        "active_space_id": active_space_id,
+                        "decision_time": decision_time,
+                        "target_space_id": target_space_id,
+                        "require_world_snapshot_guard": True,
+                    }
+                    if require_world_snapshot_guard
+                    else {}
+                )
                 await self._execute_enveloped_service(
                     domain,
                     service,
@@ -2681,6 +2816,7 @@ class ActionsMixin:
                     reason,
                     transaction_id,
                     action_seq,
+                    **active_execution_kwargs,
                 )
             finally:
                 if previous:
@@ -2759,7 +2895,8 @@ class ActionsMixin:
             "origin": "smartagent",
             "actor": "smartagent:execution",
             "decision_id": str(parent_transaction_id or "unknown"),
-            "transaction_id": str(transaction_id or "unknown"),
+            "transaction_id": str(parent_transaction_id or "unknown"),
+            "execution_transaction_id": str(transaction_id or "unknown"),
             "world_snapshot_id": str(world_snapshot_id or "unknown"),
             "correlation_id": correlation_id,
         }
@@ -2959,6 +3096,13 @@ class ActionsMixin:
             )
             if ok:
                 self._sys_log("INFO", f"[验证✓] {eid} 期望={expected} 实际={actual}（{latency}ms）")
+                record_learning_verification = getattr(
+                    self,
+                    "_record_learning_post_state_verification",
+                    None,
+                )
+                if callable(record_learning_verification):
+                    record_learning_verification(item, actual)
             else:
                 if item["retry"] < self._ACTION_RETRY_MAX:
                     self._sys_log("WARN", f"[验证✗] {eid} 期望={expected} 实际={actual}，自动重试第 {item['retry']+1} 次")
