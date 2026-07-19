@@ -344,6 +344,7 @@ class ListenersMixin:
             timers = {}
             self._presence_off_timers = timers
 
+        @callback
         def _recheck(_: datetime) -> None:
             timers.pop(entity_id, None)
             states = getattr(getattr(self, "hass", None), "states", None)

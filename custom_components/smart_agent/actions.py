@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 from homeassistant.exceptions import ServiceNotFound
@@ -2273,10 +2274,22 @@ class ActionsMixin:
                             exc_info=True,
                         )
 
+                @callback
                 def _delayed(
-                    d: str, s: str, eid: str, p: dict, r: str,
-                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str,
-                    corr_id: str, target_sid: str, result: dict, _: datetime,
+                    _: datetime,
+                    d: str = domain,
+                    s: str = service,
+                    eid: str = entity_id,
+                    p: dict = params,
+                    r: str = reason,
+                    sc: str = scene_desc,
+                    trig: str = trigger_summary,
+                    txid: int = txn_id,
+                    aseq: int = action_seq,
+                    parent_txid: str = parent_transaction_id,
+                    corr_id: str = correlation_id,
+                    target_sid: str = target_space_id,
+                    result: dict = result_entry,
                 ) -> None:
                     coro = _run_delayed(
                         d, s, eid, p, r, sc, trig, txid, aseq, parent_txid,
@@ -2319,17 +2332,9 @@ class ActionsMixin:
                             )
 
                 handle = async_call_later(
-                    self.hass, delay,
-                    lambda dt, d=domain, s=service, e=entity_id, p=params, r=reason,
-                           sc=scene_desc, trig=trigger_summary, txid=txn_id, aseq=action_seq,
-                           parent_txid=parent_transaction_id,
-                           corr_id=correlation_id,
-                           target_sid=target_space_id,
-                           result=result_entry:
-                        _delayed(
-                            d, s, e, p, r, sc, trig, txid, aseq, parent_txid,
-                            corr_id, target_sid, result, dt,
-                        ),
+                    self.hass,
+                    delay,
+                    _delayed,
                 )
                 self._active_timers[entity_id] = handle
             else:
