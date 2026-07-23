@@ -97,8 +97,6 @@ class ListenersMixin:
             "vision",
         }
     )
-    _PRESENCE_DEVICE_CLASSES = frozenset({"motion", "moving", "occupancy", "presence"})
-    _GENERIC_BINARY_CLASS_VALUES = frozenset({"", "binary_sensor", "sensor", "unknown"})
     _ACTIONABLE_CONTACT_SENSOR_TYPES = frozenset({"door", "window", "contact", "opening", "garage_door"})
     _ACTIONABLE_CONTACT_KW = ("door", "window", "contact", "opening", "men_chuang", "garage", "门", "窗", "门窗")
     _PRESENCE_OFF_DELAY = PRESENCE_OFF_DELAY
@@ -3220,23 +3218,8 @@ class ListenersMixin:
         if domain != "binary_sensor":
             return False
         row = self._listener_entity_metadata(entity_id, info=info)
-        sensor_type = str(row.get("sensor_type") or "").strip().lower()
-        if sensor_type in self._ACTIONABLE_SENSOR_TYPES:
-            return True
-        if sensor_type and sensor_type not in self._GENERIC_BINARY_CLASS_VALUES:
-            return False
-        device_class = str(row.get("device_class") or row.get("ha_device_class") or "").strip().lower()
-        capability = str(row.get("capability") or "").strip().lower()
-        specific_class = device_class or (
-            capability if capability not in self._GENERIC_BINARY_CLASS_VALUES else ""
-        )
-        if specific_class in self._PRESENCE_DEVICE_CLASSES:
-            return True
-        if specific_class:
-            return False
-        eid_lower = str(entity_id or "").lower()
-        name_lower = str(row.get("name") or row.get("friendly_name") or "").lower()
-        return any(kw in eid_lower or kw in name_lower for kw in self._PRESENCE_KW)
+        sensor_type = str(row.get("sensor_type") or row.get("presence_sensor_type") or "").strip().lower()
+        return sensor_type in self._ACTIONABLE_SENSOR_TYPES
 
     def _reconcile_active_listener_states(self, entity_ids: list[str]) -> None:
         """Catch up active managed presence sensors that were already on before listener binding."""

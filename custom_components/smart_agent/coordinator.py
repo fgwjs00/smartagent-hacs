@@ -4592,6 +4592,36 @@ class SmartAgentCoordinator(
         if automatic_submit_at is not None:
             self._patrol_last_automatic_submit_monotonic = automatic_submit_at
 
+        sensorless = (
+            result.get("sensorless_confirmations")
+            if isinstance(result.get("sensorless_confirmations"), dict)
+            else {}
+        )
+        created_confirmations = [
+            item
+            for item in list(sensorless.get("created") or [])
+            if isinstance(item, dict)
+        ]
+        if int(sensorless.get("created_count") or 0) > 0 and created_confirmations:
+            confirmation_item = created_confirmations[0]
+            action_rows = [
+                item
+                for item in list(confirmation_item.get("actions") or [])
+                if isinstance(item, dict)
+            ]
+            entity_names = [
+                str(item.get("entity_id") or "").strip()
+                for item in action_rows
+                if str(item.get("entity_id") or "").strip()
+            ]
+            space_name = str(confirmation_item.get("space_id") or "该区域").strip() or "该区域"
+            target_names = "、".join(entity_names) or "相关设备"
+            self._notify_dedup(
+                f"{space_name} 的 {target_names} 可能可以关闭。"
+                "请在 SmartAgent AI 决策中确认；未回复不会执行。",
+                "SmartAgent 设备关闭确认",
+            )
+
         status = int(result.get("__status") or 0)
         plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
         safety = plan.get("safety_net") if isinstance(plan.get("safety_net"), dict) else {}

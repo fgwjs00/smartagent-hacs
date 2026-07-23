@@ -781,6 +781,8 @@ class DevicesMixin:
         requested_entity_id = str(body.get("new_entity_id") or body.get("target_entity_id") or "").strip()
         room = str(body.get("room") or body.get("area") or body.get("space") or "").strip()
         capability_name = str(body.get("capability") or body.get("device_class") or "").strip().lower()
+        sensor_type_provided = "sensor_type" in body or "presence_sensor_type" in body
+        sensor_type = str(body.get("sensor_type") or body.get("presence_sensor_type") or "").strip().lower()
         result: dict[str, Any] = {
             "ok": True,
             "old_entity_id": eid,
@@ -789,26 +791,43 @@ class DevicesMixin:
             "source": "ha_entity_registry_mirror",
         }
 
-        async def _apply_local_capability(active_entity_id: str) -> None:
-            if not capability_name:
-                return
+        async def _apply_local_semantics(active_entity_id: str) -> bool:
+            listener_classification_changed = False
             now = self._ha_db_now_text()
             info = dict(self.device_info.get(active_entity_id, {}) or {})
-            if info:
-                info["capability"] = capability_name
-                info["type"] = capability_name
-                self.device_info[active_entity_id] = info
-            _ok = await self._async_db_exec(
-                "UPDATE devices SET type=?, updated=? WHERE entity_id=?",
-                (capability_name, now, active_entity_id),
-            )
-            if not _ok:
-                self._sys_log("WARN", f"[设备能力] 写入失败，未更新: {active_entity_id}")
-                result.setdefault("warnings", []).append("capability_persist_failed")
-            result["capability"] = capability_name
+            if capability_name:
+                if info:
+                    info["capability"] = capability_name
+                    info["type"] = capability_name
+                    self.device_info[active_entity_id] = info
+                _ok = await self._async_db_exec(
+                    "UPDATE devices SET type=?, updated=? WHERE entity_id=?",
+                    (capability_name, now, active_entity_id),
+                )
+                if not _ok:
+                    self._sys_log("WARN", f"[设备能力] 写入失败，未更新: {active_entity_id}")
+                    result.setdefault("warnings", []).append("capability_persist_failed")
+                result["capability"] = capability_name
+            if sensor_type_provided:
+                previous_sensor_type = str(info.get("sensor_type") or "").strip().lower()
+                if info:
+                    info["sensor_type"] = sensor_type
+                    self.device_info[active_entity_id] = info
+                _ok = await self._async_db_exec(
+                    "UPDATE devices SET sensor_type=?, updated=? WHERE entity_id=?",
+                    (sensor_type, now, active_entity_id),
+                )
+                if not _ok:
+                    self._sys_log("WARN", f"[设备信号用途] 写入失败，未更新: {active_entity_id}")
+                    result.setdefault("warnings", []).append("sensor_type_persist_failed")
+                result["sensor_type"] = sensor_type
+                listener_classification_changed = previous_sensor_type != sensor_type
+            return listener_classification_changed
 
         if not name and not requested_entity_id and not room:
-            await _apply_local_capability(eid)
+            semantics_changed = await _apply_local_semantics(eid)
+            if semantics_changed:
+                self._refresh_listeners()
             result.update({"skipped": True, "reason": "patch_has_no_ha_registry_fields"})
             return result
 
@@ -938,10 +957,9 @@ class DevicesMixin:
         result["entity_id"] = active_entity_id
         result["new_entity_id"] = active_entity_id
         self.async_set_updated_data({})
-        if renamed:
+        semantics_changed = await _apply_local_semantics(active_entity_id)
+        if renamed or semantics_changed:
             self._refresh_listeners()
-
-        await _apply_local_capability(active_entity_id)
         return result
 
     # ── 设备管辖域 ────────────────────────────────────────────────────────────

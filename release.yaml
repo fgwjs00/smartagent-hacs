@@ -1,15 +1,15 @@
 product: SmartAgent
-release_version: 0.0.179
-display_version: Beta 0.0.179
+release_version: 0.0.180
+display_version: Beta 0.0.180
 channel: beta
-release_date: '2026-07-20'
+release_date: '2026-07-23'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.179 修复真实 Stage A 暴露的 Presence 时态状态污染：共享 PresenceEngine 继续作为唯一权威状态机，但房间列表等读模型改用只读评估，不再以
-    guard 查询重置离开候选。真实状态事件仍推进 60 秒迟滞，DesiredState、Planner、CommandEnvelope、设备策略与最终执行守卫不变。主动
-    AI 继续默认 shadow，canary 范围为空，两个真实执行开关默认 false；部署后从首个完成 60 秒复查且 candidate_since 连续的有效周期重新累计
-    7 天和至少 300 次决策。继承 0.0.178 的 HA callback 线程安全修复。
-  customer_visible_version: Beta 0.0.179
+  summary: Beta 0.0.180 发布主动 AI 完整性整改：二值传感器用途成为显式单一真相，门窗信号不再参与 Presence 推断；设备纳管同步执行治理，无
+    Presence 空间通过习惯建议和业主确认进入原执行链；canonical Presence 与动作资格收口，已满足 60 秒无人保持窗的离开不再重复等待
+    30 秒，避免执行世界快照过期。V3 增加 Presence 传感器配置入口和对应审计展示。主动 AI 默认仍为 shadow、真实执行开关默认 false；现有现场
+    B1 canary 授权不作为发行默认值，升级后仍须完成自然周期和 post-state 验收。
+  customer_visible_version: Beta 0.0.180
