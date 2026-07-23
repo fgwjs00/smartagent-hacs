@@ -21,7 +21,7 @@ _LOGGER = logging.getLogger(__name__)
 
 def _derive_ha_url(request) -> str:
     """从 HTTP 请求中推导出可被手机/中控屏访问的 HA 地址。"""
-    host = request.host  # e.g. "192.168.2.9:8123"
+    host = request.host  # e.g. "homeassistant.local:8123"
     scheme = "https" if request.secure else "http"
     return f"{scheme}://{host}"
 

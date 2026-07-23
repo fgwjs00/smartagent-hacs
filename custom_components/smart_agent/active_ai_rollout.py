@@ -6,6 +6,8 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
+from .action_normalization import action_domain
+
 
 ACTIVE_AI_MODES = frozenset({"off", "shadow", "canary", "on"})
 DEFAULT_ACTIVE_AI_MODE = "shadow"
@@ -149,7 +151,18 @@ def enrich_active_ai_action_spaces(
             or action.get("space_id")
             or ""
         ).strip()
-        entity_id = str(action.get("entity_id") or action.get("entity") or "").strip()
+        target = action.get("target")
+        target_entity_id = (
+            target.get("entity_id")
+            if isinstance(target, Mapping)
+            else ""
+        )
+        entity_id = str(
+            action.get("entity_id")
+            or action.get("entity")
+            or target_entity_id
+            or ""
+        ).strip()
         info = devices.get(entity_id, {}) if entity_id else {}
         if not target_space_id and isinstance(info, Mapping):
             target_space_id = str(
@@ -218,16 +231,26 @@ def evaluate_active_ai_execution_gate(
     action_space_ids: list[str] = []
     action_space_missing = False
     for action in actions:
-        domain = (
-            str(action.get("domain") or "").strip().lower()
+        service = (
+            str(
+                action.get("service")
+                or action.get("action")
+                or action.get("command")
+                or ""
+            ).strip()
             if isinstance(action, Mapping)
             else ""
         )
-        if not domain and isinstance(action, Mapping):
-            entity_id = str(action.get("entity_id") or "").strip().lower()
-            service = str(action.get("service") or action.get("action") or "").strip()
-            if service and "." in entity_id:
-                domain = entity_id.split(".", 1)[0]
+        explicit_domain = (
+            str(action.get("domain") or "").strip()
+            if isinstance(action, Mapping)
+            else ""
+        )
+        domain = (
+            action_domain(dict(action))
+            if isinstance(action, Mapping) and (explicit_domain or service)
+            else ""
+        )
         if not domain:
             return _decision(
                 config,

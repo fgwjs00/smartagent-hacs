@@ -4164,17 +4164,21 @@ class SmartAgentCoordinator(
             result.append(info)
         return result
 
-    async def _async_refresh_presence_snapshot_cache(self) -> None:
+    async def _async_refresh_presence_snapshot_cache(self) -> bool:
         """Refresh the add-on-owned Presence projection for synchronous guards."""
+        request_id = int(
+            getattr(self, "_presence_snapshot_refresh_request_id", 0) or 0
+        ) + 1
+        self._presence_snapshot_refresh_request_id = request_id
         addon_client = getattr(self, "_addon_client", None)
         get_rooms = getattr(addon_client, "get_rooms", None)
         if not callable(get_rooms):
-            return
+            return False
 
         try:
             payload = await get_rooms()
         except Exception:
-            return
+            return False
 
         def _is_error_payload(value: dict[str, Any]) -> bool:
             if value.get("ok") is False:
@@ -4187,15 +4191,15 @@ class SmartAgentCoordinator(
         rows: Any = payload
         if isinstance(payload, dict):
             if _is_error_payload(payload):
-                return
+                return False
             if isinstance(payload.get("data"), list):
                 rows = payload.get("data")
             elif isinstance(payload.get("rooms"), list):
                 rows = payload.get("rooms")
             else:
-                return
+                return False
         if not isinstance(rows, (list, tuple)):
-            return
+            return False
 
         def _unknown_room_payload(
             localized_spaces: list[str],
@@ -4273,6 +4277,54 @@ class SmartAgentCoordinator(
                 if evidence_id and evidence_id not in evidence_ids:
                     evidence_ids.append(evidence_id)
 
+            presence_evidence: list[dict[str, Any]] = []
+            raw_presence_evidence = row.get("presence_evidence")
+            if isinstance(raw_presence_evidence, (list, tuple)):
+                allowed_evidence_fields = (
+                    "entity_id",
+                    "sensor_type",
+                    "state",
+                    "use_for",
+                    "confidence",
+                    "freshness_ttl_secs",
+                    "battery_powered",
+                    "last_observed_at",
+                    "stale",
+                    "stale_reason",
+                )
+                for raw_evidence in raw_presence_evidence:
+                    if not isinstance(raw_evidence, dict):
+                        continue
+                    evidence_entity_id = str(
+                        raw_evidence.get("entity_id")
+                        or raw_evidence.get("id")
+                        or ""
+                    ).strip()
+                    if not evidence_entity_id:
+                        continue
+                    evidence_row = {
+                        key: raw_evidence.get(key)
+                        for key in allowed_evidence_fields
+                        if key in raw_evidence
+                    }
+                    evidence_row["entity_id"] = evidence_entity_id
+                    use_for = evidence_row.get("use_for")
+                    if isinstance(use_for, (list, tuple, set)):
+                        evidence_row["use_for"] = [
+                            str(item or "").strip()
+                            for item in use_for
+                            if str(item or "").strip()
+                        ]
+                    elif isinstance(use_for, str):
+                        evidence_row["use_for"] = [
+                            item.strip()
+                            for item in use_for.split(",")
+                            if item.strip()
+                        ]
+                    else:
+                        evidence_row["use_for"] = []
+                    presence_evidence.append(evidence_row)
+
             confidence = 0.0
             if canonical:
                 raw_confidence = (
@@ -4312,6 +4364,8 @@ class SmartAgentCoordinator(
                 "evidence_ids": evidence_ids,
                 "metadata": {"presence_contract_source": "addon_presence_engine"},
             }
+            if canonical and presence_evidence:
+                room_payload["presence_evidence"] = presence_evidence
             previous_payload = normalized_rooms.get(room_id)
             if previous_payload is not None:
                 merged_spaces: list[str] = []
@@ -4346,11 +4400,18 @@ class SmartAgentCoordinator(
                 "canonical_presence_room_alias_conflict",
             )
 
+        committed_request_id = int(
+            getattr(self, "_presence_snapshot_refresh_committed_request_id", 0) or 0
+        )
+        if request_id <= committed_request_id:
+            return False
+        self._presence_snapshot_refresh_committed_request_id = request_id
         updated_at = time.monotonic()
         self._presence_snapshot_cache_record = (normalized_rooms, updated_at)
         # Compatibility mirrors for diagnostics and existing host read models.
         self._presence_snapshot_cache = normalized_rooms
         self._presence_snapshot_cache_updated_at = updated_at
+        return True
 
     async def _async_refresh_room_topology_cache(self) -> None:
         """Refresh room topology from add-on without exposing failures to callers."""
@@ -4793,6 +4854,18 @@ class SmartAgentCoordinator(
                 value = copied.get(key)
                 if isinstance(value, (list, tuple, set)):
                     copied[key] = list(value)
+            evidence_rows = copied.get("presence_evidence")
+            if isinstance(evidence_rows, (list, tuple)):
+                copied["presence_evidence"] = [
+                    {
+                        key: list(value)
+                        if isinstance(value, (list, tuple, set))
+                        else value
+                        for key, value in row.items()
+                    }
+                    for row in evidence_rows
+                    if isinstance(row, dict)
+                ]
             metadata = copied.get("metadata")
             if isinstance(metadata, dict):
                 copied["metadata"] = dict(metadata)

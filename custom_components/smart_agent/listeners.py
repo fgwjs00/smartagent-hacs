@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
+from .action_normalization import action_requires_presence_refresh
 from .ha_adapter import async_call_service
 from .active_ai_rollout import (
     ActiveAiRolloutConfig,
@@ -1581,6 +1582,36 @@ class ListenersMixin:
                 execution_suppressed_reason=rollout_decision.reason,
                 rollout=rollout_decision.as_trace(),
             )
+        if any(action_requires_presence_refresh(action) for action in valid_actions):
+            refresh_presence = getattr(self, "_async_refresh_presence_snapshot_cache", None)
+            refreshed = False
+            if callable(refresh_presence):
+                try:
+                    refreshed = await refresh_presence() is True
+                except Exception as exc:
+                    _LOGGER.warning(
+                        "[Add-on FastPath] presence refresh before turn_off failed: %s",
+                        exc.__class__.__name__,
+                    )
+            if not refreshed:
+                self._sys_log(
+                    "WARN",
+                    f"[Add-on FastPath] blocked turn_off because authoritative "
+                    f"Presence refresh failed transaction_id={transaction_id or '-'}",
+                )
+                return self._enqueue_fast_path_execution_audit(
+                    transaction_id=transaction_id,
+                    correlation_id=correlation_id,
+                    world_snapshot_id=world_snapshot_id,
+                    decision_trace=decision_trace,
+                    trigger=trigger or f"{entity_id}: state_changed",
+                    scene=str(scene),
+                    confidence=confidence,
+                    actions=valid_actions,
+                    execution_result=0,
+                    execution_suppressed_reason="presence_refresh_failed",
+                    rollout=rollout_decision.as_trace(),
+                )
         execution_result = await self._execute_actions(
             valid_actions,
             trigger_summary=trigger_summary,
@@ -3220,6 +3251,180 @@ class ListenersMixin:
         row = self._listener_entity_metadata(entity_id, info=info)
         sensor_type = str(row.get("sensor_type") or row.get("presence_sensor_type") or "").strip().lower()
         return sensor_type in self._ACTIONABLE_SENSOR_TYPES
+
+    def _get_live_presence_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
+        """Read current HA states for Core-authorized, fresh guard evidence."""
+        self._last_live_presence_guard_status = {
+            "ok": False,
+            "reason": "presence_snapshot_unavailable",
+        }
+        snapshot_getter = getattr(self, "get_presence_snapshot", None)
+        if not callable(snapshot_getter):
+            return {}
+        try:
+            snapshot = snapshot_getter()
+        except Exception:
+            return {}
+        rooms = snapshot.get("rooms") if isinstance(snapshot, dict) else None
+        if not isinstance(rooms, dict):
+            self._last_live_presence_guard_status["reason"] = "presence_rooms_unavailable"
+            return {}
+        states = getattr(getattr(self, "hass", None), "states", None)
+        get_state = getattr(states, "get", None)
+        if not callable(get_state):
+            self._last_live_presence_guard_status["reason"] = "ha_states_unavailable"
+            return {}
+
+        now = datetime.now(timezone.utc)
+        occupancy: dict[str, list[tuple[str, str]]] = {}
+
+        def _append_entry(
+            room_candidates: list[str],
+            entity_id: str,
+            state: str,
+        ) -> None:
+            entry = (entity_id, state)
+            for room in room_candidates:
+                room_entries = occupancy.setdefault(room, [])
+                if entry not in room_entries:
+                    room_entries.append(entry)
+
+        for room_id, payload in rooms.items():
+            if not isinstance(payload, dict):
+                continue
+            room_candidates: list[str] = []
+            for raw_value in (room_id, payload.get("localized_spaces")):
+                values = (
+                    raw_value
+                    if isinstance(raw_value, (list, tuple, set))
+                    else (raw_value,)
+                )
+                for value in values:
+                    room = str(value or "").strip()
+                    if room and room not in room_candidates:
+                        room_candidates.append(room)
+
+            evidence_rows = payload.get("presence_evidence")
+            if not isinstance(evidence_rows, (list, tuple)):
+                continue
+            for evidence in evidence_rows:
+                if not isinstance(evidence, dict) or evidence.get("stale") is True:
+                    continue
+                use_for_raw = evidence.get("use_for")
+                if isinstance(use_for_raw, str):
+                    use_for = {
+                        item.strip()
+                        for item in use_for_raw.split(",")
+                        if item.strip()
+                    }
+                elif isinstance(use_for_raw, (list, tuple, set)):
+                    use_for = {
+                        str(item or "").strip()
+                        for item in use_for_raw
+                        if str(item or "").strip()
+                    }
+                else:
+                    use_for = set()
+                if "guard" not in use_for:
+                    continue
+
+                entity_id = str(
+                    evidence.get("entity_id")
+                    or evidence.get("id")
+                    or ""
+                ).strip()
+                sensor_type = str(
+                    evidence.get("sensor_type")
+                    or evidence.get("presence_sensor_type")
+                    or ""
+                ).strip().lower()
+                if not entity_id or sensor_type in self._ACTIONABLE_CONTACT_SENSOR_TYPES:
+                    continue
+                if sensor_type not in self._ACTIONABLE_SENSOR_TYPES:
+                    continue
+
+                ttl_invalid = False
+                try:
+                    freshness_ttl_secs = float(
+                        evidence.get("freshness_ttl_secs") or 0
+                    )
+                except (TypeError, ValueError):
+                    freshness_ttl_secs = 0.0
+                    ttl_invalid = True
+                if not isfinite(freshness_ttl_secs) or freshness_ttl_secs < 0:
+                    ttl_invalid = True
+                if ttl_invalid:
+                    _append_entry(room_candidates, entity_id, "unknown")
+                    continue
+                if freshness_ttl_secs > 0:
+                    observed_text = str(
+                        evidence.get("last_observed_at")
+                        or evidence.get("observed_at")
+                        or ""
+                    ).strip()
+                    try:
+                        observed_at = datetime.fromisoformat(
+                            observed_text.replace("Z", "+00:00")
+                        )
+                        if observed_at.tzinfo is None:
+                            observed_at = observed_at.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        observed_at = None
+                    if observed_at is None:
+                        _append_entry(room_candidates, entity_id, "unknown")
+                        continue
+                    age_secs = (
+                        now - observed_at.astimezone(timezone.utc)
+                    ).total_seconds()
+                    if age_secs < -60:
+                        _append_entry(room_candidates, entity_id, "unknown")
+                        continue
+                    if age_secs > freshness_ttl_secs:
+                        continue
+                try:
+                    state_obj = get_state(entity_id)
+                except Exception:
+                    state_obj = None
+                raw_state = str(
+                    getattr(state_obj, "state", "") or ""
+                ).strip().lower()
+                if raw_state in {
+                    "on",
+                    "occupied",
+                    "present",
+                    "home",
+                    "motion",
+                    "person",
+                }:
+                    state = "on"
+                elif raw_state in {
+                    "off",
+                    "vacant",
+                    "clear",
+                    "away",
+                    "none",
+                    "idle",
+                    "empty",
+                }:
+                    state = "off"
+                elif raw_state in {"unknown", "unavailable"}:
+                    state = raw_state
+                elif sensor_type in {"person_count", "object_count", "frigate"}:
+                    try:
+                        numeric_state = float(raw_state)
+                    except (TypeError, ValueError):
+                        state = "unknown"
+                    else:
+                        if not isfinite(numeric_state) or numeric_state < 0:
+                            state = "unknown"
+                        else:
+                            state = "on" if numeric_state > 0 else "off"
+                else:
+                    state = "unknown"
+
+                _append_entry(room_candidates, entity_id, state)
+        self._last_live_presence_guard_status = {"ok": True, "reason": ""}
+        return occupancy
 
     def _reconcile_active_listener_states(self, entity_ids: list[str]) -> None:
         """Catch up active managed presence sensors that were already on before listener binding."""

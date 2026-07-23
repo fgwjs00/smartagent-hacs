@@ -100,7 +100,7 @@
         "data_description": {
           "cleanup_legacy_pair_tokens": "默认关闭。仅在怀疑历史配对令牌泄露或误签发时开启；下次启动会撤销 SmartAgent 自己签发的配对长效令牌并自动关闭本开关",
           "addon_auth_token":  "需与 SmartAgent Add-on 的 SA_AUTH_TOKEN 环境变量保持一致，留空则不启用认证",
-          "addon_base_url":    "HA 集成访问 SmartAgent Add-on 的完整地址，例如 http://192.168.2.9:8234；留空则回退到 localhost 与端口配置"
+          "addon_base_url":    "HA 集成访问 SmartAgent Add-on 的完整地址，例如 http://homeassistant.local:8234；留空则回退到 localhost 与端口配置"
         }
       },
       "showroom_config": {

@@ -16,6 +16,11 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 from homeassistant.exceptions import ServiceNotFound
 
+from .action_normalization import (
+    action_domain,
+    action_entity_id,
+    action_requires_presence_refresh,
+)
 from .const import (
     ACTION_PARAM_KEYS_COLOR,
     ACTION_PARAM_KEYS_LIGHT_SCENE,
@@ -94,6 +99,14 @@ class ActionsMixin:
     _PROTECTED_NIGHT_END_HOUR = 6
     _DAYLIGHT_SUN_STATES = frozenset({"above_horizon", "day", "daylight"})
     _DARK_SUN_STATES = frozenset({"below_horizon", "night", "dark"})
+
+    @classmethod
+    def _action_requires_presence_refresh(cls, action: Any) -> bool:
+        """Match the action shapes that will use the Presence turn-off guard."""
+        return action_requires_presence_refresh(
+            action,
+            dim_to_off_brightness_pct=cls._DIM_TO_OFF_BRIGHTNESS_PCT,
+        )
 
     @classmethod
     def _action_execution_result(
@@ -918,13 +931,30 @@ class ActionsMixin:
         room: str,
         room_candidates: list[str] | None = None,
     ) -> list[tuple[str, str]]:
-        if not hasattr(self, "_get_room_occupancy_map"):
+        live_getter = getattr(self, "_get_live_presence_occupancy_map", None)
+        getter = live_getter
+        uses_live_projection = callable(live_getter)
+        if not callable(getter):
+            getter = getattr(self, "_get_room_occupancy_map", None)
+        if not callable(getter):
             return []
+        if uses_live_projection:
+            self._last_live_presence_guard_status = {"ok": True, "reason": ""}
         try:
-            occ_map = self._get_room_occupancy_map()
+            occ_map = getter()
         except Exception:
+            if uses_live_projection:
+                self._last_live_presence_guard_status = {
+                    "ok": False,
+                    "reason": "presence_live_projection_failed",
+                }
             return []
         if not isinstance(occ_map, dict):
+            if uses_live_projection:
+                self._last_live_presence_guard_status = {
+                    "ok": False,
+                    "reason": "presence_live_projection_invalid",
+                }
             return []
         for candidate in self._space_candidate_values(room, room_candidates or []):
             entries = occ_map.get(candidate) or []
@@ -1065,7 +1095,10 @@ class ActionsMixin:
                 self._last_presence_guard_conflict = {}
             return canonical, "canonical_presence_snapshot"
         self._last_presence_guard_conflict = {}
-        return legacy, "legacy_occupancy_map" if legacy else ""
+        if not legacy:
+            return [], ""
+        live_getter = getattr(self, "_get_live_presence_occupancy_map", None)
+        return legacy, "ha_live_presence_state" if callable(live_getter) else "legacy_occupancy_map"
 
     def _room_occupancy_entries(self, room: str, room_candidates: list[str] | None = None) -> list[tuple[str, str]]:
         entries, _source = self._room_occupancy_entries_with_source(room, room_candidates)
@@ -1096,23 +1129,91 @@ class ActionsMixin:
         room_candidates = self._action_entity_space_candidates(entity_id)
         if not room and room_candidates:
             room = room_candidates[0]
-        sensors, presence_source = self._room_occupancy_entries_with_source(room, room_candidates)
-        if not room or not sensors:
+        canonical = self._canonical_room_occupancy_entries(room, room_candidates)
+        live = self._legacy_room_occupancy_entries_for_candidates(room, room_candidates)
+        live_getter = getattr(self, "_get_live_presence_occupancy_map", None)
+        live_source = "ha_live_presence_state" if callable(live_getter) else "legacy_occupancy_map"
+        live_status = getattr(self, "_last_live_presence_guard_status", {})
+        if (
+            callable(live_getter)
+            and isinstance(live_status, dict)
+            and live_status.get("ok") is False
+            and room
+        ):
+            live = [*live, ("presence.live_guard", "unknown")]
+        if canonical and self._presence_entries_conflict(canonical, live):
+            self._record_presence_guard_conflict(room, canonical, live)
+        else:
+            self._last_presence_guard_conflict = {}
+        if not room or (not canonical and not live):
+            self._last_turnoff_presence_guard_detail = {
+                "presence_source": "none",
+                "presence_reason": "presence_guard_not_applicable",
+                "presence_room": room,
+                "presence_evidence_ids": [],
+                "presence_states": [],
+            }
             return False, ""
-        occupied = [(eid, state) for eid, state in sensors if state == "on"]
-        uncertain = [(eid, state) for eid, state in sensors if state in ("unknown", "unavailable")]
-        if not occupied and not uncertain:
+
+        canonical_blocked = [
+            (eid, state)
+            for eid, state in canonical
+            if state == "on" or state in ("unknown", "unavailable")
+        ]
+        live_blocked = [
+            (eid, state)
+            for eid, state in live
+            if state == "on" or state in ("unknown", "unavailable")
+        ]
+        blocked_entries: list[tuple[str, str]] = []
+        for entry in (*canonical_blocked, *live_blocked):
+            if entry not in blocked_entries:
+                blocked_entries.append(entry)
+
+        source_parts: list[str] = []
+        if canonical_blocked:
+            source_parts.append("canonical_presence_snapshot")
+        if live_blocked:
+            source_parts.append(live_source)
+        if not blocked_entries:
+            clear_entries: list[tuple[str, str]] = []
+            for entry in (*canonical, *live):
+                if entry not in clear_entries:
+                    clear_entries.append(entry)
+            if canonical:
+                source_parts.append("canonical_presence_snapshot")
+            if live:
+                source_parts.append(live_source)
+            self._last_turnoff_presence_guard_detail = {
+                "presence_source": "+".join(source_parts) or "unknown",
+                "presence_reason": "presence_clear",
+                "presence_room": room,
+                "presence_evidence_ids": [
+                    eid for eid, _state in clear_entries if str(eid or "").strip()
+                ],
+                "presence_states": [
+                    {"entity_id": eid, "state": state}
+                    for eid, state in clear_entries
+                    if str(eid or "").strip()
+                ],
+            }
             return False, ""
-        blocked = occupied or uncertain
-        sensor_str = ", ".join(f"{eid}={state}" for eid, state in blocked[:3])
+        sensor_str = ", ".join(f"{eid}={state}" for eid, state in blocked_entries[:3])
+        projection_conflict = bool(canonical) and bool(live_blocked) and not canonical_blocked
         detail: dict[str, Any] = {
-            "presence_source": presence_source or "unknown",
-            "presence_reason": "presence_not_clear",
+            "presence_source": "+".join(source_parts) or "unknown",
+            "presence_reason": (
+                "presence_projection_conflict"
+                if projection_conflict
+                else "presence_not_clear"
+            ),
             "presence_room": room,
-            "presence_evidence_ids": [eid for eid, _state in blocked if str(eid or "").strip()],
+            "presence_evidence_ids": [
+                eid for eid, _state in blocked_entries if str(eid or "").strip()
+            ],
             "presence_states": [
                 {"entity_id": eid, "state": state}
-                for eid, state in blocked
+                for eid, state in blocked_entries
                 if str(eid or "").strip()
             ],
         }
@@ -1416,7 +1517,7 @@ class ActionsMixin:
             ]
 
         def _remember_guard_pre_state(action: dict[str, Any]) -> None:
-            entity_id = action.get("entity_id") or action.get("entity")
+            entity_id = action_entity_id(action)
             if not isinstance(entity_id, str) or "." not in entity_id:
                 return
             state = self.hass.states.get(entity_id)
@@ -1440,7 +1541,7 @@ class ActionsMixin:
         if should_isolate:
             filtered_actions = []
             for a in actions:
-                eid = a.get("entity_id") or a.get("entity")
+                eid = action_entity_id(a)
                 if not eid: continue
                 cap = self._get_action_device_capability(eid)
                 dev_room = (cap.get("room") or "").strip()
@@ -1454,7 +1555,7 @@ class ActionsMixin:
                 # 3. action 本身标记了 is_global (LLM 合法跨区指令) -> 放行
                 # 4. 房间信息经 device_info + Registry 双重查找后仍为空 -> 放行（全局设备）
                 #    注意：仅靠 device_info 为空就豁免是不安全的，已在 _get_entity_area 回退后才豁免
-                _domain = (a.get("domain") or eid.split(".")[0]) if isinstance(eid, str) else ""
+                _domain = action_domain(a)
                 is_cross_zone = self._is_cross_zone_action(trigger_room, cap)
                 control_spaces = self._resolve_action_control_spaces(cap)
                 has_adjacent_space = any(
@@ -1477,7 +1578,12 @@ class ActionsMixin:
                     _msg = f"cross_zone_isolation: {eid} belongs to {dev_room or 'unknown'}; trigger_room={trigger_room}"
                     _result = {
                         "domain": str(_domain or ""),
-                        "service": str(a.get("service") or ""),
+                        "service": str(
+                            a.get("service")
+                            or a.get("action")
+                            or a.get("command")
+                            or ""
+                        ).split(".", 1)[-1],
                         "entity_id": str(eid or ""),
                         "status": "blocked_cross_zone_isolation",
                         "msg": _msg,
@@ -1539,11 +1645,16 @@ class ActionsMixin:
             _pre_filtered = []
             _pre_blocked = []
             for _a in actions:
-                _eid = _a.get("entity_id") or _a.get("entity")
-                _svc = _a.get("service", "")
+                _eid = action_entity_id(_a)
+                _svc = str(
+                    _a.get("service")
+                    or _a.get("action")
+                    or _a.get("command")
+                    or ""
+                ).split(".", 1)[-1]
                 if _eid and _svc == "turn_on" and _eid in self._batch_trigger_controllable:
                     _pre_blocked.append(_eid)
-                    _domain = str(_a.get("domain") or (_eid.split(".", 1)[0] if isinstance(_eid, str) and "." in _eid else ""))
+                    _domain = action_domain(_a)
                     _guard = evaluate_self_trigger_protection(
                         entity_id=_eid,
                         service=_svc,
@@ -1906,7 +2017,8 @@ class ActionsMixin:
                     )
                     if ctrl_mode == "shared" and domain in ("light", "switch", "cover", "fan", "climate") \
                             and service in ("turn_on", "turn_off", "open", "close", "toggle") \
-                            and not _is_simple_off_with_params and not _has_precise_light_params:
+                            and not _is_simple_off_with_params and not _has_precise_light_params \
+                            and not (domain in ("light", "switch") and service == "turn_off"):
                         assoc_script = self._find_associated_script(entity_id, service)
                         if assoc_script:
                             # 安全检查：若 AI 意图是 turn_off 且关联脚本名称含"关"/"turn_off"/"guan"，
@@ -2181,18 +2293,46 @@ class ActionsMixin:
             # 关灯安全守卫：light/switch turn_off 前双重确认区域无人
             # 因 Frigate 存在漏检，优先以物理人体传感器为准；任意一路检测到有人则阻止关灯
             if domain in ("light", "switch") and self._mode != MODE_SHOWROOM:
+                if service == "turn_off":
+                    refresh_presence = getattr(
+                        self,
+                        "_async_refresh_presence_snapshot_cache",
+                        None,
+                    )
+                    if callable(refresh_presence):
+                        try:
+                            presence_refreshed = bool(await refresh_presence())
+                        except Exception:
+                            presence_refreshed = False
+                        if not presence_refreshed:
+                            blocked_count += 1
+                            results.append(
+                                {
+                                    **action_result_context,
+                                    "status": "blocked_person",
+                                    "msg": "presence_refresh_failed",
+                                    "ha_command_status": "not_dispatched",
+                                    "presence_source": "addon_presence_engine",
+                                    "presence_reason": "presence_refresh_failed",
+                                    "presence_evidence_ids": [],
+                                    "presence_states": [],
+                                }
+                            )
+                            continue
                 off_blocked, off_reason = self._turnoff_presence_guard(entity_id, service)
+                presence_detail = getattr(self, "_last_turnoff_presence_guard_detail", {})
+                if not isinstance(presence_detail, dict):
+                    presence_detail = {}
                 if off_blocked:
                     self._sys_log("WARN",
                         f"[关灯守卫] 阻止 {domain}.turn_off({entity_id})：{off_reason}")
                     blocked_count += 1
-                    presence_detail = getattr(self, "_last_turnoff_presence_guard_detail", {})
-                    if not isinstance(presence_detail, dict):
-                        presence_detail = {}
                     results.append({"entity_id": entity_id, "service": service,
                                     "status": "blocked_person", "msg": off_reason,
                                     **presence_detail})
                     continue
+                if presence_detail:
+                    action_result_context.update(presence_detail)
             if entity_id in self._active_timers:
                 try:
                     self._active_timers[entity_id]()
@@ -2208,8 +2348,7 @@ class ActionsMixin:
                     "status": "scheduled",
                     "delay": delay,
                 }
-                if reason:
-                    result_entry.update(action_result_context)
+                result_entry.update(action_result_context)
                 results.append(result_entry)
 
                 async def _run_delayed(
@@ -2236,6 +2375,58 @@ class ActionsMixin:
                             })
                             await _refresh_transaction_from_results()
                             return
+                        if (
+                            d in ("light", "switch")
+                            and s == "turn_off"
+                            and self._mode != MODE_SHOWROOM
+                        ):
+                            refresh_presence = getattr(
+                                self,
+                                "_async_refresh_presence_snapshot_cache",
+                                None,
+                            )
+                            if callable(refresh_presence):
+                                try:
+                                    presence_refreshed = bool(
+                                        await refresh_presence()
+                                    )
+                                except Exception:
+                                    presence_refreshed = False
+                                if not presence_refreshed:
+                                    result.update(
+                                        {
+                                            "status": "blocked_person",
+                                            "msg": "presence_refresh_failed",
+                                            "ha_command_status": "not_dispatched",
+                                            "presence_source": "addon_presence_engine",
+                                            "presence_reason": "presence_refresh_failed",
+                                            "presence_evidence_ids": [],
+                                            "presence_states": [],
+                                        }
+                                    )
+                                    await _refresh_transaction_from_results()
+                                    return
+                            off_blocked, off_reason = self._turnoff_presence_guard(
+                                eid,
+                                s,
+                            )
+                            presence_detail = getattr(
+                                self,
+                                "_last_turnoff_presence_guard_detail",
+                                {},
+                            )
+                            if isinstance(presence_detail, dict):
+                                result.update(presence_detail)
+                            if off_blocked:
+                                result.update(
+                                    {
+                                        "status": "blocked_person",
+                                        "msg": off_reason,
+                                        "ha_command_status": "not_dispatched",
+                                    }
+                                )
+                                await _refresh_transaction_from_results()
+                                return
                         ok = await self._do_call_service(
                             d,
                             s,
@@ -2361,7 +2552,8 @@ class ActionsMixin:
             _remember_result(original_position, result)
         results[:] = _ordered_results()
         if correlation_id:
-            results[:] = [{**item, "correlation_id": correlation_id} for item in results]
+            for item in results:
+                item["correlation_id"] = correlation_id
 
         # ── 4. 提交事务结果 ────────────────────────────────────────────────────
         if txn_id:
