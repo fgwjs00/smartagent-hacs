@@ -6,6 +6,12 @@ import time
 from datetime import datetime
 from typing import Any
 
+from .arrival_lighting_learning import (
+    arrival_environment_bucket,
+    arrival_lighting_entity_ids,
+    classify_arrival_observation,
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -171,6 +177,7 @@ class DatabaseLearningProjectionMixin:
         state_change_evidence: dict[str, dict[str, Any]] | None = None,
         sample_started_at: float | None = None,
         sample_ended_at: float | None = None,
+        environment_context: dict[str, Any] | None = None,
     ) -> None:
         """Forward auditable arrival lighting samples to add-on owned memory."""
         try:
@@ -191,13 +198,36 @@ class DatabaseLearningProjectionMixin:
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         month = now.month
         season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
+        try:
+            dark_lux_threshold = float(
+                getattr(self, "_DAYLIGHT_GUARD_LUX_THRESHOLD", 80.0)
+            )
+        except (TypeError, ValueError):
+            dark_lux_threshold = 80.0
+        environment_bucket = arrival_environment_bucket(
+            environment_context if isinstance(environment_context, dict) else {},
+            dark_lux_threshold=dark_lux_threshold,
+        )
         if light_states is None:
-            light_states = {}
-            for entity_id, info in getattr(self, "device_info", {}).items():
-                if not entity_id.startswith("light.") or info.get("room") != room:
-                    continue
-                state = self.hass.states.get(entity_id)
-                light_states[entity_id] = state.state if state else None
+            device_info = (
+                getattr(self, "device_info", {})
+                if isinstance(getattr(self, "device_info", None), dict)
+                else {}
+            )
+            states = getattr(getattr(self, "hass", None), "states", None)
+            lighting_entity_ids = arrival_lighting_entity_ids(
+                device_info,
+                room,
+                entity_states=states,
+            )
+            light_states = {
+                entity_id: (
+                    getattr(states.get(entity_id), "state", None)
+                    if states is not None and hasattr(states, "get")
+                    else None
+                )
+                for entity_id in lighting_entity_ids
+            }
 
         pre_light_states = pre_light_states if isinstance(pre_light_states, dict) else {}
         raw_actions = smartagent_actions if isinstance(smartagent_actions, list) else []
@@ -256,38 +286,52 @@ class DatabaseLearningProjectionMixin:
             state_changed = pre_state_known and pre_state != observed_state
             change_evidence = state_change_evidence.get(entity_id)
             change_evidence = dict(change_evidence) if isinstance(change_evidence, dict) else {}
-            explicit_user_change = False
-            if state_changed and str(change_evidence.get("origin") or "") == "user_action":
+            evidence_space = str(
+                change_evidence.get("space_id")
+                or change_evidence.get("room")
+                or ""
+            ).strip()
+            scope_matches = not evidence_space or evidence_space == room
+            time_window_matches = not state_changed or bool(causal_actions)
+            if state_changed and not causal_actions:
                 try:
                     change_time = float(change_evidence.get("time"))
                 except (TypeError, ValueError):
                     change_time = 0.0
-                explicit_user_change = (
+                time_window_matches = (
                     sample_started_at is not None
                     and sample_ended_at is not None
                     and sample_started_at <= change_time <= sample_ended_at
                 )
 
-            baseline_eligible = True
-            observation_only = False
-            exclusion_reason = ""
-            if causal_actions:
-                baseline_eligible = False
-                exclusion_reason = (
-                    "recent_ai_action_same_entity"
-                    if any(bool(action.get("verified", False)) for action in causal_actions)
-                    else "execution_status_unverified"
-                )
-            elif state_changed and not explicit_user_change:
-                baseline_eligible = False
-                observation_only = True
-                exclusion_reason = "state_change_origin_unknown"
+            classification = classify_arrival_observation(
+                pre_state=pre_state,
+                observed_state=observed_state,
+                change_origin=str(change_evidence.get("origin") or ""),
+                causal_ai_actions=causal_actions,
+                trusted_automation_source=any(
+                    change_evidence.get(key) is True
+                    for key in (
+                        "trusted_automation_source",
+                        "owner_registered",
+                    )
+                ),
+                scope_matches=scope_matches,
+                time_window_matches=time_window_matches,
+            )
+            exclusion_reason = classification.exclusion_reason
+            if causal_actions and not any(
+                bool(action.get("verified", False)) for action in causal_actions
+            ):
+                exclusion_reason = "execution_status_unverified"
 
             classifications[entity_id] = {
                 "observed_state": observed_state,
                 "pre_state": pre_state,
-                "baseline_eligible": baseline_eligible,
-                "observation_only": observation_only,
+                "baseline_eligible": classification.baseline_eligible,
+                "observation_only": classification.observation_only,
+                "evidence_kind": classification.evidence_kind,
+                "evidence_weight": classification.evidence_weight,
                 "exclusion_reason": exclusion_reason,
                 "smartagent_actions": causal_actions,
                 "source_transaction_ids": transaction_ids,
@@ -350,6 +394,14 @@ class DatabaseLearningProjectionMixin:
                 "is_on": observed_state == "on",
                 "baseline_eligible": classification["baseline_eligible"],
                 "observation_only": classification["observation_only"],
+                "environment_bucket": environment_bucket,
+                "evidence_kind": classification["evidence_kind"],
+                "evidence_weight": classification["evidence_weight"],
+                "trust_state": (
+                    "verified"
+                    if classification["baseline_eligible"]
+                    else "observation_only"
+                ),
                 "exclusion_reason": classification["exclusion_reason"],
                 "smartagent_actions": entity_actions,
                 "state_change_evidence": classification["state_change_evidence"],

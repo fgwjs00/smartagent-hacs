@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -430,4 +431,112 @@ def evaluate_priority_arbitration(
         ),
         log_code="priority_guard_rejected",
         error_type="priority_guard",
+    )
+
+
+def evaluate_confirmed_presence_reentry_override(
+    *,
+    entity_id: Any,
+    service: Any,
+    claim: Any,
+    existing: Any,
+    active_space_id: Any,
+    target_space_id: Any,
+    world_snapshot_id: Any,
+    decision_time: Any,
+    now_ts: float,
+    is_lighting: bool,
+    max_age_seconds: float,
+) -> ThinExecutionGateResult:
+    """Validate the narrow Core-issued exception for reversing an AI P4 light-off."""
+
+    entity_s = _clean(entity_id)
+    service_s = _clean(service).lower().split(".", 1)[-1]
+    active_space = _clean(active_space_id)
+    target_space = _clean(target_space_id)
+    snapshot_id = _clean(world_snapshot_id)
+    invalid = ThinExecutionGateResult(
+        allowed=False,
+        entity_id=entity_s,
+        service=service_s,
+        log_code="confirmed_presence_reentry_override_invalid",
+    )
+    if not isinstance(claim, dict) or not isinstance(existing, dict):
+        return invalid
+    try:
+        version = int(claim.get("version"))
+        previous_priority = int(claim.get("previous_priority"))
+        existing_priority = int(existing.get("priority"))
+        guard_until = float(existing.get("guard_until"))
+        now = float(now_ts)
+        max_age = max(0.0, float(max_age_seconds))
+    except (TypeError, ValueError, OverflowError):
+        return invalid
+    if not all(math.isfinite(value) for value in (guard_until, now, max_age)):
+        return invalid
+
+    raw_decision_time = _clean(decision_time)
+    if not raw_decision_time:
+        return invalid
+    try:
+        parsed_time = datetime.fromisoformat(raw_decision_time.replace("Z", "+00:00"))
+        if parsed_time.tzinfo is None:
+            parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+        decision_ts = parsed_time.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return invalid
+    age = now - decision_ts
+    if not math.isfinite(age) or age < -5.0 or age > max_age:
+        return invalid
+    raw_issued_at = _clean(claim.get("issued_at"))
+    if not raw_issued_at:
+        return invalid
+    try:
+        issued_at = datetime.fromisoformat(raw_issued_at.replace("Z", "+00:00"))
+        if issued_at.tzinfo is None:
+            issued_at = issued_at.replace(tzinfo=timezone.utc)
+        issued_ts = issued_at.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return invalid
+    issued_age = now - issued_ts
+    if (
+        not math.isfinite(issued_age)
+        or issued_age < -5.0
+        or issued_age > max_age
+        or abs(issued_ts - decision_ts) > 5.0
+    ):
+        return invalid
+
+    if (
+        version != 1
+        or _clean(claim.get("type")) != "confirmed_presence_reentry"
+        or service_s != "turn_on"
+        or not is_lighting
+        or not entity_s
+        or _clean(claim.get("entity_id")) != entity_s
+        or not active_space
+        or target_space != active_space
+        or _clean(claim.get("space_id")) != active_space
+        or not snapshot_id
+        or _clean(claim.get("world_snapshot_id")) != snapshot_id
+        or not _clean(claim.get("trigger_entity_id"))
+        or _clean(claim.get("trigger_old_state")).lower()
+        not in {"off", "clear", "vacant", "none", "idle", "empty"}
+        or _clean(claim.get("trigger_new_state")).lower()
+        not in {"on", "occupied", "present", "motion", "person"}
+        or previous_priority != 4
+        or _clean(claim.get("previous_source")).lower() != "ai_infer"
+        or _clean(claim.get("previous_state")).lower() != "off"
+        or existing_priority != 4
+        or _clean(existing.get("source")).lower() != "ai_infer"
+        or _clean(existing.get("state")).lower() != "off"
+        or guard_until <= now
+    ):
+        return invalid
+
+    return ThinExecutionGateResult(
+        allowed=True,
+        entity_id=entity_s,
+        service=service_s,
+        log_code="confirmed_presence_reentry_override",
     )

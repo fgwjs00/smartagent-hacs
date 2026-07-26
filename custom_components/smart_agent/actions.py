@@ -35,6 +35,7 @@ from .execution_gate import (
     STATELESS_DOMAINS as THIN_GATE_STATELESS_DOMAINS,
     evaluate_automation_conflict_window,
     evaluate_color_temp_mireds_param,
+    evaluate_confirmed_presence_reentry_override,
     evaluate_global_suppress_window,
     evaluate_manual_override_window,
     evaluate_self_trigger_protection,
@@ -1347,10 +1348,16 @@ class ActionsMixin:
                               f"{set(params.keys()) - set(cleaned.keys())}")
             params = cleaned
 
+        priority_override_claim = action.get("priority_override_claim")
         return {"entity_id": entity_id, "domain": domain, "service": service,
                 "params": params, "reason": action.get("reason", ""),
                 "delay_seconds": action.get("delay_seconds", 0),
-                "runtime_hints": action.get("runtime_hints") or {}}
+                "runtime_hints": action.get("runtime_hints") or {},
+                "priority_override_claim": (
+                    dict(priority_override_claim)
+                    if isinstance(priority_override_claim, dict)
+                    else {}
+                )}
 
     def _fuzzy_match_entity(self, bad_id: str, domain_hint: str) -> str | None:
         """Try to match a bad entity_id (device name) to a real entity_id."""
@@ -1880,12 +1887,25 @@ class ActionsMixin:
             entity_id = action.get("entity_id")
             params = action.get("params", {})
             reason = action.get("reason", "")
+            priority_override_claim = action.get("priority_override_claim")
             target_info = self.device_info.get(entity_id, {}) if isinstance(self.device_info, dict) else {}
             if not isinstance(target_info, dict):
                 target_info = {}
+            authoritative_target_space_id = str(
+                target_info.get("space_id")
+                or target_info.get("room_id")
+                or target_info.get("area_id")
+                or ""
+            ).strip()
             target_space_id = str(
-                action.get("target_space_id")
+                authoritative_target_space_id
+                or action.get("target_space_id")
                 or action.get("space_id")
+                or (
+                    priority_override_claim.get("space_id")
+                    if isinstance(priority_override_claim, dict)
+                    else ""
+                )
                 or target_info.get("space_id")
                 or target_info.get("room_id")
                 or target_info.get("area_id")
@@ -2160,6 +2180,32 @@ class ActionsMixin:
                     continue
             # 人员在场守卫：light/switch turn_on 前确认区域有人（仅家庭模式）
             if domain in ("light", "switch") and self._mode != MODE_SHOWROOM:
+                if service == "turn_on":
+                    refresh_presence = getattr(
+                        self,
+                        "_async_refresh_presence_snapshot_cache",
+                        None,
+                    )
+                    if callable(refresh_presence):
+                        try:
+                            presence_refreshed = bool(await refresh_presence())
+                        except Exception:
+                            presence_refreshed = False
+                        if not presence_refreshed:
+                            blocked_count += 1
+                            results.append(
+                                {
+                                    **action_result_context,
+                                    "status": "blocked_person",
+                                    "msg": "presence_refresh_failed",
+                                    "ha_command_status": "not_dispatched",
+                                    "presence_source": "addon_presence_engine",
+                                    "presence_reason": "presence_refresh_failed",
+                                    "presence_evidence_ids": [],
+                                    "presence_states": [],
+                                }
+                            )
+                            continue
                 guard_blocked, guard_reason = self._occupancy_guard_check(entity_id, service)
                 if guard_blocked:
                     self._sys_log("WARN", f"[人员守卫] 拒绝 {domain}.turn_on({entity_id})：{guard_reason}（无人区域禁止开灯）")
@@ -2354,7 +2400,7 @@ class ActionsMixin:
                 async def _run_delayed(
                     d: str, s: str, eid: str, p: dict, r: str,
                     sc: str, trig: str, txid: int, aseq: int, parent_txid: str,
-                    corr_id: str, target_sid: str, result: dict,
+                    corr_id: str, target_sid: str, override_claim: dict, result: dict,
                 ) -> None:
                     try:
                         state = self.hass.states.get(eid)
@@ -2444,6 +2490,7 @@ class ActionsMixin:
                             decision_time=decision_time,
                             target_space_id=target_sid,
                             require_world_snapshot_guard=require_world_snapshot_guard,
+                            priority_override_claim=override_claim,
                         )
                     except Exception as exc:
                         _LOGGER.debug("[Actions] 延迟动作执行失败 %s.%s(%s): %s", d, s, eid, exc)
@@ -2451,8 +2498,13 @@ class ActionsMixin:
                     if ok:
                         result["status"] = "ok"
                     else:
-                        result.update(_pop_service_call_error_or_unknown(txid, aseq, eid))
-                        result["status"] = "blocked_or_error"
+                        service_error = _pop_service_call_error_or_unknown(txid, aseq, eid)
+                        result.update(service_error)
+                        result["status"] = (
+                            "skip"
+                            if service_error.get("ha_command_status") == "skipped"
+                            else "blocked_or_error"
+                        )
                     try:
                         await _refresh_transaction_from_results()
                     except Exception as exc:
@@ -2480,11 +2532,12 @@ class ActionsMixin:
                     parent_txid: str = parent_transaction_id,
                     corr_id: str = correlation_id,
                     target_sid: str = target_space_id,
+                    override_claim: dict = priority_override_claim,
                     result: dict = result_entry,
                 ) -> None:
                     coro = _run_delayed(
                         d, s, eid, p, r, sc, trig, txid, aseq, parent_txid,
-                        corr_id, target_sid, result,
+                        corr_id, target_sid, override_claim, result,
                     )
                     try:
                         self.hass.async_create_task(coro)
@@ -2536,14 +2589,18 @@ class ActionsMixin:
                     decision_time=decision_time,
                     target_space_id=target_space_id,
                     require_world_snapshot_guard=require_world_snapshot_guard,
+                    priority_override_claim=priority_override_claim,
                 )
                 if ok:
                     executed += 1
                     results.append({**action_result_context, "status": "ok"})
                 else:
-                    failed_count += 1
                     service_error = _pop_service_call_error_or_unknown(txn_id, action_seq, entity_id)
-                    results.append({**action_result_context, **service_error, "status": "blocked_or_error"})
+                    if service_error.get("ha_command_status") == "skipped":
+                        results.append({**action_result_context, **service_error, "status": "skip"})
+                    else:
+                        failed_count += 1
+                        results.append({**action_result_context, **service_error, "status": "blocked_or_error"})
 
         for (original_position, _raw_action, _action), result in zip(
             normalized_actions,
@@ -2590,7 +2647,7 @@ class ActionsMixin:
         decision_time: str = "",
         target_space_id: str = "",
         require_world_snapshot_guard: bool = False,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Execute one HA command envelope and preserve structured failure detail."""
         from .ha_adapter import async_execute_command_envelope
 
@@ -2700,7 +2757,7 @@ class ActionsMixin:
             result = await async_execute_command_envelope(self.hass, envelope)
         if isinstance(result, dict) and result.get("ok"):
             self._clear_service_call_error(transaction_id, action_seq, entity_id)
-            return
+            return result
         failed = None
         if isinstance(result, dict):
             failed = next((item for item in result.get("results", []) if not item.get("ok")), None)
@@ -2746,6 +2803,7 @@ class ActionsMixin:
         decision_time: str = "",
         target_space_id: str = "",
         require_world_snapshot_guard: bool = False,
+        priority_override_claim: dict[str, Any] | None = None,
     ) -> bool:
         """Call HA service and record AI action for override detection. Returns True if executed.
 
@@ -2764,9 +2822,16 @@ class ActionsMixin:
                 trigger_summary=str(trigger_text or ""),
             )
         )
-        if state and service == "turn_off" and state.state == "off" and not is_presence_departure_turnoff:
-            return True
         self._clear_service_call_error(transaction_id, action_seq, entity_id)
+        if state and service == "turn_off" and state.state == "off" and not is_presence_departure_turnoff:
+            self._remember_service_call_error(
+                transaction_id,
+                action_seq,
+                entity_id,
+                msg="already_in_target_state",
+                status="skipped",
+            )
+            return False
 
         def _fail_before_service(msg: str, *, error_type: str = "ha_service_guard", status: str = "blocked") -> bool:
             self._remember_service_call_error(
@@ -2924,12 +2989,41 @@ class ActionsMixin:
             )
 
         if self._mode == MODE_HOME:
-            allowed, arb_reason = self._arbitrate(entity_id, ai_source, service, params)
-            if not allowed:
-                self._sys_log("WARN", arb_reason)
-                return _fail_before_service(
-                    str(arb_reason or "priority_guard_rejected"),
-                    error_type="priority_guard",
+            target_info = self.device_info.get(entity_id, {}) if isinstance(self.device_info, dict) else {}
+            if not isinstance(target_info, dict):
+                target_info = {}
+            reentry_override = evaluate_confirmed_presence_reentry_override(
+                entity_id=entity_id,
+                service=service,
+                claim=priority_override_claim,
+                existing=(
+                    self._device_priority_map.get(entity_id)
+                    if isinstance(getattr(self, "_device_priority_map", None), dict)
+                    else None
+                ),
+                active_space_id=active_space_id,
+                target_space_id=target_space_id,
+                world_snapshot_id=world_snapshot_id,
+                decision_time=decision_time,
+                now_ts=now_ts,
+                is_lighting=(
+                    domain == "light"
+                    or str(target_info.get("capability") or "") == "lighting"
+                ),
+                max_age_seconds=30,
+            )
+            if not (require_world_snapshot_guard and reentry_override.allowed):
+                allowed, arb_reason = self._arbitrate(entity_id, ai_source, service, params)
+                if not allowed:
+                    self._sys_log("WARN", arb_reason)
+                    return _fail_before_service(
+                        str(arb_reason or "priority_guard_rejected"),
+                        error_type="priority_guard",
+                    )
+            else:
+                self._sys_log(
+                    "INFO",
+                    f"[P4快速重返] {entity_id} 使用 Core 确认存在 claim 覆盖 AI P4 关灯保护",
                 )
 
             # 兼容旧的用户覆盖保护（对未接入优先级系统的边界情况兜底）
@@ -2984,7 +3078,7 @@ class ActionsMixin:
             text = str(exc).lower()
             return "extra keys" in text or "not allowed" in text or "unexpected" in text
 
-        async def _call_enveloped_service(call_data: dict[str, Any]) -> None:
+        async def _call_enveloped_service(call_data: dict[str, Any]) -> dict[str, Any]:
             active_correlations = getattr(self, "_active_service_correlation_ids", None)
             if not isinstance(active_correlations, dict):
                 active_correlations = {}
@@ -3005,7 +3099,7 @@ class ActionsMixin:
                     if require_world_snapshot_guard
                     else {}
                 )
-                await self._execute_enveloped_service(
+                return await self._execute_enveloped_service(
                     domain,
                     service,
                     entity_id,
@@ -3021,10 +3115,9 @@ class ActionsMixin:
                 else:
                     active_correlations.pop(task, None)
 
+        envelope_result: dict[str, Any] = {}
         try:
-            await _call_enveloped_service(safe_params)
-            if domain in ("scene", "script") and service == "turn_on":
-                self._scene_last_exec[entity_id] = time.time()
+            envelope_result = await _call_enveloped_service(safe_params)
         except Exception as call_err:
             err_str = str(call_err).lower()
             # 部分设备不支持某些扩展参数，尝试智能降级：
@@ -3038,7 +3131,7 @@ class ActionsMixin:
                     self._sys_log("WARN", f"[动作] {entity_id} 不支持色温参数 {color_keys_present}，"
                                   f"保留亮度重试: {non_color_params}")
                     try:
-                        await _call_enveloped_service(non_color_params)
+                        envelope_result = await _call_enveloped_service(non_color_params)
                     except ServiceNotFound:
                         raise
                     except Exception as retry_err:
@@ -3052,7 +3145,7 @@ class ActionsMixin:
                         # 再退一步：去除全部扩展参数
                         self._sys_log("WARN", f"[动作] {entity_id} 亮度参数也失败，去除全部扩展参数重试")
                         try:
-                            await _call_enveloped_service({})
+                            envelope_result = await _call_enveloped_service({})
                         except ServiceNotFound:
                             raise
                         except Exception as bare_retry_err:
@@ -3066,7 +3159,7 @@ class ActionsMixin:
                     # 没有可保留的参数，直接裸调用
                     self._sys_log("WARN", f"[动作] {entity_id} 不支持参数 {extra_keys}，去除后重试")
                     try:
-                        await _call_enveloped_service({})
+                        envelope_result = await _call_enveloped_service({})
                     except ServiceNotFound:
                         raise
                     except Exception as retry_err:
@@ -3083,6 +3176,44 @@ class ActionsMixin:
             else:
                 self._sys_log("ERROR", f"[动作] {entity_id} 服务调用失败: {call_err}")
                 return _fail_after_service(str(call_err))
+        envelope_rows = envelope_result.get("results")
+        receipt = (
+            envelope_rows[0]
+            if isinstance(envelope_rows, list)
+            and len(envelope_rows) == 1
+            and isinstance(envelope_rows[0], dict)
+            else None
+        )
+        if isinstance(receipt, dict) and receipt.get("ok") is True:
+            receipt_status = str(receipt.get("status") or "").strip().lower()
+            if receipt.get("executed") is False or receipt_status == "skipped":
+                noop_reason = str(
+                    receipt.get("reason") or receipt.get("status") or "already_in_target_state"
+                ).strip()
+                self._remember_service_call_error(
+                    transaction_id,
+                    action_seq,
+                    entity_id,
+                    msg=noop_reason,
+                    status="skipped",
+                )
+                return False
+            if receipt.get("executed") is not True:
+                return _fail_after_service(
+                    "ha_execution_receipt_unverified",
+                    error_type="ha_service_unverified_success",
+                    status="failed",
+                    overwrite_stale=True,
+                )
+        else:
+            return _fail_after_service(
+                "ha_execution_receipt_unverified",
+                error_type="ha_service_unverified_success",
+                status="failed",
+                overwrite_stale=True,
+            )
+        if domain in ("scene", "script") and service == "turn_on":
+            self._scene_last_exec[entity_id] = time.time()
         self._last_ai_actions[entity_id] = {
             "state": ai_new_state,
             "time": now_ts,

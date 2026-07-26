@@ -19,6 +19,7 @@ _REQUIRED_FIELDS = (
     "confirm_required",
     "arbitration_result",
 )
+_QUALIFIED_AUTO_EXECUTE_REASONS = frozenset({"confirmed_presence_lighting"})
 
 
 def _finite_percent(value: Any) -> float | None:
@@ -58,7 +59,23 @@ def validate_auto_execution_arbitration(
     ):
         return AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid")
 
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+    qualified_reason = str(payload.get("auto_execute_reason") or "").strip()
+    qualified_floor = _finite_percent(payload.get("qualified_confidence_floor"))
+    has_canonical_qualification = (
+        qualified_reason in _QUALIFIED_AUTO_EXECUTE_REASONS
+        and qualified_floor == confidence_auto
+        and str(result.get("auto_execute_reason") or "").strip() == qualified_reason
+        and _finite_percent(result.get("qualified_confidence_floor")) == qualified_floor
+        and str(details.get("auto_execute_reason") or "").strip() == qualified_reason
+        and _finite_percent(details.get("qualified_confidence_floor")) == qualified_floor
+    )
+
     if confidence >= confidence_auto:
+        expected = (True, False, "auto_execute")
+        denied_reason = ""
+    elif has_canonical_qualification:
         expected = (True, False, "auto_execute")
         denied_reason = ""
     elif confidence >= confidence_notify:

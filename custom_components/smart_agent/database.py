@@ -416,6 +416,7 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
         if not txn_id:
             return
         has_scheduled = False
+        all_skipped = False
         action_results: list[dict[str, Any]] = []
         try:
             decoded_results = json.loads(results_json or "[]")
@@ -425,12 +426,20 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
                     str((item or {}).get("status") or "") in {"scheduled", "delayed"}
                     for item in action_results
                 )
+                all_skipped = bool(action_results) and all(
+                    str((item or {}).get("status") or "").strip().lower() in {"skip", "skipped"}
+                    or str((item or {}).get("ha_command_status") or "").strip().lower() == "skipped"
+                    for item in action_results
+                )
         except Exception:
             has_scheduled = False
+            all_skipped = False
         self._record_recent_ai_action_results(txn_id, action_results)
 
         if has_scheduled:
             status = "scheduled"
+        elif all_skipped and dispatched == 0 and blocked == 0 and failed == 0:
+            status = "skipped"
         elif failed == 0 and (dispatched > 0 or blocked == 0):
             status = "success"
         elif dispatched > 0 and failed > 0:

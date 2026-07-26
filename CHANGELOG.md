@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.181 - 2026-07-24
+## Beta 0.0.182 - 2026-07-26
 
-Beta 0.0.181 是主卧无人关灯 C1 纠错候选：在 fast-path、普通即时关灯、延迟登记和延迟真实下发前刷新权威 Presence 投影；light/switch turn_off 同时校验 canonical Presence 与 Core 已授权的 HA 实时证据，刷新失败、证据过期、数值异常或 occupied/unknown 冲突均失败关闭；禁止把关灯改写为关联脚本，保留同一事务 lineage 和最终 action result。Linux amd64 native prebuilt 已重建并完成容器内行为重放。发行默认仍为 shadow、真实执行开关默认 false；发布安装后必须重新完成 B1 自然周期、post-state 和 72 小时门槛，不能把版本发布记为现场验收通过。
+Beta 0.0.182 发布 Presence 到达照明学习选择与执行边界整改：毫米波可作为主要到达与离开证据，PIR off 不单独证明无人；到达候选统一覆盖显式纳管的照明 light/switch，取消无成熟学习证据时的批量开灯回退，冷启动改为业主子集选择或保持全关。确认后仍经 CommandEnvelope、preflight、HA action result 和逐实体可信学习链；SmartAgent 自身动作、外部自动化和 legacy_unverified 样本不得晋升。实体级 canary、no-op 真实性、switch 空参数、Presence 刷新和失败关闭继续保留。发行默认仍为 shadow、真实执行开关默认 false，Orvibo 保持停用；业主已授权正式发布，真实 HA 部署与现场验收仍为独立后续门禁。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.181`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.182`，用于 Home Assistant 更新检测。

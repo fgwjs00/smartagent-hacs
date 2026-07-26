@@ -19,6 +19,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
 from .action_normalization import action_requires_presence_refresh
+from .arrival_lighting_learning import arrival_lighting_entity_ids
 from .ha_adapter import async_call_service
 from .active_ai_rollout import (
     ActiveAiRolloutConfig,
@@ -26,6 +27,7 @@ from .active_ai_rollout import (
     enrich_active_ai_action_spaces,
     evaluate_active_ai_execution_gate,
     normalize_active_ai_mode,
+    scope_active_ai_canary_actions,
 )
 from .confidence_arbitration_contract import validate_auto_execution_arbitration
 from .sensor_event_filter import EnvironmentTelemetryFilter, environment_sensor_kind
@@ -1531,7 +1533,41 @@ class ListenersMixin:
             await asyncio.sleep(defer_seconds)
 
         valid_actions = actions if isinstance(actions, list) else []
-        rollout_actions = enrich_active_ai_action_spaces(valid_actions, device_info)
+        if not valid_actions:
+            selection_confirmation = result.get("selection_confirmation")
+            pending_selection = (
+                isinstance(selection_confirmation, dict)
+                and selection_confirmation.get("required") is True
+            )
+            return self._enqueue_fast_path_execution_audit(
+                transaction_id=transaction_id,
+                correlation_id=correlation_id,
+                world_snapshot_id=world_snapshot_id,
+                decision_trace=decision_trace,
+                trigger=trigger or f"{entity_id}: state_changed",
+                scene=str(scene),
+                confidence=confidence,
+                actions=[],
+                candidate_actions=[],
+                execution_result=0,
+                execution_suppressed_reason=(
+                    "pending_selection_confirmation"
+                    if pending_selection
+                    else "no_actions"
+                ),
+            )
+        candidate_actions = (
+            result.get("rollout_original_actions")
+            if isinstance(result.get("rollout_original_actions"), list)
+            else valid_actions
+        )
+        candidate_actions = [
+            dict(item) for item in candidate_actions if isinstance(item, dict)
+        ]
+        rollout_actions = enrich_active_ai_action_spaces(
+            candidate_actions,
+            device_info,
+        )
         trigger_info = device_info.get(entity_id, {})
         if not isinstance(trigger_info, dict):
             trigger_info = {}
@@ -1546,6 +1582,48 @@ class ListenersMixin:
         rollout_payload = (
             active_ai_rollout if isinstance(active_ai_rollout, dict) else {}
         )
+        rollout_config = ActiveAiRolloutConfig.from_mapping(rollout_payload)
+        scoped_actions = scope_active_ai_canary_actions(
+            candidate_actions,
+            rollout_config,
+        )
+        if not scoped_actions.entity_missing:
+            valid_actions = list(scoped_actions.actions)
+            rollout_actions = enrich_active_ai_action_spaces(
+                valid_actions,
+                device_info,
+            )
+        rollout_blocked_actions = (
+            [
+                dict(item)
+                for item in result.get("rollout_blocked_actions", [])
+                if isinstance(item, dict)
+            ]
+            if isinstance(result.get("rollout_blocked_actions"), list)
+            else []
+        )
+        if not rollout_blocked_actions and scoped_actions.blocked_entity_ids:
+            blocked_entity_ids = set(scoped_actions.blocked_entity_ids)
+            for action in candidate_actions:
+                action_entity_id = str(
+                    action.get("entity_id")
+                    or action.get("entity")
+                    or (
+                        action.get("target", {}).get("entity_id")
+                        if isinstance(action.get("target"), dict)
+                        else ""
+                    )
+                    or ""
+                ).strip().lower()
+                if action_entity_id not in blocked_entity_ids:
+                    continue
+                rollout_blocked_actions.append(
+                    {
+                        **action,
+                        "status": "blocked_by_rollout",
+                        "reason": "active_ai_canary_entity_not_allowed",
+                    }
+                )
         execution_flags = (
             rollout_payload.get("execution_flags")
             if isinstance(rollout_payload.get("execution_flags"), dict)
@@ -1554,7 +1632,7 @@ class ListenersMixin:
         is_enabled = getattr(self, "_is_enabled", None)
         rollout_decision = evaluate_active_ai_execution_gate(
             ai_enabled=bool(is_enabled()) if callable(is_enabled) else False,
-            config=ActiveAiRolloutConfig.from_mapping(rollout_payload),
+            config=rollout_config,
             trigger_space_id=trigger_space_id,
             actions=rollout_actions,
             execution_flags=execution_flags,
@@ -1578,6 +1656,8 @@ class ListenersMixin:
                 scene=str(scene),
                 confidence=confidence,
                 actions=valid_actions,
+                candidate_actions=candidate_actions,
+                rollout_blocked_actions=rollout_blocked_actions,
                 execution_result=0,
                 execution_suppressed_reason=rollout_decision.reason,
                 rollout=rollout_decision.as_trace(),
@@ -1608,6 +1688,8 @@ class ListenersMixin:
                     scene=str(scene),
                     confidence=confidence,
                     actions=valid_actions,
+                    candidate_actions=candidate_actions,
+                    rollout_blocked_actions=rollout_blocked_actions,
                     execution_result=0,
                     execution_suppressed_reason="presence_refresh_failed",
                     rollout=rollout_decision.as_trace(),
@@ -1636,6 +1718,8 @@ class ListenersMixin:
             scene=str(scene),
             confidence=confidence,
             actions=valid_actions,
+            candidate_actions=candidate_actions,
+            rollout_blocked_actions=rollout_blocked_actions,
             execution_result=execution_result,
         )
 
@@ -1651,6 +1735,8 @@ class ListenersMixin:
         confidence: Any,
         actions: list[Any],
         execution_result: Any,
+        candidate_actions: list[Any] | None = None,
+        rollout_blocked_actions: list[Any] | None = None,
         execution_suppressed_reason: str = "",
         rollout: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1658,6 +1744,24 @@ class ListenersMixin:
         if not transaction_id:
             return {}
         valid_actions = [dict(item) for item in actions if isinstance(item, dict)]
+        candidate_action_rows = [
+            dict(item)
+            for item in (
+                candidate_actions
+                if isinstance(candidate_actions, list)
+                else valid_actions
+            )
+            if isinstance(item, dict)
+        ]
+        blocked_action_rows = [
+            dict(item)
+            for item in (
+                rollout_blocked_actions
+                if isinstance(rollout_blocked_actions, list)
+                else []
+            )
+            if isinstance(item, dict)
+        ]
         try:
             executed = int(execution_result)
         except (TypeError, ValueError):
@@ -1710,9 +1814,13 @@ class ListenersMixin:
             if action_reason:
                 fallback_result["action_reason"] = action_reason
             action_results.append(fallback_result)
+        action_results.extend(blocked_action_rows)
         final_outcome = (
             "observe_only"
             if execution_suppressed_reason == "active_ai_shadow"
+            else "no_action"
+            if execution_suppressed_reason
+            in {"pending_selection_confirmation", "no_actions"}
             else "blocked"
             if execution_suppressed_reason
             else "succeeded"
@@ -1733,9 +1841,14 @@ class ListenersMixin:
             "scene": scene,
             "confidence": confidence,
             "planned_count": len(valid_actions),
+            "candidate_action_count": len(candidate_action_rows),
+            "authorized_action_count": len(valid_actions),
             "executed_count": executed,
             "final_outcome": final_outcome,
             "actions": valid_actions,
+            "candidate_actions": candidate_action_rows,
+            "authorized_actions": valid_actions,
+            "rollout_blocked_actions": blocked_action_rows,
             "action_results": action_results,
             "pre_states": pre_states,
         }
@@ -1982,15 +2095,34 @@ class ListenersMixin:
             return
 
         states = getattr(self.hass, "states", None)
-        pre_light_states: dict[str, str | None] = {}
-        for light_entity_id, light_info in device_info.items():
-            if not str(light_entity_id).startswith("light.") or not isinstance(light_info, dict):
-                continue
-            light_room = str(light_info.get("room") or light_info.get("area") or "").strip()
-            if light_room != room:
-                continue
-            light_state = states.get(light_entity_id) if states is not None and hasattr(states, "get") else None
-            pre_light_states[light_entity_id] = getattr(light_state, "state", None) if light_state is not None else None
+        lighting_entity_ids = arrival_lighting_entity_ids(
+            device_info,
+            room,
+            entity_states=states,
+        )
+        environment_builder = getattr(
+            self,
+            "_build_fast_path_environment_context",
+            None,
+        )
+        raw_environment_context = (
+            environment_builder(device_info, entity_id)
+            if callable(environment_builder)
+            else None
+        )
+        environment_context = (
+            dict(raw_environment_context)
+            if isinstance(raw_environment_context, dict)
+            else {}
+        )
+        pre_light_states: dict[str, str | None] = {
+            lighting_entity_id: (
+                getattr(states.get(lighting_entity_id), "state", None)
+                if states is not None and hasattr(states, "get")
+                else None
+            )
+            for lighting_entity_id in lighting_entity_ids
+        }
         sample_started_at = time.time()
 
         def _sample(_now: Any = None) -> None:
@@ -2104,6 +2236,7 @@ class ListenersMixin:
                         state_change_evidence=state_change_evidence,
                         sample_started_at=sample_started_at,
                         sample_ended_at=sample_ended_at,
+                        environment_context=environment_context,
                     )
             except Exception as exc:
                 _LOGGER.debug("[ArrivalBaseline] delayed sample failed for %s: %s", entity_id, exc)
@@ -2507,7 +2640,26 @@ class ListenersMixin:
                         presence=presence_details,
                     )
                     path_taken = str(response.get("path_taken") or details.get("path_taken") or "none")
-                    reason = str(response.get("reason") or details.get("reason") or response.get("error") or "")
+                    result_payload = result if isinstance(result, dict) else {}
+                    decision_reason = str(
+                        response.get("decision_reason")
+                        or result_payload.get("decision_reason")
+                        or details.get("decision_reason")
+                        or ""
+                    )
+                    arbitration_reason = str(
+                        response.get("arbitration_reason")
+                        or result_payload.get("arbitration_reason")
+                        or details.get("arbitration_reason")
+                        or ""
+                    )
+                    reason = str(
+                        response.get("reason")
+                        or decision_reason
+                        or details.get("reason")
+                        or response.get("error")
+                        or ""
+                    )
                     confirm_required = response.get("confirm_required") is True or details.get("confirm_required") is True
                     confirm_suppressed_reason = str(details.get("confirm_suppressed_reason") or "")
                     addon_learning_mode = details.get("learning_mode")
@@ -2551,7 +2703,7 @@ class ListenersMixin:
                     world_snapshot_id = str(response.get("world_snapshot_id") or details.get("world_snapshot_id") or "")
 
                     def _fast_path_handoff_context(source: str) -> dict[str, Any]:
-                        return {
+                        context = {
                             "source": source,
                             "transaction_id": transaction_id,
                             "correlation_id": correlation_id,
@@ -2559,6 +2711,11 @@ class ListenersMixin:
                             "reason": reason or "",
                             "decision_trace": dict(decision_trace) if isinstance(decision_trace, dict) else {},
                         }
+                        if decision_reason:
+                            context["decision_reason"] = decision_reason
+                        if arbitration_reason:
+                            context["arbitration_reason"] = arbitration_reason
+                        return context
 
                     if isinstance(result, dict):
                         scene = str(result.get("scene") or result.get("source") or "")
@@ -2586,12 +2743,54 @@ class ListenersMixin:
                         device_info = {}
                     is_enabled = getattr(self, "_is_enabled", None)
                     rollout_actions = enrich_active_ai_action_spaces(actions, device_info)
+                    original_actions = list(actions)
+                    rollout_config = ActiveAiRolloutConfig.from_mapping(
+                        rollout_payload
+                    )
+                    scoped_actions = scope_active_ai_canary_actions(
+                        original_actions,
+                        rollout_config,
+                    )
+                    rollout_scope_filtered_entity_ids = list(
+                        scoped_actions.blocked_entity_ids
+                    )
+                    authorized_actions = list(actions)
+                    if not scoped_actions.entity_missing:
+                        authorized_actions = list(scoped_actions.actions)
+                        rollout_actions = enrich_active_ai_action_spaces(
+                            authorized_actions,
+                            device_info,
+                        )
+                    blocked_entity_ids = set(rollout_scope_filtered_entity_ids)
+                    rollout_blocked_actions = []
+                    for action in original_actions:
+                        if not isinstance(action, dict):
+                            continue
+                        action_entity_id = str(
+                            action.get("entity_id")
+                            or action.get("entity")
+                            or (
+                                action.get("target", {}).get("entity_id")
+                                if isinstance(action.get("target"), dict)
+                                else ""
+                            )
+                            or ""
+                        ).strip().lower()
+                        if action_entity_id not in blocked_entity_ids:
+                            continue
+                        rollout_blocked_actions.append(
+                            {
+                                **action,
+                                "status": "blocked_by_rollout",
+                                "reason": "active_ai_canary_entity_not_allowed",
+                            }
+                        )
                     trigger_info = device_info.get(entity_id, {})
                     if not isinstance(trigger_info, dict):
                         trigger_info = {}
                     rollout_decision = evaluate_active_ai_execution_gate(
                         ai_enabled=bool(is_enabled()) if callable(is_enabled) else False,
-                        config=ActiveAiRolloutConfig.from_mapping(rollout_payload),
+                        config=rollout_config,
                         trigger_space_id=str(
                             (result.get("trigger_space_id") if isinstance(result, dict) else "")
                             or trigger_info.get("space_id")
@@ -2606,17 +2805,32 @@ class ListenersMixin:
                     if matched and not rollout_decision.allow_execution and not execution_suppressed_reason:
                         execution_suppressed_reason = rollout_decision.reason
                     rollout_trace = rollout_decision.as_trace()
+                    execution_result_payload = (
+                        dict(result) if isinstance(result, dict) else {}
+                    )
+                    execution_result_payload["actions"] = authorized_actions
+                    if rollout_blocked_actions:
+                        execution_result_payload["rollout_original_actions"] = (
+                            original_actions
+                        )
+                        execution_result_payload["rollout_blocked_actions"] = (
+                            rollout_blocked_actions
+                        )
                     audit_pending = bool(
                         matched
                         and arbitration_validation.allowed
                         and not execution_suppressed_reason
-                        and self._fast_path_result_allows_slow_audit(actions)
+                        and self._fast_path_result_allows_slow_audit(
+                            authorized_actions
+                        )
                     )
                     self._sys_log(
                         "INFO",
                         "[Add-on FastPath] result "
                         f"status={status} matched={matched} path_taken={path_taken} "
                         f"reason={reason or '-'} scene={scene or '-'} "
+                        f"decision_reason={decision_reason or '-'} "
+                        f"arbitration_reason={arbitration_reason or '-'} "
                         f"confidence={confidence if confidence is not None else '-'} "
                         f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
                         f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
@@ -2636,6 +2850,8 @@ class ListenersMixin:
                             "matched": matched,
                             "path_taken": path_taken,
                             "reason": reason,
+                            "decision_reason": decision_reason,
+                            "arbitration_reason": arbitration_reason,
                             "scene": scene,
                             "confidence": confidence,
                             "confidence_auto": confidence_auto,
@@ -2646,7 +2862,10 @@ class ListenersMixin:
                             "confirm_required": confirm_required,
                             "confirm_suppressed_reason": confirm_suppressed_reason,
                             "action_count": action_count,
-                            "actions": actions,
+                            "actions": original_actions,
+                            "authorized_action_count": len(authorized_actions),
+                            "authorized_actions": authorized_actions,
+                            "rollout_blocked_actions": rollout_blocked_actions,
                             "transaction_id": transaction_id,
                             "decision_trace": decision_trace,
                             "correlation_id": correlation_id,
@@ -2658,6 +2877,9 @@ class ListenersMixin:
                             "rollback_allowed": audit_pending,
                             "execution_suppressed_reason": execution_suppressed_reason,
                             "rollout": rollout_trace,
+                            "rollout_scope_filtered_entity_ids": (
+                                rollout_scope_filtered_entity_ids
+                            ),
                             "fail_closed": arbitration_fail_closed or not (200 <= status < 300),
                             "snapshot": snapshot_diag,
                         }
@@ -2677,6 +2899,8 @@ class ListenersMixin:
                             "trigger": f"{entity_id}: {old_state} -> {new_state}",
                             "reply": "AI 已命中候选动作，但置信度低于自动执行阈值，等待用户确认。",
                             "reason": reason,
+                            "decision_reason": decision_reason,
+                            "arbitration_reason": arbitration_reason,
                             "path_taken": path_taken,
                             "result": result,
                             "txn_id": transaction_id or None,
@@ -2701,7 +2925,7 @@ class ListenersMixin:
                             )
                             if execution_suppressed_reason.startswith("active_ai_"):
                                 await self._execute_fast_path_decision_result(
-                                    result,
+                                    execution_result_payload,
                                     entity_id=entity_id,
                                     source_label="AddonFastPath",
                                     transaction_id=transaction_id,
@@ -2710,6 +2934,20 @@ class ListenersMixin:
                                     decision_trace=decision_trace,
                                     trigger=f"{entity_id}: {old_state} -> {new_state}",
                                     active_ai_rollout=rollout_payload,
+                                )
+                            else:
+                                self._enqueue_fast_path_execution_audit(
+                                    transaction_id=transaction_id,
+                                    correlation_id=correlation_id,
+                                    world_snapshot_id=world_snapshot_id,
+                                    decision_trace=decision_trace,
+                                    trigger=f"{entity_id}: {old_state} -> {new_state}",
+                                    scene=scene,
+                                    confidence=confidence,
+                                    actions=actions,
+                                    execution_result=0,
+                                    execution_suppressed_reason=execution_suppressed_reason,
+                                    rollout=rollout_trace,
                                 )
                             return
                         self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
@@ -2727,7 +2965,7 @@ class ListenersMixin:
                             )
                         try:
                             execution_audit_context = await self._execute_fast_path_decision_result(
-                                result,
+                                execution_result_payload,
                                 entity_id=entity_id,
                                 source_label="AddonFastPath",
                                 transaction_id=transaction_id,
@@ -3131,6 +3369,29 @@ class ListenersMixin:
                         ai_action_age=int(ai_action_age),
                     )
                     return
+
+            if new and new.context and new.context.user_id:
+                record_operation = getattr(self, "_record_device_operation", None)
+                if callable(record_operation):
+                    record_operation(entity_id, SOURCE_DASHBOARD, new_s)
+
+                user_overrides = getattr(self, "_user_overrides", None)
+                user_overrides_lock = getattr(self, "_user_overrides_lock", None)
+                if isinstance(user_overrides, dict) and user_overrides_lock is not None:
+                    with user_overrides_lock:
+                        user_overrides[entity_id] = {
+                            "state": new_s,
+                            "time": time.time(),
+                        }
+
+                user_manual_actions = getattr(self, "_user_manual_actions", None)
+                user_manual_actions_lock = getattr(self, "_user_manual_actions_lock", None)
+                if isinstance(user_manual_actions, dict) and user_manual_actions_lock is not None:
+                    with user_manual_actions_lock:
+                        user_manual_actions[entity_id] = {
+                            "state": new_s,
+                            "time": time.time(),
+                        }
 
             self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type, old, new)
             self._record_presence_interaction_trace(entity_id, domain, new_s, source_type)

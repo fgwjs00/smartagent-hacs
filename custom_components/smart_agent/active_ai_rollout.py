@@ -51,6 +51,7 @@ class ActiveAiRolloutConfig(NamedTuple):
     mode: str
     canary_space_ids: frozenset[str]
     canary_domains: frozenset[str]
+    canary_entity_ids: frozenset[str]
 
     @classmethod
     def from_values(
@@ -59,11 +60,13 @@ class ActiveAiRolloutConfig(NamedTuple):
         mode: Any = DEFAULT_ACTIVE_AI_MODE,
         canary_space_ids: Any = (),
         canary_domains: Any = (),
+        canary_entity_ids: Any = (),
     ) -> "ActiveAiRolloutConfig":
         return cls(
             mode=normalize_active_ai_mode(mode),
             canary_space_ids=_string_set(canary_space_ids),
             canary_domains=_string_set(canary_domains, lowercase=True),
+            canary_entity_ids=_string_set(canary_entity_ids, lowercase=True),
         )
 
     @classmethod
@@ -79,6 +82,10 @@ class ActiveAiRolloutConfig(NamedTuple):
                 "canary_domains",
                 source.get("active_ai_canary_domains"),
             ),
+            canary_entity_ids=source.get(
+                "canary_entity_ids",
+                source.get("active_ai_canary_entity_ids"),
+            ),
         )
 
 
@@ -92,6 +99,8 @@ class ActiveAiRolloutDecision(NamedTuple):
     blocked_domains: tuple[str, ...]
     action_space_ids: tuple[str, ...]
     blocked_space_ids: tuple[str, ...]
+    action_entity_ids: tuple[str, ...]
+    blocked_entity_ids: tuple[str, ...]
 
     def as_trace(self) -> dict[str, Any]:
         return {
@@ -104,7 +113,62 @@ class ActiveAiRolloutDecision(NamedTuple):
             "blocked_domains": list(self.blocked_domains),
             "action_space_ids": list(self.action_space_ids),
             "blocked_space_ids": list(self.blocked_space_ids),
+            "action_entity_ids": list(self.action_entity_ids),
+            "blocked_entity_ids": list(self.blocked_entity_ids),
         }
+
+
+class ActiveAiScopedActions(NamedTuple):
+    actions: tuple[Any, ...]
+    blocked_entity_ids: tuple[str, ...]
+    entity_missing: bool
+
+
+def scope_active_ai_canary_actions(
+    actions: Any,
+    config: ActiveAiRolloutConfig,
+) -> ActiveAiScopedActions:
+    """Limit canary actions to an optional frozen entity manifest."""
+    if not isinstance(actions, list):
+        return ActiveAiScopedActions((), (), False)
+    if config.mode != "canary" or not config.canary_entity_ids:
+        return ActiveAiScopedActions(tuple(actions), (), False)
+
+    wildcard_forbidden = "*" in config.canary_entity_ids
+    allowed: list[Any] = []
+    blocked_entity_ids: list[str] = []
+    for action in actions:
+        target = action.get("target") if isinstance(action, Mapping) else None
+        target_entity_id = (
+            target.get("entity_id")
+            if isinstance(target, Mapping)
+            else ""
+        )
+        entity_id = (
+            str(
+                action.get("entity_id")
+                or action.get("entity")
+                or target_entity_id
+                or ""
+            ).strip().lower()
+            if isinstance(action, Mapping)
+            else ""
+        )
+        if not entity_id:
+            return ActiveAiScopedActions(
+                (),
+                tuple(sorted(set(blocked_entity_ids))),
+                True,
+            )
+        if not wildcard_forbidden and entity_id in config.canary_entity_ids:
+            allowed.append(action)
+        else:
+            blocked_entity_ids.append(entity_id)
+    return ActiveAiScopedActions(
+        tuple(allowed),
+        tuple(sorted(set(blocked_entity_ids))),
+        False,
+    )
 
 
 def _decision(
@@ -118,6 +182,8 @@ def _decision(
     blocked_domains: Iterable[str] = (),
     action_space_ids: Iterable[str] = (),
     blocked_space_ids: Iterable[str] = (),
+    action_entity_ids: Iterable[str] = (),
+    blocked_entity_ids: Iterable[str] = (),
 ) -> ActiveAiRolloutDecision:
     return ActiveAiRolloutDecision(
         mode=config.mode,
@@ -129,6 +195,8 @@ def _decision(
         blocked_domains=tuple(sorted(set(blocked_domains))),
         action_space_ids=tuple(sorted(set(action_space_ids))),
         blocked_space_ids=tuple(sorted(set(blocked_space_ids))),
+        action_entity_ids=tuple(sorted(set(action_entity_ids))),
+        blocked_entity_ids=tuple(sorted(set(blocked_entity_ids))),
     )
 
 
@@ -219,6 +287,14 @@ def evaluate_active_ai_execution_gate(
         return model_gate
 
     space_id = str(trigger_space_id or "").strip()
+    if config.mode == "canary" and "*" in config.canary_entity_ids:
+        return _decision(
+            config,
+            allow_model=True,
+            allow_execution=False,
+            reason="active_ai_canary_entity_wildcard_forbidden",
+            trigger_space_id=space_id,
+        )
     if not isinstance(actions, list) or not actions:
         return _decision(
             config,
@@ -229,7 +305,9 @@ def evaluate_active_ai_execution_gate(
         )
     domains: list[str] = []
     action_space_ids: list[str] = []
+    action_entity_ids: list[str] = []
     action_space_missing = False
+    action_entity_missing = False
     for action in actions:
         service = (
             str(
@@ -274,6 +352,26 @@ def evaluate_active_ai_execution_gate(
             action_space_ids.append(target_space_id)
         else:
             action_space_missing = True
+        target = action.get("target") if isinstance(action, Mapping) else None
+        target_entity_id = (
+            target.get("entity_id")
+            if isinstance(target, Mapping)
+            else ""
+        )
+        entity_id = (
+            str(
+                action.get("entity_id")
+                or action.get("entity")
+                or target_entity_id
+                or ""
+            ).strip().lower()
+            if isinstance(action, Mapping)
+            else ""
+        )
+        if entity_id:
+            action_entity_ids.append(entity_id)
+        else:
+            action_entity_missing = True
 
     if config.mode == "shadow":
         return _decision(
@@ -284,6 +382,7 @@ def evaluate_active_ai_execution_gate(
             trigger_space_id=space_id,
             action_domains=domains,
             action_space_ids=action_space_ids,
+            action_entity_ids=action_entity_ids,
         )
     if config.mode == "canary":
         if not space_id or space_id not in config.canary_space_ids:
@@ -295,6 +394,7 @@ def evaluate_active_ai_execution_gate(
                 trigger_space_id=space_id,
                 action_domains=domains,
                 action_space_ids=action_space_ids,
+                action_entity_ids=action_entity_ids,
             )
         blocked_domains = sorted(set(domains) - config.canary_domains)
         if blocked_domains:
@@ -307,6 +407,7 @@ def evaluate_active_ai_execution_gate(
                 action_domains=domains,
                 blocked_domains=blocked_domains,
                 action_space_ids=action_space_ids,
+                action_entity_ids=action_entity_ids,
             )
         if action_space_missing:
             return _decision(
@@ -317,6 +418,7 @@ def evaluate_active_ai_execution_gate(
                 trigger_space_id=space_id,
                 action_domains=domains,
                 action_space_ids=action_space_ids,
+                action_entity_ids=action_entity_ids,
             )
         blocked_space_ids = sorted(set(action_space_ids) - config.canary_space_ids)
         if blocked_space_ids:
@@ -329,6 +431,44 @@ def evaluate_active_ai_execution_gate(
                 action_domains=domains,
                 action_space_ids=action_space_ids,
                 blocked_space_ids=blocked_space_ids,
+                action_entity_ids=action_entity_ids,
+            )
+        if not config.canary_entity_ids:
+            return _decision(
+                config,
+                allow_model=True,
+                allow_execution=False,
+                reason="active_ai_canary_entity_scope_missing",
+                trigger_space_id=space_id,
+                action_domains=domains,
+                action_space_ids=action_space_ids,
+                action_entity_ids=action_entity_ids,
+            )
+        if action_entity_missing:
+            return _decision(
+                config,
+                allow_model=True,
+                allow_execution=False,
+                reason="active_ai_action_entity_missing",
+                trigger_space_id=space_id,
+                action_domains=domains,
+                action_space_ids=action_space_ids,
+                action_entity_ids=action_entity_ids,
+            )
+        blocked_entity_ids = sorted(
+            set(action_entity_ids) - config.canary_entity_ids
+        )
+        if blocked_entity_ids:
+            return _decision(
+                config,
+                allow_model=True,
+                allow_execution=False,
+                reason="active_ai_canary_entity_not_allowed",
+                trigger_space_id=space_id,
+                action_domains=domains,
+                action_space_ids=action_space_ids,
+                action_entity_ids=action_entity_ids,
+                blocked_entity_ids=blocked_entity_ids,
             )
 
     flags = execution_flags if isinstance(execution_flags, Mapping) else {}
@@ -341,6 +481,7 @@ def evaluate_active_ai_execution_gate(
             trigger_space_id=space_id,
             action_domains=domains,
             action_space_ids=action_space_ids,
+            action_entity_ids=action_entity_ids,
         )
     if (
         "light" in domains
@@ -354,6 +495,7 @@ def evaluate_active_ai_execution_gate(
             trigger_space_id=space_id,
             action_domains=domains,
             action_space_ids=action_space_ids,
+            action_entity_ids=action_entity_ids,
         )
 
     return _decision(
@@ -368,4 +510,5 @@ def evaluate_active_ai_execution_gate(
         trigger_space_id=space_id,
         action_domains=domains,
         action_space_ids=action_space_ids,
+        action_entity_ids=action_entity_ids,
     )

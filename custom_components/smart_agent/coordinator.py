@@ -77,6 +77,7 @@ from .active_ai_rollout import (
     evaluate_active_ai_execution_gate,
     evaluate_active_ai_model_gate,
     normalize_active_ai_mode,
+    scope_active_ai_canary_actions,
 )
 from .database import DatabaseMixin
 from .devices import DevicesMixin
@@ -1230,6 +1231,7 @@ class SmartAgentCoordinator(
                 "name": self.device_info.get(eid, {}).get("name", eid),
                 "priority": rec["priority"],
                 "priority_label": rec["priority_label"],
+                "source": rec["source"],
                 "source_label": rec["source_label"],
                 "state": rec["state"],
                 "remaining_sec": int(rec["guard_until"] - now),
@@ -2969,6 +2971,7 @@ class SmartAgentCoordinator(
 
             actions = result.get("actions") if isinstance(result.get("actions"), list) else []
             valid_actions = [item for item in actions if isinstance(item, dict)]
+            candidate_actions = [dict(item) for item in valid_actions]
             scene = str(result.get("scene") or "")
             transaction_id = str(
                 result.get("transaction_id")
@@ -3013,6 +3016,44 @@ class SmartAgentCoordinator(
                     if isinstance(bundle.get("device_info"), dict)
                     else {},
                 )
+                scoped_actions = scope_active_ai_canary_actions(
+                    candidate_actions,
+                    rollout_config,
+                )
+                if not scoped_actions.entity_missing:
+                    valid_actions = list(scoped_actions.actions)
+                    rollout_actions = enrich_active_ai_action_spaces(
+                        valid_actions,
+                        bundle.get("device_info")
+                        if isinstance(bundle.get("device_info"), dict)
+                        else {},
+                    )
+                blocked_entity_ids = set(scoped_actions.blocked_entity_ids)
+                rollout_blocked_actions = []
+                for action in candidate_actions:
+                    action_entity_id = str(
+                        action.get("entity_id")
+                        or action.get("entity")
+                        or (
+                            action.get("target", {}).get("entity_id")
+                            if isinstance(action.get("target"), dict)
+                            else ""
+                        )
+                        or ""
+                    ).strip().lower()
+                    if action_entity_id not in blocked_entity_ids:
+                        continue
+                    rollout_blocked_actions.append(
+                        {
+                            **action,
+                            "status": "blocked_by_rollout",
+                            "reason": "active_ai_canary_entity_not_allowed",
+                        }
+                    )
+                result["candidate_action_count"] = len(candidate_actions)
+                result["authorized_action_count"] = len(valid_actions)
+                result["authorized_actions"] = list(valid_actions)
+                result["rollout_blocked_actions"] = rollout_blocked_actions
                 rollout_decision = evaluate_active_ai_execution_gate(
                     ai_enabled=bool(getattr(self, "_enabled", False)),
                     config=rollout_config,
@@ -3068,10 +3109,18 @@ class SmartAgentCoordinator(
                                 "arbitration_result": "blocked_by_rollout",
                                 "reason": rollout_decision.reason,
                                 "planned_count": len(valid_actions),
+                                "candidate_action_count": len(candidate_actions),
+                                "authorized_action_count": len(valid_actions),
                                 "executed_count": 0,
                                 "final_outcome": final_outcome,
                                 "actions": valid_actions,
-                                "action_results": action_results,
+                                "candidate_actions": candidate_actions,
+                                "authorized_actions": valid_actions,
+                                "rollout_blocked_actions": rollout_blocked_actions,
+                                "action_results": [
+                                    *action_results,
+                                    *rollout_blocked_actions,
+                                ],
                                 "training_sample": None,
                                 "source": "ha_slow_decision",
                                 "origin": "smartagent",
@@ -3190,10 +3239,18 @@ class SmartAgentCoordinator(
                                 "arbitration_result": arbitration_result or "missing",
                                 "reason": suppressed_reason,
                                 "planned_count": len(valid_actions),
+                                "candidate_action_count": len(candidate_actions),
+                                "authorized_action_count": len(valid_actions),
                                 "executed_count": 0,
                                 "final_outcome": final_outcome,
                                 "actions": valid_actions,
-                                "action_results": action_results,
+                                "candidate_actions": candidate_actions,
+                                "authorized_actions": valid_actions,
+                                "rollout_blocked_actions": rollout_blocked_actions,
+                                "action_results": [
+                                    *action_results,
+                                    *rollout_blocked_actions,
+                                ],
                                 "training_sample": None,
                                 "source": "ha_slow_decision",
                                 "origin": "smartagent",
@@ -3305,10 +3362,18 @@ class SmartAgentCoordinator(
                                 "arbitration_result": "observe_only",
                                 "reason": "learning_mode_observe_only",
                                 "planned_count": len(valid_actions),
+                                "candidate_action_count": len(candidate_actions),
+                                "authorized_action_count": len(valid_actions),
                                 "executed_count": 0,
                                 "final_outcome": final_outcome,
                                 "actions": valid_actions,
-                                "action_results": action_results,
+                                "candidate_actions": candidate_actions,
+                                "authorized_actions": valid_actions,
+                                "rollout_blocked_actions": rollout_blocked_actions,
+                                "action_results": [
+                                    *action_results,
+                                    *rollout_blocked_actions,
+                                ],
                                 "training_sample": None,
                                 "source": "ha_slow_decision",
                                 "origin": "smartagent",
@@ -3419,6 +3484,11 @@ class SmartAgentCoordinator(
                     if execution_correlation_id:
                         fallback_result["correlation_id"] = execution_correlation_id
                     action_results.append(fallback_result)
+                audit_action_results = [
+                    dict(item)
+                    for item in [*action_results, *rollout_blocked_actions]
+                    if isinstance(item, dict)
+                ]
                 training_sample_payload = self._build_training_sample_payload(
                     bundle=bundle,
                     actions=valid_actions,
@@ -3448,10 +3518,15 @@ class SmartAgentCoordinator(
                             "arbitration_result": arbitration_result,
                             "reason": str(result.get("reason") or "confidence_threshold_met"),
                             "planned_count": len(valid_actions),
+                            "candidate_action_count": len(candidate_actions),
+                            "authorized_action_count": len(valid_actions),
                             "executed_count": executed,
                             "final_outcome": final_outcome,
                             "actions": valid_actions,
-                            "action_results": action_results,
+                            "candidate_actions": candidate_actions,
+                            "authorized_actions": valid_actions,
+                            "rollout_blocked_actions": rollout_blocked_actions,
+                            "action_results": audit_action_results,
                             "training_sample": training_sample_payload,
                             "source": "ha_slow_decision",
                             "origin": "smartagent",
