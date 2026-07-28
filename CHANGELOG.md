@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.182 - 2026-07-26
+## Beta 0.0.183 - 2026-07-29
 
-Beta 0.0.182 发布 Presence 到达照明学习选择与执行边界整改：毫米波可作为主要到达与离开证据，PIR off 不单独证明无人；到达候选统一覆盖显式纳管的照明 light/switch，取消无成熟学习证据时的批量开灯回退，冷启动改为业主子集选择或保持全关。确认后仍经 CommandEnvelope、preflight、HA action result 和逐实体可信学习链；SmartAgent 自身动作、外部自动化和 legacy_unverified 样本不得晋升。实体级 canary、no-op 真实性、switch 空参数、Presence 刷新和失败关闭继续保留。发行默认仍为 shadow、真实执行开关默认 false，Orvibo 保持停用；业主已授权正式发布，真实 HA 部署与现场验收仍为独立后续门禁。
+Beta 0.0.183 正式发布修复真实 canary、执行事实和照明纠错链：现场 0.0.182 的 Supervisor options 已恢复为主卧 zhu_wo、light/switch 与两个明确实体的精确执行范围，天然 60 秒无人周期已验证灯带真实 turn_off；新增发布前运行版本、listener 与精确 canary 同步门禁。事务产品投影改以终态 decision_execution 为执行真相，避免 matched 或旧行覆盖 succeeded/partial/failed；手工或墙壁开关在 10 分钟内反向修改 AI 已成功执行的照明 light/switch 时写入带事务来源的隐式纠错，并支持 partial 多动作事务逐实体、连续纠错。源码、Linux amd64 预构建、前端产物和自动回归已通过，业主已授权进入五发布面与 ACR 正式发布。发行默认仍为 shadow、真实执行开关默认 false，Orvibo 保持停用；真实 0.0.183 部署与后续现场学习验收仍为独立门禁。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.182`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.183`，用于 Home Assistant 更新检测。

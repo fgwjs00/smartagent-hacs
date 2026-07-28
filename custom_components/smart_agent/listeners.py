@@ -37,6 +37,7 @@ from .const import (
     GLITCH_THRESHOLD, GLITCH_WINDOW, GLITCH_SUPPRESS_SECS,
     PRESENCE_OFF_DELAY, PRESENCE_ON_COOLDOWN, PRESENCE_ON_MIN_HOLD,
     PRESENCE_FLAP_WINDOW, PRESENCE_FLAP_THRESHOLD, PRESENCE_FLAP_SUPPRESS_SECS,
+    CORRECTION_WINDOW_SECONDS,
     FRIGATE_COUNT_ON_HOLD, FRIGATE_COUNT_CHANGE_HOLD,
     FRIGATE_COUNT_OFF_HOLD, FRIGATE_COUNT_COOLDOWN,
     SENSOR_DEADBAND_PCT,
@@ -108,6 +109,7 @@ class ListenersMixin:
     _PRESENCE_FLAP_WINDOW = PRESENCE_FLAP_WINDOW
     _PRESENCE_FLAP_THRESHOLD = PRESENCE_FLAP_THRESHOLD
     _PRESENCE_FLAP_SUPPRESS_SECS = PRESENCE_FLAP_SUPPRESS_SECS
+    _CORRECTION_WINDOW_SECONDS = CORRECTION_WINDOW_SECONDS
 
     # Frigate person_count sensor 触发阈值
     _PERSON_COUNT_KW = _FRIGATE_PERSON_COUNT_KW
@@ -1320,6 +1322,146 @@ class ListenersMixin:
             if suppressions:
                 return suppressions
         return []
+
+    def _record_implicit_reverse_correction(
+        self,
+        *,
+        entity_id: str,
+        domain: str,
+        old_state: str,
+        new_state: str,
+        new_state_obj: Any,
+        source_type: str,
+        device_info: dict[str, Any],
+    ) -> bool:
+        """Record a direct manual reversal of a recent successful AI lighting action."""
+        capability = str(device_info.get("capability") or "").strip().lower()
+        if domain != "light" and not (domain == "switch" and capability == "lighting"):
+            return False
+
+        context = getattr(new_state_obj, "context", None)
+        if context is not None and getattr(context, "parent_id", None):
+            return False
+
+        last_ai_actions = getattr(self, "_last_ai_actions", {})
+        last_ai = last_ai_actions.get(entity_id) if isinstance(last_ai_actions, dict) else None
+        if not isinstance(last_ai, dict):
+            return False
+
+        ai_state = str(last_ai.get("state") or "").strip().lower()
+        old_value = str(old_state or "").strip().lower()
+        user_state = str(new_state or "").strip().lower()
+        opposite = {"on": "off", "off": "on"}.get(ai_state)
+        if not opposite or old_value != ai_state or user_state != opposite:
+            return False
+
+        ai_service = str(last_ai.get("service") or "").strip().lower()
+        expected_service = f"{domain}.turn_{ai_state}"
+        if ai_service != expected_service:
+            return False
+        try:
+            age = time.time() - float(last_ai.get("time") or 0)
+        except (TypeError, ValueError):
+            return False
+        if age < 0 or age > self._CORRECTION_WINDOW_SECONDS:
+            return False
+
+        room = str(device_info.get("room") or device_info.get("space_id") or "").strip()
+        presence_context = "occupied" if ai_state == "on" else "vacant"
+        transaction_id = str(last_ai.get("transaction_id") or "").strip()
+        parent_transaction_id = str(last_ai.get("parent_transaction_id") or "").strip()
+        context_user_id = str(getattr(context, "user_id", None) or "").strip()
+        actor = f"ha_user:{context_user_id}" if context_user_id else "ha_user:physical_control"
+        payload: dict[str, Any] = {
+            "action": "record",
+            "outcome": "rejected",
+            "entity_id": entity_id,
+            "ai_service": ai_service,
+            "ai_state": ai_state,
+            "user_state": user_state,
+            "user_service": f"{domain}.turn_{user_state}",
+            "room": room,
+            "scene_desc": str(last_ai.get("scene") or ""),
+            "trigger_text": str(last_ai.get("trigger") or ""),
+            "presence_context": presence_context,
+            "context": "implicit_reverse_after_ai",
+            "reason": "用户在 AI 操作后直接反向操作设备",
+            "correction_source": "implicit_reverse_after_ai",
+            "source_type": source_type,
+            "ai_action_age_seconds": round(age, 3),
+            "origin": "user_correction",
+            "actor": actor,
+            "decision_id": str(last_ai.get("decision_id") or transaction_id or "unknown"),
+            "transaction_id": transaction_id or "unknown",
+            "world_snapshot_id": str(last_ai.get("world_snapshot_id") or "unknown"),
+        }
+        execution_transaction_id = str(last_ai.get("execution_transaction_id") or "").strip()
+        if execution_transaction_id:
+            payload["execution_transaction_id"] = execution_transaction_id
+        if parent_transaction_id:
+            payload["parent_transaction_id"] = parent_transaction_id
+
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if not callable(enqueue) or not enqueue("correction", payload):
+            _LOGGER.warning("[Correction] implicit correction enqueue failed: %s", entity_id)
+            return False
+
+        suppressions = self._snapshot_correction_suppressions()
+        suppression_key = (entity_id, ai_service.rsplit(".", 1)[-1], room, presence_context)
+        updated_suppressions: list[dict[str, Any]] = []
+        matched_suppression = False
+        for row in suppressions:
+            row_key = (
+                row.get("entity_id"),
+                row.get("service"),
+                row.get("room"),
+                row.get("presence"),
+            )
+            if row_key != suppression_key:
+                updated_suppressions.append(row)
+                continue
+            matched_suppression = True
+            updated_suppressions.append(
+                {
+                    **row,
+                    "suppress": True,
+                    "count": int(row.get("count") or 0) + 1,
+                    "score": 1.0,
+                }
+            )
+        if not matched_suppression:
+            updated_suppressions.insert(
+                0,
+                {
+                    "entity_id": entity_id,
+                    "service": ai_service.rsplit(".", 1)[-1],
+                    "room": room,
+                    "presence": presence_context,
+                    "suppress": True,
+                    "count": 1,
+                    "score": 1.0,
+                },
+            )
+        self._correction_suppressions_cache = updated_suppressions
+        self._correction_suppressions_cache_refresh_at = (
+            time.time() + self._CORRECTION_SUPPRESSIONS_CACHE_TTL
+        )
+        user_overrides = getattr(self, "_user_overrides", None)
+        user_overrides_lock = getattr(self, "_user_overrides_lock", None)
+        if isinstance(user_overrides, dict) and user_overrides_lock is not None:
+            with user_overrides_lock:
+                user_overrides[entity_id] = {
+                    "time": time.time(),
+                    "state": user_state,
+                    "source": "implicit_reverse_correction",
+                }
+        last_ai_actions.pop(entity_id, None)
+        self._sys_log(
+            "WARN",
+            f"[纠错学习] 已记录人工反向操作: {entity_id} "
+            f"{ai_state}->{user_state}（AI 操作后 {int(age)}s）",
+        )
+        return True
 
     async def _refresh_correction_suppressions_cache(self, addon_client: Any) -> None:
         now_ts = time.time()
@@ -3393,17 +3535,31 @@ class ListenersMixin:
                             "time": time.time(),
                         }
 
+            implicit_correction_recorded = self._record_implicit_reverse_correction(
+                entity_id=entity_id,
+                domain=domain,
+                old_state=old_s,
+                new_state=new_s,
+                new_state_obj=new,
+                source_type=source_type,
+                device_info=dict(device_info_snapshot.get(entity_id) or {}),
+            )
             self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type, old, new)
             self._record_presence_interaction_trace(entity_id, domain, new_s, source_type)
 
             if domain in self._CONTROL_EVENT_DOMAINS:
-                self._last_listener_filter_reason = "controllable_state_feedback"
+                filter_reason = (
+                    "implicit_reverse_correction"
+                    if implicit_correction_recorded
+                    else "controllable_state_feedback"
+                )
+                self._last_listener_filter_reason = filter_reason
                 self._emit_listener_event(
                     listener_action="filtered",
                     entity_id=entity_id,
                     old_state=old_s,
                     new_state=new_s,
-                    filter_reason="controllable_state_feedback",
+                    filter_reason=filter_reason,
                     source_type=source_type,
                 )
                 return
