@@ -25,6 +25,7 @@ _ALLOWED_FIELDS = frozenset({
     "diagnostic_session_state", "diagnostic_expires_at", "last_command_correlation",
     "last_command_status", "product_id", "hardware_revision", "protocol", "firmware_version",
     "bootselect_version", "schema_version", "firmware_update_transaction_id", "firmware_update_phase",
+    "firmware_trust_mode",
     "moving_gate_energy", "still_gate_energy", "ld_light_value", "out_state", "raw_temperature",
     "raw_humidity", "temperature_offset", "humidity_residual", "calibration_version",
     "calibrated_at_epoch_s", "calibration_status", "calibration_source", "calibration_quality",
