@@ -4551,6 +4551,7 @@ class ListenersMixin:
             "room": str(room or ""),
             "space_id": str(space_id or ""),
             "type": str(dev_type or domain),
+            "capability": str(row.get("capability") or dev_type or domain),
             "ops": ops,
             "control_mode": mode,
             "managed": True,

@@ -2338,7 +2338,11 @@ class ActionsMixin:
 
             # 关灯安全守卫：light/switch turn_off 前双重确认区域无人
             # 因 Frigate 存在漏检，优先以物理人体传感器为准；任意一路检测到有人则阻止关灯
-            if domain in ("light", "switch") and self._mode != MODE_SHOWROOM:
+            if (
+                domain in ("light", "switch")
+                and self._mode != MODE_SHOWROOM
+                and not _is_user_explicit
+            ):
                 if service == "turn_off":
                     refresh_presence = getattr(
                         self,
@@ -2489,6 +2493,7 @@ class ActionsMixin:
                             active_space_id=active_space_id,
                             decision_time=decision_time,
                             target_space_id=target_sid,
+                            cmd_source=cmd_source,
                             require_world_snapshot_guard=require_world_snapshot_guard,
                             priority_override_claim=override_claim,
                         )
@@ -2588,6 +2593,7 @@ class ActionsMixin:
                     active_space_id=active_space_id,
                     decision_time=decision_time,
                     target_space_id=target_space_id,
+                    cmd_source=cmd_source,
                     require_world_snapshot_guard=require_world_snapshot_guard,
                     priority_override_claim=priority_override_claim,
                 )
@@ -2646,6 +2652,7 @@ class ActionsMixin:
         active_space_id: str = "",
         decision_time: str = "",
         target_space_id: str = "",
+        cmd_source: str = "",
         require_world_snapshot_guard: bool = False,
     ) -> dict[str, Any]:
         """Execute one HA command envelope and preserve structured failure detail."""
@@ -2680,6 +2687,7 @@ class ActionsMixin:
                             "active_ai_managed": True,
                             "world_snapshot_id": str(world_snapshot_id or "").strip(),
                             "active_space_id": str(active_space_id or "").strip(),
+                            "cmd_source": str(cmd_source or "").strip(),
                             "decision_time": str(decision_time or "").strip(),
                             "target_space_ids": [str(target_space_id or "").strip()]
                             if str(target_space_id or "").strip()
@@ -2802,6 +2810,7 @@ class ActionsMixin:
         active_space_id: str = "",
         decision_time: str = "",
         target_space_id: str = "",
+        cmd_source: str = "",
         require_world_snapshot_guard: bool = False,
         priority_override_claim: dict[str, Any] | None = None,
     ) -> bool:
@@ -2813,6 +2822,7 @@ class ActionsMixin:
             trigger_text: 本次推理的触发文本，同上。
         """
         correlation_id = str(correlation_id or "").strip()
+        is_user_explicit = str(cmd_source or "").strip().upper() == "USER_EXPLICIT"
         state = self.hass.states.get(entity_id)
         is_presence_departure_turnoff = (
             service == "turn_off"
@@ -3012,7 +3022,12 @@ class ActionsMixin:
                 ),
                 max_age_seconds=30,
             )
-            if not (require_world_snapshot_guard and reentry_override.allowed):
+            if is_user_explicit:
+                self._sys_log(
+                    "INFO",
+                    f"[priority] explicit user command bypassed AI anti-flap guard: {entity_id}.{service}",
+                )
+            elif not (require_world_snapshot_guard and reentry_override.allowed):
                 allowed, arb_reason = self._arbitrate(entity_id, ai_source, service, params)
                 if not allowed:
                     self._sys_log("WARN", arb_reason)
@@ -3094,6 +3109,7 @@ class ActionsMixin:
                         "active_space_id": active_space_id,
                         "decision_time": decision_time,
                         "target_space_id": target_space_id,
+                        "cmd_source": cmd_source,
                         "require_world_snapshot_guard": True,
                     }
                     if require_world_snapshot_guard

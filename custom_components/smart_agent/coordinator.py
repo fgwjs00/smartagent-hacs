@@ -2224,6 +2224,29 @@ class SmartAgentCoordinator(
         device_info = dict(raw_device_info or {}) if isinstance(raw_device_info, dict) else {}
         raw_states = snapshot.get("states") if isinstance(snapshot.get("states"), dict) else {}
         states = dict(raw_states or {}) if isinstance(raw_states, dict) else {}
+        state_store = getattr(getattr(self, "hass", None), "states", None)
+        state_get = getattr(state_store, "get", None)
+        if callable(state_get):
+            for managed_entity_id in device_info:
+                if str(states.get(managed_entity_id) or "").strip():
+                    continue
+                state_obj = state_get(managed_entity_id)
+                if state_obj is not None:
+                    states[managed_entity_id] = str(getattr(state_obj, "state", "") or "")
+        raw_capability_snapshot = (
+            snapshot.get("device_capability_snapshot")
+            if isinstance(snapshot.get("device_capability_snapshot"), dict)
+            else {}
+        )
+        if not raw_capability_snapshot:
+            capability_snapshot_getter = getattr(self, "get_device_capability_snapshot", None)
+            if callable(capability_snapshot_getter):
+                try:
+                    candidate_capability_snapshot = capability_snapshot_getter()
+                    if isinstance(candidate_capability_snapshot, dict):
+                        raw_capability_snapshot = candidate_capability_snapshot
+                except Exception as exc:
+                    _LOGGER.debug("[决策] 慢脑设备能力快照构建失败: %s", exc)
         raw_environment_context = (
             snapshot.get("environment_context")
             if isinstance(snapshot.get("environment_context"), dict)
@@ -2327,11 +2350,16 @@ class SmartAgentCoordinator(
         _weekdays = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
         time_str = _now.strftime("%H:%M")
         day_str = f"{_now.strftime('%Y-%m-%d')} {_weekdays[_now.weekday()]}"
+        normalized_source = str(source or "").strip().lower()
+        is_voice = normalized_source == "voice" or normalized_source.startswith("voice_")
+        is_user_explicit = is_voice or normalized_source == "manual"
 
         bundle = {
             "trigger": str(trigger or ""),
             "context_text": "\n".join(part for part in context_parts if part),
             "source": f"ha_bridge_{source}",
+            "is_voice": is_voice,
+            "cmd_source": "USER_EXPLICIT" if is_user_explicit else "SENSOR",
             "time_str": time_str,
             "day_str": day_str,
             "mode": self._mode,
@@ -2351,7 +2379,7 @@ class SmartAgentCoordinator(
             "environment_context": environment_context,
             "presence_snapshot": presence_snapshot,
             "space_snapshot": snapshot.get("space_snapshot") if isinstance(snapshot.get("space_snapshot"), dict) else {},
-            "device_capability_snapshot": snapshot.get("device_capability_snapshot") if isinstance(snapshot.get("device_capability_snapshot"), dict) else {},
+            "device_capability_snapshot": raw_capability_snapshot,
             "room_topology": snapshot.get("room_topology") if isinstance(snapshot.get("room_topology"), dict) else {},
             "device_table": device_table,
             "occupancy_section": occupancy_section,
@@ -3031,18 +3059,32 @@ class SmartAgentCoordinator(
                     else {},
                 )
                 scoped_actions = scope_active_ai_canary_actions(
-                    candidate_actions,
+                    rollout_actions,
                     rollout_config,
                 )
-                if not scoped_actions.entity_missing:
-                    valid_actions = list(scoped_actions.actions)
+                blocked_entity_ids = set(scoped_actions.blocked_entity_ids)
+                if not scoped_actions.entity_missing and blocked_entity_ids:
+                    valid_actions = [
+                        action
+                        for action in valid_actions
+                        if str(
+                            action.get("entity_id")
+                            or action.get("entity")
+                            or (
+                                action.get("target", {}).get("entity_id")
+                                if isinstance(action.get("target"), dict)
+                                else ""
+                            )
+                            or ""
+                        ).strip().lower()
+                        not in blocked_entity_ids
+                    ]
                     rollout_actions = enrich_active_ai_action_spaces(
                         valid_actions,
                         bundle.get("device_info")
                         if isinstance(bundle.get("device_info"), dict)
                         else {},
                     )
-                blocked_entity_ids = set(scoped_actions.blocked_entity_ids)
                 rollout_blocked_actions = []
                 for action in candidate_actions:
                     action_entity_id = str(
@@ -3068,16 +3110,34 @@ class SmartAgentCoordinator(
                 result["authorized_action_count"] = len(valid_actions)
                 result["authorized_actions"] = list(valid_actions)
                 result["rollout_blocked_actions"] = rollout_blocked_actions
+                active_execution_space_id = str(
+                    bundle.get("trigger_space_id")
+                    or result.get("trigger_space_id")
+                    or bundle.get("trigger_room")
+                    or result.get("trigger_room")
+                    or ""
+                ).strip()
+                if (
+                    not active_execution_space_id
+                    and bool(bundle.get("is_voice"))
+                    and str(bundle.get("cmd_source") or result.get("cmd_source") or "").strip()
+                    == "USER_EXPLICIT"
+                ):
+                    action_space_ids = {
+                        str(
+                            action.get("target_space_id")
+                            or action.get("space_id")
+                            or ""
+                        ).strip()
+                        for action in rollout_actions
+                        if isinstance(action, dict)
+                    }
+                    if "" not in action_space_ids and len(action_space_ids) == 1:
+                        active_execution_space_id = next(iter(action_space_ids))
                 rollout_decision = evaluate_active_ai_execution_gate(
                     ai_enabled=bool(getattr(self, "_enabled", False)),
                     config=rollout_config,
-                    trigger_space_id=str(
-                        bundle.get("trigger_space_id")
-                        or result.get("trigger_space_id")
-                        or bundle.get("trigger_room")
-                        or result.get("trigger_room")
-                        or ""
-                    ),
+                    trigger_space_id=active_execution_space_id,
                     actions=rollout_actions,
                     execution_flags=execution_flags,
                 )
@@ -3438,15 +3498,10 @@ class SmartAgentCoordinator(
                     confidence=confidence,
                     trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
                     parent_transaction_id=transaction_id,
+                    cmd_source=str(bundle.get("cmd_source") or result.get("cmd_source") or ""),
                     world_snapshot_id=world_snapshot_id,
                     correlation_id=execution_correlation_id,
-                    active_space_id=str(
-                        bundle.get("trigger_space_id")
-                        or result.get("trigger_space_id")
-                        or bundle.get("trigger_room")
-                        or result.get("trigger_room")
-                        or ""
-                    ),
+                    active_space_id=active_execution_space_id,
                     decision_time=datetime.now(timezone.utc).isoformat(),
                     require_world_snapshot_guard=True,
                 )
@@ -3575,7 +3630,49 @@ class SmartAgentCoordinator(
                 record_decision_log=not bool(transaction_id),
             )
             nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-            result.setdefault("reply", nested.get("reply") or ("已处理" if actions else "未命中可执行动作"))
+            desired_states = result.get("desired_states")
+            if not isinstance(desired_states, list):
+                desired_states = nested.get("desired_states") if isinstance(nested.get("desired_states"), list) else []
+            reply_text = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        result.get("reply"),
+                        result.get("speak"),
+                        nested.get("reply"),
+                        nested.get("speak"),
+                    )
+                    if str(value or "").strip()
+                ),
+                "",
+            )
+            if bundle.get("is_voice") and desired_states:
+                if not valid_actions:
+                    reply_text = (
+                        "目标设备已经处于所需状态。"
+                        if str(result.get("reason") or "") == "desired_state_already_satisfied"
+                        else "已理解语音控制指令，但没有生成可安全执行的设备动作。"
+                    )
+                elif executed < len(valid_actions):
+                    reply_text = (
+                        "语音控制只执行了部分设备动作，请检查设备状态。"
+                        if executed > 0
+                        else "语音控制未实际执行成功，请检查设备状态。"
+                    )
+            if not reply_text:
+                if bundle.get("is_voice") and not valid_actions:
+                    reply_text = (
+                        "已理解语音控制指令，但没有生成可安全执行的设备动作。"
+                        if desired_states
+                        else "查询已完成，但没有可播报的结果。"
+                    )
+                else:
+                    reply_text = "已处理" if valid_actions else "未命中可执行动作"
+            result["reply"] = reply_text
+            if bundle.get("is_voice") and desired_states:
+                result["speak"] = reply_text
+            elif bundle.get("is_voice") and not str(result.get("speak") or "").strip():
+                result["speak"] = reply_text
             result.setdefault("status", "ok")
             return result
 

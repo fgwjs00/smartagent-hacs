@@ -77,6 +77,116 @@ def _brightness_pct_from_snapshot(snapshot: dict[str, Any]) -> int | None:
     return int(round(brightness * 100 / 255))
 
 
+def _numeric_value(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_vector(value: Any, length: int) -> tuple[float, ...] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        return None
+    values = tuple(_numeric_value(item) for item in value)
+    if any(item is None for item in values):
+        return None
+    return tuple(float(item) for item in values if item is not None)
+
+
+def _attribute_check(expected: Any, actual: Any, *, verified: bool) -> dict[str, Any]:
+    return {"expected": expected, "actual": actual, "verified": bool(verified)}
+
+
+def _light_attribute_checks(
+    command: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    data = command.get("data") if isinstance(command.get("data"), dict) else {}
+    attrs = snapshot.get("attributes") if isinstance(snapshot.get("attributes"), dict) else {}
+    checks: dict[str, dict[str, Any]] = {}
+
+    if "brightness_pct" in data:
+        requested = _numeric_value(data.get("brightness_pct"))
+        expected = int(round(requested)) if requested is not None else data.get("brightness_pct")
+        actual = _brightness_pct_from_snapshot(snapshot)
+        checks["brightness_pct"] = _attribute_check(
+            expected,
+            actual,
+            verified=requested is not None and actual is not None and abs(actual - requested) <= 1,
+        )
+
+    if "color_temp_kelvin" in data:
+        requested = _numeric_value(data.get("color_temp_kelvin"))
+        expected = int(round(requested)) if requested is not None else data.get("color_temp_kelvin")
+        actual_value = _numeric_value(attrs.get("color_temp_kelvin"))
+        if actual_value is None:
+            actual_mired = _numeric_value(attrs.get("color_temp"))
+            if actual_mired and actual_mired > 0:
+                actual_value = 1_000_000 / actual_mired
+        actual = int(round(actual_value)) if actual_value is not None else None
+        checks["color_temp_kelvin"] = _attribute_check(
+            expected,
+            actual,
+            verified=(
+                requested is not None
+                and actual_value is not None
+                and abs(actual_value - requested) <= 100
+            ),
+        )
+
+    if "color_temp" in data:
+        requested = _numeric_value(data.get("color_temp"))
+        expected = int(round(requested)) if requested is not None else data.get("color_temp")
+        actual_value = _numeric_value(attrs.get("color_temp"))
+        if actual_value is None:
+            actual_kelvin = _numeric_value(attrs.get("color_temp_kelvin"))
+            if actual_kelvin and actual_kelvin > 0:
+                actual_value = 1_000_000 / actual_kelvin
+        actual = int(round(actual_value)) if actual_value is not None else None
+        checks["color_temp"] = _attribute_check(
+            expected,
+            actual,
+            verified=(
+                requested is not None
+                and actual_value is not None
+                and abs(actual_value - requested) <= 2
+            ),
+        )
+
+    if "effect" in data:
+        expected = str(data.get("effect") or "")
+        actual = str(attrs.get("effect") or "")
+        checks["effect"] = _attribute_check(expected, actual, verified=actual == expected)
+
+    vector_specs = {
+        "rgb_color": (3, 2.0),
+        "hs_color": (2, 2.0),
+        "xy_color": (2, 0.02),
+    }
+    for key, (length, tolerance) in vector_specs.items():
+        if key not in data:
+            continue
+        expected_vector = _normalized_vector(data.get(key), length)
+        actual_vector = _normalized_vector(attrs.get(key), length)
+        if key == "rgb_color":
+            expected = [int(round(item)) for item in expected_vector] if expected_vector else data.get(key)
+            actual = [int(round(item)) for item in actual_vector] if actual_vector else None
+        else:
+            expected = list(expected_vector) if expected_vector else data.get(key)
+            actual = list(actual_vector) if actual_vector else None
+        verified = bool(
+            expected_vector
+            and actual_vector
+            and all(
+                abs(actual_item - expected_item) <= tolerance
+                for actual_item, expected_item in zip(actual_vector, expected_vector)
+            )
+        )
+        checks[key] = _attribute_check(expected, actual, verified=verified)
+
+    return checks
+
+
 def _command_already_in_target_state(command: dict[str, Any], snapshot: dict[str, Any]) -> bool:
     if not snapshot.get("available"):
         return False
@@ -91,18 +201,14 @@ def _command_already_in_target_state(command: dict[str, Any], snapshot: dict[str
         return False
     if state != "on":
         return False
-    if domain == "light" and "brightness_pct" in data:
-        try:
-            requested_pct = int(round(float(data.get("brightness_pct"))))
-        except (TypeError, ValueError):
-            return False
-        current_pct = _brightness_pct_from_snapshot(snapshot)
-        return current_pct is not None and current_pct == requested_pct
+    if domain == "light":
+        attribute_checks = _light_attribute_checks(command, snapshot)
+        return all(item["verified"] for item in attribute_checks.values())
     return True
 
 
 def _expected_post_state(command: dict[str, Any]) -> str | None:
-    if str(command.get("domain") or "") != "light":
+    if str(command.get("domain") or "") not in {"light", "switch"}:
         return None
     service = str(command.get("service") or "")
     if service == "turn_on":
@@ -118,10 +224,17 @@ def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, An
         return None
     snapshot = _state_snapshot(hass, str(command.get("entity_id") or ""))
     actual = str(snapshot.get("state") or "").strip().lower()
+    attribute_checks = {}
+    if expected == "on" and str(command.get("domain") or "") == "light":
+        attribute_checks = _light_attribute_checks(command, snapshot)
+    verified = bool(snapshot.get("available")) and actual == expected
+    if attribute_checks:
+        verified = verified and all(item["verified"] for item in attribute_checks.values())
     return {
         "expected": expected,
         "actual": actual,
-        "verified": bool(snapshot.get("available")) and actual == expected,
+        "verified": verified,
+        "attribute_checks": attribute_checks,
         "post_state_snapshot": snapshot,
     }
 

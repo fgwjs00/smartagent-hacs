@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 
 from .const import DOMAIN
 from .coordinator import SmartAgentCoordinator
+from .voice_text import normalize_voice_stt_text
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,9 +45,18 @@ class SmartAgentConversation(
         self, user_input: conversation.ConversationInput
     ) -> conversation.ConversationResult:
         """Process a sentence passed from HA Assist or Wyoming satellites."""
-        text = user_input.text
+        raw_text = user_input.text
+        text = normalize_voice_stt_text(raw_text)
         source_id = user_input.device_id or "unknown"
-        _LOGGER.info("[Conversation API] Received user dialog: %s from device %s", text, source_id)
+        if text != str(raw_text or "").strip():
+            _LOGGER.info(
+                "[Conversation API] Normalized zh-CN voice input: %s -> %s from device %s",
+                raw_text,
+                text,
+                source_id,
+            )
+        else:
+            _LOGGER.info("[Conversation API] Received user dialog: %s from device %s", text, source_id)
         
         # Dispatch to AI SmartAgent's voice inference router (System 2 Slow Brain)
         try:
