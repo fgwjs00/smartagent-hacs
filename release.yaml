@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.194
-display_version: Beta 0.0.194
+release_version: 0.0.195
+display_version: Beta 0.0.195
 channel: beta
-release_date: '2026-07-31'
+release_date: '2026-08-01'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.194 统一执行证据、设备治理、决策分页、语音票据和 V3 真实状态回流，并修复照明角色与打扰度持久化以及远端发布测试依赖与空间拓扑测试竞态。发布继续使用正式五发布面与阿里云
+  summary: Beta 0.0.195 统一执行证据、设备治理、决策分页、语音票据和 V3 真实状态回流，并修复照明角色与打扰度持久化以及远端发布测试依赖与空间拓扑测试竞态。发布继续使用正式五发布面与阿里云
     ACR，传感器固件、硬件和转换器仍属于独立项目；G13 默认 off/hard-off，部署验证不触发家庭设备。
-  customer_visible_version: Beta 0.0.194
+  customer_visible_version: Beta 0.0.195
