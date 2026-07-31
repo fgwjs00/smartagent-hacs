@@ -113,7 +113,11 @@ def classify_arrival_observation(
             evidence_weight=0.0,
             exclusion_reason="recent_ai_action_same_entity",
         )
-    if state_changed and origin == "user_action":
+    if state_changed and origin in {
+        "user_action",
+        "physical_action",
+        "user_scene_script_action",
+    }:
         return ArrivalObservationClassification(
             baseline_eligible=True,
             observation_only=False,

@@ -319,6 +319,10 @@ class SmartAgentCoordinator(
         self._user_overrides_lock = threading.Lock()
         self._user_manual_actions: dict[str, dict] = {}
         self._user_manual_actions_lock = threading.Lock()
+        self._arrival_manual_action_evidence: dict[str, list[dict[str, Any]]] = {}
+        self._trusted_manual_service_contexts: dict[str, dict[str, Any]] = {}
+        self._manual_scene_learning_sessions: dict[str, dict[str, Any]] = {}
+        self._manual_scene_learning_timers: dict[str, Any] = {}
         self._pending_triggers: list[dict] = []
         self._pending_triggers_lock = threading.Lock()
         self._pending_trigger_controllable: dict[str, str] = {}
@@ -1689,6 +1693,9 @@ class SmartAgentCoordinator(
         bridge = getattr(self, "_internal_event_bridge", None)
         if bridge is not None:
             bridge.start()
+        self._listener_removers.append(
+            self.hass.bus.async_listen("call_service", self._make_call_service_handler())
+        )
         self._refresh_listeners()
         # Phase 11.9: 启动时立即刷新行为戒律（强制使用最新措辞，无需等待凌晨3点）
         # Frigate MQTT 深度集成（Phase 7A）
@@ -1774,6 +1781,13 @@ class SmartAgentCoordinator(
             except Exception:
                 pass
         self._active_timers.clear()
+        for cancel in getattr(self, "_manual_scene_learning_timers", {}).values():
+            try:
+                cancel()
+            except Exception:
+                pass
+        self._manual_scene_learning_timers.clear()
+        self._manual_scene_learning_sessions.clear()
         for handle_name in ("_merge_timer_unsub", "_scan_timer_unsub",
                             "_habit_check_timer_unsub", "_habit_suggest_timeout_handle"):
             handle = getattr(self, handle_name, None)

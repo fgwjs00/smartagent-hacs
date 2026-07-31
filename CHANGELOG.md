@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.189 - 2026-07-30
+## Beta 0.0.190 - 2026-07-31
 
-Beta 0.0.189 修复 add-on 家庭助理服务地址含首尾空白时未命中 Supervisor Core 专用认证分支的问题。启动脚本现在先规范化 URL，再固定使用 Supervisor 注入令牌，避免误用旧手填 HA Token 导致 /rooms、listener 和语音上游持续 401。0.0.188 的家庭 Wi-Fi 维护、AI 场景和认证边界能力保持不变；传感器固件、硬件和转换器仍属于独立项目。发行继续保留现有 canary，G13 默认 off/hard-off，不触发家庭设备。
+Beta 0.0.190 整合 Home Assistant 原生 Assist 语音桥、结构化学习画像与人工组合场景、V3 设备控制和 Android 中控屏闭环。发布继续使用正式五发布面与阿里云 ACR，传感器固件、硬件和转换器仍属于独立项目；G13 默认 off/hard-off，部署验证不触发家庭设备。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.189`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.190`，用于 Home Assistant 更新检测。

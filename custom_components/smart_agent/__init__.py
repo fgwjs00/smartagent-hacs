@@ -215,6 +215,7 @@ def _extract_bearer_token(request: web.Request) -> str:
 
 _TRUSTED_ADDON_PROXY_PEERS = {"127.0.0.1", "::1", "localhost", "172.30.33.1"}
 _TRUSTED_ADDON_PROXY_PEER_PREFIXES = ("127.", "172.30.32.", "172.30.33.")
+_ADDON_INTERNAL_EXECUTE_CONTRACT = "ha_execute_internal_v1"
 _LEGACY_PAIR_TOKEN_CLIENT_NAMES = {
     "SmartAgent 中控屏",
     "SmartAgent 管理端会话",
@@ -222,10 +223,7 @@ _LEGACY_PAIR_TOKEN_CLIENT_NAMES = {
 }
 
 
-def _is_addon_proxy_request(request: web.Request) -> bool:
-    if str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() != "addon":
-        return False
-
+def _is_trusted_addon_proxy_peer(request: web.Request) -> bool:
     transport = getattr(request, "transport", None)
     try:
         peer = transport.get_extra_info("peername") if transport is not None else None
@@ -248,12 +246,33 @@ def _is_addon_proxy_request(request: web.Request) -> bool:
     return trusted
 
 
-def _is_addon_internal_execute_request(request: web.Request) -> bool:
+def _is_addon_proxy_request(request: web.Request) -> bool:
     return (
-        _is_addon_proxy_request(request)
+        str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() == "addon"
+        and _is_trusted_addon_proxy_peer(request)
+    )
+
+
+def _is_addon_internal_execute_request(
+    request: web.Request,
+    body: dict[str, Any] | None = None,
+) -> bool:
+    header_contract = (
+        str(request.headers.get("X-SA-Proxy-From", "") or "").strip().lower() == "addon"
         and str(request.headers.get("X-SA-Internal-Execute", "") or "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+    transport_contract = (
+        body.get("_smartagent_transport")
+        if isinstance(body, dict) and isinstance(body.get("_smartagent_transport"), dict)
+        else {}
+    )
+    body_contract = (
+        str(transport_contract.get("source") or "").strip().lower() == "addon"
+        and str(transport_contract.get("contract") or "").strip()
+        == _ADDON_INTERNAL_EXECUTE_CONTRACT
+    )
+    return bool(header_contract or body_contract) and _is_trusted_addon_proxy_peer(request)
 
 
 def _ha_log_window_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -1147,16 +1166,6 @@ class SmartAgentHaExecuteView(HomeAssistantView):
     async def post(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
-        if not _is_addon_internal_execute_request(request):
-            return self.json(
-                _json_error_payload(
-                    "ha_execute_requires_addon_internal",
-                    "forbidden",
-                    False,
-                    execution_path="ha_execute_adapter",
-                ),
-                status_code=403,
-            )
         try:
             body = await request.json()
         except Exception:
@@ -1171,7 +1180,24 @@ class SmartAgentHaExecuteView(HomeAssistantView):
                 status_code=400,
             )
 
-        safety = body.get("safety") if isinstance(body.get("safety"), dict) else {}
+        if not _is_addon_internal_execute_request(request, body):
+            return self.json(
+                _json_error_payload(
+                    "ha_execute_requires_addon_internal",
+                    "forbidden",
+                    False,
+                    execution_path="ha_execute_adapter",
+                ),
+                status_code=403,
+            )
+
+        execution_body = dict(body)
+        execution_body.pop("_smartagent_transport", None)
+        safety = (
+            execution_body.get("safety")
+            if isinstance(execution_body.get("safety"), dict)
+            else {}
+        )
         context = safety.get("context") if isinstance(safety.get("context"), dict) else {}
         if context.get("active_ai_managed") is True:
             coord = _get_first_coordinator(request.app["hass"])
@@ -1192,7 +1218,7 @@ class SmartAgentHaExecuteView(HomeAssistantView):
                     status_code=409,
                 )
 
-        result = await async_execute_command_envelope(request.app["hass"], body)
+        result = await async_execute_command_envelope(request.app["hass"], execution_body)
         status_code = 200 if bool(result.get("ok")) else 409
         error_type = str(result.get("error_type") or "")
         if error_type in {"bad_request", "safety_blocked"}:
