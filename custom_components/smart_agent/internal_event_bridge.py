@@ -170,9 +170,15 @@ class InternalEventBridge:
         if not isinstance(result, dict):
             return {"ok": False, "status": 502, "error": "invalid_addon_persistence_receipt"}
         status = int(result.get("__status") or result.get("status") or 200)
-        if status >= 400 or result.get("ok") is not True:
-            return {**result, "ok": False, "status": status}
-        return {**result, "ok": True, "status": status, "persistence_confirmed": True}
+        nested_receipt = result.get("result")
+        receipt = (
+            {**result, **nested_receipt}
+            if isinstance(nested_receipt, dict)
+            else result
+        )
+        if status >= 400 or receipt.get("ok") is not True:
+            return {**receipt, "ok": False, "status": status}
+        return {**receipt, "ok": True, "status": status, "persistence_confirmed": True}
 
     async def _post_item_result(self, item: dict[str, Any]) -> dict[str, Any] | None:
         kwargs: dict[str, Any] = {"ts": str(item.get("ts") or self._default_ts())}

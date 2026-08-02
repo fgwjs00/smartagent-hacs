@@ -2666,7 +2666,12 @@ class ActionsMixin:
             if isinstance(active_correlations, dict)
             else ""
         )
-        request_id = str(active_correlation_id or "").strip() or f"legacy-action:{transaction_id}:{action_seq}:{entity_id}"
+        normalized_correlation_id = str(active_correlation_id or "").strip()
+        request_id = (
+            f"{normalized_correlation_id}:action:{transaction_id}:{action_seq}:{time.time_ns()}"
+            if normalized_correlation_id
+            else f"legacy-action:{transaction_id}:{action_seq}:{entity_id}"
+        )
         envelope = {
             "request_id": request_id,
             "source": "smartagent_active_ai" if require_world_snapshot_guard else "smartagent_ha_host",
@@ -2683,6 +2688,11 @@ class ActionsMixin:
                 "requires_confirmation": False,
                 "reason": reason,
                 "context": {
+                    **(
+                        {"correlation_id": normalized_correlation_id}
+                        if normalized_correlation_id
+                        else {}
+                    ),
                     **(
                         {
                             "active_ai_managed": True,
