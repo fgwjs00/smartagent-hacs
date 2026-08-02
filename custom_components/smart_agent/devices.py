@@ -21,7 +21,7 @@ from .const import (
     DEVICE_CAP_KEY_RISK_LEVEL,
     DEVICE_CAP_KEY_SHARED_FIXTURE,
     DEVICE_CAP_KEY_SLEEP_SAFE,
-    DEVICE_VACANT_ACTIONS,
+    DEVICE_CONTROL_MODES,
 )
 
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
@@ -92,6 +92,197 @@ class DevicesMixin:
 
         return DatabaseMixin._ha_db_now_text(self)
 
+    async def _persist_business_event(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ts: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Wait for the Add-on single writer before mutating HA runtime state."""
+        post = getattr(self, "_post_internal_event_confirmed_async", None)
+        if not callable(post):
+            self._sys_log("WARN", f"[Storage] persistence bridge unavailable: kind={kind}")
+            return None
+        try:
+            result = await post(kind, dict(payload or {}), ts=ts)
+        except Exception as exc:
+            self._sys_log("WARN", f"[Storage] persistence request failed: kind={kind}, error={exc}")
+            return None
+        status = int(result.get("status") or result.get("__status") or 0) if isinstance(result, dict) else 0
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or result.get("persistence_confirmed") is not True
+            or status >= 400
+        ):
+            self._sys_log("WARN", f"[Storage] durable commit not confirmed: kind={kind}, result={result}")
+            return None
+        return result
+
+    async def _persist_device_record(
+        self,
+        entity_id: str,
+        info: dict[str, Any] | None = None,
+        *,
+        action: str = "upsert",
+        created: str | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "action": action,
+            "entity_id": str(entity_id or "").strip(),
+        }
+        if action != "delete":
+            row = dict(info or {})
+            payload.update(
+                {
+                    "name": str(row.get("name") or entity_id),
+                    "area": str(row.get("room") or row.get("area") or ""),
+                    "type": str(row.get("capability") or row.get("type") or ""),
+                    "ops": row.get("ops") or "",
+                    "control_mode": str(row.get("control_mode") or "shared"),
+                    "sensor_type": str(row.get("sensor_type") or ""),
+                    "created": str(created or self._ha_db_now_text()),
+                }
+            )
+        return (
+            await self._persist_business_event(
+                "device",
+                payload,
+                ts=self._ha_db_now_text(),
+            )
+        ) is not None
+
+    async def _persist_memory_action(
+        self,
+        target: str,
+        action: str,
+        content: str,
+        *,
+        previous_content: str = "",
+        asset: dict[str, Any] | None = None,
+    ) -> bool:
+        payload = {
+            "action": str(action or "").strip(),
+            "target": str(target or "").strip(),
+            "content": str(content or "").strip(),
+        }
+        if previous_content:
+            payload["previous_content"] = str(previous_content).strip()
+        source = dict(asset or {})
+        asset_id = int(source.get("asset_id") or source.get("id") or 0)
+        if asset_id > 0:
+            payload["asset_id"] = asset_id
+        for key in (
+            "member_id",
+            "space_id",
+            "entity_id",
+            "policy_effect",
+            "origin",
+            "actor",
+            "source_type",
+            "trust_state",
+            "source_table",
+            "source_id",
+        ):
+            if key in source:
+                payload[key] = source.get(key)
+        return (
+            await self._persist_business_event(
+                "habit",
+                payload,
+                ts=self._ha_db_now_text(),
+            )
+        ) is not None
+
+    def _memory_asset_for_index(self, target: str, index: int) -> dict[str, Any]:
+        attr = "_rule_assets" if target == "rule" else "_habit_assets"
+        assets = getattr(self, attr, None)
+        if not isinstance(assets, list) or index < 0 or index >= len(assets):
+            return {}
+        row = assets[index]
+        return dict(row) if isinstance(row, dict) else {}
+
+    def _mutate_memory_asset_mirror(
+        self,
+        target: str,
+        action: str,
+        index: int,
+        *,
+        content: str = "",
+        locked: bool = False,
+    ) -> None:
+        attr = "_rule_assets" if target == "rule" else "_habit_assets"
+        assets = list(getattr(self, attr, None) or [])
+        if action == "add":
+            assets.append({"content": content, "locked": bool(locked)})
+        elif 0 <= index < len(assets):
+            if action == "delete":
+                del assets[index]
+            else:
+                row = dict(assets[index]) if isinstance(assets[index], dict) else {}
+                if action == "update":
+                    row["content"] = content
+                    row["locked"] = bool(locked)
+                elif action == "toggle-lock":
+                    row["locked"] = bool(locked)
+                assets[index] = row
+        setattr(self, attr, assets)
+
+    async def _async_refresh_memory_assets_from_addon(self) -> bool:
+        """Refresh legacy tuple mirrors and full scoped assets from the Add-on."""
+        client = getattr(self, "_addon_client", None)
+        status = {"ok": False, "sources": {}, "changed": False}
+        if client is None:
+            status["error"] = "addon_client_unavailable"
+            self._last_addon_memory_sync_status = status
+            return False
+        changed = False
+        successful_sources = 0
+        for attr, asset_attr, getter_name in (
+            ("_habits", "_habit_assets", "get_memory_habits"),
+            ("_rules", "_rule_assets", "get_memory_profiles"),
+        ):
+            getter = getattr(client, getter_name, None)
+            if not callable(getter):
+                status["sources"][getter_name] = "getter_unavailable"
+                continue
+            try:
+                rows = await getter()
+            except Exception as exc:
+                status["sources"][getter_name] = f"exception:{exc}"
+                self._sys_log("WARN", f"[Storage] memory refresh failed: source={getter_name}, error={exc}")
+                continue
+            if not isinstance(rows, list):
+                status["sources"][getter_name] = "invalid_payload"
+                continue
+            successful_sources += 1
+            status["sources"][getter_name] = "ok"
+            projection: list[tuple[str, bool]] = []
+            assets: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                content = str(row.get("content") or row.get("text") or "").strip()
+                if not content:
+                    continue
+                normalized = dict(row)
+                normalized["content"] = content
+                normalized["locked"] = bool(row.get("locked") or False)
+                assets.append(normalized)
+                projection.append((content, normalized["locked"]))
+            if getattr(self, attr, None) != projection:
+                setattr(self, attr, projection)
+                changed = True
+            if getattr(self, asset_attr, None) != assets:
+                setattr(self, asset_attr, assets)
+                changed = True
+        status["ok"] = successful_sources == 2
+        status["changed"] = changed
+        self._last_addon_memory_sync_status = status
+        if changed:
+            self.async_set_updated_data({})
+        return bool(status["ok"])
     def get_device_name(self, entity_id: str) -> str:
         """Return device friendly name with room prefix if available, fallback to entity_id."""
         info = self.device_info.get(entity_id, {})
@@ -277,8 +468,6 @@ class DevicesMixin:
         ).strip().lower()
 
         vacant_action = str(info.get("vacant_action") or "preserve").strip().lower()
-        if vacant_action not in DEVICE_VACANT_ACTIONS:
-            vacant_action = "preserve"
 
         capability = {
             "entity_id": entity_id,
@@ -410,22 +599,7 @@ class DevicesMixin:
                     "sensor_type": s_type,
                     **registry_meta,
                 }
-                _ok = await self._async_db_exec(
-                    "INSERT OR IGNORE INTO devices (entity_id, name, area, type, ops, control_mode, sensor_type, ha_unique_id, ha_device_id, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        eid,
-                        name,
-                        area_name,
-                        label,
-                        ops,
-                        "shared",
-                        s_type,
-                        registry_meta.get("ha_unique_id", ""),
-                        registry_meta.get("ha_device_id", ""),
-                        now,
-                        now,
-                    ),
-                )
+                _ok = await self._persist_device_record(eid, info, created=now)
                 if not _ok:
                     self._sys_log("WARN", f"[批量添加] 写入失败，跳过设备: {eid}")
                     continue
@@ -447,7 +621,7 @@ class DevicesMixin:
         """Service handler: delete device by entity_id."""
         if entity_id in self.device_info:
             name = self.device_info[entity_id]["name"]
-            _ok = await self._async_db_exec("DELETE FROM devices WHERE entity_id=?", (entity_id,))
+            _ok = await self._persist_device_record(entity_id, action="delete")
             if not _ok:
                 self._sys_log("WARN", f"[设备删除] 写入失败，未删除: {entity_id}")
                 return
@@ -480,11 +654,7 @@ class DevicesMixin:
             info["capability"] = normalized_capability
             info["type"] = normalized_capability
 
-        now = self._ha_db_now_text()
-        _ok = await self._async_db_exec(
-            "UPDATE devices SET name=?, area=?, type=?, ops=?, sensor_type=?, updated=? WHERE entity_id=?",
-            (info["name"], info["room"], info["type"], info["ops"], info.get("sensor_type", ""), now, entity_id),
-        )
+        _ok = await self._persist_device_record(entity_id, info)
         if not _ok:
             self._sys_log("WARN", f"[设备更新] 写入失败，未更新内存态: {entity_id}")
             return
@@ -523,24 +693,7 @@ class DevicesMixin:
             "control_mode": existing_mode,
             **registry_meta,
         }
-        now = self._ha_db_now_text()
-        _ok = await self._async_db_exec(
-            "INSERT INTO devices (entity_id, name, area, type, ops, control_mode, sensor_type, ha_unique_id, ha_device_id, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(entity_id) DO UPDATE SET name=excluded.name, area=excluded.area, type=excluded.type, ops=excluded.ops, sensor_type=excluded.sensor_type, ha_unique_id=excluded.ha_unique_id, ha_device_id=excluded.ha_device_id, updated=excluded.updated",
-            (
-                entity_id,
-                info["name"],
-                info["room"],
-                info["type"],
-                info["ops"],
-                info["control_mode"],
-                info["sensor_type"],
-                info.get("ha_unique_id", ""),
-                info.get("ha_device_id", ""),
-                now,
-                now,
-            ),
-        )
+        _ok = await self._persist_device_record(entity_id, info)
         if not _ok:
             self._sys_log("WARN", f"[设备新增] 写入失败，未更新内存态: {entity_id}")
             return
@@ -554,7 +707,7 @@ class DevicesMixin:
         eid = selected.split("|")[0].strip()
         if eid in self.device_info:
             name = self.device_info[eid]["name"]
-            _ok = await self._async_db_exec("DELETE FROM devices WHERE entity_id=?", (eid,))
+            _ok = await self._persist_device_record(eid, action="delete")
             if not _ok:
                 self._sys_log("WARN", f"[设备删除] 写入失败，未删除: {eid}")
                 return
@@ -565,15 +718,14 @@ class DevicesMixin:
     async def async_refresh_device_areas(self) -> int:
         """仅刷新仍处于「待填写区域」的设备区域信息（通过 HA 注册表查找）。"""
         updated = 0
-        now = self._ha_db_now_text()
         for eid, info in self.device_info.items():
             if info.get("room") and info["room"] != "待填写区域":
                 continue
             area = self._get_entity_area(eid)
             if area:
-                _ok = await self._async_db_exec(
-                    "UPDATE devices SET area=?, updated=? WHERE entity_id=?", (area, now, eid)
-                )
+                next_info = dict(info)
+                next_info["room"] = area
+                _ok = await self._persist_device_record(eid, next_info)
                 if not _ok:
                     self._sys_log("WARN", f"[设备] 区域刷新写入失败: {eid}")
                     continue
@@ -792,38 +944,38 @@ class DevicesMixin:
         }
 
         async def _apply_local_semantics(active_entity_id: str) -> bool:
-            listener_classification_changed = False
-            now = self._ha_db_now_text()
             info = dict(self.device_info.get(active_entity_id, {}) or {})
+            if not info and (capability_name or sensor_type_provided):
+                result.setdefault("warnings", []).append("managed_device_projection_missing")
+                return False
+
+            next_info = dict(info)
+            previous_sensor_type = str(info.get("sensor_type") or "").strip().lower()
+            changed = False
+            if capability_name and str(info.get("type") or "").strip().lower() != capability_name:
+                next_info["capability"] = capability_name
+                next_info["type"] = capability_name
+                changed = True
+            if sensor_type_provided and previous_sensor_type != sensor_type:
+                next_info["sensor_type"] = sensor_type
+                changed = True
+            if not changed:
+                if capability_name:
+                    result["capability"] = capability_name
+                if sensor_type_provided:
+                    result["sensor_type"] = sensor_type
+                return False
+
+            if not await self._persist_device_record(active_entity_id, next_info):
+                result.setdefault("warnings", []).append("device_semantics_persist_failed")
+                return False
+
+            self.device_info[active_entity_id] = next_info
             if capability_name:
-                if info:
-                    info["capability"] = capability_name
-                    info["type"] = capability_name
-                    self.device_info[active_entity_id] = info
-                _ok = await self._async_db_exec(
-                    "UPDATE devices SET type=?, updated=? WHERE entity_id=?",
-                    (capability_name, now, active_entity_id),
-                )
-                if not _ok:
-                    self._sys_log("WARN", f"[设备能力] 写入失败，未更新: {active_entity_id}")
-                    result.setdefault("warnings", []).append("capability_persist_failed")
                 result["capability"] = capability_name
             if sensor_type_provided:
-                previous_sensor_type = str(info.get("sensor_type") or "").strip().lower()
-                if info:
-                    info["sensor_type"] = sensor_type
-                    self.device_info[active_entity_id] = info
-                _ok = await self._async_db_exec(
-                    "UPDATE devices SET sensor_type=?, updated=? WHERE entity_id=?",
-                    (sensor_type, now, active_entity_id),
-                )
-                if not _ok:
-                    self._sys_log("WARN", f"[设备信号用途] 写入失败，未更新: {active_entity_id}")
-                    result.setdefault("warnings", []).append("sensor_type_persist_failed")
                 result["sensor_type"] = sensor_type
-                listener_classification_changed = previous_sensor_type != sensor_type
-            return listener_classification_changed
-
+            return previous_sensor_type != str(next_info.get("sensor_type") or "").strip().lower()
         if not name and not requested_entity_id and not room:
             semantics_changed = await _apply_local_semantics(eid)
             if semantics_changed:
@@ -966,17 +1118,15 @@ class DevicesMixin:
 
     async def async_set_device_control_mode(self, entity_id: str, mode: str) -> None:
         """Service handler: set per-device control mode (ai / ha / shared)."""
-        if mode not in self._VALID_CONTROL_MODES:
+        if mode not in DEVICE_CONTROL_MODES:
             self._sys_log("WARN", f"[管辖域] 无效模式 {mode!r}，仅接受 ai/ha/shared")
             return
         if entity_id not in self.device_info:
             self._sys_log("WARN", f"[管辖域] {entity_id} 不在已配置设备中")
             return
-        now = self._ha_db_now_text()
-        _ok = await self._async_db_exec(
-            "UPDATE devices SET control_mode=?, updated=? WHERE entity_id=?",
-            (mode, now, entity_id),
-        )
+        next_info = dict(self.device_info[entity_id])
+        next_info["control_mode"] = mode
+        _ok = await self._persist_device_record(entity_id, next_info)
         if not _ok:
             self._sys_log("WARN", f"[管辖域] 写入失败，未更新: {entity_id}")
             return
@@ -987,10 +1137,9 @@ class DevicesMixin:
 
     async def async_batch_set_control_mode(self, mode: str, room: str = "", dev_type: str = "") -> int:
         """批量设置管辖域：按房间和/或类型筛选设备，一次性修改 control_mode。"""
-        if mode not in self._VALID_CONTROL_MODES:
+        if mode not in DEVICE_CONTROL_MODES:
             return 0
         labels = {"ai": "AI 全权", "ha": "HA 优先", "shared": "共享"}
-        now = self._ha_db_now_text()
         count = 0
         for eid, info in self.device_info.items():
             if room and info.get("room", "") != room:
@@ -999,10 +1148,9 @@ class DevicesMixin:
                 continue
             if info.get("control_mode") == mode:
                 continue
-            _ok = await self._async_db_exec(
-                "UPDATE devices SET control_mode=?, updated=? WHERE entity_id=?",
-                (mode, now, eid),
-            )
+            next_info = dict(info)
+            next_info["control_mode"] = mode
+            _ok = await self._persist_device_record(eid, next_info)
             if not _ok:
                 self._sys_log("WARN", f"[管辖域] 批量写入失败，跳过设备: {eid}")
                 continue
@@ -1022,241 +1170,202 @@ class DevicesMixin:
     # ── 习惯 CRUD ─────────────────────────────────────────────────────────────
 
     async def async_svc_add_habit(self, content: str) -> None:
-        now = self._ha_db_now_text()
-        _ok = await self._async_db_exec("INSERT INTO habits (content, locked, created) VALUES (?,0,?)", (content, now))
-        if not _ok:
-            self._sys_log("WARN", "[习惯] 新增失败，未更新内存态")
+        value = str(content or "").strip()
+        if not value or not await self._persist_memory_action("habit", "add", value):
             return
-        self._habits.append((content, False))
+        if self._find_habit_idx(value) < 0:
+            self._habits.append((value, False))
+            self._mutate_memory_asset_mirror("habit", "add", -1, content=value)
         self.async_set_updated_data({})
 
     async def async_svc_delete_habit(self, content: str) -> None:
         idx = self._find_habit_idx(content)
         if idx < 0:
             return
-        _, locked = self._habits[idx]
-        if locked:
+        value, locked = self._habits[idx]
+        asset = self._memory_asset_for_index("habit", idx)
+        if locked or not await self._persist_memory_action("habit", "delete", value, asset=asset):
             return
-        rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[habits] selected DB row missing; skip delete: idx={idx}")
-            return
-        if rows:
-            _ok = await self._async_db_exec("DELETE FROM habits WHERE id=?", (rows[0]["id"],))
-            if not _ok:
-                self._sys_log("WARN", f"[习惯] 删除失败: idx={idx}")
-                return
         del self._habits[idx]
+        self._mutate_memory_asset_mirror("habit", "delete", idx)
         self.async_set_updated_data({})
 
     async def async_svc_toggle_habit_lock(self, content: str) -> None:
         idx = self._find_habit_idx(content)
         if idx < 0:
             return
-        c, locked = self._habits[idx]
-        new_locked = 0 if locked else 1
-        rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[habits] selected DB row missing; skip lock toggle: idx={idx}")
+        value, locked = self._habits[idx]
+        asset = self._memory_asset_for_index("habit", idx)
+        if not await self._persist_memory_action("habit", "toggle-lock", value, asset=asset):
             return
-        if rows:
-            _ok = await self._async_db_exec("UPDATE habits SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
-            if not _ok:
-                self._sys_log("WARN", f"[习惯] 锁定状态更新失败: idx={idx}")
-                return
-        self._habits[idx] = (c, bool(new_locked))
+        self._habits[idx] = (value, not locked)
+        self._mutate_memory_asset_mirror("habit", "toggle-lock", idx, locked=not locked)
         self.async_set_updated_data({})
 
     async def async_habit_add(self, text: str, selected: str) -> None:
-        if not text:
+        value = str(text or "").strip()
+        if not value:
             return
-        now = self._ha_db_now_text()
-        idx = self._find_habit_idx(selected) if selected and selected != "(无)" else -1
+        idx = self._find_habit_idx(selected) if selected and selected != "(\u65e0)" else -1
         if idx >= 0:
-            _, locked = self._habits[idx]
+            previous, locked = self._habits[idx]
             if locked:
-                await self._async_update_status("画像管理", "⛔ 锁定条目不可修改")
+                await self._async_update_status(
+                    "\u753b\u50cf\u7ba1\u7406",
+                    "\u9501\u5b9a\u6761\u76ee\u4e0d\u53ef\u4fee\u6539",
+                )
                 return
-            rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-            if not rows:
-                self._sys_log("WARN", f"[habits] selected DB row missing; skip edit: idx={idx}")
+            asset = self._memory_asset_for_index("habit", idx)
+            if not await self._persist_memory_action(
+                "habit",
+                "update",
+                value,
+                previous_content=previous,
+                asset=asset,
+            ):
                 return
-            if rows:
-                _ok = await self._async_db_exec("UPDATE habits SET content=? WHERE id=?", (text, rows[0]["id"]))
-                if not _ok:
-                    self._sys_log("WARN", f"[习惯] 编辑失败: idx={idx}")
-                    return
-            self._habits[idx] = (text, False)
+            self._habits[idx] = (value, False)
+            self._mutate_memory_asset_mirror("habit", "update", idx, content=value)
         else:
-            _ok = await self._async_db_exec("INSERT INTO habits (content, locked, created) VALUES (?,0,?)", (text, now))
-            if not _ok:
-                self._sys_log("WARN", "[习惯] 新增失败，未更新内存态")
+            if not await self._persist_memory_action("habit", "add", value):
                 return
-            self._habits.append((text, False))
+            self._habits.append((value, False))
+            self._mutate_memory_asset_mirror("habit", "add", -1, content=value)
         self.async_set_updated_data({})
 
     async def async_habit_delete(self, selected: str) -> None:
-        if not selected or selected == "(无)":
+        if not selected or selected == "(\u65e0)":
             return
         idx = self._find_habit_idx(selected)
         if idx < 0:
             return
-        _, locked = self._habits[idx]
+        value, locked = self._habits[idx]
         if locked:
-            await self._async_update_status("画像管理", "⛔ 锁定条目不可删除")
+            await self._async_update_status(
+                "\u753b\u50cf\u7ba1\u7406",
+                "\u9501\u5b9a\u6761\u76ee\u4e0d\u53ef\u5220\u9664",
+            )
             return
-        rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[habits] selected DB row missing; skip delete: idx={idx}")
+        asset = self._memory_asset_for_index("habit", idx)
+        if not await self._persist_memory_action("habit", "delete", value, asset=asset):
             return
-        if rows:
-            _ok = await self._async_db_exec("DELETE FROM habits WHERE id=?", (rows[0]["id"],))
-            if not _ok:
-                self._sys_log("WARN", f"[习惯] 删除失败: idx={idx}")
-                return
         del self._habits[idx]
+        self._mutate_memory_asset_mirror("habit", "delete", idx)
         self.async_set_updated_data({})
 
     async def async_habit_lock(self, selected: str) -> None:
-        if not selected or selected == "(无)":
+        if not selected or selected == "(\u65e0)":
             return
         idx = self._find_habit_idx(selected)
         if idx < 0:
             return
-        content, locked = self._habits[idx]
-        new_locked = 0 if locked else 1
-        rows = await self._async_query("SELECT id FROM habits ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[habits] selected DB row missing; skip lock toggle: idx={idx}")
+        value, locked = self._habits[idx]
+        asset = self._memory_asset_for_index("habit", idx)
+        if not await self._persist_memory_action("habit", "toggle-lock", value, asset=asset):
             return
-        if rows:
-            _ok = await self._async_db_exec("UPDATE habits SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
-            if not _ok:
-                self._sys_log("WARN", f"[习惯] 锁定状态更新失败: idx={idx}")
-                return
-        self._habits[idx] = (content, bool(new_locked))
+        self._habits[idx] = (value, not locked)
+        self._mutate_memory_asset_mirror("habit", "toggle-lock", idx, locked=not locked)
         self.async_set_updated_data({})
 
-    # ── 规则 CRUD ─────────────────────────────────────────────────────────────
+    # -- Rule CRUD -------------------------------------------------------------
 
     async def async_svc_add_rule(self, content: str) -> None:
-        now = self._ha_db_now_text()
-        _ok = await self._async_db_exec("INSERT INTO rules (content, locked, created) VALUES (?,0,?)", (content, now))
-        if not _ok:
-            self._sys_log("WARN", "[规则] 新增失败，未更新内存态")
+        value = str(content or "").strip()
+        if not value or not await self._persist_memory_action("rule", "add", value):
             return
-        self._rules.append((content, False))
+        if self._find_rule_idx(value) < 0:
+            self._rules.append((value, False))
+            self._mutate_memory_asset_mirror("rule", "add", -1, content=value)
         self.async_set_updated_data({})
 
     async def async_svc_delete_rule(self, content: str) -> None:
         idx = self._find_rule_idx(content)
         if idx < 0:
             return
-        _, locked = self._rules[idx]
-        if locked:
+        value, locked = self._rules[idx]
+        asset = self._memory_asset_for_index("rule", idx)
+        if locked or not await self._persist_memory_action("rule", "delete", value, asset=asset):
             return
-        rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[rules] selected DB row missing; skip delete: idx={idx}")
-            return
-        if rows:
-            _ok = await self._async_db_exec("DELETE FROM rules WHERE id=?", (rows[0]["id"],))
-            if not _ok:
-                self._sys_log("WARN", f"[规则] 删除失败: idx={idx}")
-                return
         del self._rules[idx]
+        self._mutate_memory_asset_mirror("rule", "delete", idx)
         self.async_set_updated_data({})
 
     async def async_svc_toggle_rule_lock(self, content: str) -> None:
         idx = self._find_rule_idx(content)
         if idx < 0:
             return
-        c, locked = self._rules[idx]
-        new_locked = 0 if locked else 1
-        rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[rules] selected DB row missing; skip lock toggle: idx={idx}")
+        value, locked = self._rules[idx]
+        asset = self._memory_asset_for_index("rule", idx)
+        if not await self._persist_memory_action("rule", "toggle-lock", value, asset=asset):
             return
-        if rows:
-            _ok = await self._async_db_exec("UPDATE rules SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
-            if not _ok:
-                self._sys_log("WARN", f"[规则] 锁定状态更新失败: idx={idx}")
-                return
-        self._rules[idx] = (c, bool(new_locked))
+        self._rules[idx] = (value, not locked)
+        self._mutate_memory_asset_mirror("rule", "toggle-lock", idx, locked=not locked)
         self.async_set_updated_data({})
 
     async def async_rule_add(self, text: str, selected: str) -> None:
-        if not text:
+        value = str(text or "").strip()
+        if not value:
             return
-        now = self._ha_db_now_text()
-        idx = self._find_rule_idx(selected) if selected and selected != "(无)" else -1
+        idx = self._find_rule_idx(selected) if selected and selected != "(\u65e0)" else -1
         if idx >= 0:
-            _, locked = self._rules[idx]
+            previous, locked = self._rules[idx]
             if locked:
-                await self._async_update_status("规则管理", "⛔ 铁律不可修改")
+                await self._async_update_status(
+                    "\u89c4\u5219\u7ba1\u7406",
+                    "\u94c1\u5f8b\u4e0d\u53ef\u4fee\u6539",
+                )
                 return
-            rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-            if not rows:
-                self._sys_log("WARN", f"[rules] selected DB row missing; skip edit: idx={idx}")
+            asset = self._memory_asset_for_index("rule", idx)
+            if not await self._persist_memory_action(
+                "rule",
+                "update",
+                value,
+                previous_content=previous,
+                asset=asset,
+            ):
                 return
-            if rows:
-                _ok = await self._async_db_exec("UPDATE rules SET content=? WHERE id=?", (text, rows[0]["id"]))
-                if not _ok:
-                    self._sys_log("WARN", f"[规则] 编辑失败: idx={idx}")
-                    return
-            self._rules[idx] = (text, False)
+            self._rules[idx] = (value, False)
+            self._mutate_memory_asset_mirror("rule", "update", idx, content=value)
         else:
-            _ok = await self._async_db_exec("INSERT INTO rules (content, locked, created) VALUES (?,0,?)", (text, now))
-            if not _ok:
-                self._sys_log("WARN", "[规则] 新增失败，未更新内存态")
+            if not await self._persist_memory_action("rule", "add", value):
                 return
-            self._rules.append((text, False))
+            self._rules.append((value, False))
+            self._mutate_memory_asset_mirror("rule", "add", -1, content=value)
         self.async_set_updated_data({})
 
     async def async_rule_delete(self, selected: str) -> None:
-        if not selected or selected == "(无)":
+        if not selected or selected == "(\u65e0)":
             return
         idx = self._find_rule_idx(selected)
         if idx < 0:
             return
-        _, locked = self._rules[idx]
+        value, locked = self._rules[idx]
         if locked:
-            await self._async_update_status("规则管理", "⛔ 铁律不可删除")
+            await self._async_update_status(
+                "\u89c4\u5219\u7ba1\u7406",
+                "\u94c1\u5f8b\u4e0d\u53ef\u5220\u9664",
+            )
             return
-        rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[rules] selected DB row missing; skip delete: idx={idx}")
+        asset = self._memory_asset_for_index("rule", idx)
+        if not await self._persist_memory_action("rule", "delete", value, asset=asset):
             return
-        if rows:
-            _ok = await self._async_db_exec("DELETE FROM rules WHERE id=?", (rows[0]["id"],))
-            if not _ok:
-                self._sys_log("WARN", f"[规则] 删除失败: idx={idx}")
-                return
         del self._rules[idx]
+        self._mutate_memory_asset_mirror("rule", "delete", idx)
         self.async_set_updated_data({})
 
     async def async_rule_lock(self, selected: str) -> None:
-        if not selected or selected == "(无)":
+        if not selected or selected == "(\u65e0)":
             return
         idx = self._find_rule_idx(selected)
         if idx < 0:
             return
-        content, locked = self._rules[idx]
-        new_locked = 0 if locked else 1
-        rows = await self._async_query("SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?", (idx,))
-        if not rows:
-            self._sys_log("WARN", f"[rules] selected DB row missing; skip lock toggle: idx={idx}")
+        value, locked = self._rules[idx]
+        asset = self._memory_asset_for_index("rule", idx)
+        if not await self._persist_memory_action("rule", "toggle-lock", value, asset=asset):
             return
-        if rows:
-            _ok = await self._async_db_exec("UPDATE rules SET locked=? WHERE id=?", (new_locked, rows[0]["id"]))
-            if not _ok:
-                self._sys_log("WARN", f"[规则] 锁定状态更新失败: idx={idx}")
-                return
-        self._rules[idx] = (content, bool(new_locked))
+        self._rules[idx] = (value, not locked)
+        self._mutate_memory_asset_mirror("rule", "toggle-lock", idx, locked=not locked)
         self.async_set_updated_data({})
-
-    # ── 行为规律管理 ──────────────────────────────────────────────────────────
-
     async def async_delete_behavior_pattern(self, pattern_id: int) -> None:
         """Delete a single behavior pattern through the canonical add-on store."""
         try:

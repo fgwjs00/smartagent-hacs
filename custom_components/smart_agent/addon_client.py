@@ -1160,6 +1160,27 @@ class AddOnClient:
             return self._handle_request_exception(exc)
         return None
 
+    async def get_backup_events(self) -> dict[str, Any] | None:
+        """Read the canonical 30-day event slice used by full backups."""
+        try:
+            session = await self._get_session()
+            async with session.get(
+                f"{self._base}/events/recent",
+                params={"view": "backup", "limit": 5000, "hours": 720},
+                headers=self._request_headers(),
+                timeout=_HEALTH_TIMEOUT,
+            ) as resp:
+                if resp.status in (404, 405):
+                    return None
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                return self._build_status_result(resp.status, data)
+        except Exception as exc:
+            return self._handle_request_exception(exc)
+        return None
+
     async def post_behavior_pattern_action(self, pattern_id: int, action: str) -> dict[str, Any] | None:
         """Apply a lifecycle action to a canonical add-on behavior pattern."""
         normalized = str(action or "").strip().lower()

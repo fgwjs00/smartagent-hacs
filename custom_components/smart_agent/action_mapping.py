@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .const import ACTION_PARAM_KEYS_COMMON
+from .const import comparable_action_params
 
 DEFAULT_ON_STATES = ("on", "open", "heat", "cool", "auto")
 
@@ -47,7 +47,7 @@ def entities_to_actions(
     *,
     device_info: dict[str, dict] | None = None,
     on_states: tuple[str, ...] = DEFAULT_ON_STATES,
-    param_keys: tuple[str, ...] = ACTION_PARAM_KEYS_COMMON,
+    param_keys: tuple[str, ...] | None = None,
     default_delay_seconds: int = 0,
 ) -> list[dict]:
     """从 entities 推导 canonical actions。"""
@@ -71,10 +71,13 @@ def entities_to_actions(
             service = "open_cover" if state == "open" else "close_cover"
         else:
             service = "turn_on" if state in on_state_set else "turn_off"
-        params: dict[str, Any] = {}
-        for k in param_keys:
-            if k in e:
-                params[k] = e[k]
+        if param_keys is None:
+            params = comparable_action_params(domain, e)
+        else:
+            params: dict[str, Any] = {}
+            for k in param_keys:
+                if k in e:
+                    params[k] = e[k]
         out.append({
             "entity_id": eid,
             "domain": domain,

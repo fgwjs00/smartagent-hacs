@@ -42,7 +42,7 @@ from .const import (
     FRIGATE_COUNT_OFF_HOLD, FRIGATE_COUNT_COOLDOWN,
     SENSOR_DEADBAND_PCT,
     SOURCE_AUTOMATION, SOURCE_DASHBOARD, SOURCE_PHYSICAL, SOURCE_VOICE,
-    DEVICE_VACANT_ACTIONS,
+    DEVICE_CONTROL_MODES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -4514,7 +4514,7 @@ class ListenersMixin:
             return None
 
         mode = str(row.get("control_mode") or row.get("policy") or "shared").strip() or "shared"
-        valid_modes = getattr(self, "_VALID_CONTROL_MODES", {"ai", "ha", "shared"})
+        valid_modes = DEVICE_CONTROL_MODES
         if mode not in valid_modes:
             mode = "shared"
 
@@ -4544,8 +4544,6 @@ class ListenersMixin:
             or domain
         )
         vacant_action = str(row.get("vacant_action") or "preserve").strip().lower()
-        if vacant_action not in DEVICE_VACANT_ACTIONS:
-            vacant_action = "preserve"
         info = {
             "name": str(name or entity_id),
             "room": str(room or ""),
@@ -4753,13 +4751,11 @@ class ListenersMixin:
             self._persist_device_registry_metadata(entity_id, info)
 
     def _persist_device_registry_metadata(self, entity_id: str, info: dict[str, Any]) -> None:
-        db = getattr(self, "_db", None)
-        execute = getattr(db, "execute", None)
-        if not callable(execute):
+        if not callable(getattr(self, "_db_exec", None)):
             return
         now = self._listener_db_now_text()
         try:
-            execute(
+            self._db_exec(
                 "UPDATE devices SET ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
                 (
                     str(info.get("ha_unique_id") or ""),
@@ -4772,13 +4768,11 @@ class ListenersMixin:
             _LOGGER.debug("[Listeners] device registry metadata persist skipped for %s: %s", entity_id, exc)
 
     def _persist_device_entity_id_migration(self, old_entity_id: str, new_entity_id: str, info: dict[str, Any]) -> None:
-        db = getattr(self, "_db", None)
-        execute = getattr(db, "execute", None)
-        if not callable(execute):
+        if not callable(getattr(self, "_db_exec", None)):
             return
         now = self._listener_db_now_text()
         try:
-            execute(
+            self._db_exec(
                 "UPDATE devices SET entity_id=?, updated=? WHERE entity_id=?",
                 (new_entity_id, now, old_entity_id),
             )
@@ -4786,7 +4780,7 @@ class ListenersMixin:
             _LOGGER.warning("[Listeners] device entity_id migration persist failed %s -> %s: %s", old_entity_id, new_entity_id, exc)
             return
         try:
-            execute(
+            self._db_exec(
                 "UPDATE devices SET ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
                 (
                     str(info.get("ha_unique_id") or ""),

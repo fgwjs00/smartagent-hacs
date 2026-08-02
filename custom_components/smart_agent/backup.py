@@ -204,15 +204,7 @@ class BackupManager:
 
         try:
             # 1. 在事件循环中快照协调器的内存数据（线程安全）
-            coord = self._coord
-            snapshot = {
-                "device_info": dict(getattr(coord, "device_info", {})),
-                "rules": list(getattr(coord, "_rules", [])),
-                "habits": list(getattr(coord, "_habits", [])),
-                "memory_db": getattr(coord, "_memory_db", None),
-            }
-
-            # 2. 在 executor 中收集 DB 数据并组装 payload（使用快照，无需访问协调器）
+            snapshot = await self._collect_canonical_snapshot(level)
             payload = await self._hass.async_add_executor_job(
                 self._collect_data, level, snapshot
             )
@@ -308,6 +300,23 @@ class BackupManager:
                     self._coord._sys_log("ERROR", _fail_msg)
                 return {"success": False, "message": "恢复失败：恢复事务已回滚，数据库保持原状", "restored_keys": []}
 
+            refresh_errors = await self._async_refresh_restored_projections(restored_keys)
+            if refresh_errors:
+                _fail_msg = (
+                    "[Backup] Add-on restore committed, but runtime projection refresh failed: "
+                    + ", ".join(refresh_errors)
+                )
+                _LOGGER.error(_fail_msg)
+                if hasattr(self._coord, "_sys_log"):
+                    self._coord._sys_log("ERROR", _fail_msg)
+                return {
+                    "success": False,
+                    "committed": True,
+                    "requires_restart": True,
+                    "message": "Restore committed, but runtime refresh failed; restart is required",
+                    "restored_keys": restored_keys,
+                    "refresh_errors": refresh_errors,
+                }
             _res_msg = f"[Backup] 恢复完成，恢复数据类别: {restored_keys}"
             _LOGGER.info(_res_msg)
             if hasattr(self._coord, "_sys_log"):
@@ -493,281 +502,153 @@ class BackupManager:
 
     # ── 数据收集与恢复 ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _canonical_rows(value: Any, source: str) -> list[dict[str, Any]]:
+        if isinstance(value, list):
+            return [dict(row) for row in value if isinstance(row, dict)]
+        if isinstance(value, dict):
+            status = int(value.get("__status") or value.get("status_code") or 0)
+            if value.get("ok") is False or status >= 400:
+                raise RuntimeError(f"canonical_backup_source_failed:{source}")
+            rows = value.get("data")
+            if isinstance(rows, list):
+                return [dict(row) for row in rows if isinstance(row, dict)]
+        raise RuntimeError(f"canonical_backup_source_invalid:{source}")
+
+    async def _collect_canonical_snapshot(self, level: str) -> dict[str, Any]:
+        if level not in {BACKUP_LEVEL_BASIC, BACKUP_LEVEL_STANDARD, BACKUP_LEVEL_FULL}:
+            raise ValueError(f"invalid_backup_level:{level}")
+        client = getattr(self._coord, "_addon_client", None)
+        if client is None:
+            raise RuntimeError("canonical_backup_addon_unavailable")
+
+        required = [
+            ("devices", "get_devices"),
+            ("rules", "get_memory_profiles"),
+            ("habits", "get_memory_habits"),
+        ]
+        if level in {BACKUP_LEVEL_STANDARD, BACKUP_LEVEL_FULL}:
+            required.extend(
+                [
+                    ("behavior_patterns", "get_behavior_patterns"),
+                    ("corrections", "get_corrections"),
+                ]
+            )
+
+        if level == BACKUP_LEVEL_FULL:
+            required.append(("events", "get_backup_events"))
+
+        snapshot: dict[str, Any] = {}
+        for key, getter_name in required:
+            getter = getattr(client, getter_name, None)
+            if not callable(getter):
+                raise RuntimeError(f"canonical_backup_getter_unavailable:{getter_name}")
+            try:
+                value = await getter()
+            except Exception as exc:
+                raise RuntimeError(f"canonical_backup_source_exception:{key}") from exc
+            snapshot[key] = self._canonical_rows(value, key)
+        return snapshot
+
     def _collect_data(self, level: str, snapshot: dict) -> dict:
-        """
-        收集需要备份的数据（同步，在 executor 中运行）。
-
-        使用事先在事件循环中获取的 snapshot 快照，避免在 executor 线程中
-        直接访问协调器属性（竞争条件）。
-
-        数据内容根据 level 分级：
-          basic:    device_info + rules + habits
-          standard: basic + behavior_patterns + corrections
-          full:     standard + recent events (30 days)
-
-        永不包含：L5 生物特征、摄像头画面、音频
-
-        Args:
-            level: 备份等级
-            snapshot: 在事件循环中预先快照的协调器内存数据
-
-        Returns:
-            可序列化的字典
-        """
+        """Build a serializable payload from an Add-on canonical snapshot."""
         payload: dict[str, Any] = {
-            "version": "1.0",
+            "version": "1.1",
             "level": level,
             "exported_at": self._ha_backup_now_iso(),
             "integration_version": self._integration_version,
         }
 
-        # L0: 设备配置（来自快照，线程安全）
-        payload["device_info"] = snapshot.get("device_info", {})
-
-        # L1: 规则和习惯（来自快照）
+        device_info: dict[str, dict[str, Any]] = {}
+        for row in snapshot.get("devices", []):
+            if not isinstance(row, dict):
+                continue
+            entity_id = str(row.get("entity_id") or "").strip()
+            if entity_id:
+                device_info[entity_id] = dict(row)
+        payload["device_info"] = device_info
         payload["rules"] = [
-            {"content": c, "locked": lk}
-            for c, lk in snapshot.get("rules", [])
+            dict(row) for row in snapshot.get("rules", []) if isinstance(row, dict)
         ]
         payload["habits"] = [
-            {"content": c, "locked": lk}
-            for c, lk in snapshot.get("habits", [])
+            dict(row) for row in snapshot.get("habits", []) if isinstance(row, dict)
         ]
 
-        if level in (BACKUP_LEVEL_STANDARD, BACKUP_LEVEL_FULL):
-            # L2: 行为模式 + 修正记录（通过 coordinator._db 读取，WAL 读无锁）
-            db = getattr(self._coord, "_db", None)
-            if db and db.is_open:
-                try:
-                    payload["behavior_patterns"] = db.query(
-                        "SELECT entity_id, expected_state, hour_start, hour_end, "
-                        "weekday_mask, confidence, last_reinforced "
-                        "FROM behavior_patterns ORDER BY confidence DESC LIMIT 500"
-                    )
-                    payload["corrections"] = db.query(
-                        "SELECT time, entity_id, ai_service, ai_state, user_state, "
-                        "room, hour, correction_count, scene_desc "
-                        "FROM corrections ORDER BY correction_count DESC LIMIT 200"
-                    )
-                    payload["rules_db"] = db.query(
-                        "SELECT content, locked, created FROM rules"
-                    )
-                except Exception as exc:
-                    _LOGGER.warning("[Backup] 数据库读取失败: %s", exc)
+        if level in {BACKUP_LEVEL_STANDARD, BACKUP_LEVEL_FULL}:
+            payload["behavior_patterns"] = [
+                dict(row)
+                for row in snapshot.get("behavior_patterns", [])
+                if isinstance(row, dict)
+            ]
+            payload["corrections"] = [
+                dict(row)
+                for row in snapshot.get("corrections", [])
+                if isinstance(row, dict)
+            ]
 
         if level == BACKUP_LEVEL_FULL:
-            # L3: 近 30 天事件日志
-            db = getattr(self._coord, "_db", None)
-            if db and db.is_open:
-                try:
-                    cutoff = (self._ha_backup_now() - timedelta(days=30)).strftime("%Y-%m-%d")
-                    payload["events"] = db.query(
-                        "SELECT time, type, detail, entity, state FROM events "
-                        "WHERE time >= ? ORDER BY id DESC LIMIT 5000",
-                        (cutoff,),
-                    )
-                except Exception as exc:
-                    _LOGGER.warning("[Backup] 事件日志读取失败: %s", exc)
+            payload["events"] = [
+                dict(row) for row in snapshot.get("events", []) if isinstance(row, dict)
+            ]
 
         return payload
 
     def _restore_data(self, payload: dict) -> list[str] | None:
-        """
-        将解密后的备份数据恢复到本地（同步，在 executor 中运行）。
+        """Restore business data through the Add-on single-writer transaction."""
+        confirm = getattr(self._coord, "_post_internal_event_confirmed", None)
+        if not callable(confirm):
+            _LOGGER.error("[Backup] restore failed: Add-on persistence confirmation unavailable")
+            return None
+        result = confirm("backup_restore", {"backup": dict(payload or {})}, timeout=60.0)
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or result.get("committed") is not True
+        ):
+            _LOGGER.error(
+                "[Backup] restore failed: Add-on did not confirm atomic commit: %s",
+                (result or {}).get("error") if isinstance(result, dict) else "invalid_receipt",
+            )
+            return None
+        restored = result.get("restored")
+        if not isinstance(restored, list):
+            _LOGGER.error("[Backup] restore failed: receipt has no restored list")
+            return None
+        return [str(item) for item in restored if str(item).strip()]
 
-        恢复优先级：
-          1. device_info   → devices 表（核心设备配置）
-          2. rules_db / rules → rules 表（rules_db 优先，含 created 字段）
-          3. habits        → habits 表
-          4. behavior_patterns → behavior_patterns 表
-          5. corrections   → corrections 表
-          6. events        → events 表（仅 full 备份）
+    async def _async_refresh_restored_projections(self, restored_keys: list[str]) -> list[str]:
+        restored = {str(item or "").strip() for item in restored_keys}
+        errors: list[str] = []
+        if restored.intersection({"device_info", "devices"}):
+            refresh_devices = getattr(
+                self._coord,
+                "_async_refresh_device_info_from_addon_devices",
+                None,
+            )
+            if not callable(refresh_devices):
+                errors.append("device_projection_refresh_unavailable")
+            else:
+                try:
+                    await refresh_devices(reason="backup_restore")
+                    status = getattr(self._coord, "_last_addon_device_sync_status", {})
+                    if not isinstance(status, dict) or status.get("ok") is not True:
+                        errors.append("device_projection_refresh_failed")
+                except Exception:
+                    errors.append("device_projection_refresh_failed")
 
-        所有写操作在同一 SQLite EXCLUSIVE 事务内，任何失败触发完整 ROLLBACK。
-        事务结束后调用 _load_config() 将 DB 数据同步回 coordinator 内存。
-
-        Args:
-            payload: 解密后的字典
-
-        Returns:
-            已恢复的数据类别列表
-        """
-        coord = self._coord
-        restored: list[str] = []
-        db = getattr(coord, "_db", None)
-
-        if db and db.is_open:
-            try:
-                conn = db.get_raw_connection()
-                # 先获取 DatabaseService 写锁，再执行 EXCLUSIVE 事务，
-                # 保证与 execute() / execute_script() 不发生并发冲突。
-                # isolation_level=None（自动提交）下可直接使用显式事务控制。
-                with db._write_lock:
-                    try:
-                        conn.execute("BEGIN EXCLUSIVE")
-                        now_str = self._ha_backup_datetime_text()
-
-                        # ── 1. 设备配置（device_info → devices 表）────────────────
-                        if "device_info" in payload and isinstance(payload["device_info"], dict):
-                            conn.execute("DELETE FROM devices")
-                            for eid, info in payload["device_info"].items():
-                                if not isinstance(info, dict):
-                                    continue
-                                conn.execute(
-                                    "INSERT OR REPLACE INTO devices "
-                                    "(entity_id, name, area, type, ops, control_mode, sensor_type) "
-                                    "VALUES (?,?,?,?,?,?,?)",
-                                    (
-                                        eid,
-                                        _restore_text(info.get("name"), eid, 100),
-                                        _restore_text(info.get("room") or info.get("area"), "", 50),
-                                        _restore_text(info.get("type"), "", 30),
-                                        _restore_text(info.get("ops"), "", 200),
-                                        _restore_text(info.get("control_mode"), "shared", 20),
-                                        _restore_text(info.get("sensor_type"), "", 30),
-                                    ),
-                                )
-                            restored.append("device_info")
-                            _LOGGER.info("[Backup] 恢复设备配置: %d 台", len(payload["device_info"]))
-
-                        # ── 2. 规则（rules_db 含创建时间；rules 为内存快照回退）──
-                        rules_source = payload.get("rules_db") or [
-                            {"content": r["content"], "locked": r.get("locked", 0), "created": now_str}
-                            for r in payload.get("rules", [])
-                        ]
-                        if rules_source:
-                            conn.execute("DELETE FROM rules")
-                            for r in rules_source:
-                                if not isinstance(r, dict) or not r.get("content"):
-                                    continue
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO rules (content, locked, created) VALUES (?,?,?)",
-                                    (r["content"], int(r.get("locked", 0)), r.get("created", now_str)),
-                                )
-                            restored.append("rules")
-                            _LOGGER.info("[Backup] 恢复规则: %d 条", len(rules_source))
-
-                        # ── 3. 习惯（habits → habits 表）────────────────────────
-                        if "habits" in payload and isinstance(payload["habits"], list):
-                            conn.execute("DELETE FROM habits")
-                            for h in payload["habits"]:
-                                if not isinstance(h, dict) or not h.get("content"):
-                                    continue
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO habits (content, locked, created) VALUES (?,?,?)",
-                                    (h["content"], int(h.get("locked", 0)), now_str),
-                                )
-                            restored.append("habits")
-                            _LOGGER.info("[Backup] 恢复习惯: %d 条", len(payload["habits"]))
-
-                        # ── 4. 行为模式 ──────────────────────────────────────────
-                        if "behavior_patterns" in payload and isinstance(payload["behavior_patterns"], list):
-                            conn.execute("DELETE FROM behavior_patterns")
-                            for r in payload["behavior_patterns"]:
-                                if not isinstance(r, dict):
-                                    continue
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO behavior_patterns "
-                                    "(entity_id, expected_state, hour_start, hour_end, "
-                                    "weekday_mask, confidence, last_reinforced) "
-                                    "VALUES (?,?,?,?,?,?,?)",
-                                    (
-                                        r.get("entity_id"), r.get("expected_state"),
-                                        r.get("hour_start"), r.get("hour_end"),
-                                        r.get("weekday_mask"), r.get("confidence"),
-                                        r.get("last_reinforced"),
-                                    ),
-                                )
-                            restored.append("behavior_patterns")
-
-                        # ── 5. 修正记录 ──────────────────────────────────────────
-                        if "corrections" in payload and isinstance(payload["corrections"], list):
-                            conn.execute("DELETE FROM corrections")
-                            for r in payload["corrections"]:
-                                if not isinstance(r, dict):
-                                    continue
-                                # P0修复：time 为 NOT NULL，备份时已包含；老备份缺失时用 ISO 当前时间补全
-                                _time = r.get("time") or self._ha_backup_now_iso()
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO corrections "
-                                    "(time, entity_id, ai_service, ai_state, user_state, "
-                                    "room, hour, correction_count, scene_desc) "
-                                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                                    (
-                                        _time,
-                                        r.get("entity_id"), r.get("ai_service"),
-                                        r.get("ai_state"), r.get("user_state"),
-                                        r.get("room"), r.get("hour"),
-                                        r.get("correction_count", 1), r.get("scene_desc"),
-                                    ),
-                                )
-                            restored.append("corrections")
-
-                        # ── 6. 事件日志（full 备份才有）──────────────────────────
-                        if "events" in payload and isinstance(payload["events"], list):
-                            # 不清空 events 表，只补充备份中有而本地没有的旧事件
-                            existing_events: set[tuple[str, str, str, str, str]] = set()
-                            for row in conn.execute("SELECT time, type, detail, entity, state FROM events"):
-                                if isinstance(row, tuple):
-                                    existing_events.add(tuple("" if v is None else str(v) for v in row))
-                                else:
-                                    existing_events.add(tuple(
-                                        "" if row[field] is None else str(row[field])
-                                        for field in ("time", "type", "detail", "entity", "state")
-                                    ))
-                            inserted = 0
-                            for r in payload["events"]:
-                                if not isinstance(r, dict):
-                                    continue
-                                event_key = tuple(
-                                    "" if r.get(field) is None else str(r.get(field))
-                                    for field in ("time", "type", "detail", "entity", "state")
-                                )
-                                if event_key in existing_events:
-                                    continue
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO events (time, type, detail, entity, state) "
-                                    "VALUES (?,?,?,?,?)",
-                                    (
-                                        r.get("time"), r.get("type"),
-                                        r.get("detail"), r.get("entity"), r.get("state"),
-                                    ),
-                                )
-                                existing_events.add(event_key)
-                                inserted += 1
-                            if inserted:
-                                restored.append("events")
-                                _LOGGER.info("[Backup] 恢复事件: %d 条", inserted)
-
-                        conn.execute("COMMIT")
-                        _LOGGER.info("[Backup] 数据库恢复事务提交成功: %s", restored)
-
-                    except Exception as exc:
-                        try:
-                            conn.execute("ROLLBACK")
-                        except Exception:
-                            pass
-                        _LOGGER.error("[Backup] 恢复事务失败，已完整回滚，数据库保持一致: %s", exc)
-                        # 返回 None 作为失败哨兵，区别于"成功但 0 类别"的空列表，
-                        # 避免调用方把回滚（什么都没写入）误报为恢复成功。
-                        return None
-                # 不关闭连接——DatabaseService 持久化连接由 async_shutdown 管理
-
-            except Exception as exc:
-                _LOGGER.error("[Backup] 无法访问 DatabaseService: %s", exc)
-                return None
-
-        # 将 DB 中已恢复的数据同步回 coordinator 内存（不在事务内，失败不影响已写入的 DB）
-        if restored and hasattr(coord, "_load_config"):
-            try:
-                coord._load_config()
-                _LOGGER.info("[Backup] 已从 DB 重新加载配置到 coordinator 内存")
-            except Exception as exc:
-                _LOGGER.warning("[Backup] 配置重载失败（数据库已恢复，重启 HA 后生效）: %s", exc)
-
-        return restored
-
-    # ── 网络 API 调用 ─────────────────────────────────────────────────────────
+        if restored.intersection({"rules", "rules_db", "habits"}):
+            refresh_memory = getattr(self._coord, "_async_refresh_memory_assets_from_addon", None)
+            if not callable(refresh_memory):
+                errors.append("memory_projection_refresh_unavailable")
+            else:
+                try:
+                    refreshed = await refresh_memory()
+                    status = getattr(self._coord, "_last_addon_memory_sync_status", {})
+                    if refreshed is not True or not isinstance(status, dict) or status.get("ok") is not True:
+                        errors.append("memory_projection_refresh_failed")
+                except Exception:
+                    errors.append("memory_projection_refresh_failed")
+        return errors
 
     async def _upload(self, encrypted: bytes, level: str) -> dict:
         """上传加密数据到云端 API。"""

@@ -25,6 +25,7 @@ from .const import (
     ACTION_PARAM_KEYS_COLOR,
     ACTION_PARAM_KEYS_LIGHT_SCENE,
     ACTION_PARAM_KEYS_USELESS_WHEN_OFF,
+    DEVICE_CONTROL_MODES,
     DEVICE_CAP_KEY_COVERAGE_SPACES,
     DEVICE_CAP_KEY_SHARED_FIXTURE,
     MODE_SHOWROOM,
@@ -74,7 +75,7 @@ class ActionsMixin:
             return obj
 
     # 合法的设备管辖域值（DatabaseMixin 也定义了此常量，MRO 取第一个即可）
-    _VALID_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
+    _VALID_CONTROL_MODES = DEVICE_CONTROL_MODES
 
     # 设备管辖域标签（用于日志）
     _CONTROL_MODE_LABELS = {"ai": "AI全权", "ha": "HA优先", "shared": "共享"}

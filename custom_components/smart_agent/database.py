@@ -1,22 +1,22 @@
 """Thin SQLite bridge helpers for the Home Assistant integration."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
-import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import Any
 
+from .const import DEVICE_CONTROL_MODES
 from .db_service import DatabaseService
 from .database_learning_projection import DatabaseLearningProjectionMixin
 from .database_scenes import DatabaseSceneBridgeMixin
+from .database_write_ownership import _safe_add_column, classify_ha_local_write, ha_local_write_allowed
 
 _LOGGER = logging.getLogger(__name__)
-
-_VALID_MIGRATION_TABLES = frozenset({"events", "devices", "habits", "rules", "action_results", "ai_scenes", "action_transactions", "room_topology"})
 
 _BRIDGE_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], ...] = (
     ("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, type TEXT NOT NULL, detail TEXT, entity TEXT, state TEXT, source TEXT DEFAULT 'system', area TEXT, confidence INTEGER, transaction_id INTEGER DEFAULT 0, action_seq INTEGER DEFAULT 0)", ("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)", "CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)", "CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity)"), (("events", "transaction_id INTEGER DEFAULT 0"), ("events", "action_seq INTEGER DEFAULT 0"))),
@@ -30,28 +30,8 @@ _BRIDGE_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], 
 )
 
 
-def _safe_add_column(conn: sqlite3.Connection, table: str, column_def: str) -> None:
-    table_name = (table or "").strip()
-    col_def = (column_def or "").strip()
-
-    if table_name not in _VALID_MIGRATION_TABLES:
-        raise ValueError(f"invalid migration table: {table_name}")
-    if not col_def:
-        raise ValueError("invalid empty column definition")
-    upper_col_def = col_def.upper()
-    if ";" in col_def or "--" in col_def or "/*" in col_def or "DROP TABLE" in upper_col_def:
-        raise ValueError(f"invalid column definition: {col_def}")
-
-    try:
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_def}")
-    except sqlite3.OperationalError as exc:
-        if "duplicate column" not in str(exc).lower():
-            _LOGGER.error("[DB] migration failed: ALTER TABLE %s ADD COLUMN %s: %s", table_name, col_def, exc)
-            raise
-
-
 class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
-    _VALID_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
+    _VALID_CONTROL_MODES = DEVICE_CONTROL_MODES
 
     def _init_memory_db(self) -> None:
         try:
@@ -72,53 +52,145 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
 
         if hasattr(self, "_sys_log"):
             self._sys_log("INFO", f"Database initialized: {self._memory_db}")
-        self._migrate_json_config()
 
-    def _migrate_json_config(self) -> None:
-        """Migrate the old JSON configuration file into the bridge config tables."""
+    def _legacy_config_migration_batch(self) -> tuple[dict[str, Any], str | None] | None:
+        """Build one deterministic migration batch from legacy HA projections and JSON."""
+        devices_by_id: dict[str, dict[str, Any]] = {}
+        habits_by_content: dict[str, dict[str, Any]] = {}
+        rules_by_content: dict[str, dict[str, Any]] = {}
         try:
             conn = self._db.get_raw_connection()
-            if conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0] > 0:
-                return
+            for row in conn.execute("SELECT * FROM devices ORDER BY entity_id"):
+                columns = set(row.keys())
+                entity_id = str(row["entity_id"] or "").strip()
+                if not entity_id:
+                    continue
+                devices_by_id[entity_id] = {
+                    "entity_id": entity_id,
+                    "name": str(row["name"] or entity_id),
+                    "area": str(row["area"] or ""),
+                    "type": str(row["type"] or ""),
+                    "ops": str(row["ops"] or ""),
+                    "control_mode": str(row["control_mode"] or "shared") if "control_mode" in columns else "shared",
+                    "sensor_type": str(row["sensor_type"] or "") if "sensor_type" in columns else "",
+                }
+            for target, output in (("habits", habits_by_content), ("rules", rules_by_content)):
+                for row in conn.execute(f"SELECT content, locked, created FROM {target} ORDER BY id"):
+                    content = str(row["content"] or "").strip()
+                    if content:
+                        output[content] = {
+                            "content": content,
+                            "locked": bool(row["locked"]),
+                            "created": str(row["created"] or ""),
+                        }
         except Exception as exc:
-            _LOGGER.warning("[DB] JSON migration skipped: %s", exc)
-            return
+            _LOGGER.warning("[DB] legacy SQL projection read failed: %s", exc)
+            return None
 
         json_path = os.path.join(self._config_dir, "smart_agent_config.json")
-        if not os.path.exists(json_path):
-            return
-
-        try:
-            with open(json_path, "r", encoding="utf-8") as file:
-                cfg = json.load(file)
-            os.rename(json_path, json_path + ".migrated")
-        except Exception as exc:
-            _LOGGER.debug("[DB] legacy JSON read failed: %s", exc)
-            return
-
-        now = self._ha_db_now_text()
-        try:
+        cfg: dict[str, Any] = {}
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as file:
+                    loaded = json.load(file)
+                cfg = loaded if isinstance(loaded, dict) else {}
+            except Exception as exc:
+                _LOGGER.warning("[DB] legacy JSON read failed: %s", exc)
+                return None
             for eid, desc in cfg.get("devices", {}).items():
+                entity_id = str(eid or "").strip()
+                if not entity_id or entity_id in devices_by_id:
+                    continue
                 parts = [part.strip() for part in str(desc).split("|")]
-                conn.execute(
-                    "INSERT OR IGNORE INTO devices "
-                    "(entity_id, name, area, type, ops, created, updated) VALUES (?,?,?,?,?,?,?)",
-                    (
-                        eid,
-                        parts[0] if parts else eid,
-                        parts[1] if len(parts) > 1 else "",
-                        parts[2] if len(parts) > 2 else "",
-                        parts[3] if len(parts) > 3 else "",
-                        now,
-                        now,
-                    ),
-                )
-            for habit in cfg.get("habits", []):
-                conn.execute("INSERT INTO habits (content, created) VALUES (?,?)", (habit, now))
-            for rule in cfg.get("rules", []):
-                conn.execute("INSERT INTO rules (content, created) VALUES (?,?)", (rule, now))
+                devices_by_id[entity_id] = {
+                    "entity_id": entity_id,
+                    "name": parts[0] if parts else entity_id,
+                    "area": parts[1] if len(parts) > 1 else "",
+                    "type": parts[2] if len(parts) > 2 else "",
+                    "ops": parts[3] if len(parts) > 3 else "",
+                    "control_mode": "shared",
+                    "sensor_type": "",
+                }
+            for target, output in (("habits", habits_by_content), ("rules", rules_by_content)):
+                for item in cfg.get(target, []):
+                    content = str(item or "").strip()
+                    if content and content not in output:
+                        output[content] = {"content": content, "locked": False, "created": ""}
+
+        devices = [devices_by_id[key] for key in sorted(devices_by_id)]
+        habits = [habits_by_content[key] for key in sorted(habits_by_content)]
+        rules = [rules_by_content[key] for key in sorted(rules_by_content)]
+        if not devices and not habits and not rules:
+            return None
+        canonical = {"devices": devices, "habits": habits, "rules": rules}
+        digest = hashlib.sha256(
+            json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "migration_id": f"legacy-config:sha256:{digest}",
+            "devices": devices,
+            "habits": habits,
+            "rules": rules,
+        }
+        return payload, json_path if os.path.exists(json_path) else None
+
+    @staticmethod
+    def _legacy_migration_committed(result: Any, expected: int) -> bool:
+        return bool(
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and result.get("committed") is True
+            and int(result.get("accepted_count") or -1) == expected
+        )
+
+    @staticmethod
+    def _mark_legacy_json_migrated(json_path: str | None) -> None:
+        if not json_path or not os.path.exists(json_path):
+            return
+        os.replace(json_path, json_path + ".migrated")
+
+    def _migrate_json_config(self) -> None:
+        """Compatibility entrypoint for non-event-loop migration callers."""
+        batch = self._legacy_config_migration_batch()
+        if batch is None:
+            return
+        payload, json_path = batch
+        now = self._ha_db_now_text()
+        confirm = getattr(self, "_post_internal_event_confirmed", None)
+        if not callable(confirm):
+            _LOGGER.warning("[DB] legacy migration deferred: persistence confirmation unavailable")
+            return
+        result = confirm("legacy_config_migration", payload, ts=now)
+        expected = len(payload["devices"]) + len(payload["habits"]) + len(payload["rules"])
+        if not self._legacy_migration_committed(result, expected):
+            _LOGGER.warning("[DB] legacy migration deferred: add-on did not confirm durable commit")
+            return
+        try:
+            self._mark_legacy_json_migrated(json_path)
         except Exception as exc:
-            _LOGGER.warning("[DB] legacy JSON migration failed: %s", exc)
+            _LOGGER.warning("[DB] legacy JSON migration committed but marker rename failed: %s", exc)
+
+    async def _async_migrate_legacy_config(self) -> bool:
+        """Migrate legacy projections through the Add-on writer without blocking HA's loop."""
+        batch = await self.hass.async_add_executor_job(self._legacy_config_migration_batch)
+        if batch is None:
+            return True
+        payload, json_path = batch
+        result = await self._post_internal_event_confirmed_async(
+            "legacy_config_migration",
+            payload,
+            ts=self._ha_db_now_text(),
+        )
+        expected = len(payload["devices"]) + len(payload["habits"]) + len(payload["rules"])
+        if not self._legacy_migration_committed(result, expected):
+            _LOGGER.warning("[DB] legacy migration deferred: add-on did not confirm durable commit")
+            return False
+        try:
+            await self.hass.async_add_executor_job(self._mark_legacy_json_migrated, json_path)
+        except Exception as exc:
+            _LOGGER.warning("[DB] legacy JSON migration committed but marker rename failed: %s", exc)
+        return True
+
     def _load_config(self) -> None:
         """Load devices, habits, and rules from local HA bridge config tables."""
         self.device_info = {}
@@ -164,15 +236,19 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
         if self._p1_blocks_local_write(sql):
             return False
         return bool(await self.hass.async_add_executor_job(self._db.execute, sql, params))
+
     def _p1_blocks_local_write(self, sql: str) -> bool:
-        """P1/P5 gate: HA storage is read-only except scene entity registration."""
+        """Enforce the executable table/operation ownership contract."""
         normalized = " ".join(str(sql or "").split())
-        upper = normalized.upper()
-        if not upper.startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE ")):
+        if ha_local_write_allowed(normalized):
             return False
-        if upper.startswith("UPDATE AI_SCENES SET HA_ENTITY_ID"):
-            return False
-        _LOGGER.warning("[P1] Legacy HA local write blocked: %s", normalized[:140])
+        table, operation, _columns = classify_ha_local_write(normalized)
+        _LOGGER.warning(
+            "[P1] HA local write blocked operation=%s table=%s: %s",
+            operation or "unclassified",
+            table or "unclassified",
+            normalized[:140],
+        )
         return True
 
     def _query_events(self, sql: str, params: tuple = (), max_rows: int = 10000) -> list[dict]:

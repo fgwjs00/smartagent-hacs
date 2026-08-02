@@ -103,8 +103,8 @@ class InternalEventBridge:
         self._monitor_task = None
         self._worker_task = None
 
-    def enqueue(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> bool:
-        item = {
+    def _build_item(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> dict[str, Any]:
+        return {
             "kind": str(kind or "").strip(),
             "payload": dict(payload or {}),
             "ts": str(ts or self._default_ts()),
@@ -113,6 +113,9 @@ class InternalEventBridge:
             "seq": self._next_seq(),
             "attempts": 0,
         }
+
+    def enqueue(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> bool:
+        item = self._build_item(kind, payload, ts=ts)
         try:
             self._queue.put_nowait(item)
             return True
@@ -154,7 +157,24 @@ class InternalEventBridge:
             finally:
                 self._queue.task_done()
 
-    async def _post_item(self, item: dict[str, Any]) -> bool:
+    async def post_confirmed(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ts: str | None = None,
+    ) -> dict[str, Any]:
+        """Post one event directly and return the Add-on persistence receipt."""
+        item = self._build_item(kind, payload, ts=ts)
+        result = await self._post_item_result(item)
+        if not isinstance(result, dict):
+            return {"ok": False, "status": 502, "error": "invalid_addon_persistence_receipt"}
+        status = int(result.get("__status") or result.get("status") or 200)
+        if status >= 400 or result.get("ok") is not True:
+            return {**result, "ok": False, "status": status}
+        return {**result, "ok": True, "status": status, "persistence_confirmed": True}
+
+    async def _post_item_result(self, item: dict[str, Any]) -> dict[str, Any] | None:
         kwargs: dict[str, Any] = {"ts": str(item.get("ts") or self._default_ts())}
         if self._client_accepts_envelope_headers():
             kwargs.update(
@@ -169,6 +189,10 @@ class InternalEventBridge:
             dict(item.get("payload") or {}),
             **kwargs,
         )
+        return result if isinstance(result, dict) else None
+
+    async def _post_item(self, item: dict[str, Any]) -> bool:
+        result = await self._post_item_result(item)
         if not isinstance(result, dict):
             return False
         status = int(result.get("__status") or result.get("status") or 200)

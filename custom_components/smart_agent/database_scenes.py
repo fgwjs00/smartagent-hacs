@@ -121,7 +121,7 @@ class DatabaseSceneBridgeMixin:
 
     def _update_ai_scene_ha_entity(self, scene_id: int, ha_entity_id: str) -> bool:
         now = self._ha_db_now_text()
-        ok = self._db.execute(
+        ok = self._db_exec(
             "UPDATE ai_scenes SET ha_entity_id=?, updated=? WHERE id=?",
             (ha_entity_id, now, scene_id),
         )

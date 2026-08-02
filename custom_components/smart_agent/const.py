@@ -2,9 +2,7 @@
 
 DOMAIN = "smart_agent"
 
-DEVICE_VACANT_ACTIONS = frozenset(
-    {"preserve", "turn_off", "media_pause", "close_cover", "set_eco"}
-)
+DEVICE_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
 
 # Config entry keys
 CONF_ENGINE = "engine"
@@ -476,12 +474,38 @@ AI_SCENE_STATUS_ACTIVE = "active"
 AI_SCENE_STATUS_REJECTED = "rejected"
 AI_SCENE_STATUS_ARCHIVED = "archived"
 
-# 场景动作参数白名单（统一收敛，供 inference/patrol/actions/devices 复用）
-ACTION_PARAM_KEYS_COMMON = (
-    "brightness_pct", "brightness", "color_temp", "color_temp_kelvin",
-    "rgb_color", "hs_color", "xy_color", "transition", "temperature",
-    "fan_mode", "swing_mode", "position", "tilt_position",
-)
+# 动作比较必须按实体领域能力收敛，不能把灯光、空调、风扇等参数混成 COMMON 集合。
+ACTION_PARAM_KEYS_BY_DOMAIN = {
+    "light": frozenset({
+        "brightness_pct", "brightness", "color_temp", "color_temp_kelvin",
+        "rgb_color", "hs_color", "xy_color", "color_name", "transition",
+        "flash", "effect",
+    }),
+    "climate": frozenset({
+        "temperature", "target_temp_low", "target_temp_high", "hvac_mode",
+        "fan_mode", "swing_mode", "preset_mode",
+    }),
+    "cover": frozenset({"position", "tilt_position"}),
+    "fan": frozenset({"percentage", "preset_mode", "oscillating"}),
+    "media_player": frozenset({"volume_level", "is_volume_muted"}),
+    "scene": frozenset({"transition"}),
+    "switch": frozenset(),
+    "input_boolean": frozenset(),
+}
+
+
+def action_parameter_keys(domain: str) -> frozenset[str]:
+    return ACTION_PARAM_KEYS_BY_DOMAIN.get(str(domain or "").strip().lower(), frozenset())
+
+
+def comparable_action_params(domain: str, params: dict | None) -> dict:
+    allowed = action_parameter_keys(domain)
+    return {
+        str(key): value
+        for key, value in (params or {}).items()
+        if str(key) in allowed
+    }
+
 ACTION_PARAM_KEYS_LIGHT_SCENE = frozenset({
     "brightness_pct", "brightness", "color_temp", "color_temp_kelvin",
     "rgb_color", "hs_color", "xy_color", "transition", "flash", "effect",

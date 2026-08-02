@@ -117,6 +117,10 @@ def _value_error_reason(value: Any, schema: dict[str, Any]) -> str:
     else:
         return "service_contract_schema_invalid"
 
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and value not in enum_values:
+        return "service_parameter_value_invalid"
+
     minimum = schema.get("minimum")
     maximum = schema.get("maximum")
     if minimum is not None and any(item < float(minimum) for item in numbers):

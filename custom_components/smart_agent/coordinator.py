@@ -94,7 +94,7 @@ from .season import ha_season_for_datetime as _ha_season_for_datetime
 from .api import SmartAgentPairingView, SmartAgentAuthPageView, SmartAgentPairConfirmView
 
 from .const import (
-    ACTION_PARAM_KEYS_COMMON,
+    comparable_action_params,
     CONF_ACTIVE_AI_MODE,
     CONF_AI_ENABLED,
     CONF_COOLDOWN,
@@ -603,6 +603,56 @@ class SmartAgentCoordinator(
         except Exception as exc:
             _LOGGER.warning("[P1] internal event enqueue failed: %s", exc)
             return False
+
+    async def _post_internal_event_confirmed_async(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ts: str | None = None,
+    ) -> dict[str, Any]:
+        """Return only a terminal Add-on persistence receipt."""
+        bridge = getattr(self, "_internal_event_bridge", None)
+        if bridge is None:
+            return {"ok": False, "status": 503, "error": "internal_event_bridge_unavailable"}
+        try:
+            return await bridge.post_confirmed(kind, payload, ts=ts)
+        except Exception as exc:
+            _LOGGER.warning("[P1] confirmed internal event post failed: %s", exc)
+            return {"ok": False, "status": 502, "error": "internal_event_persistence_failed"}
+
+    def _post_internal_event_confirmed(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ts: str | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Synchronously await Add-on persistence from an executor thread."""
+        loop = getattr(self.hass, "loop", None)
+        if loop is None or not loop.is_running():
+            return {"ok": False, "status": 503, "error": "home_assistant_loop_unavailable"}
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            return {"ok": False, "status": 409, "error": "confirmed_post_cannot_block_event_loop"}
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._post_internal_event_confirmed_async(kind, payload, ts=ts),
+                loop,
+            )
+            result = future.result(timeout=max(1.0, float(timeout)))
+            return result if isinstance(result, dict) else {
+                "ok": False,
+                "status": 502,
+                "error": "invalid_addon_persistence_receipt",
+            }
+        except Exception as exc:
+            _LOGGER.warning("[P1] confirmed internal event wait failed: %s", exc)
+            return {"ok": False, "status": 504, "error": "internal_event_persistence_timeout"}
 
     # ── 系统日志 ──────────────────────────────────────────────────────────────
 
@@ -1161,7 +1211,7 @@ class SmartAgentCoordinator(
             "priority_label": PRIORITY_LABELS.get(priority, f"P{priority}"),
             "time": now,
             "state": new_state,
-            "params": {k: v for k, v in (params or {}).items() if k in ACTION_PARAM_KEYS_COMMON},
+            "params": comparable_action_params(entity_id.split(".", 1)[0], params),
             "guard_until": guard_until,
         }
         self._device_priority_map[entity_id] = record
@@ -1558,9 +1608,15 @@ class SmartAgentCoordinator(
         except Exception as exc:
             _LOGGER.debug("[AddonSettings] 启动期同步失败（保留 config_entry 初值）: %s", exc)
 
+        try:
+            await self._async_migrate_legacy_config()
+        except Exception as exc:
+            _LOGGER.warning("[Listeners] legacy config migration failed closed: %s", exc)
+
         # 周期同步：每 60 秒比对一次 add-on settings，发现变更即时刷内存
         try:
             await self._async_refresh_device_info_from_addon_devices(reason="startup")
+            await self._async_refresh_memory_assets_from_addon()
         except Exception as exc:
             _LOGGER.debug("[Listeners] startup add-on device_info sync failed: %s", exc)
 
@@ -1603,6 +1659,7 @@ class SmartAgentCoordinator(
             async def _listener_entity_set_periodic_refresh(_now: Any) -> None:
                 try:
                     await self._async_refresh_device_info_from_addon_devices(reason="periodic_listener")
+                    await self._async_refresh_memory_assets_from_addon()
                     if self._refresh_listeners_if_entity_set_changed():
                         _LOGGER.debug("[Listeners] refreshed subscriptions after managed entity set changed")
                 except Exception as exc:
