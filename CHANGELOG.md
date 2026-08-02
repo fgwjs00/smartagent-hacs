@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.198 - 2026-08-02
+## Beta 0.0.199 - 2026-08-03
 
-Beta 0.0.198 修复主动 AI 同批多动作复用审计 request ID 导致第二个动作在 HA I/O 前失败的问题，并修复嵌套持久化回执确认；新增 C1-Core 只读现场验收采集器。发布继续使用正式五发布面与阿里云 ACR；G13 保持 off/hard-off，Orvibo HomeBridge 与 MCP 继续停用。
+Beta 0.0.199 修复远程维护 HA 压缩响应在流式代理中因 Content-Length 与解压后正文不一致而中断的问题；保持 HA 原始压缩字节与响应头一致，并继续沿用 0.0.198 已发布能力。发布继续使用正式五发布面与阿里云 ACR；G13 保持 off/hard-off，Orvibo HomeBridge 与 MCP 继续停用。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.198`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.199`，用于 Home Assistant 更新检测。
