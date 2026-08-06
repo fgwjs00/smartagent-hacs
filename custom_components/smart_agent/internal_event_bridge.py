@@ -44,6 +44,7 @@ class InternalEventBridge:
         self._monitor_interval = max(1.0, float(monitor_interval))
         self._worker_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
+        self._retry_tasks: set[asyncio.Task] = set()
         self._posted = 0
         self._failed = 0
         self._dropped = 0
@@ -56,6 +57,7 @@ class InternalEventBridge:
             "posted": self._posted,
             "failed": self._failed,
             "dropped": self._dropped,
+            "retrying": len(self._retry_tasks),
         }
 
     def _default_ts(self) -> str:
@@ -93,13 +95,21 @@ class InternalEventBridge:
         self._monitor_task = asyncio.ensure_future(self._monitor_loop())
 
     async def stop(self) -> None:
-        for task in (self._monitor_task, self._worker_task):
-            if task and not task.done():
+        tasks = [
+            task
+            for task in (
+                self._monitor_task,
+                self._worker_task,
+                *tuple(self._retry_tasks),
+            )
+            if task is not None
+        ]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._retry_tasks.clear()
         self._monitor_task = None
         self._worker_task = None
 
@@ -147,15 +157,36 @@ class InternalEventBridge:
                     self._posted += 1
                 else:
                     self._failed += 1
-                    await self._retry_later(item)
+                    self._schedule_retry(item)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self._failed += 1
                 self._warn(f"[P1] internal event post failed: {exc}")
-                await self._retry_later(item)
+                self._schedule_retry(item)
             finally:
                 self._queue.task_done()
+
+    @staticmethod
+    def _normalize_persistence_receipt(
+        result: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, int]:
+        if not isinstance(result, dict):
+            return None, 502
+        nested_receipt = result.get("result")
+        receipt = (
+            {**result, **nested_receipt}
+            if isinstance(nested_receipt, dict)
+            else dict(result)
+        )
+        if result.get("ok") is False:
+            receipt["ok"] = False
+        try:
+            status = int(result.get("__status") or result.get("status") or 200)
+        except (TypeError, ValueError):
+            status = 502
+        return receipt, status
+
 
     async def post_confirmed(
         self,
@@ -167,15 +198,9 @@ class InternalEventBridge:
         """Post one event directly and return the Add-on persistence receipt."""
         item = self._build_item(kind, payload, ts=ts)
         result = await self._post_item_result(item)
-        if not isinstance(result, dict):
+        receipt, status = self._normalize_persistence_receipt(result)
+        if receipt is None:
             return {"ok": False, "status": 502, "error": "invalid_addon_persistence_receipt"}
-        status = int(result.get("__status") or result.get("status") or 200)
-        nested_receipt = result.get("result")
-        receipt = (
-            {**result, **nested_receipt}
-            if isinstance(nested_receipt, dict)
-            else result
-        )
         if status >= 400 or receipt.get("ok") is not True:
             return {**receipt, "ok": False, "status": status}
         return {**receipt, "ok": True, "status": status, "persistence_confirmed": True}
@@ -199,15 +224,22 @@ class InternalEventBridge:
 
     async def _post_item(self, item: dict[str, Any]) -> bool:
         result = await self._post_item_result(item)
-        if not isinstance(result, dict):
-            return False
-        status = int(result.get("__status") or result.get("status") or 200)
-        return status < 400 and result.get("ok") is not False
+        receipt, status = self._normalize_persistence_receipt(result)
+        return receipt is not None and status < 400 and receipt.get("ok") is True
 
-    async def _retry_later(self, item: dict[str, Any]) -> None:
+    def _schedule_retry(self, item: dict[str, Any]) -> None:
         attempts = int(item.get("attempts") or 0) + 1
         item["attempts"] = attempts
-        await asyncio.sleep(min(30.0, float(attempts)))
+
+        async def _requeue_after_delay() -> None:
+            await asyncio.sleep(min(30.0, float(attempts)))
+            self._enqueue_retry_item(item)
+
+        task = asyncio.ensure_future(_requeue_after_delay())
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
+
+    def _enqueue_retry_item(self, item: dict[str, Any]) -> None:
         try:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:

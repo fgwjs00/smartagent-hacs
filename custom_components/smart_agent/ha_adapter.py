@@ -33,6 +33,7 @@ else:
 
 _POST_STATE_VERIFY_TIMEOUT_SECONDS = 2.0
 _POST_STATE_VERIFY_INTERVAL_SECONDS = 0.1
+_TERMINAL_STATE_VERIFICATION_DOMAINS = frozenset({"cover", "climate", "media_player"})
 
 
 def async_get_state(hass: HomeAssistant, entity_id: str) -> Any:
@@ -208,24 +209,44 @@ def _command_already_in_target_state(command: dict[str, Any], snapshot: dict[str
 
 
 def _expected_post_state(command: dict[str, Any]) -> str | None:
-    if str(command.get("domain") or "") not in {"light", "switch"}:
-        return None
+    domain = str(command.get("domain") or "")
     service = str(command.get("service") or "")
-    if service == "turn_on":
+    data = command.get("data") if isinstance(command.get("data"), dict) else {}
+    if domain in {"light", "switch"} and service == "turn_on":
         return "on"
-    if service == "turn_off":
+    if domain in {"light", "switch", "climate", "media_player"} and service == "turn_off":
         return "off"
+    if domain == "cover":
+        return {"open_cover": "open", "close_cover": "closed"}.get(service)
+    if domain == "climate" and service == "set_hvac_mode":
+        return str(data.get("hvac_mode") or "").strip().lower() or None
+    if domain == "media_player":
+        return {
+            "media_play": "playing",
+            "media_pause": "paused",
+        }.get(service)
     return None
 
 
 def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any] | None:
     expected = _expected_post_state(command)
-    if expected is None:
-        return None
+    domain = str(command.get("domain") or "")
     snapshot = _state_snapshot(hass, str(command.get("entity_id") or ""))
     actual = str(snapshot.get("state") or "").strip().lower()
+    if expected is None:
+        if domain not in _TERMINAL_STATE_VERIFICATION_DOMAINS:
+            return None
+        return {
+            "expected": "",
+            "actual": actual,
+            "verified": False,
+            "verification_supported": False,
+            "verification_reason": "terminal_state_contract_missing",
+            "attribute_checks": {},
+            "post_state_snapshot": snapshot,
+        }
     attribute_checks = {}
-    if expected == "on" and str(command.get("domain") or "") == "light":
+    if expected == "on" and domain == "light":
         attribute_checks = _light_attribute_checks(command, snapshot)
     verified = bool(snapshot.get("available")) and actual == expected
     if attribute_checks:
@@ -234,6 +255,8 @@ def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, An
         "expected": expected,
         "actual": actual,
         "verified": verified,
+        "verification_supported": True,
+        "verification_reason": "",
         "attribute_checks": attribute_checks,
         "post_state_snapshot": snapshot,
     }
@@ -241,7 +264,11 @@ def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, An
 
 async def _wait_for_post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any] | None:
     verification = _post_state_verification(hass, command)
-    if verification is None or verification.get("verified"):
+    if (
+        verification is None
+        or verification.get("verified")
+        or verification.get("verification_supported") is False
+    ):
         return verification
     deadline = time.monotonic() + max(0.0, float(_POST_STATE_VERIFY_TIMEOUT_SECONDS))
     interval = max(0.0, float(_POST_STATE_VERIFY_INTERVAL_SECONDS))

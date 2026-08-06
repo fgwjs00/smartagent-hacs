@@ -1858,7 +1858,7 @@ class ListenersMixin:
             decision_time=datetime.now(timezone.utc).isoformat(),
             require_world_snapshot_guard=True,
         )
-        return self._enqueue_fast_path_execution_audit(
+        audit_context = self._enqueue_fast_path_execution_audit(
             transaction_id=transaction_id,
             correlation_id=correlation_id,
             world_snapshot_id=world_snapshot_id,
@@ -1870,7 +1870,9 @@ class ListenersMixin:
             candidate_actions=candidate_actions,
             rollout_blocked_actions=rollout_blocked_actions,
             execution_result=execution_result,
+            enqueue_event=False,
         )
+        return await self._persist_fast_path_execution_audit(audit_context)
 
     def _enqueue_fast_path_execution_audit(
         self,
@@ -1888,6 +1890,7 @@ class ListenersMixin:
         rollout_blocked_actions: list[Any] | None = None,
         execution_suppressed_reason: str = "",
         rollout: dict[str, Any] | None = None,
+        enqueue_event: bool = True,
     ) -> dict[str, Any]:
         transaction_id = str(transaction_id or "").strip()
         if not transaction_id:
@@ -2005,6 +2008,8 @@ class ListenersMixin:
             audit_context["execution_suppressed_reason"] = execution_suppressed_reason
         if isinstance(rollout, dict):
             audit_context["rollout"] = dict(rollout)
+        if not enqueue_event:
+            return audit_context
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue):
             return audit_context
@@ -2015,6 +2020,63 @@ class ListenersMixin:
                 f"[Add-on FastPath] decision_execution 回写入队失败 transaction_id={transaction_id}",
             )
         return audit_context
+
+    async def _persist_fast_path_execution_audit(
+        self,
+        audit_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        context = dict(audit_context) if isinstance(audit_context, dict) else {}
+        transaction_id = str(context.get("transaction_id") or "").strip()
+        if not transaction_id:
+            return context
+
+        confirmed_post = getattr(
+            self,
+            "_post_internal_event_confirmed_async",
+            None,
+        )
+        receipt: dict[str, Any] = {}
+        if callable(confirmed_post):
+            try:
+                raw_receipt = await asyncio.wait_for(
+                    confirmed_post("decision_execution", context),
+                    timeout=5.0,
+                )
+                if isinstance(raw_receipt, dict):
+                    receipt = dict(raw_receipt)
+            except asyncio.TimeoutError:
+                receipt = {
+                    "ok": False,
+                    "status": 504,
+                    "error": "decision_execution_persistence_timeout",
+                }
+            except Exception as exc:
+                receipt = {
+                    "ok": False,
+                    "status": 502,
+                    "error": (
+                        "decision_execution_persistence_failed:"
+                        f"{exc.__class__.__name__}"
+                    ),
+                }
+            if (
+                receipt.get("ok") is True
+                and receipt.get("persistence_confirmed") is True
+            ):
+                return context
+
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        queued = bool(enqueue("decision_execution", context)) if callable(enqueue) else False
+        if not queued:
+            sys_log = getattr(self, "_sys_log", None)
+            if callable(sys_log):
+                sys_log(
+                    "WARN",
+                    "[Add-on FastPath] execution receipt persistence failed "
+                    f"transaction_id={transaction_id}",
+                )
+        return context
+
 
     def _fast_path_audit_action_is_low_risk(self, action: Any) -> bool:
         if not isinstance(action, dict):
@@ -2249,6 +2311,61 @@ class ListenersMixin:
             return normalized_service not in {"", "reload", "turn_off"}
         return False
 
+    def _trusted_registered_ha_sources(self) -> dict[str, str]:
+        """Return owner-approved HA behavior sources keyed by entity id."""
+        result: dict[str, str] = {}
+        expected_domains = {
+            "ha_automation": "automation",
+            "ha_script": "script",
+            "ha_scene": "scene",
+        }
+        assets = getattr(self, "_habit_assets", None)
+        if not isinstance(assets, list):
+            return result
+        for row in assets:
+            if not isinstance(row, dict):
+                continue
+            source_type = str(row.get("source_type") or "").strip().lower()
+            domain = expected_domains.get(source_type)
+            source_id = str(row.get("source_id") or "").strip()
+            if (
+                not domain
+                or not source_id.startswith(f"{domain}.")
+                or source_id.count(".") != 1
+                or str(row.get("trust_state") or "").strip().lower() != "verified"
+                or str(row.get("origin") or "").strip().lower() != "explicit_user_approval"
+                or str(row.get("lifecycle_state") or "active").strip().lower() != "active"
+            ):
+                continue
+            result[source_id] = source_type
+        return result
+
+    @staticmethod
+    def _ha_service_source_id(
+        domain: str,
+        service: str,
+        service_data: dict[str, Any],
+    ) -> str:
+        normalized_domain = str(domain or "").strip().lower()
+        normalized_service = str(service or "").strip().lower()
+        raw_entity_id = service_data.get("entity_id")
+        if isinstance(raw_entity_id, str):
+            candidates = [item.strip() for item in raw_entity_id.split(",") if item.strip()]
+        elif isinstance(raw_entity_id, (list, tuple, set)):
+            candidates = [str(item or "").strip() for item in raw_entity_id if str(item or "").strip()]
+        else:
+            candidates = []
+        expected_prefix = f"{normalized_domain}."
+        for entity_id in candidates:
+            if entity_id.startswith(expected_prefix):
+                return entity_id
+        if (
+            normalized_domain == "script"
+            and normalized_service not in {"", "reload", "turn_off", "turn_on", "toggle"}
+        ):
+            return f"script.{normalized_service}"
+        return ""
+
     def _make_call_service_handler(self):
         """Track owner-started scene/script context lineage for child device actions."""
 
@@ -2283,13 +2400,38 @@ class ListenersMixin:
             elif parent_id and isinstance(cache.get(parent_id), dict):
                 attribution = dict(cache[parent_id])
                 attribution["time"] = now
+            elif self._is_user_scene_script_service(domain, service):
+                service_data = data.get("service_data")
+                if not isinstance(service_data, dict):
+                    service_data = {}
+                source_id = self._ha_service_source_id(domain, service, service_data)
+                source_type = self._trusted_registered_ha_sources().get(source_id)
+                if source_type:
+                    attribution = {
+                        "origin": "automation",
+                        "actor": f"homeassistant:{source_id}",
+                        "context_id": context_id,
+                        "root_context_id": context_id,
+                        "manual_service_domain": domain,
+                        "manual_service": service,
+                        "registered_source_id": source_id,
+                        "registered_source_type": source_type,
+                        "owner_registered": True,
+                        "trusted_automation_source": True,
+                        "time": now,
+                    }
 
             if attribution is not None:
                 cache[context_id] = attribution
 
         return _call_service
 
-    def _manual_action_attribution(self, state_obj: Any) -> dict[str, Any]:
+    def _manual_action_attribution(
+        self,
+        state_obj: Any,
+        *,
+        entity_id: str = "",
+    ) -> dict[str, Any]:
         context = getattr(state_obj, "context", None)
         context_id = str(getattr(context, "id", None) or "").strip()
         user_id = str(getattr(context, "user_id", None) or "").strip()
@@ -2313,22 +2455,52 @@ class ListenersMixin:
                 or "not_applicable"
             )
             result = {
-                "origin": "user_scene_script_action",
+                "origin": str(lineage.get("origin") or "user_scene_script_action"),
                 "actor": str(lineage.get("actor") or "ha_user:scene_script"),
                 "context_id": root_context_id,
             }
-            for key in ("manual_service_domain", "manual_service"):
-                value = str(lineage.get(key) or "").strip()
-                if value:
+            for key in (
+                "manual_service_domain",
+                "manual_service",
+                "registered_source_id",
+                "registered_source_type",
+                "owner_registered",
+                "trusted_automation_source",
+            ):
+                value = lineage.get(key)
+                if value not in (None, ""):
                     result[key] = value
             return result
 
         if parent_id:
-            return {
+            result = {
                 "origin": "automation",
                 "actor": "homeassistant:automation",
                 "context_id": context_id or parent_id,
             }
+            managed = getattr(self, "_automation_managed_device_entities", None)
+            candidate_ids = (
+                set(managed.get(entity_id) or set())
+                if isinstance(managed, dict) and entity_id
+                else set()
+            )
+            trusted_sources = self._trusted_registered_ha_sources()
+            if candidate_ids and all(
+                trusted_sources.get(source_id) == "ha_automation"
+                for source_id in candidate_ids
+            ):
+                source_ids = sorted(candidate_ids)
+                result.update(
+                    {
+                        "actor": "homeassistant:" + ",".join(source_ids),
+                        "registered_source_id": source_ids[0],
+                        "registered_source_ids": source_ids,
+                        "registered_source_type": "ha_automation",
+                        "owner_registered": True,
+                        "trusted_automation_source": True,
+                    }
+                )
+            return result
         return {
             "origin": "physical_action",
             "actor": "ha_user:physical_control",
@@ -2369,12 +2541,16 @@ class ListenersMixin:
         if before == after or before not in {"on", "off"} or after not in {"on", "off"}:
             return False
 
-        attribution = self._manual_action_attribution(new_state_obj)
+        attribution = self._manual_action_attribution(new_state_obj, entity_id=entity_id)
+        trusted_registered_source = bool(
+            attribution.get("owner_registered")
+            and attribution.get("trusted_automation_source")
+        )
         if attribution["origin"] not in {
             "user_action",
             "physical_action",
             "user_scene_script_action",
-        }:
+        } and not trusted_registered_source:
             return False
 
         room = str(
@@ -2488,7 +2664,157 @@ class ListenersMixin:
                 return True
         return False
 
-    def _schedule_arrival_baseline_sample(self, entity_id: str, old_state: str, new_state: str) -> None:
+    @staticmethod
+    def _presence_cycle_observation_is_fresh(
+        raw_info: dict[str, Any],
+        state_obj: Any,
+    ) -> bool:
+        if raw_info.get("presence_eligible") is False or raw_info.get("stale") is True:
+            return False
+        eligible_text = str(raw_info.get("presence_eligible") or "").strip().lower()
+        if eligible_text in {"0", "false", "no", "off"}:
+            return False
+
+        if "use_for" in raw_info:
+            raw_use_for = raw_info.get("use_for")
+            if isinstance(raw_use_for, str):
+                use_for = {
+                    item.strip()
+                    for item in raw_use_for.split(",")
+                    if item.strip()
+                }
+            elif isinstance(raw_use_for, (list, tuple, set)):
+                use_for = {
+                    str(item or "").strip()
+                    for item in raw_use_for
+                    if str(item or "").strip()
+                }
+            else:
+                use_for = set()
+            if not use_for.intersection({"turn_on", "occupied_or", "guard"}):
+                return False
+
+        raw_ttl = raw_info.get("freshness_ttl_secs")
+        if raw_ttl in (None, ""):
+            return True
+        try:
+            freshness_ttl_secs = float(raw_ttl)
+        except (TypeError, ValueError):
+            return False
+        if not isfinite(freshness_ttl_secs) or freshness_ttl_secs < 0:
+            return False
+        if freshness_ttl_secs == 0:
+            return True
+
+        observed_value = (
+            raw_info.get("last_observed_at")
+            or raw_info.get("observed_at")
+            or getattr(state_obj, "last_updated", None)
+            or getattr(state_obj, "last_changed", None)
+        )
+        if isinstance(observed_value, datetime):
+            observed_at = observed_value
+        else:
+            observed_text = str(observed_value or "").strip()
+            try:
+                observed_at = datetime.fromisoformat(
+                    observed_text.replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                return False
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        age_secs = (
+            datetime.now(timezone.utc) - observed_at.astimezone(timezone.utc)
+        ).total_seconds()
+        return -60 <= age_secs <= freshness_ttl_secs
+
+
+    def _arrival_occupancy_cycle_for_edge(
+        self,
+        entity_id: str,
+        old_state: str,
+        new_state: str,
+    ) -> tuple[str, bool, bool]:
+        """Return the stable cycle id plus first-arrival/final-departure edges."""
+        device_info = (
+            getattr(self, "device_info", {})
+            if isinstance(getattr(self, "device_info", None), dict)
+            else {}
+        )
+        info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
+        room = str(
+            (info or {}).get("space_id")
+            or (info or {}).get("room")
+            or (info or {}).get("area")
+            or ""
+        ).strip()
+        if not room:
+            return "", False, False
+
+        states = getattr(getattr(self, "hass", None), "states", None)
+        other_active = False
+        for presence_entity_id, raw_info in device_info.items():
+            if presence_entity_id == entity_id or not isinstance(raw_info, dict):
+                continue
+            presence_room = str(
+                raw_info.get("space_id")
+                or raw_info.get("room")
+                or raw_info.get("area")
+                or ""
+            ).strip()
+            if presence_room != room or not self._is_presence_listener_entity(
+                presence_entity_id,
+                raw_info,
+            ):
+                continue
+            state_obj = states.get(presence_entity_id) if hasattr(states, "get") else None
+            if not self._presence_cycle_observation_is_fresh(raw_info, state_obj):
+                continue
+            state = str(getattr(state_obj, "state", "") or "").strip().lower()
+            if state in self._ARRIVAL_ACTIVE_STATES:
+                other_active = True
+                break
+
+        cycles = getattr(self, "_arrival_occupancy_cycles", None)
+        if not isinstance(cycles, dict):
+            cycles = {}
+            self._arrival_occupancy_cycles = cycles
+        cycle = cycles.get(room) if isinstance(cycles.get(room), dict) else {}
+        new_value = str(new_state or "").strip().lower()
+        if new_value in self._ARRIVAL_ACTIVE_STATES:
+            if cycle.get("active") is True or other_active:
+                if not cycle.get("cycle_id"):
+                    generation = int(cycle.get("generation") or 0) + 1
+                    cycle = {
+                        "cycle_id": f"occ-{hashlib.sha256(f'{room}|{generation}|{time.time_ns()}'.encode()).hexdigest()[:20]}",
+                        "active": True,
+                        "generation": generation,
+                    }
+                    cycles[room] = cycle
+                return str(cycle.get("cycle_id") or ""), False, False
+            generation = int(cycle.get("generation") or 0) + 1
+            cycle = {
+                "cycle_id": f"occ-{hashlib.sha256(f'{room}|{generation}|{time.time_ns()}'.encode()).hexdigest()[:20]}",
+                "active": True,
+                "generation": generation,
+            }
+            cycles[room] = cycle
+            return str(cycle["cycle_id"]), True, False
+
+        if other_active:
+            return str(cycle.get("cycle_id") or ""), False, False
+        if cycle:
+            cycle["active"] = False
+        return str(cycle.get("cycle_id") or ""), False, True
+    def _schedule_arrival_baseline_sample(
+        self,
+        entity_id: str,
+        old_state: str,
+        new_state: str,
+        *,
+        occupancy_cycle_id: str = "",
+    ) -> None:
         """先确认到达，再在独立的较宽时间窗中采集业主照明选择。"""
         old_value = str(old_state or "").strip().lower()
         new_value = str(new_state or "").strip().lower()
@@ -2599,7 +2925,7 @@ class ListenersMixin:
                         except (AttributeError, TypeError, ValueError, OSError):
                             changed_at = 0.0
                         if sample_started_at <= changed_at <= sample_ended_at:
-                            attribution = self._manual_action_attribution(light_state)
+                            attribution = self._manual_action_attribution(light_state, entity_id=light_entity_id)
                             state_change_evidence[light_entity_id] = {
                                 **attribution,
                                 "time": changed_at,
@@ -2667,6 +2993,7 @@ class ListenersMixin:
                         sample_started_at=sample_started_at,
                         sample_ended_at=sample_ended_at,
                         environment_context=environment_context,
+                        occupancy_cycle_id=occupancy_cycle_id,
                     )
             except Exception as exc:
                 _LOGGER.debug("[ArrivalBaseline] delayed sample failed for %s: %s", entity_id, exc)
@@ -2741,23 +3068,32 @@ class ListenersMixin:
         ts = now.strftime("%Y-%m-%d %H:%M:%S")
         old_attrs = getattr(old_state_obj, "attributes", None)
         new_attrs = getattr(new_state_obj, "attributes", None)
-        attribution = self._manual_action_attribution(new_state_obj)
+        attribution = self._manual_action_attribution(new_state_obj, entity_id=entity_id)
         origin = str(attribution.get("origin") or "unknown")
         trusted_manual = origin in {
             "user_action",
             "physical_action",
             "user_scene_script_action",
         }
+        trusted_registered_source = bool(
+            attribution.get("owner_registered")
+            and attribution.get("trusted_automation_source")
+        )
         learning_mode = bool(getattr(self, "_learning_mode", False))
         domain = str(entity_id or "").split(".", 1)[0]
         if not learning_mode and (
-            not trusted_manual or domain not in self._CONTROL_EVENT_DOMAINS
+            (not trusted_manual and not trusted_registered_source)
+            or domain not in self._CONTROL_EVENT_DOMAINS
         ):
             return
         if origin in {"user_action", "user_scene_script_action"}:
             learning_source_type = "user_interface"
         elif origin == "physical_action":
             learning_source_type = "manual_action"
+        elif trusted_registered_source:
+            learning_source_type = str(
+                attribution.get("registered_source_type") or "ha_automation"
+            )
         else:
             learning_source_type = str(source_type or "")
         manual_session = self._manual_scene_learning_session(
@@ -2804,14 +3140,27 @@ class ListenersMixin:
         origin = str(attribution.get("origin") or "").strip()
         actor = str(attribution.get("actor") or "").strip()
         context_id = str(attribution.get("context_id") or "").strip()
-        if not space_id or origin not in {
-            "user_action",
-            "physical_action",
-            "user_scene_script_action",
-        }:
+        trusted_registered_source = bool(
+            attribution.get("owner_registered")
+            and attribution.get("trusted_automation_source")
+        )
+        if not space_id or (
+            origin not in {
+                "user_action",
+                "physical_action",
+                "user_scene_script_action",
+            }
+            and not trusted_registered_source
+        ):
             return {}
 
-        explicit_lineage = origin == "user_scene_script_action" and context_id
+        explicit_lineage = bool(
+            context_id
+            and (
+                origin == "user_scene_script_action"
+                or trusted_registered_source
+            )
+        )
         session_scope = (
             f"explicit|{actor}|{context_id}"
             if explicit_lineage
@@ -3128,6 +3477,8 @@ class ListenersMixin:
         entity_id: str,
         new_state: str,
         old_state: str,
+        *,
+        occupancy_cycle_id: str = "",
     ) -> None:
         should_fail_closed = True
         if normalize_active_ai_mode(
@@ -3167,6 +3518,8 @@ class ListenersMixin:
         if addon_client is not None:
             await self._refresh_correction_suppressions_cache(addon_client)
         snapshot = self._build_addon_fast_path_snapshot(entity_id)
+        if occupancy_cycle_id:
+            snapshot["occupancy_cycle_id"] = occupancy_cycle_id
         request_id = self._new_addon_fast_path_request_id(entity_id, old_state, new_state)
         snapshot["request_id"] = request_id
         snapshot_diag = self._addon_fast_path_snapshot_diagnostics(snapshot, entity_id)
@@ -4079,16 +4432,68 @@ class ListenersMixin:
                     return
                 self._record_presence_flap(entity_id)
 
-            self._schedule_arrival_baseline_sample(entity_id, old_s, new_s)
+            occupancy_cycle_id = ""
+            arrival_started = False
+            learning_cycle_status = ""
+            if is_presence_sensor and old_presence_state != new_presence_state:
+                (
+                    occupancy_cycle_id,
+                    arrival_started,
+                    departure_completed,
+                ) = self._arrival_occupancy_cycle_for_edge(
+                    entity_id,
+                    old_s,
+                    new_s,
+                )
+                duplicate_arrival = new_presence_state == "on" and not arrival_started
+                incomplete_departure = new_presence_state == "off" and not departure_completed
+                if duplicate_arrival:
+                    learning_cycle_status = "duplicate_occupancy_cycle"
+                elif incomplete_departure:
+                    learning_cycle_status = "occupancy_cycle_still_active"
+
+            if not is_presence_sensor or arrival_started or not occupancy_cycle_id:
+                try:
+                    self._schedule_arrival_baseline_sample(
+                        entity_id,
+                        old_s,
+                        new_s,
+                        occupancy_cycle_id=occupancy_cycle_id,
+                    )
+                except TypeError as exc:
+                    if "occupancy_cycle_id" not in str(exc):
+                        raise
+                    self._schedule_arrival_baseline_sample(
+                        entity_id,
+                        old_s,
+                        new_s,
+                    )
             self._emit_listener_event(
                 listener_action="fast_path_scheduled",
                 entity_id=entity_id,
                 old_state=old_s,
                 new_state=new_s,
                 source_type=source_type,
+                occupancy_cycle_id=occupancy_cycle_id,
+                learning_cycle_status=learning_cycle_status,
             )
+            try:
+                fast_path_coro = self._run_addon_fast_path_fail_closed(
+                    entity_id,
+                    new_s,
+                    old_s,
+                    occupancy_cycle_id=occupancy_cycle_id,
+                )
+            except TypeError as exc:
+                if "occupancy_cycle_id" not in str(exc):
+                    raise
+                fast_path_coro = self._run_addon_fast_path_fail_closed(
+                    entity_id,
+                    new_s,
+                    old_s,
+                )
             self._spawn_addon_fast_path_task(
-                self._run_addon_fast_path_fail_closed(entity_id, new_s, old_s),
+                fast_path_coro,
                 entity_id=entity_id,
                 old_state=old_s,
                 new_state=new_s,

@@ -13,6 +13,8 @@ class ArrivalObservationClassification:
     observation_only: bool
     evidence_kind: str
     evidence_weight: float
+    evidence_tier: str = "legacy_untrusted"
+    execution_permission: str = "suggest_only"
     exclusion_reason: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -125,6 +127,8 @@ def classify_arrival_observation(
                 "explicit_positive" if after == "on" else "explicit_negative"
             ),
             evidence_weight=1.0,
+            evidence_tier="direct_user_action",
+            execution_permission="auto_eligible",
         )
     if state_changed and origin == "automation" and trusted_automation_source:
         return ArrivalObservationClassification(
@@ -135,7 +139,9 @@ def classify_arrival_observation(
                 if after == "on"
                 else "registered_habit_negative"
             ),
-            evidence_weight=1.0,
+            evidence_weight=0.5,
+            evidence_tier="registered_ha_orchestration",
+            execution_permission="suggest_only",
         )
     if state_changed and origin == "automation":
         return ArrivalObservationClassification(
@@ -151,6 +157,8 @@ def classify_arrival_observation(
             observation_only=False,
             evidence_kind="implicit_negative",
             evidence_weight=0.5,
+            evidence_tier="observation_only",
+            execution_permission="suggest_only",
         )
     return ArrivalObservationClassification(
         baseline_eligible=False,

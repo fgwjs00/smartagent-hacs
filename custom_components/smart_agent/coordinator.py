@@ -534,6 +534,7 @@ class SmartAgentCoordinator(
         self._ha_automations: list[dict] = []
         self._automation_managed_sensors: set[str] = set()
         self._automation_managed_devices: dict[str, set[str]] = {}
+        self._automation_managed_device_entities: dict[str, set[str]] = {}
         self._automation_executing: dict[str, float] = {}
 
         self._memory_retention_days = MEMORY_RETENTION_DAYS
@@ -1050,6 +1051,7 @@ class SmartAgentCoordinator(
         scripts, scenes, autos = [], [], []
         managed_sensors: set[str] = set()
         managed_devices: dict[str, set[str]] = {}
+        managed_device_entities: dict[str, set[str]] = {}
         for state in self.hass.states.async_all("script"):
             scripts.append({"entity_id": state.entity_id, "name": state.attributes.get("friendly_name", state.entity_id)})
         for state in self.hass.states.async_all("scene"):
@@ -1081,6 +1083,7 @@ class SmartAgentCoordinator(
                     domain = eid.split(".", 1)[0]
                     if domain in ("light", "switch", "fan", "cover", "climate", "media_player", "script", "scene"):
                         managed_devices.setdefault(eid, set()).add(auto_name)
+                        managed_device_entities.setdefault(eid, set()).add(auto_state.entity_id)
         except Exception as exc:
             self._sys_log("WARN", f"[资源] 自动化配置解析出错（不影响核心功能）: {exc}")
 
@@ -1089,6 +1092,7 @@ class SmartAgentCoordinator(
         self._ha_automations = autos
         self._automation_managed_sensors = managed_sensors
         self._automation_managed_devices = managed_devices
+        self._automation_managed_device_entities = managed_device_entities
         self._sys_log("INFO", f"[资源] HA资源刷新: 脚本={len(scripts)} 场景={len(scenes)} 自动化={len(autos)}")
 
     def _get_room_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:

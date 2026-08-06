@@ -178,6 +178,7 @@ class DatabaseLearningProjectionMixin:
         sample_started_at: float | None = None,
         sample_ended_at: float | None = None,
         environment_context: dict[str, Any] | None = None,
+        occupancy_cycle_id: str = "",
     ) -> None:
         """Forward auditable arrival lighting samples to add-on owned memory."""
         try:
@@ -389,6 +390,7 @@ class DatabaseLearningProjectionMixin:
                 "entity_id": entity_id,
                 "room": room,
                 "presence_entity_id": presence_entity_id,
+                "occupancy_cycle_id": str(occupancy_cycle_id or "").strip(),
                 "pre_state": classification["pre_state"],
                 "observed_state": observed_state,
                 "is_on": observed_state == "on",
