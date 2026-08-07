@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.205
-display_version: Beta 0.0.205
+release_version: 0.0.206
+display_version: Beta 0.0.206
 channel: beta
 release_date: '2026-08-08'
 public_release_ready: true
@@ -8,7 +8,8 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.205 完成到达照明学习闭环：冷启动 Presence 默认 5 秒重评、离场默认 30 秒去抖并可在 V3 运维设置中调整；业主确认必须来自
-    3 个独立占用周期且后验状态验证通过，第三次仍人工、下一次到达才可自动。全局自动门槛统一为 90，到达照明专用门槛 70 只降低合格证据路径的执行阈值，不抬高原始置信度；HA
-    对策略、空间、环境和动作指纹二次校验。G13、Orvibo HomeBridge 与 MCP 继续停用，真实执行 canary 不扩大。
-  customer_visible_version: Beta 0.0.205
+  summary: Beta 0.0.206 完成到达照明学习闭环，并修复 Windows/Linux V3 构建的文件名哈希与 CSS 浮点末位漂移：冷启动 Presence
+    默认 5 秒重评、离场默认 30 秒去抖并可在 V3 运维设置中调整；业主确认必须来自 3 个独立占用周期且后验状态验证通过，第三次仍人工、下一次到达才可自动。全局自动门槛统一为
+    90，到达照明专用门槛 70 只降低合格证据路径的执行阈值，不抬高原始置信度；HA 对策略、空间、环境和动作指纹二次校验。G13、Orvibo HomeBridge
+    与 MCP 继续停用，真实执行 canary 不扩大。
+  customer_visible_version: Beta 0.0.206
