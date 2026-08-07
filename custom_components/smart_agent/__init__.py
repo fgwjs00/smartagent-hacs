@@ -1858,7 +1858,7 @@ class SmartAgentMcpStatusView(HomeAssistantView):
 
         return self.json(
             {
-                "enabled": bool(getattr(coord, "_mcp_enabled", True)) if coord is not None else False,
+                "enabled": bool(getattr(coord, "_mcp_enabled", False)) if coord is not None else False,
                 "protocol": "mcp",
                 "endpoint": "/api/v1/mcp",
                 "tools": tools,

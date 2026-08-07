@@ -266,7 +266,6 @@ class SmartAgentCoordinator(
         data = {**(entry.data or {}), **(entry.options or {})}
         self._file_log_level = _coerce_file_log_level(data.get(CONF_FILE_LOG_LEVEL, DEFAULT_FILE_LOG_LEVEL))
         self._file_log_level_name = logging.getLevelName(self._file_log_level)
-        
         # 文件日志记录器（handler 延迟到 async_start_listeners 中在 executor 里初始化，避免阻塞事件循环）
         self._file_logger = logging.getLogger(f"{DOMAIN}.system")
         self._file_logger.setLevel(self._file_log_level)
@@ -351,6 +350,7 @@ class SmartAgentCoordinator(
         self._sensors_muted = bool(data.get(CONF_SENSORS_MUTED, False))
         self._learning_mode = bool(data.get(CONF_LEARNING_MODE, False))
         self._habit_proactive = bool(data.get(CONF_HABIT_PROACTIVE, False))
+        self._mcp_enabled = bool(data.get("mcp_enabled", False))
         self._patrol_enabled = False
         self._patrol_interval_minutes = 15
         self._patrol_scope_space_ids: tuple[str, ...] = ()
@@ -4032,7 +4032,7 @@ class SmartAgentCoordinator(
             "license_key": (self._license_key[:6] + "****" + self._license_key[-4:]) if len(self._license_key) > 10 else "****",
             "log_retention_days": self._log_retention_days,
             "file_log_level": getattr(self, "_file_log_level_name", DEFAULT_FILE_LOG_LEVEL),
-            "mcp_enabled": bool(getattr(self, "_mcp_enabled", True)),
+            "mcp_enabled": bool(getattr(self, "_mcp_enabled", False)),
             # ── 品牌化配置 ──
             "brand_name": self.brand_name,
             "brand_primary_color": self.brand_primary_color,

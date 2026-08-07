@@ -19,8 +19,24 @@ class SmartAgentMCPEndpointView(HomeAssistantView):
     def __init__(self, hass: HomeAssistant):
         self._hass = hass
 
+    def _is_enabled(self) -> bool:
+        coordinators = self._hass.data.get("smart_agent", {})
+        return any(
+            bool(getattr(coordinator, "_mcp_enabled", False))
+            for coordinator in coordinators.values()
+        )
+
     async def post(self, request: web.Request) -> web.Response:
         """Handle MCP tool call requests."""
+        if not self._is_enabled():
+            return self.json(
+                {
+                    "error": "mcp_disabled",
+                    "error_type": "feature_disabled",
+                    "retryable": False,
+                },
+                status_code=503,
+            )
         try:
             req_data = await request.json()
             method = req_data.get("method")
@@ -58,4 +74,4 @@ class SmartAgentMCPEndpointView(HomeAssistantView):
             return self.json({
                 "jsonrpc": "2.0",
                 "error": {"code": -32603, "message": str(exc)}
-            }, status=500)
+            }, status_code=500)
