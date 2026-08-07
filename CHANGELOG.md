@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.204 - 2026-08-07
+## Beta 0.0.205 - 2026-08-08
 
-Beta 0.0.204 继承 MCP fail-closed 修复，并恢复由 Linux Node 20 可复现生成的 V3 打包资产，修复 0.0.203 的跨平台 bundle 哈希同步门禁失败；旧标签保持不可变。主动 AI 决策、学习、Presence、真实执行授权和 canary 范围不变；G13、Orvibo HomeBridge 与 MCP 继续停用。
+Beta 0.0.205 完成到达照明学习闭环：冷启动 Presence 默认 5 秒重评、离场默认 30 秒去抖并可在 V3 运维设置中调整；业主确认必须来自 3 个独立占用周期且后验状态验证通过，第三次仍人工、下一次到达才可自动。全局自动门槛统一为 90，到达照明专用门槛 70 只降低合格证据路径的执行阈值，不抬高原始置信度；HA 对策略、空间、环境和动作指纹二次校验。G13、Orvibo HomeBridge 与 MCP 继续停用，真实执行 canary 不扩大。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.204`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.205`，用于 Home Assistant 更新检测。

@@ -30,6 +30,7 @@ from .active_ai_rollout import (
     scope_active_ai_canary_actions,
 )
 from .confidence_arbitration_contract import validate_auto_execution_arbitration
+from .presence_runtime import DEFAULT_COLD_START_RECHECK_SECONDS, advance_occupancy_cycle, async_restore_occupancy_cycles, attach_occupancy_cycle, cleanup_startup_reconciliation, enrich_fast_path_presence_timing, learning_space_identity, occupancy_cycle_outcome, persist_occupancy_cycles, resolve_space_id, room_candidates, room_snapshot, schedule_arrival_baseline_sample, schedule_startup_presence_reconciliation, slow_fallback_allowed
 from .sensor_event_filter import EnvironmentTelemetryFilter, environment_sensor_kind
 from .const import (
     FRIGATE_PERSON_COUNT_KW as _FRIGATE_PERSON_COUNT_KW,
@@ -117,6 +118,7 @@ class ListenersMixin:
     _PRESENCE_FLAP_THRESHOLD = PRESENCE_FLAP_THRESHOLD
     _PRESENCE_FLAP_SUPPRESS_SECS = PRESENCE_FLAP_SUPPRESS_SECS
     _CORRECTION_WINDOW_SECONDS = CORRECTION_WINDOW_SECONDS
+    _STARTUP_PRESENCE_RECONCILE_HOLD_SECONDS = DEFAULT_COLD_START_RECHECK_SECONDS
 
     # Frigate person_count sensor 触发阈值
     _PERSON_COUNT_KW = _FRIGATE_PERSON_COUNT_KW
@@ -384,7 +386,8 @@ class ListenersMixin:
         reasons: list[str] | None = None,
     ) -> dict[str, Any]:
         """Build a compatibility Presence Snapshot without local HA inference."""
-        room = (self.device_info.get(entity_id, {}) or {}).get("room", "").strip()
+        candidates = room_candidates(self.device_info.get(entity_id, {}) or {})
+        room = candidates[0] if candidates else ""
         snapshot_fn = getattr(self, "get_presence_snapshot", None)
         if callable(snapshot_fn) and room:
             try:
@@ -393,9 +396,9 @@ class ListenersMixin:
                 _LOGGER.debug("[Listeners] get_presence_snapshot failed: %s", exc)
                 root_snapshot = None
             rooms = root_snapshot.get("rooms") if isinstance(root_snapshot, dict) else None
-            room_snapshot = rooms.get(room) if isinstance(rooms, dict) else None
-            if isinstance(room_snapshot, dict):
-                snap = dict(room_snapshot)
+            selected_snapshot = room_snapshot(rooms, candidates)
+            if isinstance(selected_snapshot, dict):
+                snap = dict(selected_snapshot)
                 if reasons:
                     snap["reasons"] = list(snap.get("reasons", [])) + list(reasons)
                 if blocked_actions:
@@ -1373,7 +1376,7 @@ class ListenersMixin:
         if age < 0 or age > self._CORRECTION_WINDOW_SECONDS:
             return False
 
-        room = str(device_info.get("room") or device_info.get("space_id") or "").strip()
+        room = str(device_info.get("space_id") or device_info.get("room") or "").strip()
         presence_context = "occupied" if ai_state == "on" else "vacant"
         transaction_id = str(last_ai.get("transaction_id") or "").strip()
         parent_transaction_id = str(last_ai.get("parent_transaction_id") or "").strip()
@@ -1388,6 +1391,7 @@ class ListenersMixin:
             "user_state": user_state,
             "user_service": f"{domain}.turn_{user_state}",
             "room": room,
+            "room_aliases": room_candidates(device_info),
             "scene_desc": str(last_ai.get("scene") or ""),
             "trigger_text": str(last_ai.get("trigger") or ""),
             "presence_context": presence_context,
@@ -2780,33 +2784,13 @@ class ListenersMixin:
         if not isinstance(cycles, dict):
             cycles = {}
             self._arrival_occupancy_cycles = cycles
-        cycle = cycles.get(room) if isinstance(cycles.get(room), dict) else {}
-        new_value = str(new_state or "").strip().lower()
-        if new_value in self._ARRIVAL_ACTIVE_STATES:
-            if cycle.get("active") is True or other_active:
-                if not cycle.get("cycle_id"):
-                    generation = int(cycle.get("generation") or 0) + 1
-                    cycle = {
-                        "cycle_id": f"occ-{hashlib.sha256(f'{room}|{generation}|{time.time_ns()}'.encode()).hexdigest()[:20]}",
-                        "active": True,
-                        "generation": generation,
-                    }
-                    cycles[room] = cycle
-                return str(cycle.get("cycle_id") or ""), False, False
-            generation = int(cycle.get("generation") or 0) + 1
-            cycle = {
-                "cycle_id": f"occ-{hashlib.sha256(f'{room}|{generation}|{time.time_ns()}'.encode()).hexdigest()[:20]}",
-                "active": True,
-                "generation": generation,
-            }
-            cycles[room] = cycle
-            return str(cycle["cycle_id"]), True, False
-
-        if other_active:
-            return str(cycle.get("cycle_id") or ""), False, False
-        if cycle:
-            cycle["active"] = False
-        return str(cycle.get("cycle_id") or ""), False, True
+        outcome = advance_occupancy_cycle(
+            cycles, room=room, new_state=new_state, other_active=other_active,
+            active_states=self._ARRIVAL_ACTIVE_STATES,
+            departure_debounce_seconds=max(0.0, float(getattr(self, "_PRESENCE_OFF_DELAY", PRESENCE_OFF_DELAY) or 0.0)),
+        )
+        persist_occupancy_cycles(self)
+        return outcome
     def _schedule_arrival_baseline_sample(
         self,
         entity_id: str,
@@ -2824,14 +2808,10 @@ class ListenersMixin:
             return
         device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
         info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
-        room = str((info or {}).get("room") or (info or {}).get("area") or "").strip()
-        if not room:
-            area_getter = getattr(self, "_get_entity_area", None)
-            if callable(area_getter):
-                try:
-                    room = str(area_getter(entity_id) or "").strip()
-                except Exception:
-                    room = ""
+        room = resolve_space_id(
+            info or {}, entity_id=entity_id,
+            area_getter=getattr(self, "_get_entity_area", None),
+        )
         if not room:
             return
 
@@ -3050,17 +3030,10 @@ class ListenersMixin:
         info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
         if not isinstance(info, dict):
             info = {}
-        info_payload = dict(info)
-        room = str(info.get("room") or info.get("area") or "").strip()
-        if not room:
-            area_getter = getattr(self, "_get_entity_area", None)
-            if callable(area_getter):
-                try:
-                    room = str(area_getter(entity_id) or "").strip()
-                except Exception:
-                    room = ""
-        if room and not str(info_payload.get("room") or info_payload.get("area") or "").strip():
-            info_payload["room"] = room
+        info_payload, space_id, room = learning_space_identity(
+            info, entity_id=entity_id,
+            area_getter=getattr(self, "_get_entity_area", None),
+        )
         now = self._ha_local_now()
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue):
@@ -3098,7 +3071,7 @@ class ListenersMixin:
             learning_source_type = str(source_type or "")
         manual_session = self._manual_scene_learning_session(
             attribution=attribution,
-            space_id=str(info_payload.get("space_id") or room).strip(),
+            space_id=space_id,
             room=str(
                 info_payload.get("room_name")
                 or info_payload.get("area_name")
@@ -3479,6 +3452,8 @@ class ListenersMixin:
         old_state: str,
         *,
         occupancy_cycle_id: str = "",
+        trigger_context: dict[str, Any] | None = None,
+        suppress_slow_fallback: bool = False,
     ) -> None:
         should_fail_closed = True
         if normalize_active_ai_mode(
@@ -3518,8 +3493,8 @@ class ListenersMixin:
         if addon_client is not None:
             await self._refresh_correction_suppressions_cache(addon_client)
         snapshot = self._build_addon_fast_path_snapshot(entity_id)
-        if occupancy_cycle_id:
-            snapshot["occupancy_cycle_id"] = occupancy_cycle_id
+        enrich_fast_path_presence_timing(self, snapshot, trigger_context)
+        snapshot["occupancy_cycle_id"] = str(occupancy_cycle_id).strip()
         request_id = self._new_addon_fast_path_request_id(entity_id, old_state, new_state)
         snapshot["request_id"] = request_id
         snapshot_diag = self._addon_fast_path_snapshot_diagnostics(snapshot, entity_id)
@@ -3572,7 +3547,10 @@ class ListenersMixin:
                     status = int(response.get("__status") or 0)
                     result = response.get("result")
                     matched = response.get("matched") is True
-                    arbitration_validation = validate_auto_execution_arbitration(response)
+                    arbitration_validation = validate_auto_execution_arbitration(
+                        response,
+                        context_snapshot=snapshot,
+                    )
                     arbitration_fail_closed = matched and arbitration_validation.reason in {
                         "confidence_arbitration_missing",
                         "confidence_arbitration_invalid",
@@ -3657,6 +3635,7 @@ class ListenersMixin:
                             "reason": reason or "",
                             "decision_trace": dict(decision_trace) if isinstance(decision_trace, dict) else {},
                         }
+                        attach_occupancy_cycle(context, snapshot)
                         if decision_reason:
                             context["decision_reason"] = decision_reason
                         if arbitration_reason:
@@ -3951,7 +3930,7 @@ class ListenersMixin:
                             )
                             return
                         if reason == "no_match":
-                            if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot):
+                            if slow_fallback_allowed(suppress_slow_fallback, self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)):
                                 self._sys_log(
                                     "INFO",
                                     f"[Add-on FastPath] no_match; scheduling slow inference | entity={entity_id} "
@@ -3979,7 +3958,10 @@ class ListenersMixin:
                                 f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
                             )
                         if reason == "confidence_below_auto_threshold" and not confirm_required:
-                            if action_count > 0 or self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot):
+                            if slow_fallback_allowed(suppress_slow_fallback, (
+                                action_count > 0
+                                or self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)
+                            )):
                                 self._sys_log(
                                     "INFO",
                                     f"[Add-on FastPath] confidence_below_auto_threshold; scheduling slow inference | "
@@ -4017,7 +3999,7 @@ class ListenersMixin:
                             f"[Add-on FastPath] addon_fast_path_input_incomplete fail-closed | "
                             f"status={status} reason={reason or 'input_incomplete'} entity={entity_id}",
                         )
-                        if self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot):
+                        if slow_fallback_allowed(suppress_slow_fallback, self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)):
                             self._sys_log(
                                 "INFO",
                                 f"[Add-on FastPath] 409 input incomplete; scheduling slow inference | "
@@ -4432,42 +4414,33 @@ class ListenersMixin:
                     return
                 self._record_presence_flap(entity_id)
 
-            occupancy_cycle_id = ""
-            arrival_started = False
-            learning_cycle_status = ""
-            if is_presence_sensor and old_presence_state != new_presence_state:
-                (
-                    occupancy_cycle_id,
-                    arrival_started,
-                    departure_completed,
-                ) = self._arrival_occupancy_cycle_for_edge(
-                    entity_id,
-                    old_s,
-                    new_s,
-                )
-                duplicate_arrival = new_presence_state == "on" and not arrival_started
-                incomplete_departure = new_presence_state == "off" and not departure_completed
-                if duplicate_arrival:
-                    learning_cycle_status = "duplicate_occupancy_cycle"
-                elif incomplete_departure:
-                    learning_cycle_status = "occupancy_cycle_still_active"
+            occupancy_cycle_id, arrival_started, duplicate_arrival, learning_cycle_status = occupancy_cycle_outcome(
+                self, entity_id, old_s, new_s,
+                is_presence_sensor=is_presence_sensor,
+                old_presence_state=old_presence_state,
+                new_presence_state=new_presence_state,
+            )
 
-            if not is_presence_sensor or arrival_started or not occupancy_cycle_id:
-                try:
-                    self._schedule_arrival_baseline_sample(
-                        entity_id,
-                        old_s,
-                        new_s,
-                        occupancy_cycle_id=occupancy_cycle_id,
-                    )
-                except TypeError as exc:
-                    if "occupancy_cycle_id" not in str(exc):
-                        raise
-                    self._schedule_arrival_baseline_sample(
-                        entity_id,
-                        old_s,
-                        new_s,
-                    )
+            if is_presence_sensor and duplicate_arrival:
+                self._cancel_presence_temporal_recheck(entity_id)
+                self._emit_listener_event(
+                    listener_action="filtered",
+                    entity_id=entity_id,
+                    old_state=old_s,
+                    new_state=new_s,
+                    filter_reason="duplicate_occupancy_cycle",
+                    source_type=source_type,
+                    occupancy_cycle_id=occupancy_cycle_id,
+                    learning_cycle_status=learning_cycle_status,
+                )
+                return
+
+            schedule_arrival_baseline_sample(
+                self, entity_id, old_s, new_s,
+                is_presence_sensor=is_presence_sensor,
+                arrival_started=arrival_started,
+                occupancy_cycle_id=occupancy_cycle_id,
+            )
             self._emit_listener_event(
                 listener_action="fast_path_scheduled",
                 entity_id=entity_id,
@@ -4746,9 +4719,9 @@ class ListenersMixin:
             reconcile_marker = f"{state}:{state_marker}"
             if reconciled.get(entity_id) == reconcile_marker:
                 continue
-            reconciled[entity_id] = reconcile_marker
 
             if not self._is_enabled():
+                reconciled.pop(entity_id, None)
                 self._emit_listener_event(
                     listener_action="filtered",
                     entity_id=entity_id,
@@ -4760,6 +4733,7 @@ class ListenersMixin:
                 )
                 continue
             if getattr(self, "_sensors_muted", False):
+                reconciled.pop(entity_id, None)
                 self._emit_listener_event(
                     listener_action="filtered",
                     entity_id=entity_id,
@@ -4771,6 +4745,7 @@ class ListenersMixin:
                 )
                 continue
 
+            reconciled[entity_id] = reconcile_marker
             self._emit_listener_event(
                 listener_action="filtered",
                 entity_id=entity_id,
@@ -4779,6 +4754,9 @@ class ListenersMixin:
                 filter_reason="state_recovery_unknown_unavailable",
                 source_type="state_reconcile",
                 reconcile_reason="listener_refresh_active_state",
+            )
+            schedule_startup_presence_reconciliation(
+                self, entity_id, reconcile_marker=reconcile_marker, schedule=async_call_later,
             )
 
     async def _async_refresh_device_info_from_addon_devices(self, *, reason: str = "") -> bool:
@@ -5221,6 +5199,7 @@ class ListenersMixin:
         state_removers.clear()
         entity_ids = self._managed_listener_entity_ids()
         self._listener_entity_ids = set(entity_ids)
+        cleanup_startup_reconciliation(self, entity_ids)
         if entity_ids:
             state_removers.append(
                 async_track_state_change_event(self.hass, entity_ids, self._make_state_handler())

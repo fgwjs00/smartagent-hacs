@@ -51,7 +51,6 @@ _FILE_LOG_LEVELS = {
     logging.CRITICAL,
 }
 
-
 def _coerce_file_log_level(value: Any) -> int:
     text = str(value or DEFAULT_FILE_LOG_LEVEL).strip().upper()
     if text == "WARN":
@@ -81,7 +80,7 @@ from .active_ai_rollout import (
 )
 from .database import DatabaseMixin
 from .devices import DevicesMixin
-from .confidence_arbitration_contract import validate_auto_execution_arbitration
+from .confidence_arbitration_contract import apply_arrival_lighting_confirmation_gate, pending_confirmation_allowed, validate_auto_execution_arbitration
 from .execution_gate import (
     evaluate_priority_arbitration,
     evaluate_slow_brain_confidence_gate,
@@ -90,9 +89,9 @@ from .frigate import FrigateMixin
 from .ha_adapter import async_call_service
 from .license import LicenseMixin
 from .listeners import ListenersMixin
+from .presence_runtime import apply_presence_timing_settings, async_restore_occupancy_cycles, room_candidates
 from .season import ha_season_for_datetime as _ha_season_for_datetime
 from .api import SmartAgentPairingView, SmartAgentAuthPageView, SmartAgentPairConfirmView
-
 from .const import (
     comparable_action_params,
     CONF_ACTIVE_AI_MODE,
@@ -1498,6 +1497,7 @@ class SmartAgentCoordinator(
             if new_value != self.cooldown:
                 self.cooldown = new_value
                 applied.append(f"cooldown={new_value}")
+        apply_presence_timing_settings(self, payload, applied)
         if "mode" in payload:
             new_value = "showroom" if str(payload.get("mode") or "").strip().lower() == "showroom" else "home"
             if new_value != self._mode:
@@ -1606,6 +1606,7 @@ class SmartAgentCoordinator(
         """Register state change listeners for device domains."""
         await self.hass.async_add_executor_job(self._init_file_logger)
 
+        await async_restore_occupancy_cycles(self)
         # add-on first：启动时把 add-on settings 当作真源覆写到内存（learning/habit/frigate）
         try:
             await self._async_apply_addon_system_settings()
@@ -2263,6 +2264,7 @@ class SmartAgentCoordinator(
                     "transaction_id",
                     "correlation_id",
                     "world_snapshot_id",
+                    "occupancy_cycle_id",
                     "reason",
                     "decision_trace",
                 )
@@ -2452,6 +2454,7 @@ class SmartAgentCoordinator(
             "parent_decision_trace": source_trace_context.get("decision_trace") if isinstance(source_trace_context.get("decision_trace"), dict) else {},
             "parent_correlation_id": str(source_trace_context.get("correlation_id") or ""),
             "parent_world_snapshot_id": str(source_trace_context.get("world_snapshot_id") or ""),
+            "occupancy_cycle_id": str(snapshot.get("occupancy_cycle_id") or source_trace_context.get("occupancy_cycle_id") or "").strip(),
         }
         return bundle
 
@@ -3295,22 +3298,17 @@ class SmartAgentCoordinator(
                     result.setdefault("status", "ok")
                     return result
 
+                apply_arrival_lighting_confirmation_gate(result, actions=valid_actions, context_snapshot=bundle)
+
                 arbitration_result = str(result.get("arbitration_result") or "").strip()
                 confidence_gate = evaluate_slow_brain_confidence_gate(
                     confidence=result.get("confidence"),
                     threshold=self.confidence_auto,
                 )
-                arbitration_validation = validate_auto_execution_arbitration(
-                    result if confidence_gate.log_code != "confidence_invalid" else {}
-                )
+                arbitration_validation = validate_auto_execution_arbitration(result if confidence_gate.log_code != "confidence_invalid" else {}, context_snapshot=bundle)
                 local_confidence_block = not confidence_gate.allowed
                 auto_execute = arbitration_validation.allowed and confidence_gate.allowed
-                confirm_required = (
-                    not local_confidence_block
-                    and arbitration_validation.reason == "confidence_below_auto_threshold"
-                    and result.get("confirm_required") is True
-                    and arbitration_result == "pending_confirmation"
-                )
+                confirm_required = pending_confirmation_allowed(arbitration_validation.reason, local_confidence_block=local_confidence_block, payload=result)
                 if not auto_execute:
                     decision_reason = str(result.get("reason") or "").strip()
                     if local_confidence_block:
@@ -4243,7 +4241,8 @@ class SmartAgentCoordinator(
             "ai_service": last_ai.get("service", ""),
             "ai_state": last_ai.get("state", ""),
             "user_state": user_state,
-            "room": self.device_info.get(entity_id, {}).get("room", ""),
+            "room": self.device_info.get(entity_id, {}).get("space_id") or self.device_info.get(entity_id, {}).get("room", ""),
+            "room_aliases": room_candidates(self.device_info.get(entity_id, {})),
             "scene": last_ai.get("scene", ""),
             "trigger": last_ai.get("trigger", ""),
             "reason": reason,
