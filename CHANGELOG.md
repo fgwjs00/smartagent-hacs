@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.206 - 2026-08-08
+## Beta 0.0.207 - 2026-08-08
 
-Beta 0.0.206 完成到达照明学习闭环，并修复 Windows/Linux V3 构建的文件名哈希与 CSS 浮点末位漂移：冷启动 Presence 默认 5 秒重评、离场默认 30 秒去抖并可在 V3 运维设置中调整；业主确认必须来自 3 个独立占用周期且后验状态验证通过，第三次仍人工、下一次到达才可自动。全局自动门槛统一为 90，到达照明专用门槛 70 只降低合格证据路径的执行阈值，不抬高原始置信度；HA 对策略、空间、环境和动作指纹二次校验。G13、Orvibo HomeBridge 与 MCP 继续停用，真实执行 canary 不扩大。
+Beta 0.0.207 新增 SA 设置页直连 Cloud 账号与家庭：一次性凭证仅放在 URL fragment，Cloud 密码不经过 SA，成功后继续复用既有网关证书、撤销与审计链路；已配对主机不解绑、不扩大真实执行 canary，G13、Orvibo HomeBridge 与 MCP 继续停用。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.206`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.207`，用于 Home Assistant 更新检测。
