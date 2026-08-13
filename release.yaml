@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.211
-display_version: Beta 0.0.211
+release_version: 0.0.212
+display_version: Beta 0.0.212
 channel: beta
 release_date: '2026-08-14'
 public_release_ready: true
@@ -8,7 +8,7 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.211 修复显式语音控制被自主 AI 灰度误拦截与错误成功播报，并修复 AI 场景手动触发因世界快照缺失返回 503；同时归一化中控屏
-    Workbox 产物并保留 AI 场景真实接口来源说明；用户明确语音只绕过自主 AI 灰度，仍保留纳管、精确实体、服务白名单、世界状态与执行回执门禁，自主传感器控制继续仅限精确
-    canary。
-  customer_visible_version: Beta 0.0.211
+  summary: Beta 0.0.212 修复显式语音控制被自主 AI 灰度误拦截与错误成功播报，并修复 AI 场景手动触发因世界快照缺失返回 503；归一化中控屏
+    Workbox 产物、保留 AI 场景真实接口来源说明，并关闭当前阿里云 ACR 不支持的 OCI provenance/SBOM 附加清单；用户明确语音只绕过自主
+    AI 灰度，仍保留纳管、精确实体、服务白名单、世界状态与执行回执门禁，自主传感器控制继续仅限精确 canary。
+  customer_visible_version: Beta 0.0.212
