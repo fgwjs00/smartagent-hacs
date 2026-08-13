@@ -9,7 +9,9 @@ from typing import Any, NamedTuple
 from .action_normalization import action_domain
 
 
-ACTIVE_AI_MODES = frozenset({"off", "shadow", "canary", "on"})
+# M7 v0.1 deliberately has no unscoped all-home execution mode. Production
+# expansion must happen through an exact canary scope and an independent grant.
+ACTIVE_AI_MODES = frozenset({"off", "shadow", "canary"})
 DEFAULT_ACTIVE_AI_MODE = "shadow"
 
 
@@ -502,11 +504,7 @@ def evaluate_active_ai_execution_gate(
         config,
         allow_model=True,
         allow_execution=True,
-        reason=(
-            "active_ai_canary_allowed"
-            if config.mode == "canary"
-            else "active_ai_on_allowed"
-        ),
+        reason="active_ai_canary_allowed",
         trigger_space_id=space_id,
         action_domains=domains,
         action_space_ids=action_space_ids,

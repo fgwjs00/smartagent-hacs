@@ -320,6 +320,7 @@ class AddOnClient:
         trigger: str,
         bundle: dict[str, Any] | None = None,
         request_id: str | None = None,
+        user_explicit_voice: bool = False,
     ) -> dict[str, Any] | None:
         """Run the add-on owned full decision path and return executable actions."""
         provided_request_id = str(request_id or "").strip()
@@ -330,6 +331,14 @@ class AddOnClient:
         }
         if bundle is not None:
             payload["bundle"] = {**dict(bundle), "request_id": normalized_request_id}
+        operator_headers: dict[str, str] | None = None
+        if user_explicit_voice:
+            payload["user_goal"] = str(trigger or "").strip()
+            payload["is_voice"] = True
+            operator_headers = {
+                "X-SA-Execution-Intent": "user_explicit",
+                "X-SA-Actor-Class": "authenticated_gateway_operator",
+            }
 
         result = await self.request_json(
             "POST",
@@ -337,6 +346,7 @@ class AddOnClient:
             body=payload,
             timeout=_INFER_TIMEOUT,
             request_id=normalized_request_id,
+            extra_headers=operator_headers,
         )
         if not isinstance(result, dict):
             return None
@@ -351,6 +361,8 @@ class AddOnClient:
     async def execute_command_envelope(
         self,
         envelope: dict[str, Any],
+        *,
+        user_explicit: bool = False,
     ) -> dict[str, Any] | None:
         """Run the authoritative add-on preflight before HA execution."""
         request_id = str(envelope.get("request_id") or "").strip() or None
@@ -360,6 +372,14 @@ class AddOnClient:
             body=dict(envelope),
             timeout=aiohttp.ClientTimeout(total=25),
             request_id=request_id,
+            extra_headers=(
+                {
+                    "X-SA-Execution-Intent": "user_explicit",
+                    "X-SA-Actor-Class": "authenticated_gateway_operator",
+                }
+                if user_explicit
+                else None
+            ),
         )
         if not isinstance(result, dict):
             return None

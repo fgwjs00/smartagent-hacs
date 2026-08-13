@@ -1485,6 +1485,7 @@ class ActionsMixin:
         active_space_id: str = "",
         decision_time: str = "",
         require_world_snapshot_guard: bool = False,
+        direct_entity_only: bool = False,
     ) -> int:
         """Execute a list of AI actions with transaction tracking."""
         import json as _json
@@ -2036,7 +2037,7 @@ class ActionsMixin:
                             )
                         )
                     )
-                    if ctrl_mode == "shared" and domain in ("light", "switch", "cover", "fan", "climate") \
+                    if not direct_entity_only and ctrl_mode == "shared" and domain in ("light", "switch", "cover", "fan", "climate") \
                             and service in ("turn_on", "turn_off", "open", "close", "toggle") \
                             and not _is_simple_off_with_params and not _has_precise_light_params \
                             and not (domain in ("light", "switch") and service == "turn_off"):
@@ -2660,6 +2661,7 @@ class ActionsMixin:
         from .ha_adapter import async_execute_command_envelope
 
         payload = call_params if isinstance(call_params, dict) else {}
+        is_user_explicit = str(cmd_source or "").strip().upper() == "USER_EXPLICIT"
         active_correlations = getattr(self, "_active_service_correlation_ids", {})
         active_correlation_id = (
             active_correlations.get(asyncio.current_task(), "")
@@ -2674,7 +2676,13 @@ class ActionsMixin:
         )
         envelope = {
             "request_id": request_id,
-            "source": "smartagent_active_ai" if require_world_snapshot_guard else "smartagent_ha_host",
+            "source": (
+                "smartagent_user_explicit"
+                if is_user_explicit
+                else "smartagent_active_ai"
+                if require_world_snapshot_guard
+                else "smartagent_ha_host"
+            ),
             "scope": "home_control",
             "commands": [{
                 "entity_id": entity_id,
@@ -2695,7 +2703,15 @@ class ActionsMixin:
                     ),
                     **(
                         {
-                            "active_ai_managed": True,
+                            "active_ai_managed": not is_user_explicit,
+                            **(
+                                {
+                                    "execution_intent": "user_explicit",
+                                    "actor_class": "authenticated_gateway_operator",
+                                }
+                                if is_user_explicit
+                                else {}
+                            ),
                             "world_snapshot_id": str(world_snapshot_id or "").strip(),
                             "active_space_id": str(active_space_id or "").strip(),
                             "cmd_source": str(cmd_source or "").strip(),
@@ -2718,7 +2734,7 @@ class ActionsMixin:
                 if callable(is_enabled)
                 else bool(getattr(self, "_enabled", False))
             )
-            if not ai_enabled:
+            if not ai_enabled and not is_user_explicit:
                 result = {
                     "ok": False,
                     "error": "active_ai_global_disabled",
@@ -2764,7 +2780,11 @@ class ActionsMixin:
                         "status": "failed",
                     }
                 else:
-                    result = await execute(envelope)
+                    result = (
+                        await execute(envelope, user_explicit=True)
+                        if is_user_explicit
+                        else await execute(envelope)
+                    )
                     if not isinstance(result, dict):
                         result = {
                             "ok": False,

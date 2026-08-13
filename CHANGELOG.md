@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.207 - 2026-08-08
+## Beta 0.0.209 - 2026-08-14
 
-Beta 0.0.207 新增 SA 设置页直连 Cloud 账号与家庭：一次性凭证仅放在 URL fragment，Cloud 密码不经过 SA，成功后继续复用既有网关证书、撤销与审计链路；已配对主机不解绑、不扩大真实执行 canary，G13、Orvibo HomeBridge 与 MCP 继续停用。
+Beta 0.0.209 修复显式语音控制被自主 AI 灰度误拦截与错误成功播报，并修复 AI 场景手动触发因世界快照缺失返回 503；用户明确语音只绕过自主 AI 灰度，仍保留纳管、精确实体、服务白名单、世界状态与执行回执门禁，自主传感器控制继续仅限精确 canary。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.207`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.209`，用于 Home Assistant 更新检测。

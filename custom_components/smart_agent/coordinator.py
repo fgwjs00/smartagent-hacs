@@ -2810,6 +2810,11 @@ class SmartAgentCoordinator(
             source=source,
             source_trace_context=source_trace_context,
         )
+        policy_unauthorized_speech = "当前策略未授权执行"
+        explicit_voice_control = bool(
+            bundle.get("is_voice")
+            and str(bundle.get("cmd_source") or "").strip().upper() == "USER_EXPLICIT"
+        )
         addon_client = getattr(self, "_addon_client", None)
         self._sys_log(
             "INFO",
@@ -2954,7 +2959,7 @@ class SmartAgentCoordinator(
             ai_enabled=bool(getattr(self, "_enabled", False)),
             config=pre_rollout_config,
         )
-        if not pre_rollout.allow_model:
+        if not pre_rollout.allow_model and not explicit_voice_control:
             public_reason = _rollout_public_reason(pre_rollout.reason)
             rollout_trace = pre_rollout.as_trace()
             _emit_slow_decision_bubble(
@@ -2971,7 +2976,7 @@ class SmartAgentCoordinator(
                 fail_closed=True,
                 record_decision_log=True,
             )
-            return {
+            blocked_response = {
                 "status": "ok",
                 "matched": False,
                 "actions": [],
@@ -2980,6 +2985,10 @@ class SmartAgentCoordinator(
                 "rollout": rollout_trace,
                 "final_outcome": "blocked",
             }
+            if bundle.get("is_voice"):
+                blocked_response["reply"] = policy_unauthorized_speech
+                blocked_response["speak"] = policy_unauthorized_speech
+            return blocked_response
 
         if addon_client is None:
             self._sys_log("WARN", "[决策] add-on decision provider unavailable")
@@ -3030,6 +3039,7 @@ class SmartAgentCoordinator(
                     trigger=str(trigger or ""),
                     bundle=bundle,
                     request_id=str(bundle.get("parent_correlation_id") or "") or None,
+                    user_explicit_voice=explicit_voice_control,
                 )
             except Exception as exc:
                 self._sys_log("WARN", f"[决策] add-on decision provider 调用失败: {exc}")
@@ -3073,7 +3083,21 @@ class SmartAgentCoordinator(
                     fail_closed=True,
                     record_decision_log=True,
                 )
-                return {"status": "error", "message": str(error), **result}
+                policy_rejected = bool(
+                    str(result.get("error_type") or "").strip() == "policy_rejected"
+                    or str(error).strip().startswith(("active_ai_", "policy_"))
+                )
+                error_response = {"status": "error", **result}
+                error_response["status"] = "error"
+                error_response["message"] = (
+                    policy_unauthorized_speech
+                    if bundle.get("is_voice") and policy_rejected
+                    else str(error)
+                )
+                if bundle.get("is_voice") and policy_rejected:
+                    error_response["reply"] = policy_unauthorized_speech
+                    error_response["speak"] = policy_unauthorized_speech
+                return error_response
 
             actions = result.get("actions") if isinstance(result.get("actions"), list) else []
             valid_actions = [item for item in actions if isinstance(item, dict)]
@@ -3104,6 +3128,7 @@ class SmartAgentCoordinator(
             learning_observe_only = bool(getattr(self, "_learning_mode", False)) and source == "listener"
             executed = 0
             final_outcome = "no_actions"
+            action_results: list[dict[str, Any]] = []
             if valid_actions:
                 rollout_payload = (
                     result.get("active_ai_rollout")
@@ -3122,12 +3147,20 @@ class SmartAgentCoordinator(
                     if isinstance(bundle.get("device_info"), dict)
                     else {},
                 )
-                scoped_actions = scope_active_ai_canary_actions(
-                    rollout_actions,
-                    rollout_config,
+                scoped_actions = (
+                    None
+                    if explicit_voice_control
+                    else scope_active_ai_canary_actions(
+                        rollout_actions,
+                        rollout_config,
+                    )
                 )
-                blocked_entity_ids = set(scoped_actions.blocked_entity_ids)
-                if not scoped_actions.entity_missing and blocked_entity_ids:
+                blocked_entity_ids = (
+                    set(scoped_actions.blocked_entity_ids)
+                    if scoped_actions is not None
+                    else set()
+                )
+                if scoped_actions is not None and not scoped_actions.entity_missing and blocked_entity_ids:
                     valid_actions = [
                         action
                         for action in valid_actions
@@ -3198,21 +3231,56 @@ class SmartAgentCoordinator(
                     }
                     if "" not in action_space_ids and len(action_space_ids) == 1:
                         active_execution_space_id = next(iter(action_space_ids))
-                rollout_decision = evaluate_active_ai_execution_gate(
-                    ai_enabled=bool(getattr(self, "_enabled", False)),
-                    config=rollout_config,
-                    trigger_space_id=active_execution_space_id,
-                    actions=rollout_actions,
-                    execution_flags=execution_flags,
-                )
-                rollout_trace = rollout_decision.as_trace()
+                if explicit_voice_control:
+                    action_domains = sorted({
+                        str(action.get("domain") or "").strip().lower()
+                        for action in rollout_actions
+                        if isinstance(action, dict) and str(action.get("domain") or "").strip()
+                    })
+                    action_space_ids = sorted({
+                        str(action.get("target_space_id") or action.get("space_id") or "").strip()
+                        for action in rollout_actions
+                        if isinstance(action, dict) and str(action.get("target_space_id") or action.get("space_id") or "").strip()
+                    })
+                    action_entity_ids = sorted({
+                        str(action.get("entity_id") or action.get("entity") or "").strip().lower()
+                        for action in rollout_actions
+                        if isinstance(action, dict) and str(action.get("entity_id") or action.get("entity") or "").strip()
+                    })
+                    rollout_reason = "user_explicit_rollout_bypass"
+                    rollout_trace = {
+                        "mode": rollout_config.mode,
+                        "allow_model": True,
+                        "allow_execution": True,
+                        "reason": rollout_reason,
+                        "trigger_space_id": active_execution_space_id,
+                        "action_domains": action_domains,
+                        "blocked_domains": [],
+                        "action_space_ids": action_space_ids,
+                        "blocked_space_ids": [],
+                        "action_entity_ids": action_entity_ids,
+                        "blocked_entity_ids": [],
+                        "bypass_scope": "authenticated_user_explicit_voice",
+                    }
+                    rollout_allow_execution = True
+                else:
+                    rollout_decision = evaluate_active_ai_execution_gate(
+                        ai_enabled=bool(getattr(self, "_enabled", False)),
+                        config=rollout_config,
+                        trigger_space_id=active_execution_space_id,
+                        actions=rollout_actions,
+                        execution_flags=execution_flags,
+                    )
+                    rollout_trace = rollout_decision.as_trace()
+                    rollout_reason = rollout_decision.reason
+                    rollout_allow_execution = rollout_decision.allow_execution
                 result["rollout"] = rollout_trace
-                result["rollout_reason"] = rollout_decision.reason
-                if not rollout_decision.allow_execution:
-                    is_shadow = rollout_decision.reason == "active_ai_shadow"
+                result["rollout_reason"] = rollout_reason
+                if not rollout_allow_execution:
+                    is_shadow = rollout_reason == "active_ai_shadow"
                     final_outcome = "observe_only" if is_shadow else "blocked"
                     action_status = "not_executed" if is_shadow else "blocked"
-                    public_reason = _rollout_public_reason(rollout_decision.reason)
+                    public_reason = _rollout_public_reason(rollout_reason)
                     result["matched"] = True
                     result["executed_count"] = 0
                     result["auto_execute"] = False
@@ -3227,7 +3295,7 @@ class SmartAgentCoordinator(
                             "service": str(action.get("service") or ""),
                             "entity_id": str(action.get("entity_id") or ""),
                             "status": action_status,
-                            "reason": rollout_decision.reason,
+                            "reason": rollout_reason,
                         }
                         for action in valid_actions
                     ]
@@ -3245,7 +3313,7 @@ class SmartAgentCoordinator(
                                 "auto_execute": False,
                                 "confirm_required": False,
                                 "arbitration_result": "blocked_by_rollout",
-                                "reason": rollout_decision.reason,
+                                "reason": rollout_reason,
                                 "planned_count": len(valid_actions),
                                 "candidate_action_count": len(candidate_actions),
                                 "authorized_action_count": len(valid_actions),
@@ -3276,8 +3344,8 @@ class SmartAgentCoordinator(
                             )
                     self._sys_log(
                         "INFO",
-                        f"[决策] 主动 AI 灰度门禁阻止执行 mode={rollout_decision.mode} "
-                        f"reason={rollout_decision.reason} transaction_id={transaction_id or '-'}",
+                        f"[决策] 主动 AI 灰度门禁阻止执行 mode={rollout_trace.get('mode')} "
+                        f"reason={rollout_reason} transaction_id={transaction_id or '-'}",
                     )
                     _emit_slow_decision_bubble(
                         result_payload=result,
@@ -3294,7 +3362,11 @@ class SmartAgentCoordinator(
                         record_decision_log=not bool(transaction_id),
                     )
                     nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-                    result.setdefault("reply", nested.get("reply") or public_reason)
+                    if bundle.get("is_voice"):
+                        result["reply"] = policy_unauthorized_speech
+                        result["speak"] = policy_unauthorized_speech
+                    else:
+                        result.setdefault("reply", nested.get("reply") or public_reason)
                     result.setdefault("status", "ok")
                     return result
 
@@ -3563,6 +3635,7 @@ class SmartAgentCoordinator(
                     active_space_id=active_execution_space_id,
                     decision_time=datetime.now(timezone.utc).isoformat(),
                     require_world_snapshot_guard=True,
+                    direct_entity_only=explicit_voice_control,
                 )
                 executed = int(execution_result)
                 execution_transaction_id = str(
@@ -3705,7 +3778,25 @@ class SmartAgentCoordinator(
                 ),
                 "",
             )
-            if bundle.get("is_voice") and desired_states:
+            policy_rejected_action = any(
+                isinstance(item, dict)
+                and (
+                    str(item.get("error_type") or "").strip() == "policy_rejected"
+                    or str(item.get("error") or item.get("reason") or "").strip().startswith(("active_ai_", "policy_", "world_snapshot_"))
+                )
+                for item in action_results
+            )
+            policy_rejected_result = bool(
+                str(result.get("error_type") or "").strip() == "policy_rejected"
+                or (
+                    str(result.get("reason") or result.get("error") or "").strip().startswith(("active_ai_", "policy_", "world_snapshot_"))
+                    and str(result.get("final_outcome") or final_outcome).strip().lower()
+                    in {"blocked", "observe_only", "failed"}
+                )
+            )
+            if bundle.get("is_voice") and (policy_rejected_action or policy_rejected_result):
+                reply_text = policy_unauthorized_speech
+            elif bundle.get("is_voice") and desired_states:
                 if not valid_actions:
                     reply_text = (
                         "目标设备已经处于所需状态。"
@@ -3728,7 +3819,9 @@ class SmartAgentCoordinator(
                 else:
                     reply_text = "已处理" if valid_actions else "未命中可执行动作"
             result["reply"] = reply_text
-            if bundle.get("is_voice") and desired_states:
+            if bundle.get("is_voice") and (policy_rejected_action or policy_rejected_result):
+                result["speak"] = policy_unauthorized_speech
+            elif bundle.get("is_voice") and desired_states:
                 result["speak"] = reply_text
             elif bundle.get("is_voice") and not str(result.get("speak") or "").strip():
                 result["speak"] = reply_text
