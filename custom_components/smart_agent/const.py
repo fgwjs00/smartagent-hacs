@@ -2,6 +2,86 @@
 
 DOMAIN = "smart_agent"
 
+CONF_REFRESH_REGISTRY_SOURCE_ENABLED = "refresh_registry_source_enabled"
+CONF_REFRESH_REGISTRY_INGRESS_URL = "refresh_registry_ingress_url"
+CONF_REFRESH_REGISTRY_SITE_ID = "refresh_registry_site_id"
+CONF_REFRESH_REGISTRY_INGRESS_SECRET = "refresh_registry_ingress_secret"
+CONF_REFRESH_REGISTRY_ATTESTATION_SECRET = "refresh_registry_attestation_secret"
+DEFAULT_REFRESH_REGISTRY_INGRESS_URL = ""
+
+# Dedicated add-on -> HA observation-refresh Provider channel.  The shared
+# request secret signs both directions under separate purpose-derived keys;
+# replay state uses an independent HA-only integrity secret.
+CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED = (
+    "observation_refresh_provider_runtime_enabled"
+)
+CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET = (
+    "observation_refresh_provider_request_secret"
+)
+CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET = (
+    "observation_refresh_provider_previous_request_secret"
+)
+CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET = (
+    "observation_refresh_provider_replay_integrity_secret"
+)
+
+# Dedicated HA -> add-on output ledger channel.  It is independent from the
+# ordinary add-on bearer and remains disabled unless all three secret domains
+# are explicitly provisioned on the two sides.
+CONF_OUTPUT_LEDGER_INGRESS_ENABLED = "output_ledger_ingress_enabled"
+CONF_OUTPUT_LEDGER_INGRESS_URL = "output_ledger_ingress_url"
+CONF_OUTPUT_LEDGER_INGRESS_SECRET = "output_ledger_ingress_secret"
+CONF_OUTPUT_LEDGER_ATTESTATION_SECRET = "output_ledger_attestation_secret"
+DEFAULT_OUTPUT_LEDGER_INGRESS_URL = ""
+
+# Dedicated current-admin -> add-on maintenance delegation ledger.  This
+# channel persists only a pre-dispatch reservation or a no-dispatch terminal
+# receipt; it never grants change application or device-effect authority.
+CONF_MAINTENANCE_CHANGE_INGRESS_ENABLED = "maintenance_change_ingress_enabled"
+CONF_MAINTENANCE_CHANGE_INGRESS_URL = "maintenance_change_ingress_url"
+CONF_MAINTENANCE_CHANGE_INGRESS_SECRET = "maintenance_change_ingress_secret"
+CONF_MAINTENANCE_DELEGATION_ATTESTATION_SECRET = (
+    "maintenance_delegation_attestation_secret"
+)
+DEFAULT_MAINTENANCE_CHANGE_INGRESS_URL = ""
+
+# Explicit current-session Field Canary operator identity ingress.  This is
+# intentionally separate from the ordinary add-on bearer and from the
+# RegistrySnapshot transport.  Enabling it can persist only an operator
+# identity fact; it does not publish an approval or execution authority.
+CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_ENABLED = (
+    "field_canary_operator_identity_ingress_enabled"
+)
+CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL = (
+    "field_canary_operator_identity_ingress_url"
+)
+CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_SECRET = (
+    "field_canary_operator_identity_ingress_secret"
+)
+CONF_FIELD_CANARY_OPERATOR_IDENTITY_ATTESTATION_SECRET = (
+    "field_canary_operator_identity_attestation_secret"
+)
+CONF_FIELD_CANARY_OPERATOR_IDENTITY_PREVIOUS_ATTESTATION_SECRET = (
+    "field_canary_operator_identity_previous_attestation_secret"
+)
+DEFAULT_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL = ""
+
+# Dedicated add-on -> HA verification keyring for Field Canary dispatch proof
+# v2.  It must never fall back to the ordinary add-on bearer used by v1.
+CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED = (
+    "field_canary_host_dispatch_proof_enabled"
+)
+CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET = (
+    "field_canary_host_dispatch_proof_secret"
+)
+CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET = (
+    "field_canary_previous_host_dispatch_proof_secret"
+)
+
+# Dedicated HA-only signer for authenticated voice intent.  Empty keeps the
+# ordinary voice/decision path available but does not mint user authority.
+CONF_USER_INTENT_DELEGATION_SECRET = "user_intent_delegation_secret"
+
 DEVICE_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
 
 # Config entry keys

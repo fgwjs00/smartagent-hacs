@@ -8,6 +8,10 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .admin_actor import current_human_admin_for_entity_call
+from .maintenance_delegation_publisher import (
+    MaintenanceDelegationPublisherError,
+)
 from .const import (
     CONF_AI_ENABLED,
     CONF_SENSORS_MUTED,
@@ -24,6 +28,17 @@ from .const import (
     ENTITY_VISION,
 )
 from .coordinator import SmartAgentCoordinator
+
+
+async def _require_current_human_admin(entity):
+    """Fail closed unless this entity service call is from a current HA admin."""
+
+    user = await current_human_admin_for_entity_call(entity.hass, entity)
+    if user is None:
+        raise HomeAssistantError(
+            "仅当前有效的 Home Assistant 管理员可修改 SmartAgent 策略"
+        )
+    return user
 
 
 async def async_setup_entry(
@@ -69,12 +84,40 @@ class SmartAgentPausedSwitch(CoordinatorEntity, SwitchEntity):
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
     async def async_turn_on(self, **kwargs) -> None:
+        admin_user = await _require_current_human_admin(self)
+        publisher = getattr(
+            self.coordinator, "_maintenance_delegation_publisher", None
+        )
+        if publisher is None or publisher.enabled is not True:
+            raise HomeAssistantError(
+                "维护授权入口未启用，AI 智能托管仍保持暂停"
+            )
+        try:
+            result = await publisher.async_enable_ai_management(
+                user=admin_user,
+                admin_context=self._context,
+            )
+        except MaintenanceDelegationPublisherError as exc:
+            self.coordinator._sys_log(
+                "WARNING",
+                f"[MaintenanceDelegation] AI 智能托管恢复失败: {exc}",
+            )
+            raise HomeAssistantError(
+                "维护授权或状态回读失败，AI 智能托管仍保持暂停"
+            ) from exc
+        if (
+            result.get("effect_status") != "verified_success"
+            or result.get("device_effect_authority") != "none"
+        ):
+            raise HomeAssistantError(
+                "AI 智能托管恢复未获得可验证回执，当前保持暂停"
+            )
         self.coordinator._enabled = True
         self._attr_is_on = True
-        self._persist(True)
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         self.coordinator._enabled = False
         self._attr_is_on = False
         self._persist(False)
@@ -113,6 +156,7 @@ class SmartAgentSensorMuteSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs) -> None:
         """开启传感器静默：所有 binary_sensor / sensor 事件不触发推理."""
+        await _require_current_human_admin(self)
         self.coordinator._sensors_muted = True
         self._attr_is_on = True
         self._persist(True)
@@ -121,6 +165,7 @@ class SmartAgentSensorMuteSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         """关闭传感器静默：恢复正常监听."""
+        await _require_current_human_admin(self)
         self.coordinator._sensors_muted = False
         self._attr_is_on = False
         self._persist(False)
@@ -177,6 +222,7 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         return True
 
     async def async_turn_on(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         # add-on first：先反写 add-on（真源）；写失败则 fail-closed，不翻转内存态/不持久化/不记成功。
         if not await self._push_to_addon("learning_mode", True):
             raise HomeAssistantError("写入 add-on 失败，静默学习模式未开启")
@@ -187,8 +233,31 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
-        if not await self._push_to_addon("learning_mode", False):
-            raise HomeAssistantError("写入 add-on 失败，静默学习模式未关闭")
+        admin_user = await _require_current_human_admin(self)
+        publisher = getattr(
+            self.coordinator, "_maintenance_delegation_publisher", None
+        )
+        if publisher is None or publisher.enabled is not True:
+            raise HomeAssistantError(
+                "维护授权入口未启用，静默学习模式未关闭"
+            )
+        try:
+            result = await publisher.async_disable_learning_mode(
+                user=admin_user,
+                admin_context=self._context,
+            )
+        except MaintenanceDelegationPublisherError as exc:
+            self.coordinator._sys_log(
+                "WARNING",
+                f"[MaintenanceDelegation] learning_mode 关闭失败: {exc}",
+            )
+            raise HomeAssistantError(
+                "维护授权失败，静默学习模式未关闭"
+            ) from exc
+        if result.get("status") not in {"applied", "already_applied", "already_disabled"}:
+            raise HomeAssistantError(
+                "维护授权回执无效，静默学习模式未关闭"
+            )
         self.coordinator._learning_mode = False
         self._attr_is_on = False
         self._persist(False)
@@ -244,6 +313,7 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
         return True
 
     async def async_turn_on(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         if not await self._push_to_addon("habit_proactive", True):
             raise HomeAssistantError("写入 add-on 失败，习惯主动询问未开启")
         self.coordinator._habit_proactive = True
@@ -253,6 +323,7 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         if not await self._push_to_addon("habit_proactive", False):
             raise HomeAssistantError("写入 add-on 失败，习惯主动询问未关闭")
         self.coordinator._habit_proactive = False
@@ -310,6 +381,7 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
         return True
 
     async def async_turn_on(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         if not await self._push_to_addon("frigate_enabled", True):
             raise HomeAssistantError("写入 add-on 失败，Frigate 视觉感知未启用")
         self.coordinator._frigate_enabled = True
@@ -323,6 +395,7 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         if not await self._push_to_addon("frigate_enabled", False):
             raise HomeAssistantError("写入 add-on 失败，Frigate 视觉感知未关闭")
         self.coordinator._frigate_enabled = False
@@ -381,6 +454,7 @@ class SmartAgentVisionSwitch(CoordinatorEntity, SwitchEntity):
         return True
 
     async def async_turn_on(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         if not await self._push_to_addon("vision_enabled", True):
             raise HomeAssistantError("写入 add-on 失败，LLMVision 视觉增强未启用")
         self.coordinator._vision_enabled = True
@@ -390,6 +464,7 @@ class SmartAgentVisionSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
+        await _require_current_human_admin(self)
         if not await self._push_to_addon("vision_enabled", False):
             raise HomeAssistantError("写入 add-on 失败，LLMVision 视觉增强未关闭")
         self.coordinator._vision_enabled = False

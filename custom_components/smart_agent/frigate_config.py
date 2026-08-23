@@ -417,11 +417,14 @@ async def get_cameras_from_frigate_api() -> tuple[list[dict], str]:
     return [], ""
 
 
-async def restart_frigate_addon(hass: Any, addon_slug: str) -> bool:
+async def restart_frigate_addon(
+    hass: Any,
+    addon_slug: str,
+    *,
+    admin_actor_ref: str = "",
+) -> bool:
     """
-    通过 HA Supervisor API 重启 Frigate Add-on。
-
-    使用 SUPERVISOR_TOKEN 环境变量认证（HA OS 标准环境变量）。
+    Quarantined until a sealed, one-use HA-admin delegation is implemented.
 
     Args:
         hass: Home Assistant 实例
@@ -430,41 +433,7 @@ async def restart_frigate_addon(hass: Any, addon_slug: str) -> bool:
     Returns:
         重启请求成功返回 True，失败返回 False。
     """
-    # 方式一：通过 hassio 域服务（更可靠）
-    try:
-        if hass.services.has_service("hassio", "addon_restart"):
-            from .ha_adapter import async_call_service
-
-            await async_call_service(
-                hass,
-                "hassio", "addon_restart",
-                {"addon": addon_slug},
-                blocking=False,
-            )
-            _LOGGER.info("[FrigateConfig] 已通过 hassio 服务发送重启请求: %s", addon_slug)
-            return True
-    except Exception as exc:
-        _LOGGER.debug("[FrigateConfig] hassio 服务重启失败: %s，尝试 Supervisor HTTP API", exc)
-
-    # 方式二：直接调用 Supervisor REST API
-    try:
-        import aiohttp  # noqa: PLC0415
-        token = os.environ.get("SUPERVISOR_TOKEN", "")
-        if not token:
-            _LOGGER.warning("[FrigateConfig] SUPERVISOR_TOKEN 未设置，无法通过 API 重启")
-            return False
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"http://supervisor/addons/{addon_slug}/restart",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    _LOGGER.info("[FrigateConfig] Supervisor API 重启成功: %s", addon_slug)
-                    return True
-                _LOGGER.warning("[FrigateConfig] Supervisor API 返回 %s", resp.status)
-    except Exception as exc:
-        _LOGGER.warning("[FrigateConfig] Supervisor API 重启失败: %s", exc)
-
+    _LOGGER.warning(
+        "[FrigateConfig] restart denied: sealed admin maintenance delegation not implemented"
+    )
     return False

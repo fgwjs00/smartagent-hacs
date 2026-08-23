@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from aiohttp import web
 
+from .admin_actor import is_current_human_admin
 from .ha_adapter import async_merge_ha_area
 
 
@@ -25,7 +26,7 @@ class RoomMergeViewMixin:
 
     async def post(self, request: web.Request, room_id: str) -> web.Response:
         user = request.get("hass_user")
-        if user is not None and not user.is_admin:
+        if not is_current_human_admin(user):
             return self.json(_error_payload("forbidden_admin_required", "auth_failed", scope="rooms_merge"), status_code=403)
         try:
             body = await request.json()

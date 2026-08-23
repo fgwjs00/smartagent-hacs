@@ -16,6 +16,7 @@ class ServiceRegistration:
 
 
 SERVICE_REGISTRATION_NAMES: tuple[str, ...] = (
+    "authorize_pairing",
     "discover_devices",
     "sync_rooms_to_ha",
     "save_room_topology",
@@ -32,6 +33,7 @@ SERVICE_REGISTRATION_NAMES: tuple[str, ...] = (
     "manual_inference",
     "clear_overrides",
     "report_correction",
+    "dismiss_ai_action",
     "delete_behavior_pattern",
     "set_mode",
     "set_showroom_scene",
@@ -53,7 +55,6 @@ SERVICE_REGISTRATION_NAMES: tuple[str, ...] = (
 )
 SERVICE_UNLOAD_NAMES: tuple[str, ...] = (
     *SERVICE_REGISTRATION_NAMES,
-    "dismiss_ai_action",
 )
 
 

@@ -30,27 +30,8 @@ V1_HOST_BRIDGE_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentDevicePairConfirmView",
 )
 
-# These views authenticate in HA, but their calibration and firmware truth is
-# owned by the add-on through typed AddOnClient calls. Keep that boundary
-# visible instead of treating them as additional HASS-bound host views.
-ADDON_OWNED_MAINTENANCE_VIEW_CLASS_NAMES: tuple[str, ...] = (
-    "SmartAgentEnvironmentCalibrationView",
-    "SmartAgentEnvironmentCalibrationSamplesView",
-    "SmartAgentEnvironmentCalibrationSuggestionsView",
-    "SmartAgentEnvironmentCalibrationApplyView",
-    "SmartAgentEnvironmentCalibrationRollbackView",
-    "SmartAgentFirmwareImagesView",
-    "SmartAgentDeviceFirmwareView",
-    "SmartAgentDeviceFirmwarePlanView",
-    "SmartAgentDeviceFirmwareExecuteView",
-    "SmartAgentDeviceFirmwareRetryView",
-    "SmartAgentDeviceFirmwareCancelView",
-    "SmartAgentDeviceFirmwareTransactionView",
-)
-
 V1_VIEW_CLASS_NAMES: tuple[str, ...] = (
     *V1_HOST_BRIDGE_VIEW_CLASS_NAMES,
-    *ADDON_OWNED_MAINTENANCE_VIEW_CLASS_NAMES,
 )
 
 POST_V1_HOST_VIEW_CLASS_NAMES: tuple[str, ...] = (
@@ -61,9 +42,9 @@ HASS_BOUND_VIEW_CLASS_NAMES: tuple[str, ...] = (
 
 _HASS_BOUND_VIEW_CLASSES: Mapping[str, Any] = {}
 
-# Device-maintenance HTTP ownership remains in the add-on. HA callers use the
-# typed AddOnClient methods and never register a second LD2410 truth surface.
-ADDON_OWNED_DEVICE_MAINTENANCE_DOMAINS: tuple[str, ...] = ("ld2410", "environment_calibration", "firmware")
+# Sensor OTA and temperature/humidity offset management are owned by the
+# device mini-program. SmartAgent keeps only LD2410 radar maintenance active.
+ADDON_OWNED_DEVICE_MAINTENANCE_DOMAINS: tuple[str, ...] = ("ld2410",)
 
 
 def register_v1_views(hass: Any, view_namespace: Mapping[str, Any]) -> None:

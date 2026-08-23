@@ -1,6 +1,8 @@
 """Config flow for SmartAgent: engine -> connect, with add-on connection options."""
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -15,6 +17,36 @@ from .const import (
     CONF_ADDON_AUTH_TOKEN,
     CONF_ADDON_BASE_URL,
     CONF_CLEANUP_LEGACY_PAIR_TOKENS,
+    CONF_REFRESH_REGISTRY_SOURCE_ENABLED,
+    CONF_REFRESH_REGISTRY_INGRESS_URL,
+    CONF_REFRESH_REGISTRY_SITE_ID,
+    CONF_REFRESH_REGISTRY_INGRESS_SECRET,
+    CONF_REFRESH_REGISTRY_ATTESTATION_SECRET,
+    DEFAULT_REFRESH_REGISTRY_INGRESS_URL,
+    CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED,
+    CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET,
+    CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET,
+    CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET,
+    CONF_OUTPUT_LEDGER_INGRESS_ENABLED,
+    CONF_OUTPUT_LEDGER_INGRESS_URL,
+    CONF_OUTPUT_LEDGER_INGRESS_SECRET,
+    CONF_OUTPUT_LEDGER_ATTESTATION_SECRET,
+    DEFAULT_OUTPUT_LEDGER_INGRESS_URL,
+    CONF_MAINTENANCE_CHANGE_INGRESS_ENABLED,
+    CONF_MAINTENANCE_CHANGE_INGRESS_URL,
+    CONF_MAINTENANCE_CHANGE_INGRESS_SECRET,
+    CONF_MAINTENANCE_DELEGATION_ATTESTATION_SECRET,
+    DEFAULT_MAINTENANCE_CHANGE_INGRESS_URL,
+    CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_ENABLED,
+    CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL,
+    CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_SECRET,
+    CONF_FIELD_CANARY_OPERATOR_IDENTITY_ATTESTATION_SECRET,
+    CONF_FIELD_CANARY_OPERATOR_IDENTITY_PREVIOUS_ATTESTATION_SECRET,
+    DEFAULT_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL,
+    CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED,
+    CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET,
+    CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET,
+    CONF_USER_INTENT_DELEGATION_SECRET,
     CONF_OLLAMA_URL,
     CONF_OLLAMA_MODEL,
     CONF_ONLINE_API_KEY,
@@ -65,6 +97,7 @@ from .const import (
     LOCAL_MODELS_SUGGESTIONS,
 )
 from .addon_client import derive_addon_gateway_base_url
+from .security_channel_secrets import security_channel_secret_mapping_is_valid
 
 
 # 供应商下拉选项
@@ -286,10 +319,379 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
         errors: dict = {}
 
         if user_input is not None:
+            refresh_enabled = (
+                user_input.get(CONF_REFRESH_REGISTRY_SOURCE_ENABLED, False) is True
+            )
+            refresh_url_raw = user_input.get(CONF_REFRESH_REGISTRY_INGRESS_URL) or ""
+            refresh_site_raw = user_input.get(CONF_REFRESH_REGISTRY_SITE_ID) or ""
+            refresh_url = (
+                refresh_url_raw.strip() if type(refresh_url_raw) is str else ""
+            )
+            refresh_site = (
+                refresh_site_raw.strip() if type(refresh_site_raw) is str else ""
+            )
+            refresh_ingress_secret = user_input.get(
+                CONF_REFRESH_REGISTRY_INGRESS_SECRET, ""
+            )
+            refresh_attestation_secret = user_input.get(
+                CONF_REFRESH_REGISTRY_ATTESTATION_SECRET, ""
+            )
+            provider_runtime_enabled_value = user_input.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED,
+                False,
+            )
+            provider_runtime_enabled = provider_runtime_enabled_value is True
+            provider_request_secret = user_input.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET,
+                "",
+            )
+            provider_previous_request_secret = user_input.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET,
+                "",
+            )
+            provider_replay_integrity_secret = user_input.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET,
+                "",
+            )
+            output_enabled_value = user_input.get(
+                CONF_OUTPUT_LEDGER_INGRESS_ENABLED,
+                False,
+            )
+            output_enabled = output_enabled_value is True
+            output_url_raw = user_input.get(
+                CONF_OUTPUT_LEDGER_INGRESS_URL,
+                "",
+            )
+            output_url = (
+                output_url_raw.strip()
+                if type(output_url_raw) is str
+                else ""
+            )
+            output_ingress_secret = user_input.get(
+                CONF_OUTPUT_LEDGER_INGRESS_SECRET,
+                "",
+            )
+            output_attestation_secret = user_input.get(
+                CONF_OUTPUT_LEDGER_ATTESTATION_SECRET,
+                "",
+            )
+            maintenance_enabled_value = user_input.get(
+                CONF_MAINTENANCE_CHANGE_INGRESS_ENABLED,
+                False,
+            )
+            maintenance_enabled = maintenance_enabled_value is True
+            maintenance_url_raw = user_input.get(
+                CONF_MAINTENANCE_CHANGE_INGRESS_URL,
+                "",
+            )
+            maintenance_url = (
+                maintenance_url_raw.strip()
+                if type(maintenance_url_raw) is str
+                else ""
+            )
+            maintenance_ingress_secret = user_input.get(
+                CONF_MAINTENANCE_CHANGE_INGRESS_SECRET,
+                "",
+            )
+            maintenance_attestation_secret = user_input.get(
+                CONF_MAINTENANCE_DELEGATION_ATTESTATION_SECRET,
+                "",
+            )
+            operator_enabled = (
+                user_input.get(
+                    CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_ENABLED, False
+                )
+                is True
+            )
+            operator_url_raw = user_input.get(
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL
+            ) or ""
+            operator_url = (
+                operator_url_raw.strip()
+                if type(operator_url_raw) is str
+                else ""
+            )
+            operator_ingress_secret = user_input.get(
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_SECRET, ""
+            )
+            operator_attestation_secret = user_input.get(
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_ATTESTATION_SECRET, ""
+            )
+            operator_previous_attestation_secret = user_input.get(
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_PREVIOUS_ATTESTATION_SECRET,
+                "",
+            )
+            host_proof_enabled = (
+                user_input.get(
+                    CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED,
+                    False,
+                )
+                is True
+            )
+            host_proof_secret_raw = user_input.get(
+                CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET,
+                "",
+            )
+            previous_host_proof_secret_raw = user_input.get(
+                CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET,
+                "",
+            )
+            host_proof_secret = (
+                host_proof_secret_raw.strip()
+                if type(host_proof_secret_raw) is str
+                else ""
+            )
+            previous_host_proof_secret = (
+                previous_host_proof_secret_raw.strip()
+                if type(previous_host_proof_secret_raw) is str
+                else ""
+            )
+            user_intent_delegation_secret = user_input.get(
+                CONF_USER_INTENT_DELEGATION_SECRET,
+                "",
+            )
+            if refresh_enabled:
+                parsed_refresh_url = urlsplit(refresh_url)
+                refresh_texts = (
+                    refresh_site,
+                    refresh_ingress_secret,
+                    refresh_attestation_secret,
+                )
+                if (
+                    parsed_refresh_url.scheme not in {"http", "https"}
+                    or type(refresh_url_raw) is not str
+                    or type(refresh_site_raw) is not str
+                    or not parsed_refresh_url.hostname
+                    or parsed_refresh_url.username is not None
+                    or parsed_refresh_url.password is not None
+                    or parsed_refresh_url.query
+                    or parsed_refresh_url.fragment
+                    or parsed_refresh_url.path not in {"", "/"}
+                    or any(type(value) is not str for value in refresh_texts)
+                    or not refresh_site
+                    or refresh_site != refresh_site.strip()
+                    or len(refresh_ingress_secret) < 32
+                    or len(refresh_attestation_secret) < 32
+                    or refresh_ingress_secret != refresh_ingress_secret.strip()
+                    or refresh_attestation_secret
+                    != refresh_attestation_secret.strip()
+                    or refresh_ingress_secret == refresh_attestation_secret
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for value in refresh_texts
+                        for character in value
+                    )
+                ):
+                    errors["base"] = "invalid_refresh_registry_config"
+                    user_input = None
+            if user_input is not None and operator_enabled:
+                parsed_operator_url = urlsplit(operator_url)
+                operator_secrets = (
+                    operator_ingress_secret,
+                    operator_attestation_secret,
+                )
+                optional_operator_secrets = (
+                    operator_previous_attestation_secret,
+                )
+                all_operator_values = operator_secrets + tuple(
+                    value for value in optional_operator_secrets if value
+                )
+                if (
+                    type(operator_url_raw) is not str
+                    or parsed_operator_url.scheme not in {"http", "https"}
+                    or not parsed_operator_url.hostname
+                    or parsed_operator_url.username is not None
+                    or parsed_operator_url.password is not None
+                    or parsed_operator_url.query
+                    or parsed_operator_url.fragment
+                    or parsed_operator_url.path not in {"", "/"}
+                    or any(type(value) is not str for value in all_operator_values)
+                    or any(len(value) < 32 for value in all_operator_values)
+                    or any(value != value.strip() for value in all_operator_values)
+                    or len(set(all_operator_values)) != len(all_operator_values)
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for value in all_operator_values
+                        for character in value
+                    )
+                ):
+                    errors["base"] = "invalid_field_canary_operator_identity_config"
+                    user_input = None
+            if user_input is not None and (
+                provider_runtime_enabled
+                or bool(provider_request_secret)
+                or bool(provider_previous_request_secret)
+                or bool(provider_replay_integrity_secret)
+            ):
+                provider_secrets = (
+                    provider_request_secret,
+                    provider_previous_request_secret,
+                    provider_replay_integrity_secret,
+                )
+                nonempty_provider_secrets = tuple(
+                    value for value in provider_secrets if value
+                )
+                if (
+                    type(provider_runtime_enabled_value) is not bool
+                    or any(type(value) is not str for value in provider_secrets)
+                    or (
+                        provider_runtime_enabled
+                        and (
+                            not provider_request_secret
+                            or not provider_replay_integrity_secret
+                        )
+                    )
+                    or any(
+                        len(value) < 32 for value in nonempty_provider_secrets
+                    )
+                    or any(
+                        value != value.strip()
+                        for value in nonempty_provider_secrets
+                    )
+                    or len(set(nonempty_provider_secrets))
+                    != len(nonempty_provider_secrets)
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for value in nonempty_provider_secrets
+                        for character in value
+                    )
+                ):
+                    errors["base"] = (
+                        "invalid_observation_refresh_provider_config"
+                    )
+                    user_input = None
+            if user_input is not None and output_enabled:
+                parsed_output_url = urlsplit(output_url)
+                output_secrets = (
+                    output_ingress_secret,
+                    output_attestation_secret,
+                )
+                if (
+                    type(output_enabled_value) is not bool
+                    or type(output_url_raw) is not str
+                    or parsed_output_url.scheme not in {"http", "https"}
+                    or not parsed_output_url.hostname
+                    or parsed_output_url.username is not None
+                    or parsed_output_url.password is not None
+                    or parsed_output_url.query
+                    or parsed_output_url.fragment
+                    or parsed_output_url.path not in {"", "/"}
+                    or any(type(value) is not str for value in output_secrets)
+                    or any(len(value) < 32 for value in output_secrets)
+                    or any(value != value.strip() for value in output_secrets)
+                    or len(set(output_secrets)) != len(output_secrets)
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for value in output_secrets
+                        for character in value
+                    )
+                ):
+                    errors["base"] = "invalid_output_ledger_config"
+                    user_input = None
+            if user_input is not None and maintenance_enabled:
+                parsed_maintenance_url = urlsplit(maintenance_url)
+                maintenance_secrets = (
+                    maintenance_ingress_secret,
+                    maintenance_attestation_secret,
+                )
+                if (
+                    type(maintenance_enabled_value) is not bool
+                    or type(maintenance_url_raw) is not str
+                    or parsed_maintenance_url.scheme not in {"http", "https"}
+                    or not parsed_maintenance_url.hostname
+                    or parsed_maintenance_url.username is not None
+                    or parsed_maintenance_url.password is not None
+                    or parsed_maintenance_url.query
+                    or parsed_maintenance_url.fragment
+                    or parsed_maintenance_url.path not in {"", "/"}
+                    or any(type(value) is not str for value in maintenance_secrets)
+                    or any(len(value) < 32 for value in maintenance_secrets)
+                    or any(value != value.strip() for value in maintenance_secrets)
+                    or len(set(maintenance_secrets)) != len(maintenance_secrets)
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for value in maintenance_secrets
+                        for character in value
+                    )
+                ):
+                    errors["base"] = "invalid_maintenance_change_ingress_config"
+                    user_input = None
+            if user_input is not None and (
+                host_proof_enabled
+                or bool(host_proof_secret_raw)
+                or bool(previous_host_proof_secret_raw)
+            ):
+                host_proof_values = (
+                    host_proof_secret,
+                    previous_host_proof_secret,
+                )
+                nonempty_host_proof_values = tuple(
+                    value for value in host_proof_values if value
+                )
+                addon_auth_token = user_input.get(CONF_ADDON_AUTH_TOKEN) or ""
+                if (
+                    type(host_proof_secret_raw) is not str
+                    or type(previous_host_proof_secret_raw) is not str
+                    or type(addon_auth_token) is not str
+                    or (host_proof_enabled and not host_proof_secret)
+                    or any(len(value) < 32 for value in nonempty_host_proof_values)
+                    or host_proof_secret_raw != host_proof_secret
+                    or previous_host_proof_secret_raw
+                    != previous_host_proof_secret
+                    or len(set(nonempty_host_proof_values))
+                    != len(nonempty_host_proof_values)
+                    or addon_auth_token.strip() in nonempty_host_proof_values
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for value in nonempty_host_proof_values
+                        for character in value
+                    )
+                ):
+                    errors["base"] = (
+                        "invalid_field_canary_host_dispatch_proof_config"
+                    )
+                    user_input = None
+            if user_input is not None and not (
+                security_channel_secret_mapping_is_valid(user_input)
+            ):
+                errors["base"] = "invalid_security_channel_secret_separation"
+                user_input = None
+            if user_input is None:
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=self._options_schema(d),
+                    errors=errors,
+                )
             saved = {
                 CONF_ADDON_BASE_URL: (user_input.get(CONF_ADDON_BASE_URL) or "").strip(),
                 CONF_ADDON_AUTH_TOKEN: (user_input.get(CONF_ADDON_AUTH_TOKEN) or "").strip(),
                 CONF_CLEANUP_LEGACY_PAIR_TOKENS: bool(user_input.get(CONF_CLEANUP_LEGACY_PAIR_TOKENS, False)),
+                CONF_REFRESH_REGISTRY_SOURCE_ENABLED: refresh_enabled,
+                CONF_REFRESH_REGISTRY_INGRESS_URL: refresh_url,
+                CONF_REFRESH_REGISTRY_SITE_ID: refresh_site,
+                CONF_REFRESH_REGISTRY_INGRESS_SECRET: refresh_ingress_secret,
+                CONF_REFRESH_REGISTRY_ATTESTATION_SECRET: refresh_attestation_secret,
+                CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED: provider_runtime_enabled,
+                CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET: provider_request_secret,
+                CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET: provider_previous_request_secret,
+                CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET: provider_replay_integrity_secret,
+                CONF_OUTPUT_LEDGER_INGRESS_ENABLED: output_enabled,
+                CONF_OUTPUT_LEDGER_INGRESS_URL: output_url,
+                CONF_OUTPUT_LEDGER_INGRESS_SECRET: output_ingress_secret,
+                CONF_OUTPUT_LEDGER_ATTESTATION_SECRET: output_attestation_secret,
+                CONF_MAINTENANCE_CHANGE_INGRESS_ENABLED: maintenance_enabled,
+                CONF_MAINTENANCE_CHANGE_INGRESS_URL: maintenance_url,
+                CONF_MAINTENANCE_CHANGE_INGRESS_SECRET: maintenance_ingress_secret,
+                CONF_MAINTENANCE_DELEGATION_ATTESTATION_SECRET: maintenance_attestation_secret,
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_ENABLED: operator_enabled,
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL: operator_url,
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_SECRET: operator_ingress_secret,
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_ATTESTATION_SECRET: operator_attestation_secret,
+                CONF_FIELD_CANARY_OPERATOR_IDENTITY_PREVIOUS_ATTESTATION_SECRET: operator_previous_attestation_secret,
+                CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED: host_proof_enabled,
+                CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET: host_proof_secret,
+                CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET: previous_host_proof_secret,
+                CONF_USER_INTENT_DELEGATION_SECRET: user_intent_delegation_secret,
             }
             return self.async_create_entry(title="", data=saved)
 
@@ -297,13 +699,79 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({
+            data_schema=self._options_schema(d, addon_base_default=addon_base_default),
+            errors=errors,
+        )
+
+    def _options_schema(
+        self, d: dict, *, addon_base_default: str | None = None
+    ) -> vol.Schema:
+        if addon_base_default is None:
+            addon_base_default = (
+                (d.get(CONF_ADDON_BASE_URL) or "").strip()
+                or _suggest_addon_base_url(self.hass)
+            )
+        return vol.Schema({
                 vol.Optional(CONF_ADDON_BASE_URL,
                              default=addon_base_default): str,
                 vol.Optional(CONF_ADDON_AUTH_TOKEN,
                              default=d.get(CONF_ADDON_AUTH_TOKEN, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED,
+                             default=d.get(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED, False)): bool,
+                vol.Optional(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET,
+                             default=d.get(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET,
+                             default=d.get(CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_USER_INTENT_DELEGATION_SECRET,
+                             default=d.get(CONF_USER_INTENT_DELEGATION_SECRET, "")): _PASSWORD_SELECTOR,
                 vol.Optional(CONF_CLEANUP_LEGACY_PAIR_TOKENS,
                              default=d.get(CONF_CLEANUP_LEGACY_PAIR_TOKENS, False)): bool,
-            }),
-            errors=errors,
-        )
+                vol.Optional(CONF_REFRESH_REGISTRY_SOURCE_ENABLED,
+                             default=d.get(CONF_REFRESH_REGISTRY_SOURCE_ENABLED, False)): bool,
+                vol.Optional(CONF_REFRESH_REGISTRY_INGRESS_URL,
+                             default=d.get(CONF_REFRESH_REGISTRY_INGRESS_URL,
+                                           DEFAULT_REFRESH_REGISTRY_INGRESS_URL)): str,
+                vol.Optional(CONF_REFRESH_REGISTRY_SITE_ID,
+                             default=d.get(CONF_REFRESH_REGISTRY_SITE_ID, "")): str,
+                vol.Optional(CONF_REFRESH_REGISTRY_INGRESS_SECRET,
+                             default=d.get(CONF_REFRESH_REGISTRY_INGRESS_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_REFRESH_REGISTRY_ATTESTATION_SECRET,
+                             default=d.get(CONF_REFRESH_REGISTRY_ATTESTATION_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED,
+                             default=d.get(CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED, False)): bool,
+                vol.Optional(CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET,
+                             default=d.get(CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET,
+                             default=d.get(CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET,
+                             default=d.get(CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_OUTPUT_LEDGER_INGRESS_ENABLED,
+                             default=d.get(CONF_OUTPUT_LEDGER_INGRESS_ENABLED, False)): bool,
+                vol.Optional(CONF_OUTPUT_LEDGER_INGRESS_URL,
+                             default=d.get(CONF_OUTPUT_LEDGER_INGRESS_URL,
+                                           DEFAULT_OUTPUT_LEDGER_INGRESS_URL)): str,
+                vol.Optional(CONF_OUTPUT_LEDGER_INGRESS_SECRET,
+                             default=d.get(CONF_OUTPUT_LEDGER_INGRESS_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_OUTPUT_LEDGER_ATTESTATION_SECRET,
+                             default=d.get(CONF_OUTPUT_LEDGER_ATTESTATION_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_MAINTENANCE_CHANGE_INGRESS_ENABLED,
+                             default=d.get(CONF_MAINTENANCE_CHANGE_INGRESS_ENABLED, False)): bool,
+                vol.Optional(CONF_MAINTENANCE_CHANGE_INGRESS_URL,
+                             default=d.get(CONF_MAINTENANCE_CHANGE_INGRESS_URL,
+                                           DEFAULT_MAINTENANCE_CHANGE_INGRESS_URL)): str,
+                vol.Optional(CONF_MAINTENANCE_CHANGE_INGRESS_SECRET,
+                             default=d.get(CONF_MAINTENANCE_CHANGE_INGRESS_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_MAINTENANCE_DELEGATION_ATTESTATION_SECRET,
+                             default=d.get(CONF_MAINTENANCE_DELEGATION_ATTESTATION_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_ENABLED,
+                             default=d.get(CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_ENABLED, False)): bool,
+                vol.Optional(CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL,
+                             default=d.get(CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL,
+                                           DEFAULT_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL)): str,
+                vol.Optional(CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_SECRET,
+                             default=d.get(CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_FIELD_CANARY_OPERATOR_IDENTITY_ATTESTATION_SECRET,
+                             default=d.get(CONF_FIELD_CANARY_OPERATOR_IDENTITY_ATTESTATION_SECRET, "")): _PASSWORD_SELECTOR,
+                vol.Optional(CONF_FIELD_CANARY_OPERATOR_IDENTITY_PREVIOUS_ATTESTATION_SECRET,
+                             default=d.get(CONF_FIELD_CANARY_OPERATOR_IDENTITY_PREVIOUS_ATTESTATION_SECRET, "")): _PASSWORD_SELECTOR,
+            })

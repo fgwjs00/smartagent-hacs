@@ -11,8 +11,17 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from .admin_actor import is_current_human_admin
 from .const import DOMAIN
 from .coordinator import SmartAgentCoordinator
+from .field_canary_operator_identity_publisher import (
+    FieldCanaryOperatorIdentityPublisherError,
+    async_commit_current_operator_promotion_grant_revocation,
+    async_issue_current_operator_promotion_grant,
+    async_prepare_current_operator_promotion_grant_revocation,
+    async_publish_current_operator_approval,
+    async_publish_current_operator_identity,
+)
 from .ha_adapter import (
     get_ai_scenes_cache_snapshot,
     get_device_info_snapshot,
@@ -63,7 +72,7 @@ def build_smart_agent_websocket_commands(
         WS 面板注册时已 require_admin=True，此校验为纵深防御，
         防止非管理员用户绕过 UI 直接调用 WebSocket 命令。
         """
-        if not connection.user.is_admin:
+        if not is_current_human_admin(getattr(connection, "user", None)):
             connection.send_error(msg_id, "forbidden", "Admin access required")
             return False
         return True
@@ -771,6 +780,297 @@ def build_smart_agent_websocket_commands(
         except Exception as e:
             connection.send_error(msg["id"], "error", str(e))
 
+    @websocket_api.websocket_command({
+        vol.Required("type"): "smart_agent/field_canary/operator_identity/attest",
+        vol.Required("approval_definition_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_attest_field_canary_operator_identity(
+        hass: HomeAssistant, connection, msg: dict
+    ) -> None:
+        """Persist the exact current admin-session identity; never an approval."""
+
+        if not _require_admin(connection, msg["id"]):
+            return
+        coord = _get_coord(hass)
+        entry = getattr(coord, "_entry", None) if coord is not None else None
+        if entry is None:
+            connection.send_error(
+                msg["id"], "not_found", "SmartAgent configuration is unavailable"
+            )
+            return
+        try:
+            result = await async_publish_current_operator_identity(
+                hass,
+                entry,
+                connection,
+                approval_definition_id=msg["approval_definition_id"],
+            )
+        except FieldCanaryOperatorIdentityPublisherError:
+            connection.send_error(
+                msg["id"],
+                "operator_identity_rejected",
+                "当前管理员会话身份未能持久化",
+            )
+            return
+        connection.send_result(
+            msg["id"],
+            {
+                "ok": result.get("canonical_operator_identity_verified") is True,
+                "disposition": result.get("disposition", "identity_not_committed"),
+                "canonical_operator_identity_verified": result.get(
+                    "canonical_operator_identity_verified", False
+                ),
+                "approval_record_issued": False,
+                "promotion_grant_issued": False,
+                "execution_eligible": False,
+                "execution_permitted": False,
+                "field_accepted": False,
+                "device_effect_authority": "none",
+            },
+        )
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): "smart_agent/field_canary/operator_approval/publish",
+        vol.Required("approval_definition_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_publish_field_canary_operator_approval(
+        hass: HomeAssistant, connection, msg: dict
+    ) -> None:
+        """Explicitly approve one server-owned proposal as the current admin."""
+
+        if not _require_admin(connection, msg["id"]):
+            return
+        coord = _get_coord(hass)
+        entry = getattr(coord, "_entry", None) if coord is not None else None
+        if entry is None:
+            connection.send_error(
+                msg["id"], "not_found", "SmartAgent configuration is unavailable"
+            )
+            return
+        try:
+            result = await async_publish_current_operator_approval(
+                hass,
+                entry,
+                connection,
+                approval_definition_id=msg["approval_definition_id"],
+            )
+        except FieldCanaryOperatorIdentityPublisherError:
+            connection.send_error(
+                msg["id"],
+                "operator_approval_rejected",
+                "当前管理员会话未能完成该提案审批",
+            )
+            return
+        connection.send_result(
+            msg["id"],
+            {
+                "ok": result.get("approval_record_issued") is True,
+                "disposition": result.get(
+                    "disposition", "approval_not_committed"
+                ),
+                "canonical_operator_identity_verified": result.get(
+                    "canonical_operator_identity_verified", False
+                ),
+                "approval_record_issued": result.get(
+                    "approval_record_issued", False
+                ),
+                "promotion_grant_issued": False,
+                "execution_eligible": False,
+                "execution_permitted": False,
+                "field_accepted": False,
+                "device_effect_authority": "none",
+            },
+        )
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): "smart_agent/field_canary/promotion_grant/issue",
+        vol.Required("approval_definition_id"): str,
+        vol.Required("grant_definition_id"): str,
+        vol.Required("materialization_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_issue_field_canary_promotion_grant(
+        hass: HomeAssistant, connection, msg: dict
+    ) -> None:
+        """Issue one exact non-executable Grant from the current admin gesture."""
+
+        if not _require_admin(connection, msg["id"]):
+            return
+        coord = _get_coord(hass)
+        entry = getattr(coord, "_entry", None) if coord is not None else None
+        if entry is None:
+            connection.send_error(
+                msg["id"], "not_found", "SmartAgent configuration is unavailable"
+            )
+            return
+        try:
+            result = await async_issue_current_operator_promotion_grant(
+                hass,
+                entry,
+                connection,
+                approval_definition_id=msg["approval_definition_id"],
+                grant_definition_id=msg["grant_definition_id"],
+                materialization_id=msg["materialization_id"],
+            )
+        except FieldCanaryOperatorIdentityPublisherError:
+            connection.send_error(
+                msg["id"],
+                "promotion_grant_rejected",
+                "当前管理员手势未能签发该精确 Grant",
+            )
+            return
+        connection.send_result(
+            msg["id"],
+            {
+                "ok": result.get("promotion_grant_issued") is True,
+                "disposition": result.get(
+                    "disposition", "promotion_grant_not_committed"
+                ),
+                "promotion_grant_issued": result.get(
+                    "promotion_grant_issued", False
+                ),
+                "execution_eligible": False,
+                "execution_permitted": False,
+                "field_accepted": False,
+                "device_effect_authority": "none",
+            },
+        )
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): (
+            "smart_agent/field_canary/promotion_grant/revocation/prepare"
+        ),
+        vol.Required("grant_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_prepare_field_canary_promotion_grant_revocation(
+        hass: HomeAssistant, connection, msg: dict
+    ) -> None:
+        """Prepare current-admin approval only; never revoke the Grant."""
+
+        if not _require_admin(connection, msg["id"]):
+            return
+        coord = _get_coord(hass)
+        entry = getattr(coord, "_entry", None) if coord is not None else None
+        if entry is None:
+            connection.send_error(
+                msg["id"], "not_found", "SmartAgent configuration is unavailable"
+            )
+            return
+        try:
+            result = await async_prepare_current_operator_promotion_grant_revocation(
+                hass,
+                entry,
+                connection,
+                grant_id=msg["grant_id"],
+            )
+        except FieldCanaryOperatorIdentityPublisherError:
+            connection.send_error(
+                msg["id"],
+                "promotion_grant_revocation_prepare_rejected",
+                "当前管理员撤销审批准备未完成",
+            )
+            return
+        connection.send_result(
+            msg["id"],
+            {
+                "ok": result.get("disposition") == "revocation_approval_prepared",
+                "disposition": result.get(
+                    "disposition", "revocation_approval_not_prepared"
+                ),
+                "grant_id": result.get("grant_id", ""),
+                "proposal_id": result.get("proposal_id", ""),
+                "approval_record_id": result.get("approval_record_id", ""),
+                "canonical_revoker_identity_verified": result.get(
+                    "canonical_revoker_identity_verified", False
+                ),
+                "approval_record_issued": result.get(
+                    "approval_record_issued", False
+                ),
+                "grant_revocation_authorized": False,
+                "grant_revoked": False,
+                "positive_authority": False,
+                "execution_eligible": False,
+                "execution_permitted": False,
+                "field_accepted": False,
+                "runtime_consumer_enabled": False,
+                "device_effect_authority": "none",
+            },
+        )
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): (
+            "smart_agent/field_canary/promotion_grant/revocation/commit"
+        ),
+        vol.Required("grant_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_commit_field_canary_promotion_grant_revocation(
+        hass: HomeAssistant, connection, msg: dict
+    ) -> None:
+        """Commit one approval-bound current-admin Grant revocation."""
+
+        if not _require_admin(connection, msg["id"]):
+            return
+        coord = _get_coord(hass)
+        entry = getattr(coord, "_entry", None) if coord is not None else None
+        if entry is None:
+            connection.send_error(
+                msg["id"], "not_found", "SmartAgent configuration is unavailable"
+            )
+            return
+        try:
+            result = await async_commit_current_operator_promotion_grant_revocation(
+                hass,
+                entry,
+                connection,
+                grant_id=msg["grant_id"],
+            )
+        except FieldCanaryOperatorIdentityPublisherError:
+            connection.send_error(
+                msg["id"],
+                "promotion_grant_revocation_commit_rejected",
+                "当前管理员撤销提交未完成",
+            )
+            return
+        connection.send_result(
+            msg["id"],
+            {
+                "ok": (
+                    result.get("grant_revocation_authorized") is True
+                    and result.get("grant_revoked") is True
+                ),
+                "disposition": result.get(
+                    "disposition", "promotion_grant_not_revoked"
+                ),
+                "grant_id": result.get("grant_id", ""),
+                "proposal_id": result.get("proposal_id", ""),
+                "receipt_id": result.get("receipt_id", ""),
+                "generic_revocation_id": result.get(
+                    "generic_revocation_id", ""
+                ),
+                "canonical_revoker_identity_verified": result.get(
+                    "canonical_revoker_identity_verified", False
+                ),
+                "approval_record_issued": result.get(
+                    "approval_record_issued", False
+                ),
+                "approval_consumed": result.get("approval_consumed", False),
+                "grant_revocation_authorized": result.get(
+                    "grant_revocation_authorized", False
+                ),
+                "grant_revoked": result.get("grant_revoked", False),
+                "positive_authority": False,
+                "execution_eligible": False,
+                "execution_permitted": False,
+                "field_accepted": False,
+                "runtime_consumer_enabled": False,
+                "device_effect_authority": "none",
+            },
+        )
+
     # ── 传感器管理 WS END ─────────────────────────────────────────────────────
 
     return (
@@ -793,5 +1093,10 @@ def build_smart_agent_websocket_commands(
         ws_save_sensor_type,
         ws_get_room_topology,
         ws_list_backups,
+        ws_attest_field_canary_operator_identity,
+        ws_publish_field_canary_operator_approval,
+        ws_issue_field_canary_promotion_grant,
+        ws_prepare_field_canary_promotion_grant_revocation,
+        ws_commit_field_canary_promotion_grant_revocation,
     )
 

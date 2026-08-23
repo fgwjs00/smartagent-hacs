@@ -24,30 +24,35 @@ from homeassistant.helpers import entity_registry
 from homeassistant.helpers import config_validation as cv
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_CLEANUP_LEGACY_PAIR_TOKENS, DOMAIN, MODE_HOME, MODE_SHOWROOM
-from .environment_calibration_views import (
-    SmartAgentEnvironmentCalibrationApplyView,
-    SmartAgentEnvironmentCalibrationRollbackView,
-    SmartAgentEnvironmentCalibrationSamplesView,
-    SmartAgentEnvironmentCalibrationSuggestionsView,
-    SmartAgentEnvironmentCalibrationView,
+from .const import (
+    CONF_AI_ENABLED,
+    CONF_CLEANUP_LEGACY_PAIR_TOKENS,
+    CONF_REFRESH_REGISTRY_SOURCE_ENABLED,
+    CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED,
+    CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET,
+    CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET,
+    CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET,
+    DOMAIN,
+    MODE_HOME,
+    MODE_SHOWROOM,
 )
-from .device_firmware_views import (
-    SmartAgentDeviceFirmwareCancelView,
-    SmartAgentDeviceFirmwareExecuteView,
-    SmartAgentDeviceFirmwarePlanView,
-    SmartAgentDeviceFirmwareRetryView,
-    SmartAgentDeviceFirmwareTransactionView,
-    SmartAgentDeviceFirmwareView,
-    SmartAgentFirmwareImagesView,
+from .dispatch_proof import (
+    DispatchProofError,
+    async_consume_dispatch_proof,
+    verify_dispatch_proof,
 )
+from .host_dispatch_proof import dispatch_proof_secret_for_ha_request
 from .coordinator import SmartAgentCoordinator, _coerce_file_log_level
+from .config_update_service import apply_config_update_service
+from .admin_actor import is_current_human_admin, is_current_human_user
 from .host_read_models import (
     build_presence_sensors_payload as _build_presence_sensors_payload,
     local_device_rows as _local_device_rows,
     local_room_rows as _local_room_rows,
 )
 from .ha_adapter import (
+    _bind_verified_dispatch_authority,
+    _bind_user_explicit_output_authority,
     async_call_service,
     async_delete_ha_area,
     async_ensure_ha_area,
@@ -59,11 +64,28 @@ from .ha_adapter import (
 )
 from .room_merge_view import RoomMergeViewMixin
 from .sensor_event_filter import EnvironmentTelemetryFilter
+from .listener_registry_runtime import is_explicitly_managed_device_row
+from .security_channel_secrets import security_channel_secret_mapping_is_valid
+from .refresh_registry_publisher import (
+    RefreshRegistryPublisherError,
+    async_publish_refresh_registry_snapshot_once,
+)
 from .service_registration import register_smart_agent_services, remove_smart_agent_services, ServiceRegistration
+from .service_runtime import build_entry_service_runtime
 from .websocket_handlers import build_smart_agent_websocket_commands
 from .websocket_registration import register_smart_agent_websocket_commands
 from .view_registration import register_host_views
 from .ld2410_maintenance_bridge import LD2410MaintenanceMQTTBridge
+from .maintenance_delegation_publisher import (
+    MaintenanceDelegationPublisherError,
+)
+from .observation_refresh_provider_request_attestation import (
+    ObservationRefreshProviderRequestVerificationError,
+)
+from .observation_refresh_provider_view import (
+    make_observation_refresh_provider_view,
+    setup_observation_refresh_provider_view,
+)
 
 
 # AI Scene snake_case/legacy 仅作为迁移兼容入口，统一集中管理。
@@ -196,7 +218,25 @@ def _view_admin_check(request: web.Request):
     """P1修复：HTTP 视图管理员校验。返回 403 Response 或 None（通过）。
     需要认证（requires_auth=True）的视图中使用，在实际业务逻辑前调用。"""
     user = request.get("hass_user")
-    if user is not None and not user.is_admin:
+    method = str(getattr(request, "method", "GET") or "GET").strip().upper()
+    path = str(getattr(request, "path", "") or "").strip()
+    is_write = method in {"POST", "PUT", "PATCH", "DELETE"}
+
+    # Device effects are not admin maintenance.  The exact host execution
+    # endpoint continues to its dedicated peer/header + one-use proof checks.
+    if (
+        is_write
+        and path == "/api/v1/ha/execute"
+        and _is_addon_internal_execute_request(request)
+    ):
+        return None
+
+    rejected = (
+        not is_current_human_admin(user)
+        if is_write
+        else user is not None and getattr(user, "is_admin", None) is not True
+    )
+    if rejected:
         payload = _json_error_payload(
             error="forbidden_admin_required",
             error_type="auth_failed",
@@ -273,6 +313,19 @@ def _is_addon_internal_execute_request(
         == _ADDON_INTERNAL_EXECUTE_CONTRACT
     )
     return bool(header_contract or body_contract) and _is_trusted_addon_proxy_peer(request)
+
+
+def _dispatch_proof_secret_for_request(
+    hass: HomeAssistant,
+    proof: Any,
+    *,
+    request: web.Request | None = None,
+) -> str:
+    return dispatch_proof_secret_for_ha_request(
+        hass,
+        proof,
+        request_bearer=_extract_bearer_token(request) if request is not None else "",
+    )
 
 
 def _ha_log_window_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -821,6 +874,7 @@ class SmartAgentEventsWSView(HomeAssistantView):
             "automation.",
         )
         managed_event_entity_ids: set[str] = set()
+        managed_event_sampling_contracts: dict[str, dict[str, Any]] = {}
         managed_event_entity_ids_updated_at = 0.0
         forward_send_failures = 0
         forward_send_last_warn = 0.0
@@ -828,12 +882,14 @@ class SmartAgentEventsWSView(HomeAssistantView):
 
         def _refresh_managed_event_entity_ids() -> set[str]:
             nonlocal managed_event_entity_ids, managed_event_entity_ids_updated_at
+            nonlocal managed_event_sampling_contracts
             now_monotonic = time.monotonic()
             if managed_event_entity_ids_updated_at and now_monotonic - managed_event_entity_ids_updated_at < 5:
                 return managed_event_entity_ids
 
             coord = _get_first_coordinator(hass)
             next_ids: set[str] = set()
+            next_sampling_contracts: dict[str, dict[str, Any]] = {}
             if coord is not None:
                 for row in _local_device_rows(coord, hass):
                     if not isinstance(row, dict):
@@ -841,11 +897,15 @@ class SmartAgentEventsWSView(HomeAssistantView):
                     entity_id = str(row.get("entity_id") or "").strip()
                     if not entity_id:
                         continue
-                    if row.get("managed") is False or row.get("in_sa") is False:
+                    if not is_explicitly_managed_device_row(row):
                         continue
                     next_ids.add(entity_id)
+                    sampling_contract = row.get("signal_sampling_contract")
+                    if isinstance(sampling_contract, dict):
+                        next_sampling_contracts[entity_id] = dict(sampling_contract)
 
             managed_event_entity_ids = next_ids
+            managed_event_sampling_contracts = next_sampling_contracts
             managed_event_entity_ids_updated_at = now_monotonic
             return managed_event_entity_ids
 
@@ -892,6 +952,11 @@ class SmartAgentEventsWSView(HomeAssistantView):
                     attributes = state_payload.get("attributes")
                     if isinstance(attributes, dict):
                         environment_metadata.update(attributes)
+                sampling_contract = managed_event_sampling_contracts.get(entity_id)
+                if isinstance(sampling_contract, dict):
+                    environment_metadata["signal_sampling_contract"] = dict(
+                        sampling_contract
+                    )
                 environment_decision = environment_event_filter.evaluate(
                     entity_id,
                     (old_state or {}).get("state") if isinstance(old_state, dict) else "",
@@ -1191,8 +1256,51 @@ class SmartAgentHaExecuteView(HomeAssistantView):
                 status_code=403,
             )
 
+        dispatch_proof = body.get("_smartagent_dispatch_proof")
+        proof_secret = _dispatch_proof_secret_for_request(
+            request.app["hass"],
+            dispatch_proof,
+            request=request,
+        )
+        try:
+            verified_proof = verify_dispatch_proof(
+                body,
+                dispatch_proof,
+                secret=proof_secret,
+            )
+        except DispatchProofError as exc:
+            return self.json(
+                _json_error_payload(
+                    str(exc) or "ha_execute_dispatch_proof_invalid",
+                    "forbidden",
+                    False,
+                    execution_path="ha_execute_adapter",
+                ),
+                status_code=403,
+            )
+
         execution_body = dict(body)
         execution_body.pop("_smartagent_transport", None)
+        execution_body.pop("_smartagent_dispatch_proof", None)
+        # A valid one-time proof is a presented bearer.  Burn it durably before
+        # any mutable runtime policy check so a rejected request cannot wait for
+        # the policy state to change and replay the same authorization later.
+        try:
+            await async_consume_dispatch_proof(
+                request.app["hass"],
+                verified_proof,
+            )
+        except DispatchProofError as exc:
+            return self.json(
+                _json_error_payload(
+                    str(exc) or "ha_execute_dispatch_proof_consume_failed",
+                    "forbidden",
+                    False,
+                    execution_path="ha_execute_adapter",
+                ),
+                status_code=409 if str(exc) == "dispatch_proof_replayed" else 503,
+            )
+
         safety = (
             execution_body.get("safety")
             if isinstance(execution_body.get("safety"), dict)
@@ -1218,7 +1326,26 @@ class SmartAgentHaExecuteView(HomeAssistantView):
                     status_code=409,
                 )
 
-        result = await async_execute_command_envelope(request.app["hass"], execution_body)
+        try:
+            dispatch_authority = _bind_verified_dispatch_authority(
+                execution_body,
+                verified_proof,
+            )
+        except ValueError:
+            return self.json(
+                _json_error_payload(
+                    "verified_dispatch_authority_binding_invalid",
+                    "forbidden",
+                    False,
+                    execution_path="ha_execute_adapter",
+                ),
+                status_code=403,
+            )
+        result = await async_execute_command_envelope(
+            request.app["hass"],
+            execution_body,
+            authority=dispatch_authority,
+        )
         status_code = 200 if bool(result.get("ok")) else 409
         error_type = str(result.get("error_type") or "")
         if error_type in {"bad_request", "safety_blocked"}:
@@ -2305,12 +2432,95 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartAgent from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+    security_channel_values = {
+        **dict(entry.data or {}),
+        **dict(entry.options or {}),
+    }
+    if not security_channel_secret_mapping_is_valid(security_channel_values):
+        _LOGGER.error(
+            "SmartAgent setup blocked: dedicated security channel secret "
+            "domains are invalid; update the integration options"
+        )
+        return False
     await _async_cleanup_legacy_pair_tokens_if_enabled(hass, entry)
     await _async_remove_legacy_entities(hass, entry)
     coordinator = SmartAgentCoordinator(hass, entry)
+    maintenance_publisher = getattr(
+        coordinator, "_maintenance_delegation_publisher", None
+    )
+    if maintenance_publisher is not None and maintenance_publisher.enabled is True:
+        requested_ai_enabled = dict(entry.options or {}).get(CONF_AI_ENABLED)
+        if type(requested_ai_enabled) is not bool:
+            coordinator._enabled = False
+            _LOGGER.warning(
+                "[MaintenanceDelegation] AI management startup blocked: "
+                "ai_enabled is not an explicit boolean"
+            )
+        elif requested_ai_enabled is True:
+            coordinator._enabled = False
+            try:
+                recovery = (
+                    await maintenance_publisher.async_reconcile_ai_management_startup()
+                )
+            except MaintenanceDelegationPublisherError as exc:
+                _LOGGER.warning(
+                    "[MaintenanceDelegation] AI management startup reconciliation "
+                    "blocked error=%s",
+                    str(exc),
+                )
+            else:
+                if (
+                    recovery.get("effect_status") == "verified_success"
+                    and recovery.get("device_effect_authority") == "none"
+                    and dict(entry.options or {}).get(CONF_AI_ENABLED) is True
+                ):
+                    coordinator._enabled = True
     await hass.async_add_executor_job(coordinator._blocking_init)
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    provider_options = {
+        **dict(entry.data or {}),
+        **dict(entry.options or {}),
+    }
+    try:
+        provider_view_cleanup = setup_observation_refresh_provider_view(
+            hass=hass,
+            entry_id=entry.entry_id,
+            enabled=provider_options.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED,
+                False,
+            ),
+            request_attestation_secret=provider_options.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_REQUEST_SECRET,
+                "",
+            ),
+            previous_request_attestation_secret=provider_options.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET,
+                "",
+            ),
+            replay_integrity_secret=provider_options.get(
+                CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET,
+                "",
+            ),
+            clock=lambda: dt_util.now(),
+            trusted_peer=_is_trusted_addon_proxy_peer,
+            register_view=lambda: hass.http.register_view(
+                make_observation_refresh_provider_view(
+                    HomeAssistantView,
+                    trusted_peer=_is_trusted_addon_proxy_peer,
+                )()
+            ),
+        )
+    except ObservationRefreshProviderRequestVerificationError as exc:
+        _LOGGER.error(
+            "Observation-refresh Provider view setup blocked: %s",
+            str(exc),
+        )
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        await coordinator.async_shutdown()
+        return False
+    entry.async_on_unload(provider_view_cleanup)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -2325,16 +2535,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, coordinator.async_start_listeners(), "smart_agent_listeners"
     )
 
+    refresh_registry_options = {
+        **dict(entry.data or {}),
+        **dict(entry.options or {}),
+    }
+    if refresh_registry_options.get(CONF_REFRESH_REGISTRY_SOURCE_ENABLED) is True:
+        async def _publish_registry_source_once() -> None:
+            try:
+                await async_publish_refresh_registry_snapshot_once(hass, entry)
+            except RefreshRegistryPublisherError as exc:
+                _LOGGER.warning(
+                    "[RegistrySource] one-shot publication blocked error=%s",
+                    str(exc),
+                )
+            except Exception as exc:
+                _LOGGER.warning(
+                    "[RegistrySource] one-shot publication failed type=%s",
+                    exc.__class__.__name__,
+                )
+
+        entry.async_create_background_task(
+            hass,
+            _publish_registry_source_once(),
+            "smart_agent_refresh_registry_source_once",
+        )
+
     # ── 注册 HA 服务 ──────────────────────────────────────────────
 
     async def _check_admin(call: ServiceCall) -> bool:
-        """P1修复：校验服务调用者是否为管理员，非管理员记录警告并返回 False。
-        系统调用（user_id=None）视为受信任，始终放行。"""
-        uid = call.context.user_id
-        if uid is None:
-            return True
-        user = await hass.auth.async_get_user(uid)
-        if user is None or not user.is_admin:
+        """只接受当前、有效、非系统生成的 HA 管理员。
+
+        automation/系统调用没有当前用户，必须拒绝。未来 maintenance
+        delegation 需使用独立、精确、一次性的合同，不能从 ``user_id=None``
+        推断授权。
+        """
+        context = getattr(call, "context", None)
+        uid = str(getattr(context, "user_id", "") or "").strip()
+        user = await hass.auth.async_get_user(uid) if uid else None
+        if not is_current_human_admin(user):
             _LOGGER.warning(
                 "[Auth] SmartAgent 服务 '%s' 被非管理员调用拒绝（user=%s）",
                 call.service,
@@ -2343,11 +2581,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return False
         return True
 
+    async def _check_current_user(call: ServiceCall) -> bool:
+        """Only accept a current, active, non-system-generated HA user."""
+        context = getattr(call, "context", None)
+        uid = str(getattr(context, "user_id", "") or "").strip()
+        user = await hass.auth.async_get_user(uid) if uid else None
+        if not is_current_human_user(user):
+            _LOGGER.warning(
+                "[Auth] SmartAgent 服务 '%s' 被非当前用户调用拒绝（user=%s）",
+                call.service,
+                user.name if user else uid,
+            )
+            return False
+        return True
+
+    async def svc_authorize_pairing(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
+        await coordinator.async_svc_authorize_pairing(call)
+
     async def svc_discover(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator._async_discover_devices()
 
     async def svc_sync_rooms_to_ha(call: ServiceCall) -> None:
         """将 SmartAgent 的房间信息同步到 HA Area Registry。"""
+        if not await _check_admin(call):
+            return
         await coordinator.async_sync_rooms_to_ha()
 
     async def svc_save_room_topology(call: ServiceCall) -> None:
@@ -2375,19 +2636,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator.async_set_updated_data({})
 
     async def svc_batch_add(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         raw = call.data.get("entities", "")
         entity_ids = [e.strip() for e in raw.split(",") if e.strip()]
         await coordinator.async_batch_add_devices(entity_ids)
 
     async def svc_add_device(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_add_device(
             call.data["entity_id"], call.data["description"]
         )
 
     async def svc_delete_device(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_delete_device(call.data["entity_id"])
 
     async def svc_update_device(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_update_device(
             call.data["entity_id"],
             name=call.data.get("name", ""),
@@ -2398,21 +2667,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     async def svc_add_habit(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_add_habit(call.data["content"])
 
     async def svc_delete_habit(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_delete_habit(call.data["content"])
 
     async def svc_toggle_habit_lock(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_toggle_habit_lock(call.data["content"])
 
     async def svc_add_rule(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_add_rule(call.data["content"])
 
     async def svc_delete_rule(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_delete_rule(call.data["content"])
 
     async def svc_toggle_rule_lock(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_svc_toggle_rule_lock(call.data["content"])
 
     async def svc_manual_inference(call: ServiceCall) -> None:
@@ -2422,20 +2703,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_manual_inference(trigger)
 
     async def svc_clear_overrides(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         await coordinator.async_clear_overrides()
 
+    async def svc_report_correction(call: ServiceCall) -> None:
+        if not await _check_current_user(call):
+            return
+        await coordinator.async_svc_report_correction(call)
+
+    async def svc_dismiss_ai_action(call: ServiceCall) -> None:
+        if not await _check_current_user(call):
+            return
+        await coordinator.async_svc_dismiss_ai_action(call)
+
     async def svc_delete_behavior_pattern(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         pattern_id = call.data.get("id")
         if pattern_id is not None:
             await coordinator.async_delete_behavior_pattern(int(pattern_id))
 
     async def svc_set_mode(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         mode = call.data.get("mode", "home")
         if mode not in (MODE_HOME, MODE_SHOWROOM):
             mode = MODE_HOME
         await coordinator.async_set_mode(mode)
 
     async def svc_set_showroom_scene(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         scene = call.data.get("scene") or None
         if scene == "":
             scene = None
@@ -2446,151 +2745,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
 
-    # ── Phase 4: AI 场景管理服务 ──────────────────────────────────────────────
-    async def _proxy_ai_scene_lifecycle(action: str, scene_id: int) -> None:
-        _addon_client = getattr(coordinator, "_addon_client", None)
-        if _addon_client is None:
-            coordinator._sys_log("WARN", "[AI场景] add-on lifecycle provider unavailable")
-            return
-
-        try:
-            if action == "approve":
-                result = await _addon_client.post_ai_scene_action("approve", scene_id)
-            elif action == "reject":
-                result = await _addon_client.post_ai_scene_action("reject", scene_id)
-            elif action == "delete":
-                result = await _addon_client.post_ai_scene_delete_fallback(scene_id)
-            elif action == "trigger":
-                result = await _addon_client.trigger_ai_scene(scene_id)
-            else:
-                coordinator._sys_log("WARN", f"[AI场景] 不支持的 lifecycle action: {action}")
-                return
-        except Exception as exc:
-            coordinator._sys_log("WARN", f"[AI场景] add-on lifecycle provider 调用失败: {exc}")
-            return
-
-        if not isinstance(result, dict):
-            coordinator._sys_log("WARN", "[AI场景] add-on lifecycle provider unavailable")
-            return
-        status = int(result.get("__status", 200) or 200)
-        if status >= 400 or result.get("ok") is False:
-            error = result.get("error") or result.get("error_type") or f"http_{status}"
-            coordinator._sys_log("WARN", f"[AI场景] add-on lifecycle provider 返回失败: {action} id={scene_id} error={error}")
-            return
-
-        coordinator._sys_log("INFO", f"[AI场景] lifecycle 已交由 add-on provider: {action} id={scene_id}")
-        coordinator.async_set_updated_data({})
-
-    async def svc_approve_ai_scene(call: ServiceCall) -> None:
-        scene_id = int(call.data["id"])
-        await _proxy_ai_scene_lifecycle("approve", scene_id)
-
-    async def svc_reject_ai_scene(call: ServiceCall) -> None:
-        scene_id = int(call.data["id"])
-        await _proxy_ai_scene_lifecycle("reject", scene_id)
-
-    async def svc_delete_ai_scene(call: ServiceCall) -> None:
-        scene_id = int(call.data["id"])
-        await _proxy_ai_scene_lifecycle("delete", scene_id)
-
-    async def svc_trigger_ai_scene(call: ServiceCall) -> None:
-        scene_id = int(call.data["id"])
-        await _proxy_ai_scene_lifecycle("trigger", scene_id)
-
-    _ai_scene_schema = vol.Schema({vol.Required("id"): vol.Coerce(int)})
-
-    # ── 一句话生成场景 ─────────────────────────────────────────────────────────
-    async def svc_create_scene_from_text(call: ServiceCall) -> None:
-        """用自然语言描述直接创建 AI 场景。
-
-        参数：
-          text (str, 必填)：场景描述，如"下午 2 点到 6 点，工作日，打开客厅灯 80%"
-          auto_activate (bool, 可选, 默认 False)：是否跳过审批直接激活
-        """
-        _addon_client = getattr(coordinator, "_addon_client", None)
-        if _addon_client is None:
-            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: create-from-text")
-            return
-        body = {
-            "text": call.data["text"],
-            "auto_activate": bool(call.data.get("auto_activate", False)),
-        }
-        result = await _addon_client.post_ai_scene_ops("ai-scenes/create-from-text", body)
-        if not isinstance(result, dict):
-            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: create-from-text")
-            return
-        status = int(result.get("__status", 200) or 200)
-        if status >= 400 or result.get("ok") is False:
-            error = result.get("error") or result.get("error_type") or f"http_{status}"
-            coordinator._sys_log("WARN", f"[AI场景] add-on create-from-text failed: {error}")
-            return
-        coordinator.hass.bus.async_fire(
-            "smart_agent_scene_created",
-            {"success": result.get("success"), "scene_id": result.get("scene_id"),
-             "name": result.get("name"), "status": result.get("status"),
-             "error": result.get("error", "")},
-        )
-
-    _create_scene_schema = vol.Schema({
-        vol.Required("text"): str,
-        vol.Optional("auto_activate", default=False): bool,
-    })
-
-    # ── Layer 2: 事务管理服务 ──────────────────────────────────────────────────
-    async def svc_rollback_transaction(call: ServiceCall) -> None:
-        """回滚指定事务：将目标设备恢复到执行前的状态快照。"""
-        if not await _check_admin(call):
-            return
-        await coordinator.async_rollback_transaction(int(call.data["id"]))
-
-    async def svc_refresh_transactions(call: ServiceCall) -> None:
-        """刷新事务缓存（优先从 add-on 单一事务属主加载近期记录）。"""
-        _addon_client = getattr(coordinator, "_addon_client", None)
-        if _addon_client is None:
-            coordinator._sys_log("WARN", "[Transaction] refresh unavailable: add-on client missing")
-            return
-        try:
-            payload = await _addon_client.get_transactions()
-        except Exception as exc:
-            coordinator._sys_log("WARN", f"[Transaction] add-on transaction refresh failed: {exc}")
-            return
-        rows: list[dict[str, Any]] = []
-        if isinstance(payload, list):
-            rows = [dict(item) for item in payload if isinstance(item, dict)]
-        elif isinstance(payload, dict):
-            try:
-                status = int(payload.get("__status") or payload.get("status") or 0)
-            except (TypeError, ValueError):
-                status = 0
-            if status >= 400 or payload.get("ok") is False:
-                error = payload.get("error") or payload.get("error_type") or f"http_{status}"
-                coordinator._sys_log("WARN", f"[Transaction] add-on transaction refresh failed: {error}")
-                return
-            for key in ("transactions", "items", "data"):
-                value = payload.get(key)
-                if isinstance(value, list):
-                    rows = [dict(item) for item in value if isinstance(item, dict)]
-                    break
-        else:
-            coordinator._sys_log("WARN", "[Transaction] add-on transaction refresh returned empty result")
-            return
-        coordinator._transactions_cache = rows
-        coordinator.async_set_updated_data({})
-
-    _txn_schema = vol.Schema({vol.Required("id"): vol.Coerce(int)})
 
     async def svc_set_device_control_mode(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         entity_id = call.data["entity_id"]
         mode = call.data["mode"]
         await coordinator.async_set_device_control_mode(entity_id, mode)
 
     async def svc_batch_set_control_mode(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         mode = call.data["mode"]
         room = call.data.get("room", "")
         dev_type = call.data.get("type", "")
         await coordinator.async_batch_set_control_mode(mode, room=room, dev_type=dev_type)
 
     async def svc_update_showroom_scene_config(call: ServiceCall) -> None:
+        if not await _check_admin(call):
+            return
         scene_key = call.data.get("scene_key", "")
         await coordinator.async_update_showroom_scene_config(
             scene_key=scene_key,
@@ -2601,204 +2774,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     async def svc_update_config(call: ServiceCall) -> None:
-        """前端设置面板保存通用配置，持久化到 config entry options。"""
+        await apply_config_update_service(
+            hass,
+            entry,
+            coordinator,
+            call,
+            check_admin=_check_admin,
+            coerce_file_log_level=_coerce_file_log_level,
+        )
+
+
+
+    async def svc_verify_license(call: ServiceCall) -> None:
         if not await _check_admin(call):
             return
-        from .const import (
-            CONF_TTS_SERVICE, CONF_TTS_TARGET, CONF_TTS_LEVEL,
-            CONF_ENGINE, CONF_OLLAMA_URL, CONF_OLLAMA_MODEL,
-            CONF_ONLINE_API_KEY, CONF_ONLINE_BASE_URL, CONF_ONLINE_MODEL,
-            CONF_CONFIDENCE_AUTO, CONF_CONFIDENCE_NOTIFY, CONF_COOLDOWN,
-            CONF_SHOWROOM_BIZ_START, CONF_SHOWROOM_BIZ_END,
-            CONF_SHOWROOM_AREA_NAME, CONF_SHOWROOM_EXCLUDED_SUBAREAS,
-            CONF_SHOWROOM_ZONE_MAP,
-            CONF_FRIGATE_ENABLED, CONF_QWEATHER_API_KEY, CONF_SEARXNG_URL,
-            CONF_CLOUD_FALLBACK, CONF_VISION_ENABLED, CONF_VISION_ENGINE,
-            CONF_VISION_MODEL,
-            CONF_BRAND_NAME, CONF_BRAND_PRIMARY_COLOR, CONF_BRAND_LOGO_URL, CONF_DEPLOY_NAME,
-            CONF_LICENSE_KEY, CONF_LOG_RETENTION, CONF_FILE_LOG_LEVEL,
-            CONF_CLEANUP_LEGACY_PAIR_TOKENS,
-            CONF_PRESENCE_FUSION,
-            CONF_CIRCADIAN_ENABLED, CONF_CIRCADIAN_WAKE_TIME,
-            CONF_CIRCADIAN_SLEEP_TIME, CONF_CIRCADIAN_MAX_BRIGHTNESS,
-            CONF_CIRCADIAN_AUTO_ADJUST,
-        )
-        opts = dict(entry.options or {})
-        
-        # 定义所有可能的配置键及其转换函数
-        conf_map = {
-            "tts_service": (CONF_TTS_SERVICE, str),
-            "tts_target": (CONF_TTS_TARGET, str),
-            "tts_level": (CONF_TTS_LEVEL, int),
-            "engine": (CONF_ENGINE, str),
-            "ollama_url": (CONF_OLLAMA_URL, str),
-            "ollama_model": (CONF_OLLAMA_MODEL, str),
-            "online_api_key": (CONF_ONLINE_API_KEY, str),
-            "online_base_url": (CONF_ONLINE_BASE_URL, str),
-            "online_model": (CONF_ONLINE_MODEL, str),
-            "confidence_auto": (CONF_CONFIDENCE_AUTO, int),
-            "confidence_notify": (CONF_CONFIDENCE_NOTIFY, int),
-            "cooldown": (CONF_COOLDOWN, int),
-            "showroom_biz_start": (CONF_SHOWROOM_BIZ_START, int),
-            "showroom_biz_end": (CONF_SHOWROOM_BIZ_END, int),
-            "showroom_area_name": (CONF_SHOWROOM_AREA_NAME, str),
-            "showroom_excluded_subareas": (CONF_SHOWROOM_EXCLUDED_SUBAREAS, str),
-            "showroom_zone_map": (CONF_SHOWROOM_ZONE_MAP, str),
-            "frigate_enabled": (CONF_FRIGATE_ENABLED, bool),
-            "qweather_api_key": (CONF_QWEATHER_API_KEY, str),
-            "searxng_url": (CONF_SEARXNG_URL, str),
-            "cloud_fallback": (CONF_CLOUD_FALLBACK, bool),
-            "vision_enabled": (CONF_VISION_ENABLED, bool),
-            "vision_engine": (CONF_VISION_ENGINE, str),
-            "vision_model": (CONF_VISION_MODEL, str),
-            "license_key": (CONF_LICENSE_KEY, str),
-            "log_retention_days": (CONF_LOG_RETENTION, int),
-            "file_log_level": (CONF_FILE_LOG_LEVEL, str),
-            "cleanup_legacy_pair_tokens": (CONF_CLEANUP_LEGACY_PAIR_TOKENS, bool),
-            "mcp_enabled": ("mcp_enabled", bool),
-            # 品牌化/白标
-            "brand_name": (CONF_BRAND_NAME, str),
-            "brand_primary_color": (CONF_BRAND_PRIMARY_COLOR, str),
-            "brand_logo_url": (CONF_BRAND_LOGO_URL, str),
-            "deploy_name": (CONF_DEPLOY_NAME, str),
-            # 存在传感器融合域（Phase 12.0）
-            "presence_fusion": (CONF_PRESENCE_FUSION, str),
-            # 昼夜节律引擎（Phase 13）
-            "circadian_enabled": (CONF_CIRCADIAN_ENABLED, bool),
-            "circadian_wake_time": (CONF_CIRCADIAN_WAKE_TIME, str),
-            "circadian_sleep_time": (CONF_CIRCADIAN_SLEEP_TIME, str),
-            "circadian_max_brightness": (CONF_CIRCADIAN_MAX_BRIGHTNESS, int),
-            "circadian_auto_adjust": (CONF_CIRCADIAN_AUTO_ADJUST, bool),
-        }
+        await coordinator.async_svc_verify_license(call)
 
-        import re as _re
-        import json as _json
-        # HH:MM 严格校验：小时 00-23，分钟 00-59
-        _TIME_RE = _re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
-        _TIME_KEYS = {"circadian_wake_time", "circadian_sleep_time"}
-        # 需要合法 JSON 数组或对象的字段，写入前校验
-        _JSON_ARRAY_KEYS = {"presence_fusion"}
-        _JSON_OBJ_KEYS   = {"showroom_zone_map"}
-
-        any_changed = False
-        for key, (conf_key, transform) in conf_map.items():
-            if key in call.data:
-                val = call.data[key]
-                if transform == int:
-                    try:
-                        val = int(val)
-                    except (ValueError, TypeError):
-                        continue
-                elif transform == bool:
-                    # bool("false") == True，需要专门处理字符串布尔值
-                    if isinstance(val, str):
-                        val = val.strip().lower() not in ("false", "0", "no", "off", "")
-                    else:
-                        val = bool(val)
-                elif key in _TIME_KEYS:
-                    # HH:MM 严格格式校验，范围外值（如 99:99）跳过
-                    if not _TIME_RE.match(str(val)):
-                        _LOGGER.warning(
-                            "[Config] %s 格式错误（应为 HH:MM，小时00-23分钟00-59）: %s，已忽略",
-                            key, val
-                        )
-                        continue
-                elif key in _JSON_ARRAY_KEYS:
-                    # P2修复：写入前验证为合法 JSON 数组，防止无效值存入配置导致运行时崩溃
-                    if val and isinstance(val, str):
-                        try:
-                            _parsed = _json.loads(val)
-                            if not isinstance(_parsed, list):
-                                raise ValueError("非数组")
-                        except (ValueError, TypeError) as _je:
-                            _LOGGER.warning("[Config] %s 不是合法 JSON 数组: %s，已忽略", key, _je)
-                            continue
-                elif key in _JSON_OBJ_KEYS:
-                    # P2修复：写入前验证为合法 JSON 对象
-                    if val and isinstance(val, str):
-                        try:
-                            _parsed = _json.loads(val)
-                            if not isinstance(_parsed, dict):
-                                raise ValueError("非对象")
-                        except (ValueError, TypeError) as _je:
-                            _LOGGER.warning("[Config] %s 不是合法 JSON 对象: %s，已忽略", key, _je)
-                            continue
-
-                if opts.get(conf_key) != val:
-                    # 密码型字段保护：前端回显使用掩码（如 **** / sk-xx****yy），
-                    # 空值或掩码值不应覆盖已保存的真实密钥。
-                    if conf_key in (CONF_ONLINE_API_KEY, CONF_QWEATHER_API_KEY, CONF_LICENSE_KEY):
-                        if not str(val or "").strip() or "****" in str(val):
-                            continue
-                    opts[conf_key] = val
-                    # 同步更新 coordinator 内存中的值（JSON 字段保持运行态结构类型）
-                    sync_val = val
-                    if key == "file_log_level":
-                        sync_val = _coerce_file_log_level(val)
-                        coordinator._file_log_level_name = logging.getLevelName(sync_val)
-                        coordinator._file_logger.setLevel(sync_val)
-                    if key in _JSON_OBJ_KEYS and isinstance(val, str):
-                        try:
-                            _obj = _json.loads(val) if val else {}
-                            sync_val = _obj if isinstance(_obj, dict) else {}
-                        except (ValueError, TypeError):
-                            sync_val = {}
-                    attr_name = f"_{key}" if hasattr(coordinator, f"_{key}") else key
-                    if hasattr(coordinator, attr_name):
-                        setattr(coordinator, attr_name, sync_val)
-                    elif hasattr(coordinator, key):
-                        setattr(coordinator, key, sync_val)
-                    any_changed = True
-
-        if any_changed:
-            # Phase 13: 热更新昼夜节律引擎配置
-            _ce = getattr(coordinator, "_circadian_engine", None)
-            if _ce is not None:
-                _ce.update_config(
-                    wake_time=opts.get(CONF_CIRCADIAN_WAKE_TIME),
-                    sleep_time=opts.get(CONF_CIRCADIAN_SLEEP_TIME),
-                    max_brightness=opts.get(CONF_CIRCADIAN_MAX_BRIGHTNESS),
-                    enabled=opts.get(CONF_CIRCADIAN_ENABLED),
-                )
-                coordinator._circadian_auto_adjust = opts.get(CONF_CIRCADIAN_AUTO_ADJUST, False)
-
-            coordinator._skip_next_reload = True
-            hass.config_entries.async_update_entry(entry, options=opts)
-            coordinator.async_set_updated_data(coordinator.get_config_attributes())
-            coordinator._sys_log("INFO", "[配置] 系统参数已更新")
-
-
-    async def svc_tts_test(call: ServiceCall) -> None:
-        """发送一条测试 TTS 播报，验证 TTS 配置是否正确。"""
-        await coordinator._tts_speak("SmartAgent TTS 测试，语音播报正常。", min_level=0)
-
-    async def svc_voice_command(call: ServiceCall) -> None:
-        """处理来自中控屏的语音文本指令"""
-        command = call.data.get("command", "")
-        source = call.data.get("source", "touch")
-        await coordinator._run_voice_inference(command, source=source)
-
-
-    async def svc_run_pattern_analysis(_call: ServiceCall) -> None:
-        """触发行为规律分析与 AI 场景生成（async 处理器，事件循环内直接 await）。"""
-        _addon_client = getattr(coordinator, "_addon_client", None)
-        if _addon_client is None:
-            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: analyze")
-            return
-        result = await _addon_client.post_ai_scene_ops("ai-scenes/analyze", {})
-        if not isinstance(result, dict):
-            coordinator._sys_log("WARN", "[AI场景] add-on ops provider unavailable: analyze")
-            return
-        status = int(result.get("__status", 200) or 200)
-        if status >= 400 or result.get("ok") is False:
-            error = result.get("error") or result.get("error_type") or f"http_{status}"
-            coordinator._sys_log("WARN", f"[AI场景] add-on analyze failed: {error}")
-            return
-        coordinator.async_set_updated_data({})
+    service_runtime = build_entry_service_runtime(
+        hass=hass,
+        coordinator=coordinator,
+        _check_admin=_check_admin,
+    )
 
     register_smart_agent_services(
         hass,
         (
+            ServiceRegistration("authorize_pairing", svc_authorize_pairing),
             ServiceRegistration("discover_devices", svc_discover),
             ServiceRegistration("sync_rooms_to_ha", svc_sync_rooms_to_ha, vol.Schema({})),
             ServiceRegistration(
@@ -2871,12 +2872,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 vol.Schema({vol.Optional("trigger", default="手动测试触发"): cv.string}),
             ),
             ServiceRegistration("clear_overrides", svc_clear_overrides, vol.Schema({})),
-            ServiceRegistration("report_correction", coordinator.async_svc_report_correction, vol.Schema({
+            ServiceRegistration("report_correction", svc_report_correction, vol.Schema({
                 vol.Required("entity_id"): cv.string,
                 vol.Optional("outcome", default="rejected"): vol.In(["accepted", "rejected"]),
                 vol.Optional("transaction_id", default=""): cv.string,
                 vol.Optional("reason", default="用户手动纠正"): cv.string,
             })),
+            ServiceRegistration("dismiss_ai_action", svc_dismiss_ai_action),
             ServiceRegistration(
                 "delete_behavior_pattern",
                 svc_delete_behavior_pattern,
@@ -2896,13 +2898,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     vol.Optional("is_command", default=False): cv.boolean,
                 }),
             ),
-            ServiceRegistration("approve_ai_scene", svc_approve_ai_scene, _ai_scene_schema),
-            ServiceRegistration("reject_ai_scene", svc_reject_ai_scene, _ai_scene_schema),
-            ServiceRegistration("delete_ai_scene", svc_delete_ai_scene, _ai_scene_schema),
-            ServiceRegistration("trigger_ai_scene", svc_trigger_ai_scene, _ai_scene_schema),
-            ServiceRegistration("create_scene_from_text", svc_create_scene_from_text, _create_scene_schema),
-            ServiceRegistration("rollback_transaction", svc_rollback_transaction, _txn_schema),
-            ServiceRegistration("refresh_transactions", svc_refresh_transactions, vol.Schema({})),
+            ServiceRegistration("approve_ai_scene", service_runtime.approve_ai_scene, service_runtime.ai_scene_schema),
+            ServiceRegistration("reject_ai_scene", service_runtime.reject_ai_scene, service_runtime.ai_scene_schema),
+            ServiceRegistration("delete_ai_scene", service_runtime.delete_ai_scene, service_runtime.ai_scene_schema),
+            ServiceRegistration("trigger_ai_scene", service_runtime.trigger_ai_scene, service_runtime.ai_scene_schema),
+            ServiceRegistration("create_scene_from_text", service_runtime.create_scene_from_text, service_runtime.create_scene_schema),
+            ServiceRegistration("rollback_transaction", service_runtime.rollback_transaction, service_runtime.transaction_schema),
+            ServiceRegistration("refresh_transactions", service_runtime.refresh_transactions, vol.Schema({})),
             ServiceRegistration(
                 "set_device_control_mode",
                 svc_set_device_control_mode,
@@ -2932,20 +2934,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 }),
             ),
             ServiceRegistration("update_config", svc_update_config),
-            ServiceRegistration("tts_test", svc_tts_test, vol.Schema({})),
-            ServiceRegistration("run_pattern_analysis", svc_run_pattern_analysis, vol.Schema({})),
+            ServiceRegistration("tts_test", service_runtime.tts_test, vol.Schema({})),
+            ServiceRegistration("run_pattern_analysis", service_runtime.run_pattern_analysis, vol.Schema({})),
             ServiceRegistration(
                 "verify_license",
-                coordinator.async_svc_verify_license,
+                svc_verify_license,
                 vol.Schema({vol.Optional("license_key", default=""): cv.string}),
             ),
             ServiceRegistration(
                 "voice_command",
-                svc_voice_command,
-                vol.Schema({
-                    vol.Required("command"): cv.string,
-                    vol.Optional("source", default="touch"): cv.string,
-                }),
+                service_runtime.voice_command,
+                vol.Schema({vol.Required("command"): cv.string}),
             ),
         ),
     )

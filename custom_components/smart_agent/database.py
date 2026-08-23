@@ -1,7 +1,6 @@
 """Thin SQLite bridge helpers for the Home Assistant integration."""
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -13,6 +12,10 @@ from typing import Any
 from .const import DEVICE_CONTROL_MODES
 from .db_service import DatabaseService
 from .database_learning_projection import DatabaseLearningProjectionMixin
+from .database_legacy_migration import (
+    LegacyConfigMigrationError,
+    build_legacy_config_migration_batch,
+)
 from .database_scenes import DatabaseSceneBridgeMixin
 from .database_write_ownership import _safe_add_column, classify_ha_local_write, ha_local_write_allowed
 
@@ -55,84 +58,13 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
 
     def _legacy_config_migration_batch(self) -> tuple[dict[str, Any], str | None] | None:
         """Build one deterministic migration batch from legacy HA projections and JSON."""
-        devices_by_id: dict[str, dict[str, Any]] = {}
-        habits_by_content: dict[str, dict[str, Any]] = {}
-        rules_by_content: dict[str, dict[str, Any]] = {}
         try:
             conn = self._db.get_raw_connection()
-            for row in conn.execute("SELECT * FROM devices ORDER BY entity_id"):
-                columns = set(row.keys())
-                entity_id = str(row["entity_id"] or "").strip()
-                if not entity_id:
-                    continue
-                devices_by_id[entity_id] = {
-                    "entity_id": entity_id,
-                    "name": str(row["name"] or entity_id),
-                    "area": str(row["area"] or ""),
-                    "type": str(row["type"] or ""),
-                    "ops": str(row["ops"] or ""),
-                    "control_mode": str(row["control_mode"] or "shared") if "control_mode" in columns else "shared",
-                    "sensor_type": str(row["sensor_type"] or "") if "sensor_type" in columns else "",
-                }
-            for target, output in (("habits", habits_by_content), ("rules", rules_by_content)):
-                for row in conn.execute(f"SELECT content, locked, created FROM {target} ORDER BY id"):
-                    content = str(row["content"] or "").strip()
-                    if content:
-                        output[content] = {
-                            "content": content,
-                            "locked": bool(row["locked"]),
-                            "created": str(row["created"] or ""),
-                        }
-        except Exception as exc:
-            _LOGGER.warning("[DB] legacy SQL projection read failed: %s", exc)
+            return build_legacy_config_migration_batch(conn, self._config_dir)
+        except LegacyConfigMigrationError as exc:
+            source = "SQL" if exc.stage == "sql_projection" else "JSON"
+            _LOGGER.warning("[DB] legacy %s projection read failed: %s", source, exc)
             return None
-
-        json_path = os.path.join(self._config_dir, "smart_agent_config.json")
-        cfg: dict[str, Any] = {}
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, "r", encoding="utf-8") as file:
-                    loaded = json.load(file)
-                cfg = loaded if isinstance(loaded, dict) else {}
-            except Exception as exc:
-                _LOGGER.warning("[DB] legacy JSON read failed: %s", exc)
-                return None
-            for eid, desc in cfg.get("devices", {}).items():
-                entity_id = str(eid or "").strip()
-                if not entity_id or entity_id in devices_by_id:
-                    continue
-                parts = [part.strip() for part in str(desc).split("|")]
-                devices_by_id[entity_id] = {
-                    "entity_id": entity_id,
-                    "name": parts[0] if parts else entity_id,
-                    "area": parts[1] if len(parts) > 1 else "",
-                    "type": parts[2] if len(parts) > 2 else "",
-                    "ops": parts[3] if len(parts) > 3 else "",
-                    "control_mode": "shared",
-                    "sensor_type": "",
-                }
-            for target, output in (("habits", habits_by_content), ("rules", rules_by_content)):
-                for item in cfg.get(target, []):
-                    content = str(item or "").strip()
-                    if content and content not in output:
-                        output[content] = {"content": content, "locked": False, "created": ""}
-
-        devices = [devices_by_id[key] for key in sorted(devices_by_id)]
-        habits = [habits_by_content[key] for key in sorted(habits_by_content)]
-        rules = [rules_by_content[key] for key in sorted(rules_by_content)]
-        if not devices and not habits and not rules:
-            return None
-        canonical = {"devices": devices, "habits": habits, "rules": rules}
-        digest = hashlib.sha256(
-            json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        payload = {
-            "migration_id": f"legacy-config:sha256:{digest}",
-            "devices": devices,
-            "habits": habits,
-            "rules": rules,
-        }
-        return payload, json_path if os.path.exists(json_path) else None
 
     @staticmethod
     def _legacy_migration_committed(result: Any, expected: int) -> bool:
@@ -491,39 +423,14 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
     ) -> None:
         if not txn_id:
             return
-        has_scheduled = False
-        all_skipped = False
-        action_results: list[dict[str, Any]] = []
-        try:
-            decoded_results = json.loads(results_json or "[]")
-            if isinstance(decoded_results, list):
-                action_results = [dict(item) for item in decoded_results if isinstance(item, dict)]
-                has_scheduled = any(
-                    str((item or {}).get("status") or "") in {"scheduled", "delayed"}
-                    for item in action_results
-                )
-                all_skipped = bool(action_results) and all(
-                    str((item or {}).get("status") or "").strip().lower() in {"skip", "skipped"}
-                    or str((item or {}).get("ha_command_status") or "").strip().lower() == "skipped"
-                    for item in action_results
-                )
-        except Exception:
-            has_scheduled = False
-            all_skipped = False
+        action_results = self._decode_transaction_action_results(results_json)
         self._record_recent_ai_action_results(txn_id, action_results)
-
-        if has_scheduled:
-            status = "scheduled"
-        elif all_skipped and dispatched == 0 and blocked == 0 and failed == 0:
-            status = "skipped"
-        elif failed == 0 and (dispatched > 0 or blocked == 0):
-            status = "success"
-        elif dispatched > 0 and failed > 0:
-            status = "partial"
-        elif dispatched == 0 and blocked > 0:
-            status = "blocked"
-        else:
-            status = "failed"
+        status = self._transaction_end_status(
+            action_results,
+            dispatched=dispatched,
+            blocked=blocked,
+            failed=failed,
+        )
         timestamp = self._ha_db_now_text()
         payload = {
             "transaction_id": str(txn_id),
@@ -543,6 +450,45 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
         }
         if not self._enqueue_bridge_event("transaction_end", payload, ts=timestamp):
             _LOGGER.warning("[Transaction] complete enqueue failed: txn_id=%s", txn_id)
+
+    @staticmethod
+    def _decode_transaction_action_results(results_json: str) -> list[dict[str, Any]]:
+        try:
+            decoded_results = json.loads(results_json or "[]")
+            if isinstance(decoded_results, list):
+                return [dict(item) for item in decoded_results if isinstance(item, dict)]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _transaction_end_status(
+        action_results: list[dict[str, Any]],
+        *,
+        dispatched: int,
+        blocked: int,
+        failed: int,
+    ) -> str:
+        has_scheduled = any(
+            str(item.get("status") or "") in {"scheduled", "delayed"}
+            for item in action_results
+        )
+        all_skipped = bool(action_results) and all(
+            str(item.get("status") or "").strip().lower() in {"skip", "skipped"}
+            or str(item.get("ha_command_status") or "").strip().lower() == "skipped"
+            for item in action_results
+        )
+        if has_scheduled:
+            return "scheduled"
+        if all_skipped and dispatched == 0 and blocked == 0 and failed == 0:
+            return "skipped"
+        if failed == 0 and (dispatched > 0 or blocked == 0):
+            return "success"
+        if dispatched > 0 and failed > 0:
+            return "partial"
+        if dispatched == 0 and blocked > 0:
+            return "blocked"
+        return "failed"
 
     def _rollback_transaction_db(self, txn_id: int) -> dict | None:
         _LOGGER.warning(

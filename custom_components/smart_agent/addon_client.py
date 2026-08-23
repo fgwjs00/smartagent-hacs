@@ -96,6 +96,9 @@ class AddOnClient:
         base_url: str = "",
         auth_token: str = "",
         port: int = _DEFAULT_ADDON_PORT,
+        field_canary_host_dispatch_proof_enabled: bool = False,
+        field_canary_host_dispatch_proof_secret: str = "",
+        field_canary_previous_host_dispatch_proof_secret: str = "",
     ) -> None:
         """初始化客户端。
 
@@ -103,9 +106,49 @@ class AddOnClient:
         :param auth_token: 内部认证令牌（对应 Add-on 环境变量 SA_AUTH_TOKEN），
                            空字符串表示不发送认证头（向后兼容）
         :param port: Add-on 内部 API 端口，默认 18099。base_url 非空时忽略此参数。
+        :param field_canary_host_dispatch_proof_enabled: 是否启用独立的 v2
+                           Field Canary host-proof 验证 keyring。
+        :param field_canary_host_dispatch_proof_secret: 当前 v2 proof secret；
+                           不得复用普通 add-on bearer。
+        :param field_canary_previous_host_dispatch_proof_secret: 仅用于短暂
+                           rotation grace 的上一把 v2 proof secret。
         """
         self._base = (base_url.rstrip("/") if base_url else _build_addon_base_url(port))
         self._auth_token: str = auth_token.strip()
+        if type(field_canary_host_dispatch_proof_enabled) is not bool:
+            raise ValueError("field_canary_host_dispatch_proof_enabled_invalid")
+        proof_secrets = (
+            field_canary_host_dispatch_proof_secret,
+            field_canary_previous_host_dispatch_proof_secret,
+        )
+        if any(type(secret) is not str for secret in proof_secrets):
+            raise ValueError("field_canary_host_dispatch_proof_secret_invalid")
+        normalized_proof_secrets = tuple(secret.strip() for secret in proof_secrets)
+        if any(
+            secret != normalized
+            or (secret and len(secret) < 32)
+            or any(ord(character) < 32 or ord(character) == 127 for character in secret)
+            for secret, normalized in zip(proof_secrets, normalized_proof_secrets)
+        ):
+            raise ValueError("field_canary_host_dispatch_proof_secret_invalid")
+        current_proof_secret, previous_proof_secret = normalized_proof_secrets
+        if field_canary_host_dispatch_proof_enabled and not current_proof_secret:
+            raise ValueError("field_canary_host_dispatch_proof_secret_required")
+        nonempty_proof_secrets = tuple(
+            secret for secret in normalized_proof_secrets if secret
+        )
+        if (
+            len(set(nonempty_proof_secrets)) != len(nonempty_proof_secrets)
+            or self._auth_token in nonempty_proof_secrets
+        ):
+            raise ValueError("field_canary_host_dispatch_proof_secret_reuse_forbidden")
+        self._field_canary_host_dispatch_proof_enabled = (
+            field_canary_host_dispatch_proof_enabled
+        )
+        self._field_canary_host_dispatch_proof_secret = current_proof_secret
+        self._field_canary_previous_host_dispatch_proof_secret = (
+            previous_proof_secret
+        )
         self._session: aiohttp.ClientSession | None = None
         # 可用性缓存：避免每次推理都发 HTTP 健康检查
         self._avail_cache: bool = False
@@ -171,6 +214,12 @@ class AddOnClient:
         if self._auth_token and self._auth_token in out:
             token_mask = "***" if len(self._auth_token) <= 16 else self._auth_token[:4] + "***" + self._auth_token[-4:]
             out = out.replace(self._auth_token, token_mask)
+        for secret in (
+            self._field_canary_host_dispatch_proof_secret,
+            self._field_canary_previous_host_dispatch_proof_secret,
+        ):
+            if secret and secret in out:
+                out = out.replace(secret, "***")
         out = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1***", out)
         out = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[\w\-]{8,}", r"\1***", out)
         # LD2410 passwords are exactly six printable ASCII characters. Consume
@@ -314,6 +363,35 @@ class AddOnClient:
         response["__status"] = status
         return response
 
+    async def finalize_decision_fast_path_claim(
+        self,
+        *,
+        event_claim: dict[str, Any],
+        attempt_id: str,
+        outcome: str,
+    ) -> dict[str, Any] | None:
+        """Consume a fast-path continuation after the host chooses no slow handoff."""
+
+        normalized_attempt_id = str(attempt_id or "").strip()
+        result = await self.request_json(
+            "POST",
+            "/decision/fast-path/finalize",
+            body={
+                "schema_version": "smartagent.decision_fast_path_terminal.v0.1",
+                "event_claim": dict(event_claim),
+                "attempt_id": normalized_attempt_id,
+                "outcome": str(outcome or "").strip(),
+            },
+            request_id=normalized_attempt_id or None,
+        )
+        if not isinstance(result, dict):
+            return None
+        status = int(result.get("status_code") or 0)
+        body = result.get("body")
+        response = body if isinstance(body, dict) else {"ok": 200 <= status < 300}
+        response["__status"] = status
+        return response
+
     async def run_decision(
         self,
         *,
@@ -345,8 +423,8 @@ class AddOnClient:
             "/decision/run",
             body=payload,
             timeout=_INFER_TIMEOUT,
-            request_id=normalized_request_id,
             extra_headers=operator_headers,
+            request_id=normalized_request_id,
         )
         if not isinstance(result, dict):
             return None
@@ -363,23 +441,33 @@ class AddOnClient:
         envelope: dict[str, Any],
         *,
         user_explicit: bool = False,
+        user_intent_delegation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Run the authoritative add-on preflight before HA execution."""
+        # Compatibility-only.  The gateway transport cannot self-attest a
+        # current user gesture; the add-on derives execution provenance from
+        # the authenticated principal and ignores caller-owned headers.
+        del user_explicit
         request_id = str(envelope.get("request_id") or "").strip() or None
+        body = dict(envelope)
+        if user_intent_delegation is not None:
+            # Import lazily so legacy test harnesses that load addon_client.py
+            # without the package path still exercise the non-delegated path.
+            from .user_intent_delegation import (
+                TRANSPORT_FIELD,
+                validate_transport_binding,
+            )
+
+            body[TRANSPORT_FIELD] = validate_transport_binding(
+                body,
+                user_intent_delegation,
+            )
         result = await self.request_json(
             "POST",
             "/ha/execute",
-            body=dict(envelope),
+            body=body,
             timeout=aiohttp.ClientTimeout(total=25),
             request_id=request_id,
-            extra_headers=(
-                {
-                    "X-SA-Execution-Intent": "user_explicit",
-                    "X-SA-Actor-Class": "authenticated_gateway_operator",
-                }
-                if user_explicit
-                else None
-            ),
         )
         if not isinstance(result, dict):
             return None

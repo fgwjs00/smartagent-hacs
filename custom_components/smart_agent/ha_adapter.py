@@ -7,7 +7,9 @@ plain command envelope.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
+import json
 import sys
 import time
 from pathlib import Path
@@ -16,6 +18,7 @@ from homeassistant.core import HomeAssistant
 
 if __package__:
     from .service_contracts import ServiceContractResult, validate_service_call
+    from .output_contracts import begin_output_attempt, finalize_output_attempt
 else:
     _contract_module_name = "_smart_agent_service_contracts_runtime"
     _contract_module = sys.modules.get(_contract_module_name)
@@ -29,11 +32,151 @@ else:
         _contract_spec.loader.exec_module(_contract_module)
     ServiceContractResult = _contract_module.ServiceContractResult
     validate_service_call = _contract_module.validate_service_call
+    _output_module_name = "_smart_agent_output_contracts_runtime"
+    _output_module = sys.modules.get(_output_module_name)
+    if _output_module is None:
+        _output_path = Path(__file__).with_name("output_contracts.py")
+        _output_spec = importlib.util.spec_from_file_location(_output_module_name, _output_path)
+        if _output_spec is None or _output_spec.loader is None:
+            raise RuntimeError(f"unable to load output contract module: {_output_path}")
+        _output_module = importlib.util.module_from_spec(_output_spec)
+        sys.modules[_output_module_name] = _output_module
+        _output_spec.loader.exec_module(_output_module)
+    begin_output_attempt = _output_module.begin_output_attempt
+    finalize_output_attempt = _output_module.finalize_output_attempt
 
 
 _POST_STATE_VERIFY_TIMEOUT_SECONDS = 2.0
 _POST_STATE_VERIFY_INTERVAL_SECONDS = 0.1
-_TERMINAL_STATE_VERIFICATION_DOMAINS = frozenset({"cover", "climate", "media_player"})
+_EXECUTION_RECEIPT_VERSION = "0.1"
+_DISPATCH_AUTHORITY_SEAL = object()
+_USER_OUTPUT_AUTHORITY_SEAL = object()
+
+
+def _host_envelope_digest(envelope: dict[str, Any]) -> str:
+    """Bind an in-process dispatch authority to one exact JSON envelope."""
+    try:
+        canonical = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("verified_dispatch_envelope_invalid") from exc
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class _VerifiedDispatchAuthority:
+    """Opaque host capability issued only after proof verification/consumption."""
+
+    __slots__ = ("_seal", "_used", "envelope_digest", "proof_jti")
+
+    def __init__(self, envelope_digest: str, proof_jti: str, *, seal: object) -> None:
+        if seal is not _DISPATCH_AUTHORITY_SEAL:
+            raise ValueError("verified_dispatch_authority_constructor_forbidden")
+        self._seal = seal
+        self._used = False
+        self.envelope_digest = envelope_digest
+        self.proof_jti = proof_jti
+
+
+class _UserExplicitOutputAuthority:
+    """One-use host capability for one exact authenticated TTS test call."""
+
+    __slots__ = ("_seal", "_used", "service_key", "target_entity_id", "user_id")
+
+    def __init__(
+        self,
+        *,
+        user_id: str,
+        service_key: str,
+        target_entity_id: str,
+        seal: object,
+    ) -> None:
+        if seal is not _USER_OUTPUT_AUTHORITY_SEAL:
+            raise ValueError("user_output_authority_constructor_forbidden")
+        self._seal = seal
+        self._used = False
+        self.user_id = user_id
+        self.service_key = service_key
+        self.target_entity_id = target_entity_id
+
+
+def _bind_user_explicit_output_authority(
+    *,
+    authenticated_user_id: str,
+    domain: str,
+    service: str,
+    target_entity_id: str,
+) -> _UserExplicitOutputAuthority:
+    """Bind a verified HA user to one exact supported diagnostic output."""
+    user_id = str(authenticated_user_id or "").strip()
+    domain_text = str(domain or "").strip().lower()
+    service_text = str(service or "").strip().lower()
+    target_text = str(target_entity_id or "").strip()
+    if not user_id or (domain_text, service_text) != ("tts", "speak") or not target_text:
+        raise ValueError("user_output_authority_binding_invalid")
+    return _UserExplicitOutputAuthority(
+        user_id=user_id,
+        service_key=f"{domain_text}.{service_text}",
+        target_entity_id=target_text,
+        seal=_USER_OUTPUT_AUTHORITY_SEAL,
+    )
+
+
+def _consume_user_output_authority(
+    authority: Any,
+    *,
+    service_key: str,
+    target_entity_id: str,
+) -> bool:
+    valid = bool(
+        isinstance(authority, _UserExplicitOutputAuthority)
+        and authority._seal is _USER_OUTPUT_AUTHORITY_SEAL
+        and authority._used is False
+        and authority.service_key == service_key
+        and authority.target_entity_id == target_entity_id
+        and bool(authority.user_id)
+    )
+    if valid:
+        authority._used = True
+    return valid
+
+
+def _bind_verified_dispatch_authority(
+    envelope: dict[str, Any],
+    verified_proof: dict[str, Any],
+) -> _VerifiedDispatchAuthority:
+    """Convert already verified and consumed proof claims into a sink capability."""
+    digest = _host_envelope_digest(envelope)
+    proof_digest = str(verified_proof.get("envelope_sha256") or "").strip().lower()
+    proof_jti = str(verified_proof.get("jti") or "").strip().lower()
+    if proof_digest != digest or len(proof_jti) != 64:
+        raise ValueError("verified_dispatch_authority_binding_invalid")
+    return _VerifiedDispatchAuthority(
+        digest,
+        proof_jti,
+        seal=_DISPATCH_AUTHORITY_SEAL,
+    )
+
+
+def _dispatch_authority_matches(
+    authority: Any,
+    envelope: dict[str, Any],
+) -> bool:
+    valid = bool(
+        isinstance(authority, _VerifiedDispatchAuthority)
+        and authority._seal is _DISPATCH_AUTHORITY_SEAL
+        and authority._used is False
+        and authority.envelope_digest == _host_envelope_digest(envelope)
+    )
+    if valid:
+        # Consume before the first await in the physical sink. A local caller
+        # cannot reuse the in-process capability even if it retains a reference.
+        authority._used = True
+    return valid
 
 
 def async_get_state(hass: HomeAssistant, entity_id: str) -> Any:
@@ -212,9 +355,12 @@ def _expected_post_state(command: dict[str, Any]) -> str | None:
     domain = str(command.get("domain") or "")
     service = str(command.get("service") or "")
     data = command.get("data") if isinstance(command.get("data"), dict) else {}
-    if domain in {"light", "switch"} and service == "turn_on":
+    if domain in {"light", "switch", "fan"} and service == "turn_on":
         return "on"
-    if domain in {"light", "switch", "climate", "media_player"} and service == "turn_off":
+    if (
+        domain in {"light", "switch", "fan", "climate", "media_player"}
+        and service == "turn_off"
+    ):
         return "off"
     if domain == "cover":
         return {"open_cover": "open", "close_cover": "closed"}.get(service)
@@ -228,20 +374,18 @@ def _expected_post_state(command: dict[str, Any]) -> str | None:
     return None
 
 
-def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any] | None:
+def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any]:
     expected = _expected_post_state(command)
     domain = str(command.get("domain") or "")
     snapshot = _state_snapshot(hass, str(command.get("entity_id") or ""))
     actual = str(snapshot.get("state") or "").strip().lower()
     if expected is None:
-        if domain not in _TERMINAL_STATE_VERIFICATION_DOMAINS:
-            return None
         return {
             "expected": "",
             "actual": actual,
             "verified": False,
             "verification_supported": False,
-            "verification_reason": "terminal_state_contract_missing",
+            "verification_reason": "verification_contract_missing",
             "attribute_checks": {},
             "post_state_snapshot": snapshot,
         }
@@ -262,11 +406,10 @@ def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, An
     }
 
 
-async def _wait_for_post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any] | None:
+async def _wait_for_post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any]:
     verification = _post_state_verification(hass, command)
     if (
-        verification is None
-        or verification.get("verified")
+        verification.get("verified")
         or verification.get("verification_supported") is False
     ):
         return verification
@@ -275,9 +418,51 @@ async def _wait_for_post_state_verification(hass: Any, command: dict[str, Any]) 
     while time.monotonic() < deadline:
         await asyncio.sleep(interval)
         verification = _post_state_verification(hass, command)
-        if verification is None or verification.get("verified"):
+        if verification.get("verified"):
             return verification
     return verification
+
+
+def _execution_receipt_fields(
+    *,
+    transport_status: str,
+    verification: dict[str, Any] | None,
+    workflow_status: str = "",
+) -> dict[str, Any]:
+    verification = verification if isinstance(verification, dict) else {}
+    snapshot = verification.get("post_state_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    if verification.get("verified") is True:
+        effect_status = "verified_success"
+    elif (
+        verification.get("verification_supported") is False
+        or snapshot.get("available") is False
+        or transport_status == "transport_error"
+    ):
+        effect_status = "effect_unknown"
+    else:
+        effect_status = "verified_failed"
+    if not workflow_status:
+        workflow_status = {
+            "verified_success": "completed",
+            "verified_failed": "failed",
+            "effect_unknown": "reconciliation_required",
+        }[effect_status]
+    retry_disposition = "manual_review" if effect_status == "effect_unknown" else "forbidden"
+    return {
+        "receipt_version": _EXECUTION_RECEIPT_VERSION,
+        "verification_contract_version": (
+            "ha_post_state.v1"
+            if verification.get("verification_supported") is not False
+            else "missing"
+        ),
+        "transport_status": transport_status,
+        "effect_status": effect_status,
+        "workflow_status": workflow_status,
+        "retry_disposition": retry_disposition,
+        "automatic_retry_allowed": False,
+        "reconciliation_required": workflow_status == "reconciliation_required",
+    }
 
 
 def async_get_entity_registry(hass: HomeAssistant) -> Any:
@@ -667,15 +852,144 @@ async def async_call_service(
     data: dict[str, Any] | None = None,
     *,
     blocking: bool = True,
-) -> None:
-    """统一 HA service 调用边界，供宿主桥接层复用。"""
+    execution_class: str = "",
+    actor_ref: str = "",
+    authority: Any = None,
+    output_ledger_publisher: Any = None,
+) -> Any:
+    """Execute an explicitly classified non-autonomous HA service call."""
+    domain_text = str(domain or "").strip().lower()
+    service_text = str(service or "").strip().lower()
+    class_text = str(execution_class or "").strip().lower()
+    actor_text = str(actor_ref or "").strip()
+    service_key = f"{domain_text}.{service_text}"
+    internal_policy = {
+        ("notification", "coordinator.notify"): {
+            "persistent_notification.create",
+        },
+        ("notification", "coordinator.addon_repair"): {
+            "persistent_notification.create",
+            "persistent_notification.dismiss",
+        },
+        ("notification", "coordinator.pairing"): {
+            "persistent_notification.create",
+        },
+    }
+    authority_ref = actor_text
+    if class_text == "user_explicit_output":
+        target_entity_id = str(
+            (data if isinstance(data, dict) else {}).get("entity_id") or ""
+        ).strip()
+        allowed = _consume_user_output_authority(
+            authority,
+            service_key=service_key,
+            target_entity_id=target_entity_id,
+        )
+        if allowed:
+            authority_ref = str(authority.user_id)
+    else:
+        allowed = service_key in internal_policy.get((class_text, actor_text), set())
+    if not allowed:
+        raise ValueError("classified_ha_service_call_required")
     payload = data if isinstance(data, dict) else {}
-    await hass.services.async_call(domain, service, payload, blocking=blocking)
+    output_attempt = None
+    if class_text in {"notification", "user_explicit_output"}:
+        try:
+            detached_payload = json.loads(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("output_payload_invalid") from exc
+        payload = detached_payload
+        if class_text == "user_explicit_output":
+            target_ref = str(payload.get("entity_id") or "").strip()
+            audience_ref = target_ref
+            ttl_seconds = 30
+        else:
+            notification_id = str(payload.get("notification_id") or "").strip()
+            target_ref = notification_id or "ha:persistent_notification_store"
+            audience_ref = "ha:authenticated_frontend_users"
+            ttl_seconds = 86_400
+        output_attempt = begin_output_attempt(
+            execution_class=class_text,
+            authority_ref=authority_ref,
+            service_key=service_key,
+            target_ref=target_ref,
+            payload=payload,
+            audience_ref=audience_ref,
+            ttl_seconds=ttl_seconds,
+        )
+    output_claim = None
+    publisher_enabled = bool(
+        output_attempt is not None
+        and getattr(output_ledger_publisher, "enabled", False) is True
+    )
+    if publisher_enabled:
+        claim = getattr(output_ledger_publisher, "async_claim", None)
+        finalize = getattr(output_ledger_publisher, "async_finalize", None)
+        if not callable(claim) or not callable(finalize):
+            raise ValueError("output_ledger_publisher_invalid")
+        output_claim = await claim(output_attempt)
+
+    try:
+        await hass.services.async_call(domain_text, service_text, payload, blocking=blocking)
+    except Exception as exc:
+        if output_attempt is not None:
+            receipt = finalize_output_attempt(output_attempt, accepted_by_ha=False)
+            try:
+                setattr(exc, "smartagent_output_receipt", receipt.to_dict())
+            except Exception:
+                pass
+            if output_claim is not None:
+                try:
+                    await output_ledger_publisher.async_finalize(
+                        receipt,
+                        output_claim,
+                    )
+                except Exception as ledger_exc:
+                    try:
+                        setattr(
+                            exc,
+                            "smartagent_output_ledger_error_type",
+                            ledger_exc.__class__.__name__,
+                        )
+                    except Exception:
+                        pass
+        raise
+    if output_attempt is not None:
+        receipt = finalize_output_attempt(output_attempt, accepted_by_ha=True)
+        if output_claim is not None:
+            try:
+                await output_ledger_publisher.async_finalize(
+                    receipt,
+                    output_claim,
+                )
+            except Exception as exc:
+                try:
+                    setattr(exc, "smartagent_output_receipt", receipt.to_dict())
+                except Exception:
+                    pass
+                raise
+        return receipt
+    return None
 
 
-async def async_reload_scenes(hass: Any) -> None:
+async def async_reload_scenes(hass: Any, *, authority: Any = None) -> None:
     """Reload HA scene YAML through the adapter boundary."""
-    await async_call_service(hass, "scene", "reload", {})
+    await async_call_service(
+        hass,
+        "scene",
+        "reload",
+        {},
+        execution_class="scene_maintenance",
+        authority=authority,
+    )
 
 
 async def async_create_scene(
@@ -683,6 +997,7 @@ async def async_create_scene(
     *,
     scene_id: str,
     entities: dict[str, Any],
+    authority: Any = None,
 ) -> None:
     """Create an ephemeral HA scene through the adapter boundary."""
     await async_call_service(
@@ -690,17 +1005,33 @@ async def async_create_scene(
         "scene",
         "create",
         {"scene_id": scene_id, "entities": entities if isinstance(entities, dict) else {}},
+        execution_class="scene_maintenance",
+        authority=authority,
     )
 
 
-async def async_delete_scene(hass: Any, entity_id: str) -> None:
+async def async_delete_scene(hass: Any, entity_id: str, *, authority: Any = None) -> None:
     """Delete a HA scene entity through the adapter boundary."""
-    await async_call_service(hass, "scene", "delete", {"entity_id": entity_id})
+    await async_call_service(
+        hass,
+        "scene",
+        "delete",
+        {"entity_id": entity_id},
+        execution_class="scene_maintenance",
+        authority=authority,
+    )
 
 
-async def async_reload_automations(hass: Any) -> None:
+async def async_reload_automations(hass: Any, *, authority: Any = None) -> None:
     """Reload HA automations through the adapter boundary."""
-    await async_call_service(hass, "automation", "reload", {})
+    await async_call_service(
+        hass,
+        "automation",
+        "reload",
+        {},
+        execution_class="scene_maintenance",
+        authority=authority,
+    )
 
 
 def list_binary_sensor_states(hass: HomeAssistant) -> list[dict[str, Any]]:
@@ -826,11 +1157,27 @@ def _normalize_command(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) -> dict[str, Any]:
+async def async_execute_command_envelope(
+    hass: Any,
+    envelope: dict[str, Any],
+    *,
+    authority: _VerifiedDispatchAuthority | None = None,
+) -> dict[str, Any]:
     """Execute a CommandEnvelope through HA services and return ExecutionResult."""
     request_id = str((envelope or {}).get("request_id") or "")
     if not request_id:
         request_id = "unknown"
+    try:
+        authority_valid = _dispatch_authority_matches(authority, envelope)
+    except (TypeError, ValueError):
+        authority_valid = False
+    if not authority_valid:
+        return _json_error(
+            request_id,
+            "verified_dispatch_authority_required",
+            error_type="forbidden",
+            retryable=False,
+        )
     commands_raw = (envelope or {}).get("commands")
     if not isinstance(commands_raw, list) or not commands_raw:
         return _json_error(request_id, "commands_required", error_type="bad_request")
@@ -867,6 +1214,11 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 "retryable": False,
                 "latency_ms": 0,
                 "data": {},
+                **_execution_receipt_fields(
+                    transport_status="not_sent",
+                    verification=None,
+                    workflow_status="skipped",
+                ),
             })
             continue
         started = time.monotonic()
@@ -889,6 +1241,10 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                     "service_key": contract_result.service_key,
                     "invalid_fields": list(contract_result.invalid_fields),
                 },
+                **_execution_receipt_fields(
+                    transport_status="not_sent",
+                    verification=None,
+                ),
             })
             if stop_on_first_error:
                 stopped_after_error = True
@@ -905,6 +1261,10 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "data": {},
                 "status": "failed",
+                **_execution_receipt_fields(
+                    transport_status="not_sent",
+                    verification=None,
+                ),
             })
             if stop_on_first_error:
                 stopped_after_error = True
@@ -913,7 +1273,7 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
         snapshot = _state_snapshot(hass, command["entity_id"])
         pre_state_snapshot.append(snapshot)
         if _command_already_in_target_state(command, snapshot):
-            verification = _post_state_verification(hass, command) or {}
+            verification = _post_state_verification(hass, command)
             results.append({
                 **command,
                 "ok": True,
@@ -926,6 +1286,11 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 "status": "skipped",
                 "reason": "already_in_target_state",
                 **verification,
+                **_execution_receipt_fields(
+                    transport_status="not_sent",
+                    verification=verification,
+                    workflow_status="skipped",
+                ),
             })
             continue
         try:
@@ -936,56 +1301,108 @@ async def async_execute_command_envelope(hass: Any, envelope: dict[str, Any]) ->
                 blocking=True,
             )
             verification = await _wait_for_post_state_verification(hass, command)
-            verified = verification is None or bool(verification.get("verified"))
+            receipt = _execution_receipt_fields(
+                transport_status="acknowledged",
+                verification=verification,
+            )
+            effect_status = str(receipt["effect_status"])
+            verified = effect_status == "verified_success"
+            unknown = effect_status == "effect_unknown"
             results.append({
                 **command,
                 "ok": verified,
                 "executed": True,
                 "service_call_succeeded": True,
-                "error": "" if verified else "post_state_not_converged",
-                "error_type": "" if verified else "state_verification_failed",
+                "error": "" if verified else "physical_effect_unknown" if unknown else "post_state_not_converged",
+                "error_type": "" if verified else "effect_unknown" if unknown else "state_verification_failed",
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
-                "status": "succeeded" if verified else "verification_failed",
-                **(verification or {}),
+                "status": "succeeded" if verified else "effect_unknown" if unknown else "verification_failed",
+                **verification,
+                **receipt,
             })
             if not verified and stop_on_first_error:
                 stopped_after_error = True
         except Exception as exc:
-            verification = _post_state_verification(hass, command) or {}
+            verification = _post_state_verification(hass, command)
+            receipt = _execution_receipt_fields(
+                transport_status="transport_error",
+                verification=verification,
+            )
+            verified = receipt["effect_status"] == "verified_success"
             results.append({
                 **command,
-                "ok": False,
-                "executed": False,
+                "ok": verified,
+                "executed": True if verified else None,
                 "service_call_succeeded": False,
-                "error": str(exc) or exc.__class__.__name__,
-                "error_type": "ha_service_error",
+                "error": "" if verified else str(exc) or exc.__class__.__name__,
+                "error_type": "" if verified else "ha_service_error",
+                "transport_error_detail": str(exc) or exc.__class__.__name__,
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
-                "status": "failed",
+                "status": "succeeded" if verified else "effect_unknown",
                 **verification,
+                **receipt,
             })
-            if stop_on_first_error:
+            if not verified and stop_on_first_error:
                 stopped_after_error = True
 
     ok = bool(results) and all(bool(item.get("ok")) for item in results)
     first_error = next((item for item in results if not item.get("ok")), None)
     succeeded_count = sum(1 for item in results if bool(item.get("ok")) and item.get("status") != "skipped")
     failed_count = sum(1 for item in results if not bool(item.get("ok")) and item.get("status") != "skipped")
+    effect_unknown_count = sum(1 for item in results if item.get("effect_status") == "effect_unknown")
     skipped_count = sum(1 for item in results if item.get("status") == "skipped")
     partial_success = succeeded_count > 0 and (failed_count > 0 or skipped_count > 0)
     rollback_available = bool(pre_state_snapshot)
     rollback_mode = "manual" if rollback_available else "not_supported"
+    if effect_unknown_count:
+        effect_status = "effect_unknown"
+        workflow_status = "reconciliation_required"
+        retry_disposition = "manual_review"
+    elif ok:
+        effect_status = "verified_success"
+        workflow_status = "completed"
+        retry_disposition = "forbidden"
+    else:
+        effect_status = "verified_failed"
+        workflow_status = "failed"
+        retry_disposition = "forbidden"
+    transport_statuses = {str(item.get("transport_status") or "not_sent") for item in results}
+    if "transport_error" in transport_statuses:
+        transport_status = "transport_error"
+    elif "acknowledged" in transport_statuses:
+        transport_status = "acknowledged"
+    elif "sent" in transport_statuses:
+        transport_status = "sent"
+    else:
+        transport_status = "not_sent"
+    safety = envelope.get("safety") if isinstance(envelope.get("safety"), dict) else {}
+    safety_context = safety.get("context") if isinstance(safety.get("context"), dict) else {}
     return {
         "request_id": request_id,
         "ok": ok,
         "results": results,
+        "receipt_version": _EXECUTION_RECEIPT_VERSION,
+        "transport_status": transport_status,
+        "effect_status": effect_status,
+        "workflow_status": workflow_status,
+        "retry_disposition": retry_disposition,
+        "automatic_retry_allowed": False,
+        "reconciliation_required": workflow_status == "reconciliation_required",
+        "effect_unknown_count": effect_unknown_count,
+        "idempotency_key": str(envelope.get("idempotency_key") or request_id),
+        "decision_snapshot_id": str(safety_context.get("world_snapshot_id") or ""),
+        "policy_version": str(
+            policy.get("policy_version") or safety.get("policy_version") or ""
+        ),
         "pre_state_snapshot": pre_state_snapshot,
         "partial_success": partial_success,
         "stop_on_first_error": stop_on_first_error,
         "command_status": {
             "succeeded": succeeded_count,
             "failed": failed_count,
+            "effect_unknown": effect_unknown_count,
             "skipped": skipped_count,
             "partial_success": partial_success,
         },

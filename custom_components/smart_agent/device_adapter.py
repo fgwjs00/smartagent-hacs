@@ -81,9 +81,11 @@ class DeviceAdapter(ABC):
 
 
 class HAAdapter(DeviceAdapter):
-    """DeviceAdapter 的 HA 实现，通过 SmartAgent command envelope 控制设备。
+    """Legacy read adapter retained for state compatibility.
 
-    这是当前唯一的生产实现。所有设备控制最终都经过统一执行边界。
+    Physical writes are deliberately disabled here. SmartAgent device effects
+    must enter through the add-on execution ledger and the one-use host dispatch
+    proof boundary; this compatibility object has neither authority.
     """
 
     def __init__(self, hass: "HomeAssistant") -> None:
@@ -99,44 +101,14 @@ class HAAdapter(DeviceAdapter):
         entity_id: str,
         params: dict[str, Any] | None = None,
     ) -> bool:
-        """通过统一 command envelope 控制设备。"""
-        service_data: dict[str, Any] = dict(params or {})
-        service_data.pop("entity_id", None)
-        try:
-            from .ha_adapter import async_execute_command_envelope
-
-            result = await async_execute_command_envelope(self._hass, {
-                "request_id": f"device-adapter:{entity_id}:{service}",
-                "commands": [{
-                    "entity_id": entity_id,
-                    "domain": domain,
-                    "service": service,
-                    "data": service_data,
-                }],
-                "execution_policy": {"stop_on_first_error": True},
-                "safety": {
-                    "risk_level": "safe",
-                    "requires_confirmation": False,
-                    "reason": "DeviceAdapter compatibility execution",
-                },
-            })
-            if isinstance(result, dict) and result.get("ok"):
-                return True
-            error = (
-                result.get("error") or result.get("error_type") or "command_envelope_failed"
-                if isinstance(result, dict)
-                else "command_envelope_failed"
-            )
-            raise RuntimeError(error)
-        except Exception as exc:
-            _LOGGER.warning(
-                "[HAAdapter] call_service 失败: %s.%s(%s): %s",
-                domain,
-                service,
-                entity_id,
-                exc,
-            )
-            return False
+        """Fail closed: this compatibility adapter has no execution authority."""
+        _LOGGER.warning(
+            "[HAAdapter] direct write rejected (canonical add-on proof required): %s.%s(%s)",
+            domain,
+            service,
+            entity_id,
+        )
+        return False
 
     async def get_state(self, entity_id: str) -> DeviceState | None:
         """获取 HA 中的设备状态。"""

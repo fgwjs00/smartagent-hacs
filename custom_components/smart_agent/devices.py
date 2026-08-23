@@ -1505,13 +1505,20 @@ class DevicesMixin:
         )
 
     async def async_approve_ai_scene(self, scene_id: int) -> None:
-        """用户确认候选场景 → 状态置为 active，写入 smart_agent_scenes.yaml 并调用 scene.reload。
+        """Fail closed: legacy host approval cannot install or activate a HA scene."""
+        # Scene installation is a configuration mutation.  Keep the legacy
+        # host-side installer quarantined until an exact, one-use maintenance
+        # delegation plus change/backup/rollback ledger is wired.  The current
+        # service surface delegates lifecycle changes to the add-on; this
+        # early return protects old/internal callers as well.
+        self._sys_log(
+            "WARN",
+            "[AI场景] not_authorized: maintenance delegation/change ledger 未实现，"
+            f"候选保持隔离且不写入 HA 配置 id={int(scene_id)}",
+        )
+        self.async_set_updated_data({})
+        return
 
-        5C-2: 场景通过 YAML 文件持久化注册，重启 HA 后仍可通过 scene_candidate 引用。
-        用户首次使用时只需在 configuration.yaml 中添加：
-            scene: !include smart_agent_scenes.yaml
-        之后批准的 AI 场景均自动生效，无需手动操作。
-        """
         import json as _json
         from .const import AI_SCENE_STATUS_ACTIVE
         from .ha_adapter import async_create_scene, async_reload_scenes
@@ -1719,14 +1726,14 @@ class DevicesMixin:
     def _write_scene_to_yaml(
         self, ha_scene_id: str, scene_name: str, ha_entities: dict
     ) -> bool:
-        """将 AI 场景写入 smart_agent_scenes.yaml（同步，在 executor 中调用）。
+        """Fail closed: direct HA scene YAML mutation is not authorized."""
+        self._sys_log(
+            "WARN",
+            "[AI场景] not_authorized: 禁止绕过 maintenance ledger 写入 "
+            f"smart_agent_scenes.yaml scene={str(ha_scene_id).strip()}",
+        )
+        return False
 
-        文件格式与 HA scenes.yaml 兼容。用户只需在 configuration.yaml 添加：
-            scene: !include smart_agent_scenes.yaml
-
-        采用 id 去重：同一场景重复批准只更新，不重复追加。
-        返回 True 表示写入成功，返回 False 表示需要降级处理。
-        """
         import os as _os
         import yaml as _yaml
 
@@ -1771,7 +1778,14 @@ class DevicesMixin:
                 return False
 
     def _remove_scene_from_yaml(self, ha_scene_id: str) -> None:
-        """从 smart_agent_scenes.yaml 中移除指定 id 的场景（同步，在 executor 中调用）。"""
+        """Fail closed: direct HA scene YAML removal is not authorized."""
+        self._sys_log(
+            "WARN",
+            "[AI场景] not_authorized: 禁止绕过 maintenance ledger 修改 "
+            f"smart_agent_scenes.yaml scene={str(ha_scene_id).strip()}",
+        )
+        return
+
         import os as _os
         import yaml as _yaml
 
@@ -1803,74 +1817,13 @@ class DevicesMixin:
 
     async def _export_to_ha_automation(self, scene_id: int) -> bool:
         """
-        Phase 7D: 场景批准时自动将定时触发自动化写入配置目录。
-
-        写入路径: <config_dir>/smart_agent_automations.yaml
-        采用 alias 去重：同一场景反复批准只更新，不重复追加。
-        写入后调用 automation.reload 令 HA 立即识别。
-
-        用户只需第一次在 configuration.yaml 添加：
-            automation: !include smart_agent_automations.yaml
-        之后重启一次 HA，后续批准的场景均自动生效，无需手动操作。
+        Device-effect HA automations are draft-only until canonical re-entry exists.
         """
-        import os as _os
-        import yaml as _yaml
-        from .ha_adapter import async_reload_automations
-
-        yaml_str = self.get_scene_automation_yaml(scene_id)
-        if yaml_str.startswith("# 错误") or yaml_str.startswith("# 生成"):
-            self._sys_log("WARN", f"[Phase 7D] 生成 YAML 失败，跳过写入: {yaml_str[:80]}")
-            return False
-
-        try:
-            new_automation = _yaml.safe_load(yaml_str)
-            if isinstance(new_automation, list) and new_automation:
-                new_automation = new_automation[0]
-        except Exception as exc:
-            self._sys_log("WARN", f"[Phase 7D] YAML 解析失败: {exc}")
-            return False
-
-        config_dir = self.hass.config.config_dir
-        target_file = _os.path.join(config_dir, "smart_agent_automations.yaml")
-        _lock = self._automations_yaml_lock
-
-        def _write():
-            with _lock:
-                automations: list = []
-                if _os.path.exists(target_file):
-                    try:
-                        with open(target_file, encoding="utf-8") as _f:
-                            existing = _yaml.safe_load(_f)
-                        if isinstance(existing, list):
-                            automations = existing
-                    except Exception:
-                        automations = []
-                alias = new_automation.get("alias", f"SmartAgent AI 场景 {scene_id}")
-                automations = [a for a in automations if a.get("alias") != alias]
-                automations.append(new_automation)
-                with open(target_file, "w", encoding="utf-8") as _f:
-                    _yaml.dump(automations, _f, allow_unicode=True,
-                               sort_keys=False, default_flow_style=False)
-                return len(automations)
-
-        try:
-            count = await self.hass.async_add_executor_job(_write)
-            self._sys_log(
-                "INFO",
-                f"[Phase 7D] 已写入 smart_agent_automations.yaml"
-                f"（场景 id={scene_id}，共 {count} 条定时自动化）"
-            )
-        except Exception as exc:
-            self._sys_log("WARN", f"[Phase 7D] 写入自动化文件失败（不影响场景激活）: {exc}")
-            return False
-
-        # 调用 automation.reload（静默失败：用户可能尚未配置 !include）
-        try:
-            await async_reload_automations(self.hass)
-        except Exception:
-            pass
-
-        return True
+        self._sys_log(
+            "WARN",
+            "[Phase 7D] not_authorized: 设备动作型 HA 自动化仅允许不可执行草稿，禁止安装或 reload",
+        )
+        return False
 
     def get_scene_automation_yaml(self, scene_id: int) -> str:
         """
@@ -1996,7 +1949,14 @@ class DevicesMixin:
         return
 
     async def _try_delete_ha_scene(self, scene_id: int) -> None:
-        """尝试删除对应的 HA 场景实体 scene.ai_<id>，同时从 YAML 文件中移除（静默失败）。"""
+        """Fail closed: legacy HA scene removal requires maintenance governance."""
+        self._sys_log(
+            "WARN",
+            "[AI场景] not_authorized: maintenance delegation/change ledger 未实现，"
+            f"不修改 HA 场景或 YAML id={int(scene_id)}",
+        )
+        return
+
         from .ha_adapter import async_delete_scene, async_reload_scenes
 
         ha_scene_id = f"ai_{scene_id}"
@@ -2022,39 +1982,17 @@ class DevicesMixin:
             self._sys_log("WARN", f"[AI场景] 删除 HA 场景实体失败（不影响数据库操作）: {exc}")
 
     async def async_trigger_ai_scene(self, scene_id: int) -> None:
-        """手动触发一个 active AI 场景：批量执行场景内所有设备动作。"""
-        import json as _json
-        from .const import AI_SCENE_STATUS_ACTIVE
-        scene = next(
-            (s for s in self._ai_scenes_cache
-             if s["id"] == scene_id and s["status"] == AI_SCENE_STATUS_ACTIVE),
-            None,
-        )
-        if not scene:
-            self._sys_log("WARN", f"[AI场景] 手动触发失败：场景 id={scene_id} 不存在或未激活")
+        """Delegate scene execution to the add-on authority boundary."""
+        addon_client = getattr(self, "_addon_client", None)
+        trigger = getattr(addon_client, "trigger_ai_scene", None)
+        if not callable(trigger):
+            self._sys_log("WARN", "[AI场景] add-on lifecycle provider unavailable")
             return
-        actions: list[dict] = []
-        try:
-            actions_raw = _json.loads(scene.get("actions_json", "[]") or "[]")
-            actions = normalize_raw_actions(actions_raw, device_info=self.device_info)
-        except Exception:
-            actions = []
-
-        if not actions:
-            try:
-                entities = _json.loads(scene["entities_json"])
-            except Exception:
-                self._sys_log("WARN", f"[AI场景] 场景 {scene['name']} entities_json 解析失败")
-                return
-
-            actions = entities_to_actions(
-                entities,
-                device_info=self.device_info,
-                on_states=("on", "open", "heat", "cool", "auto"),
+        result = await trigger(int(scene_id))
+        if not isinstance(result, dict) or not bool(result.get("ok")):
+            error = (
+                str(result.get("error") or result.get("error_type") or "scene_trigger_failed")
+                if isinstance(result, dict)
+                else "scene_trigger_failed"
             )
-
-        if actions:
-            for a in actions:
-                a["reason"] = f"手动触发AI场景: {scene['name']}"
-            self._sys_log("INFO", f"[AI场景] 手动触发: {scene['name']} ({len(actions)} 个设备)")
-            await self._execute_actions(actions, is_global_cmd=True)
+            self._sys_log("WARN", f"[AI场景] add-on trigger failed id={scene_id}: {error}")

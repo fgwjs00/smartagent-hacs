@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 from .action_normalization import action_domain
 
 
-# M7 v0.1 deliberately has no unscoped all-home execution mode. Production
+# M7 v0.1 deliberately has no unscoped all-home execution mode.  Production
 # expansion must happen through an exact canary scope and an independent grant.
 ACTIVE_AI_MODES = frozenset({"off", "shadow", "canary"})
 DEFAULT_ACTIVE_AI_MODE = "shadow"

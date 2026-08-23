@@ -23,14 +23,56 @@ from .arrival_lighting_learning import arrival_lighting_entity_ids
 from .ha_adapter import async_call_service
 from .active_ai_rollout import (
     ActiveAiRolloutConfig,
-    DEFAULT_ACTIVE_AI_MODE,
     enrich_active_ai_action_spaces,
     evaluate_active_ai_execution_gate,
-    normalize_active_ai_mode,
     scope_active_ai_canary_actions,
 )
-from .confidence_arbitration_contract import validate_auto_execution_arbitration
-from .presence_runtime import DEFAULT_COLD_START_RECHECK_SECONDS, advance_occupancy_cycle, async_restore_occupancy_cycles, attach_occupancy_cycle, cleanup_startup_reconciliation, enrich_fast_path_presence_timing, learning_space_identity, occupancy_cycle_outcome, persist_occupancy_cycles, resolve_space_id, room_candidates, room_snapshot, schedule_arrival_baseline_sample, schedule_startup_presence_reconciliation, slow_fallback_allowed
+from .fast_path_listener import run_addon_fast_path_fail_closed
+from .listener_trigger_projection import (
+    compact_listener_triggers,
+    format_listener_state,
+    format_listener_trigger,
+    listener_trigger_public_summary,
+)
+from .listener_trigger_runtime import (
+    build_presence_snapshot_for_entity,
+    cancel_presence_temporal_recheck,
+    effective_cooldown,
+    emit_slow_inference_task_failure,
+    flush_triggers,
+    handle_slow_inference_task_done,
+    is_presence_flap_suppressed,
+    is_presence_interaction_active,
+    presence_interaction_source,
+    presence_temporal_recheck_delay,
+    record_presence_flap,
+    record_presence_interaction_trace,
+    schedule_inference,
+    schedule_inference_after_addon_policy_sync,
+    schedule_presence_temporal_recheck,
+    should_trigger,
+    slow_inference_cooldown_key,
+    spawn_slow_inference_task,
+)
+from .listener_state_runtime import handle_listener_state_changed
+from .listener_registry_runtime import (
+    async_refresh_device_info_from_addon_devices,
+    device_info_row_from_addon_device,
+    get_live_presence_occupancy_map,
+    is_actionable_sensor_runtime_entity,
+    is_listener_runtime_entity,
+    is_presence_listener_entity,
+    listener_entity_metadata,
+    managed_device_info_row_from_addon_device,
+    managed_listener_entity_ids,
+    persist_device_entity_id_migration,
+    persist_device_registry_metadata,
+    persist_ha_registry_metadata,
+    reconcile_active_listener_states,
+    reconcile_device_info_entity_ids_from_ha_registry,
+    refresh_listeners_if_entity_set_changed,
+)
+from .presence_runtime import DEFAULT_COLD_START_RECHECK_SECONDS, advance_occupancy_cycle, async_restore_occupancy_cycles, cleanup_startup_reconciliation, learning_space_identity, occupancy_cycle_outcome, persist_occupancy_cycles, resolve_space_id, room_candidates, room_snapshot, schedule_arrival_baseline_sample, schedule_startup_presence_reconciliation
 from .sensor_event_filter import EnvironmentTelemetryFilter, environment_sensor_kind
 from .const import (
     FRIGATE_PERSON_COUNT_KW as _FRIGATE_PERSON_COUNT_KW,
@@ -71,7 +113,9 @@ class ListenersMixin:
     # AI 操作后 N 秒内的同向状态变化视为 AI 自身引起，不再触发
     _AI_ACTION_SKIP_WINDOW = AI_ACTION_SKIP_WINDOW
     _ARRIVAL_LEARNING_LOOKBACK_SECONDS = 30.0
-    _ARRIVAL_LEARNING_WINDOW_SECONDS = 30.0
+    # Arrival evidence is sampled after a short stable-presence window. The
+    # separate 30-second product setting is reserved for departure debounce.
+    _ARRIVAL_LEARNING_WINDOW_SECONDS = 5.0
     _ARRIVAL_MANUAL_EVIDENCE_RETENTION_SECONDS = 120.0
     _MANUAL_SERVICE_CONTEXT_RETENTION_SECONDS = 15 * 60.0
     _MANUAL_SCENE_SESSION_IDLE_SECONDS = 90.0
@@ -173,158 +217,13 @@ class ListenersMixin:
 
     # ── 触发校验 ──────────────────────────────────────────────────────────────
 
-    def _should_trigger(self, entity_id: str, old: str, new: str) -> bool:
-        if not self._is_enabled():
-            self._sys_log("WARN", f"触发被拒: AI 已暂停 | {entity_id}")
-            return False
-        elapsed = time.time() - self._startup_time
-        if elapsed < self._startup_grace:
-            remaining = int(self._startup_grace - elapsed)
-            self._sys_log("INFO", f"启动冷却中({remaining}s 后就绪)，忽略触发: {entity_id} {old}→{new}")
-            if remaining <= 3 and not getattr(self, "_startup_ready_notified", False):
-                self._startup_ready_notified = True
-                self._sys_log("INFO", "✅ 系统即将就绪，下次触发将开始 AI 推理")
-            return False
-        if not getattr(self, "_startup_ready_notified", False):
-            self._startup_ready_notified = True
-            self._sys_log("INFO", f"✅ 启动冷却已结束（{int(elapsed)}s），AI 推理已就绪")
-        if new in ("unavailable", "unknown"):
-            self._sys_log("INFO", f"[过滤] 设备状态变为 {new}，跳过: {entity_id}")
-            return False
-        if old in ("unavailable", "unknown"):
-            self._sys_log("INFO", f"[过滤] 设备从 {old} 恢复为 {new}，跳过: {entity_id}")
-            return False
-        if entity_id not in self.device_info:
-            self._sys_log("WARN", f"触发被拒: {entity_id} 不在已配置设备列表中（请在设备页面添加）")
-            return False
-
-        # 数值型传感器死区过滤（SYS-02）：
-        # 仅针对 sensor.* 且 old/new 均可解析为浮点数的情况做变化量检查。
-        # 非数值传感器（motion: on/off / door: open/closed）直接放行。
-        if entity_id.split(".")[0] == "sensor":
-            try:
-                _old_v = float(old)
-                _new_v = float(new)
-                _base = max(abs(_old_v), abs(_new_v), 1.0)
-                _change_pct = abs(_new_v - _old_v) / _base * 100
-                if _change_pct < self._SENSOR_DEADBAND_PCT:
-                    self._sys_log(
-                        "INFO",
-                        f"[死区过滤] {entity_id} {old}→{new} 变化 {_change_pct:.1f}% "
-                        f"< 阈值 {self._SENSOR_DEADBAND_PCT}%，跳过推理",
-                    )
-                    return False
-            except (ValueError, TypeError):
-                pass  # 非数值型状态（on/off 等），直接放行
-
-        last_ai = self._last_ai_actions.get(entity_id)
-        if last_ai:
-            age = time.time() - last_ai["time"]
-            if age < self._AI_ACTION_SKIP_WINDOW and last_ai["state"] == new:
-                self._sys_log("INFO", f"[过滤] AI 操作后 {int(age)}s 内同向变化，跳过: {entity_id} → {new}")
-                return False
-        return True
-
-    def _effective_cooldown(self) -> int:
-        """展厅模式使用更短冷却以便快速响应演示。"""
-        return self._SHOWROOM_COOLDOWN if self._mode == "showroom" else self.cooldown
-
-    def _slow_inference_cooldown_key(self, entity_id: str, new_state: str) -> str:
-        """避免同一存在传感器的到达和离开互相吞掉慢脑调度。"""
-        if self._is_presence_arrival_for_slow_inference(entity_id, new_state):
-            return f"{entity_id}:presence_arrival"
-        if self._is_presence_departure_for_slow_inference(entity_id, new_state):
-            return f"{entity_id}:presence_departure"
-        return entity_id
-
-    def _is_presence_flap_suppressed(self, entity_id: str) -> tuple[bool, int]:
-        """检查存在传感器是否处于抖动风暴抑制期。"""
-        now_ts = time.time()
-        suppressed = getattr(self, "_presence_flap_suppressed", None)
-        if not isinstance(suppressed, dict):
-            suppressed = {}
-            self._presence_flap_suppressed = suppressed
-        suppress_until = suppressed.get(entity_id, 0)
-        if now_ts < suppress_until:
-            return True, int(suppress_until - now_ts)
-        if suppress_until:
-            suppressed.pop(entity_id, None)
-        return False, 0
-
-    def _record_presence_flap(self, entity_id: str) -> None:
-        """记录 on/off 反转并在高频抖动时进入抑制期。"""
-        now_ts = time.time()
-        history_map = getattr(self, "_presence_flap_history", None)
-        if not isinstance(history_map, dict):
-            history_map = {}
-            self._presence_flap_history = history_map
-        suppressed = getattr(self, "_presence_flap_suppressed", None)
-        if not isinstance(suppressed, dict):
-            suppressed = {}
-            self._presence_flap_suppressed = suppressed
-        history = history_map.setdefault(entity_id, [])
-        history.append(now_ts)
-        history_map[entity_id] = [
-            t for t in history if now_ts - t <= self._PRESENCE_FLAP_WINDOW
-        ]
-        flap_count = len(history_map[entity_id])
-        if flap_count < self._PRESENCE_FLAP_THRESHOLD:
-            return
-
-        suppress_until = now_ts + self._PRESENCE_FLAP_SUPPRESS_SECS
-        suppressed[entity_id] = suppress_until
-        history_map[entity_id] = []
-        presence_on_start = getattr(self, "_presence_on_start", None)
-        if isinstance(presence_on_start, dict):
-            presence_on_start.pop(entity_id, None)
-        presence_off_timers = getattr(self, "_presence_off_timers", None)
-        old_off = presence_off_timers.pop(entity_id, None) if isinstance(presence_off_timers, dict) else None
-        if old_off:
-            try:
-                old_off()
-            except Exception as exc:
-                _LOGGER.debug("[Listeners] 取消离开确认计时器失败 (flap): %s", exc)
-
-        self._sys_log(
-            "WARN",
-            f"[存在去抖] {entity_id} 在 {self._PRESENCE_FLAP_WINDOW}s 内状态反转 {flap_count} 次，"
-            f"判定抖动风暴，抑制 {self._PRESENCE_FLAP_SUPPRESS_SECS}s",
-        )
-
-    def _cancel_presence_temporal_recheck(self, entity_id: str) -> None:
-        timers = getattr(self, "_presence_off_timers", None)
-        if not isinstance(timers, dict):
-            return
-        cancel = timers.pop(entity_id, None)
-        if callable(cancel):
-            try:
-                cancel()
-            except Exception as exc:
-                _LOGGER.debug("[PresenceTemporal] cancel recheck failed for %s: %s", entity_id, exc)
-
-    @staticmethod
-    def _presence_temporal_recheck_delay(presence: dict[str, Any]) -> float | None:
-        if str(presence.get("temporal_status") or "") != "vacant_hold_pending":
-            return None
-        try:
-            hold_secs = max(0.0, float(presence.get("hold_secs") or 0.0))
-        except (TypeError, ValueError):
-            return None
-        if hold_secs <= 0:
-            return None
-        candidate_text = str(presence.get("candidate_since") or "").strip()
-        if not candidate_text:
-            return hold_secs
-        if candidate_text.endswith("Z"):
-            candidate_text = f"{candidate_text[:-1]}+00:00"
-        try:
-            candidate_since = datetime.fromisoformat(candidate_text)
-        except ValueError:
-            return hold_secs
-        if candidate_since.tzinfo is None:
-            candidate_since = candidate_since.replace(tzinfo=timezone.utc)
-        elapsed = max(0.0, time.time() - candidate_since.timestamp())
-        return max(1.0, hold_secs - elapsed)
+    _should_trigger = should_trigger
+    _effective_cooldown = effective_cooldown
+    _slow_inference_cooldown_key = slow_inference_cooldown_key
+    _is_presence_flap_suppressed = is_presence_flap_suppressed
+    _record_presence_flap = record_presence_flap
+    _cancel_presence_temporal_recheck = cancel_presence_temporal_recheck
+    _presence_temporal_recheck_delay = staticmethod(presence_temporal_recheck_delay)
 
     def _schedule_presence_temporal_recheck(
         self,
@@ -334,146 +233,19 @@ class ListenersMixin:
         new_state: str,
         presence: dict[str, Any] | None,
     ) -> None:
-        vacant_states = {"off", "closed", "not_home", "away", "idle", "clear", "empty", "vacant"}
-        normalized_state = str(new_state or "").strip().lower()
-        temporal = presence if isinstance(presence, dict) else {}
-        delay = self._presence_temporal_recheck_delay(temporal)
+        schedule_presence_temporal_recheck(
+            self,
+            entity_id,
+            old_state=old_state,
+            new_state=new_state,
+            presence=presence,
+            schedule=async_call_later,
+        )
 
-        if normalized_state not in vacant_states:
-            self._cancel_presence_temporal_recheck(entity_id)
-            return
-        if delay is None:
-            if str(temporal.get("temporal_status") or "") in {
-                "vacant_hold_satisfied",
-                "vacant_confirmed",
-            }:
-                self._cancel_presence_temporal_recheck(entity_id)
-            return
-
-        self._cancel_presence_temporal_recheck(entity_id)
-        timers = getattr(self, "_presence_off_timers", None)
-        if not isinstance(timers, dict):
-            timers = {}
-            self._presence_off_timers = timers
-
-        @callback
-        def _recheck(_: datetime) -> None:
-            timers.pop(entity_id, None)
-            states = getattr(getattr(self, "hass", None), "states", None)
-            get_state = getattr(states, "get", None)
-            state_obj = get_state(entity_id) if callable(get_state) else None
-            current_state = str(getattr(state_obj, "state", "") or "").strip().lower()
-            if current_state not in vacant_states:
-                return
-            self._spawn_addon_fast_path_task(
-                self._run_addon_fast_path_fail_closed(entity_id, current_state, old_state),
-                entity_id=entity_id,
-                old_state=old_state,
-                new_state=current_state,
-            )
-
-        try:
-            timers[entity_id] = async_call_later(self.hass, delay, _recheck)
-        except Exception as exc:
-            timers.pop(entity_id, None)
-            _LOGGER.debug("[PresenceTemporal] schedule recheck failed for %s: %s", entity_id, exc)
-
-    def _build_presence_snapshot_for_entity(
-        self,
-        entity_id: str,
-        *,
-        blocked_actions: list[str] | None = None,
-        reasons: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Build a compatibility Presence Snapshot without local HA inference."""
-        candidates = room_candidates(self.device_info.get(entity_id, {}) or {})
-        room = candidates[0] if candidates else ""
-        snapshot_fn = getattr(self, "get_presence_snapshot", None)
-        if callable(snapshot_fn) and room:
-            try:
-                root_snapshot = snapshot_fn()
-            except Exception as exc:
-                _LOGGER.debug("[Listeners] get_presence_snapshot failed: %s", exc)
-                root_snapshot = None
-            rooms = root_snapshot.get("rooms") if isinstance(root_snapshot, dict) else None
-            selected_snapshot = room_snapshot(rooms, candidates)
-            if isinstance(selected_snapshot, dict):
-                snap = dict(selected_snapshot)
-                if reasons:
-                    snap["reasons"] = list(snap.get("reasons", [])) + list(reasons)
-                if blocked_actions:
-                    snap["blocked_actions"] = list(snap.get("blocked_actions", [])) + list(blocked_actions)
-                localized_spaces = list(snap.get("localized_spaces") or [])
-                if room not in localized_spaces:
-                    localized_spaces.insert(0, room)
-                snap["localized_spaces"] = localized_spaces
-                return snap
-
-        fallback_reasons = list(reasons or [])
-        fallback_reasons.append("presence_decision_owned_by_addon")
-        if not room:
-            fallback_reasons.append("no_room")
-        return {
-            "state": "unknown",
-            "confidence": 0.0,
-            "reasons": fallback_reasons,
-            "enter_qualified": False,
-            "leave_qualified": False,
-            "localized_spaces": [room] if room else [],
-            "blocked_actions": list(blocked_actions or []),
-        }
-
-    def _is_presence_interaction_active(self, domain: str, state: str) -> bool:
-        normalized = str(state or "").strip().lower()
-        if domain == "light":
-            return normalized == "on"
-        if domain == "media_player":
-            return normalized in {"on", "playing", "paused"}
-        if domain == "climate":
-            return normalized not in {"", "off", "unavailable", "unknown"}
-        return False
-
-    def _presence_interaction_source(self, entity_id: str, source_type: str) -> str:
-        classifier = getattr(self, "_classify_source", None)
-        if callable(classifier):
-            try:
-                return str(classifier(entity_id, source_type))
-            except Exception as exc:
-                _LOGGER.debug("[PresenceInference] classify interaction source failed: %s", exc)
-        if source_type == "自动化/脚本":
-            return SOURCE_AUTOMATION
-        if source_type == "用户界面":
-            return SOURCE_DASHBOARD
-        if source_type == "语音":
-            return SOURCE_VOICE
-        return SOURCE_PHYSICAL
-
-    def _record_presence_interaction_trace(
-        self,
-        entity_id: str,
-        domain: str,
-        new_state: str,
-        source_type: str,
-        *,
-        source: str | None = None,
-    ) -> bool:
-        if domain not in self._PRESENCE_INTERACTION_DOMAINS:
-            return False
-        if not self._is_presence_interaction_active(domain, new_state):
-            return False
-        trace_source = str(source or self._presence_interaction_source(entity_id, source_type))
-        inference = getattr(self, "_presence_inference", None)
-        update_trace = getattr(inference, "update_device_trace", None)
-        if not callable(update_trace):
-            return False
-        try:
-            update_trace(entity_id, new_state, source=trace_source)
-            return trace_source in self._PRESENCE_INTERACTION_HUMAN_SOURCES
-        except Exception as exc:
-            _LOGGER.debug("[PresenceInference] update_device_trace failed for %s: %s", entity_id, exc)
-            return False
-
-    # ── 触发调度与合并 ────────────────────────────────────────────────────────
+    _build_presence_snapshot_for_entity = build_presence_snapshot_for_entity
+    _is_presence_interaction_active = is_presence_interaction_active
+    _presence_interaction_source = presence_interaction_source
+    _record_presence_interaction_trace = record_presence_interaction_trace
 
     @callback
     def _schedule_inference(
@@ -486,461 +258,33 @@ class ListenersMixin:
         _policy_synced: bool = False,
         _allow_learning_mode_inference: bool = False,
         source_trace_context: dict[str, Any] | None = None,
+        causal_event: dict[str, Any] | None = None,
     ) -> None:
-
-        # ── 门控检查（所有路径统一入口，包括 Frigate MQTT / 巡检 / HA 状态变化）──────
-        # 1. AI 是否已暂停
-        if not self._is_enabled():
-            self._sys_log("WARN", f"触发被拒: AI 已暂停 | {entity_id}")
-            self._emit_listener_event(
-                listener_action="filtered",
-                entity_id=entity_id,
-                new_state=new_state,
-                filter_reason="ai_disabled",
-                source_type="schedule_gate",
-                trigger=trigger,
-            )
-            return
-        # 2. 启动冷却（HA 重启后等待设备状态稳定）
-        _startup_elapsed = time.time() - self._startup_time
-        if _startup_elapsed < self._startup_grace:
-            _remaining = int(self._startup_grace - _startup_elapsed)
-            self._sys_log("INFO", f"启动冷却中({_remaining}s 后就绪)，忽略触发: {entity_id}")
-            self._emit_listener_event(
-                listener_action="filtered",
-                entity_id=entity_id,
-                new_state=new_state,
-                filter_reason="startup_cooldown",
-                source_type="schedule_gate",
-                trigger=trigger,
-                cooldown_remaining=_remaining,
-            )
-            return
-        # 3. 静默学习模式（记录与学习，抑制执行）
-        if not _policy_synced:
-            self._spawn_slow_inference_task(
-                self._schedule_inference_after_addon_policy_sync(
-                    entity_id,
-                    trigger,
-                    new_state,
-                    one_off_prompt,
-                    _allow_learning_mode_inference=_allow_learning_mode_inference,
-                    source_trace_context=source_trace_context,
-                ),
-                trigger=trigger,
-                entity_id=entity_id,
-            )
-            return
-        if self._learning_mode and not _allow_learning_mode_inference:
-            self._emit_listener_event(
-                listener_action="filtered",
-                entity_id=entity_id,
-                new_state=new_state,
-                filter_reason="learning_mode",
-                source_type="schedule_gate",
-                trigger=trigger,
-            )
-            # 仅记录真实 HA 实体（entity_id 必须含"."，排除"展厅系统"等虚拟调度实体）
-            _is_real_entity = "." in entity_id and not entity_id.startswith(".")
-            if _is_real_entity:
-                self._sys_log("INFO", f"[静默学习] {entity_id} {new_state}，记录与学习，抑制执行")
-                self.hass.async_add_executor_job(
-                    self._record_event, "Learning", trigger, entity_id, new_state
-                )
-            else:
-                self._sys_log("INFO", f"[静默学习] {entity_id} {new_state}，记录与学习，抑制执行")
-            return
-        # ──────────────────────────────────────────────────────────────────────────
-
-        now = time.time()
-        cooldown = self._effective_cooldown()
-        cooldown_key = self._slow_inference_cooldown_key(entity_id, new_state)
-        elapsed = now - self._last_inference.get(cooldown_key, 0)
-        if elapsed < cooldown:
-            _remaining = int(cooldown - elapsed)
-            self._sys_log("INFO", f"[冷却] {entity_id} 冷却中({_remaining}s 后可再触发)")
-            self._emit_listener_event(
-                listener_action="filtered",
-                entity_id=entity_id,
-                new_state=new_state,
-                filter_reason="cooldown",
-                source_type="schedule_gate",
-                trigger=trigger,
-                cooldown_remaining=_remaining,
-                cooldown_key=cooldown_key,
-            )
-            return
-        self._last_inference[cooldown_key] = now
-        with self._pending_triggers_lock:
-            if len(self._pending_triggers) >= 50:
-                _dropped = [t.get("entity_id", "?") for t in self._pending_triggers[:25]]
-                self._sys_log("WARN", f"[事件溢出] 触发队列满，丢弃 25 个事件: {_dropped}")
-                self._pending_triggers = self._pending_triggers[-25:]
-            pending_trigger = {"text": trigger, "entity_id": entity_id, "one_off": one_off_prompt}
-            if isinstance(source_trace_context, dict) and source_trace_context:
-                pending_trigger["source_trace_context"] = dict(source_trace_context)
-            self._pending_triggers.append(pending_trigger)
-
-        domain = entity_id.split(".")[0]
-        if domain in ("light", "switch", "fan", "cover", "climate", "media_player"):
-            with self._pending_triggers_lock:
-                self._pending_trigger_controllable[entity_id] = new_state
-        is_urgent = domain in ("binary_sensor", "device_tracker", "person")
-        window = self._URGENT_MERGE_WINDOW if is_urgent else self._NORMAL_MERGE_WINDOW
-
-        if self._merge_timer_unsub is not None and is_urgent:
-            try:
-                self._merge_timer_unsub()
-            except Exception as _e:
-                _LOGGER.debug("[调度] 取消合并定时器异常（忽略）: %s", _e)
-            self._merge_timer_unsub = None
-
-        self._sys_log("INFO", f"[调度] 推理已加入队列，{window}s 后执行{'（紧急）' if is_urgent else ''}")
-        if self._merge_timer_unsub is None:
-            self._merge_timer_unsub = async_call_later(self.hass, window, self._flush_triggers)
-
-    async def _schedule_inference_after_addon_policy_sync(
-        self,
-        entity_id: str,
-        trigger: str,
-        new_state: str = "",
-        one_off_prompt: str = "",
-        *,
-        _allow_learning_mode_inference: bool = False,
-        source_trace_context: dict[str, Any] | None = None,
-    ) -> None:
-        try:
-            await self._async_apply_addon_system_settings()
-        except Exception as exc:
-            _LOGGER.debug("[AddonSettings] pre-inference policy sync failed: %s", exc)
-        self._schedule_inference(
+        schedule_inference(
+            self,
             entity_id,
             trigger,
             new_state,
             one_off_prompt,
-            _policy_synced=True,
+            _policy_synced=_policy_synced,
             _allow_learning_mode_inference=_allow_learning_mode_inference,
             source_trace_context=source_trace_context,
+            causal_event=causal_event,
+            schedule=async_call_later,
         )
 
-    def _emit_slow_inference_task_failure(
-        self,
-        *,
-        trigger: str,
-        entity_id: str,
-        reason: str,
-        scene: str,
-        status: int,
-        message: str = "",
-    ) -> None:
-        old_state = ""
-        new_state = ""
-        match = re.match(r"^\s*([^:]+):\s*(.*?)\s*->\s*(.*?)\s*$", str(trigger or ""))
-        if match:
-            entity_id = entity_id or match.group(1).strip()
-            old_state = match.group(2).strip()
-            new_state = match.group(3).strip()
-        try:
-            self.hass.bus.async_fire("smart_agent_decision_bubble", {
-                "source": "ha_slow_decision",
-                "entity_id": str(entity_id or ""),
-                "trigger_entity_id": str(entity_id or ""),
-                "old_state": old_state,
-                "new_state": new_state,
-                "trigger": str(trigger or ""),
-                "status": status,
-                "matched": False,
-                "path_taken": "llm",
-                "reason": reason,
-                "scene": scene,
-                "confidence": 0,
-                "action_count": 0,
-                "actions": [],
-                "transaction_id": "",
-                "executed": False,
-                "executed_count": 0,
-                "final_outcome": "failed",
-                "fail_closed": True,
-                "message": str(message or ""),
-            })
-        except Exception as exc:
-            _LOGGER.debug("[SlowInference] failure bubble emit failed: %s", exc)
-        enqueue = getattr(self, "_enqueue_internal_event", None)
-        if callable(enqueue):
-            result_payload = {
-                "source": "ha_slow_decision",
-                "path_taken": "llm",
-                "reason": reason,
-                "scene": scene,
-                "trigger": str(trigger or ""),
-                "actions": [],
-                "matched": False,
-                "final_outcome": "failed",
-                "fail_closed": True,
-                "message": str(message or ""),
-            }
-            log_payload = {
-                "trigger": str(trigger or ""),
-                "scene": scene,
-                "source": "ha_slow_decision",
-                "path_taken": "llm",
-                "confidence": 0,
-                "matched": False,
-                "action_count": 0,
-                "reason": reason,
-                "actions": [],
-                "result": result_payload,
-            }
-            try:
-                if not enqueue("decision_log", log_payload):
-                    self._sys_log("WARN", f"[SlowInference] decision_log enqueue failed reason={reason}")
-            except Exception as exc:
-                _LOGGER.debug("[SlowInference] decision_log enqueue failed: %s", exc)
-
-    def _handle_slow_inference_task_done(self, task: Any, *, trigger: str, entity_id: str) -> None:
-        cancelled = False
-        try:
-            cancelled = bool(task.cancelled()) if hasattr(task, "cancelled") else False
-        except Exception:
-            cancelled = False
-        if cancelled:
-            self._sys_log("WARN", f"[决策] 线上大模型任务被取消: {entity_id}")
-            self._emit_slow_inference_task_failure(
-                trigger=trigger,
-                entity_id=entity_id,
-                reason="slow_inference_task_cancelled",
-                scene="线上大模型任务已取消",
-                status=499,
-            )
-            return
-        try:
-            exc = task.exception() if hasattr(task, "exception") else None
-        except asyncio.CancelledError:
-            self._sys_log("WARN", f"[决策] 线上大模型任务被取消: {entity_id}")
-            self._emit_slow_inference_task_failure(
-                trigger=trigger,
-                entity_id=entity_id,
-                reason="slow_inference_task_cancelled",
-                scene="线上大模型任务已取消",
-                status=499,
-            )
-            return
-        except Exception as err:
-            exc = err
-        if exc is None:
-            return
-        self._sys_log("ERROR", f"[决策] 线上大模型任务异常: {entity_id} | {exc}")
-        self._emit_slow_inference_task_failure(
-            trigger=trigger,
-            entity_id=entity_id,
-            reason="slow_inference_task_failed",
-            scene="线上大模型任务失败",
-            status=500,
-            message=str(exc),
-        )
-
-    def _spawn_slow_inference_task(self, coro: Any, *, trigger: str, entity_id: str) -> None:
-        try:
-            task = self.hass.async_create_task(coro)
-        except Exception as exc:
-            close = getattr(coro, "close", None)
-            if callable(close):
-                close()
-            self._sys_log("ERROR", f"[决策] 创建线上大模型任务失败: {entity_id} | {exc}")
-            self._emit_slow_inference_task_failure(
-                trigger=trigger,
-                entity_id=entity_id,
-                reason="slow_inference_task_create_failed",
-                scene="线上大模型任务创建失败",
-                status=500,
-                message=str(exc),
-            )
-            return
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if callable(add_done_callback):
-            add_done_callback(
-                lambda finished: self._handle_slow_inference_task_done(
-                    finished,
-                    trigger=trigger,
-                    entity_id=entity_id,
-                )
-            )
+    _schedule_inference_after_addon_policy_sync = schedule_inference_after_addon_policy_sync
+    _emit_slow_inference_task_failure = emit_slow_inference_task_failure
+    _handle_slow_inference_task_done = handle_slow_inference_task_done
+    _spawn_slow_inference_task = spawn_slow_inference_task
 
     @callback
-    def _flush_triggers(self, _: datetime) -> None:
-        self._merge_timer_unsub = None
-        with self._pending_triggers_lock:
-            if not self._pending_triggers:
-                return
-
-        # 每次 flush 时顺手清理 _user_manual_actions 过期键（超过 _USER_MANUAL_WINDOW）
-        # 防止字典无限增长（随历史手动操作实体数线性增大）
-        with self._user_manual_actions_lock:
-            if self._user_manual_actions:
-                _now_ts = time.time()
-                _expired = [
-                    eid for eid, v in self._user_manual_actions.items()
-                    if (_now_ts - v.get("time", 0)) > self._USER_MANUAL_WINDOW
-                ]
-                for eid in _expired:
-                    del self._user_manual_actions[eid]
-
-        with self._pending_triggers_lock:
-            triggers = self._pending_triggers.copy()
-            self._pending_triggers.clear()
-            controllable_snapshot = self._pending_trigger_controllable.copy()
-            self._pending_trigger_controllable.clear()
-
-        # 状态校验：合并窗口内检查可控设备当前状态是否与上报一致
-        # 同时维护闪断累计计数，频繁闪断的设备进入抑制期，暂停触发推理
-        # （_glitch_history / _glitch_suppressed 已在 coordinator.__init__ 中初始化）
-
-        _now_glitch = time.time()
-        glitched: list[str] = []
-        for eid, reported in controllable_snapshot.items():
-            if not reported:
-                continue
-            # 检查该设备是否处于闪断抑制期，若是则直接视为闪断跳过
-            suppress_until = self._glitch_suppressed.get(eid, 0)
-            if _now_glitch < suppress_until:
-                glitched.append(eid)
-                remain = int(suppress_until - _now_glitch)
-                self._sys_log("INFO", f"[状态校验] {eid} 处于闪断抑制期，跳过触发（剩余{remain}s）")
-                continue
-            current = self.hass.states.get(eid)
-            if current and current.state != reported:
-                glitched.append(eid)
-                name = self.get_device_name(eid)
-                self._sys_log("WARN", f"[状态校验] {name}({eid}) 上报 {reported} 但刷新后为 {current.state}，判定为通信闪断，移除该触发")
-                with self._user_overrides_lock:
-                    self._user_overrides.pop(eid, None)
-                # 累计闪断记录，清理超出时间窗口的旧记录
-                history = self._glitch_history.setdefault(eid, [])
-                history.append(_now_glitch)
-                self._glitch_history[eid] = [t for t in history if _now_glitch - t < self._GLITCH_WINDOW]
-                # 若在时间窗口内闪断次数达到阈值，进入抑制期
-                if len(self._glitch_history[eid]) >= self._GLITCH_THRESHOLD:
-                    self._glitch_suppressed[eid] = _now_glitch + self._GLITCH_SUPPRESS_SECS
-                    self._sys_log("WARN",
-                        f"[状态校验] {name}({eid}) {self._GLITCH_WINDOW}s内闪断{len(self._glitch_history[eid])}次，"
-                        f"进入{self._GLITCH_SUPPRESS_SECS}s抑制期，暂停触发推理"
-                    )
-                    self._glitch_history[eid] = []  # 重置计数，等待抑制期结束
-
-        if glitched:
-            triggers = [t for t in triggers if t["entity_id"] not in glitched]
-            for eid in glitched:
-                controllable_snapshot.pop(eid, None)
-
-        if not triggers:
-            self._sys_log("INFO", "[状态校验] 所有触发均为通信闪断，取消本次推理")
-            return
-
-        self._batch_trigger_controllable = controllable_snapshot
-        if self._batch_trigger_controllable:
-            self._sys_log("INFO", f"[自触发保护] 本批次含可控设备触发: {', '.join(self._batch_trigger_controllable)}，AI 不可反向操作这些设备")
-        
-        contextual_triggers = [
-            item
-            for item in triggers
-            if isinstance(item.get("source_trace_context"), dict)
-            and item.get("source_trace_context")
-        ]
-        mergeable_triggers = [item for item in triggers if item not in contextual_triggers]
-        inference_batches: list[dict[str, Any]] = []
-
-        merged_batch: dict[str, Any] | None = None
-        if mergeable_triggers:
-            mergeable_texts = [item["text"] for item in mergeable_triggers]
-            merged_trigger = (
-                mergeable_texts[0]
-                if len(mergeable_texts) == 1
-                else self._compact_merged_trigger(mergeable_texts)
-            )
-            one_off_prompts = [
-                item.get("one_off")
-                for item in mergeable_triggers
-                if item.get("one_off")
-            ]
-            merged_batch = {
-                "trigger": merged_trigger,
-                "entity_id": str(mergeable_triggers[0].get("entity_id") or ""),
-                "one_off_prompt": one_off_prompts[0] if one_off_prompts else "",
-                "source_trace_context": None,
-                "trigger_count": len(mergeable_triggers),
-                "public_summary": self._trigger_public_summary(mergeable_texts),
-            }
-
-        merged_batch_added = False
-        for item in triggers:
-            context = item.get("source_trace_context")
-            if isinstance(context, dict) and context:
-                inference_batches.append(
-                    {
-                        "trigger": item["text"],
-                        "entity_id": str(item.get("entity_id") or ""),
-                        "one_off_prompt": str(item.get("one_off") or ""),
-                        "source_trace_context": dict(context),
-                        "trigger_count": 1,
-                        "public_summary": self._trigger_public_summary([item["text"]]),
-                    }
-                )
-            elif merged_batch is not None and not merged_batch_added:
-                inference_batches.append(merged_batch)
-                merged_batch_added = True
-
-        for batch in inference_batches:
-            self._sys_log(
-                "INFO",
-                f"[合并] 合并 {batch['trigger_count']} 个触发，启动推理: {batch['public_summary']}",
-            )
-            try:
-                trigger_text = str(batch["trigger"])
-                self._spawn_slow_inference_task(
-                    self._run_addon_decision(
-                        trigger_text,
-                        one_off_prompt=str(batch["one_off_prompt"]),
-                        source_trace_context=batch["source_trace_context"],
-                    ),
-                    trigger=trigger_text,
-                    entity_id=str(batch["entity_id"]),
-                )
-            except Exception as exc:
-                self._sys_log("ERROR", f"[合并] 创建推理任务失败: {exc}")
-
-    # ── 触发文本格式化 ────────────────────────────────────────────────────────
-
-    _DOMAIN_ZH_MAP = {
-        "light": "灯光", "switch": "开关", "climate": "空调",
-        "cover": "窗帘", "fan": "风扇", "sensor": "数值传感器",
-        "binary_sensor": "传感器", "media_player": "播放器",
-        "device_tracker": "位置", "person": "人员",
-    }
-
-    # 仅存在感/二进制传感器使用"有人/无人"语义翻译
-    _PRESENCE_STATE_ZH = {"on": "有人", "off": "无人"}
-    # 可控设备（灯/开关/窗帘等）使用"开/关"
-    _CTRL_STATE_ZH = {
-        "on": "开", "off": "关",
-        "open": "已开", "closed": "已关",
-        "heat": "制热", "cool": "制冷", "dry": "除湿",
-        "fan_only": "送风", "auto": "自动",
-        "home": "回家", "not_home": "离家",
-        "unavailable": "离线", "unknown": "未知",
-    }
-    # 存在感传感器关键词（与 _PRESENCE_KW 保持一致）
-    _PRESENCE_DOMAINS = frozenset({"binary_sensor"})
+    def _flush_triggers(self, now: datetime) -> None:
+        flush_triggers(self, now)
 
     def _fmt_state(self, domain: str, entity_id: str, state: str) -> str:
         """根据设备类型返回语义准确的状态文字。"""
-        if domain in self._PRESENCE_DOMAINS:
-            eid_lower = entity_id.lower()
-            is_presence = any(kw in eid_lower or kw in (
-                self.device_info.get(entity_id, {}).get("name", "").lower()
-            ) for kw in self._PRESENCE_KW)
-            if is_presence:
-                return self._PRESENCE_STATE_ZH.get(state, state)
-        return self._CTRL_STATE_ZH.get(state, state)
+        return format_listener_state(self, domain, entity_id, state)
 
     def _fmt_trigger(self, source: str, domain: str, name: str,
                      entity_id: str, old_s: str, new_s: str) -> str:
@@ -948,11 +292,15 @@ class ListenersMixin:
         
         保留 entity_id 让 AI 可精确识别设备，状态按设备类型语义化翻译。
         """
-        dz = self._DOMAIN_ZH_MAP.get(domain, domain)
-        oz = self._fmt_state(domain, entity_id, old_s)
-        nz = self._fmt_state(domain, entity_id, new_s)
-        src_short = {"物理/自动": "物理", "自动化/脚本": "脚本", "用户界面": "用户"}.get(source, source)
-        return f"[{src_short}] {dz}「{name}」{oz}→{nz}（{entity_id}）"
+        return format_listener_trigger(
+            self,
+            source,
+            domain,
+            name,
+            entity_id,
+            old_s,
+            new_s,
+        )
 
     def _trigger_public_summary(
         self,
@@ -963,57 +311,12 @@ class ListenersMixin:
         new_state: str = "",
     ) -> str:
         """Return a log-safe trigger summary without friendly names or raw text."""
-        if isinstance(trigger, (list, tuple, set)):
-            texts = [str(item or "").strip() for item in trigger if str(item or "").strip()]
-        else:
-            text = str(trigger or "").strip()
-            texts = [text] if text else []
-
-        def _summary_from_text(text: str) -> str:
-            patterns = (
-                re.compile(r"\[(?P<src>[^\]]+)\].*?」(?P<old>[^→（）\s]+)→(?P<new>[^（）\s]+)（(?P<eid>[^）]+)）"),
-                re.compile(r"\[(?P<src>[^\]]+)\].*?\((?P<eid>[^)]+)\)\]\s+changed:\s+(?P<old>\S+)\s+->\s+(?P<new>\S+)"),
-                re.compile(r"(?P<eid>[A-Za-z0-9_]+\.[A-Za-z0-9_.:-]+)\s*[:：]?\s*(?P<old>[^\s→-]+)\s*(?:→|->)\s*(?P<new>\S+)"),
-            )
-            for pattern in patterns:
-                match = pattern.search(text)
-                if not match:
-                    continue
-                src = str(match.groupdict().get("src") or "").strip()
-                eid = str(match.group("eid") or "").strip()
-                old_s = str(match.group("old") or "?").strip()
-                new_s = str(match.group("new") or "?").strip()
-                if eid:
-                    prefix = f"[{src}] " if src else ""
-                    return f"{prefix}{eid}:{old_s}->{new_s}"
-            return ""
-
-        summaries: list[str] = []
-        seen: set[str] = set()
-        for text in texts:
-            summary = _summary_from_text(text)
-            if summary and summary not in seen:
-                summaries.append(summary)
-                seen.add(summary)
-
-        fallback_entity = str(entity_id or "").strip()
-        if fallback_entity:
-            old_s = str(old_state or "?").strip() or "?"
-            new_s = str(new_state or "?").strip() or "?"
-            fallback = f"{fallback_entity}:{old_s}->{new_s}"
-            if fallback not in seen:
-                summaries.append(fallback)
-
-        if summaries:
-            visible = summaries[:6]
-            suffix = f"; +{len(summaries) - len(visible)} more" if len(summaries) > len(visible) else ""
-            return ("; ".join(visible) + suffix)[:240]
-
-        combined = "\n".join(texts)
-        if not combined:
-            return "-"
-        digest = hashlib.sha256(combined.encode("utf-8", "ignore")).hexdigest()[:12]
-        return f"trigger_hash={digest} len={len(combined)}"
+        return listener_trigger_public_summary(
+            trigger,
+            entity_id=entity_id,
+            old_state=old_state,
+            new_state=new_state,
+        )
 
     # ── 触发合并压缩 ──────────────────────────────────────────────────────────
 
@@ -1025,63 +328,7 @@ class ListenersMixin:
         2. 不同类型/方向的设备各自独立一行
         3. 整体长度控制在 200 字以内
         """
-        import re as _re
-        # 兼容新格式: [来源] 域「名称」旧→新（entity_id）
-        # 兼容旧格式: [来源] domain [名称(entity_id)] changed: old -> new
-        _pat_new = _re.compile(r"\[(.+?)\]\s+\S+「(.+?)」(\S+)→(\S+)（(\S+?)）")
-        _pat_old = _re.compile(r"\[(.+?)\]\s+\S+\s+\[(.+?)\((.+?)\)\]\s+changed:\s+(\S+)\s+->\s+(\S+)")
-        parsed = []
-        unparsed = []
-        for t in texts:
-            m = _pat_new.search(t)
-            if m:
-                src, name, old_s, new_s, eid = m.groups()
-                domain = eid.split(".")[0]
-                parsed.append({"src": src, "name": name, "eid": eid,
-                                "domain": domain, "old": old_s, "new": new_s})
-                continue
-            m = _pat_old.search(t)
-            if m:
-                src, name, eid, old_s, new_s = m.groups()
-                domain = eid.split(".")[0]
-                parsed.append({"src": src, "name": name, "eid": eid,
-                                "domain": domain, "old": old_s, "new": new_s})
-            else:
-                unparsed.append(t)
-
-        # 按 (src, domain, old→new) 分组，值存 (name, eid) 以便状态翻译时参考 eid
-        from collections import defaultdict
-        groups: dict = defaultdict(list)
-        for p in parsed:
-            key = (p["src"], p["domain"], p["old"], p["new"])
-            groups[key].append((p["name"], p["eid"]))
-
-        lines = []
-        for (src, domain, old_s, new_s), items in groups.items():
-            # items 现在是 (name, eid) 的列表
-            dz = self._DOMAIN_ZH_MAP.get(domain, domain)
-            # 用第一个 eid 判断状态翻译策略（同组设备类型相同）
-            rep_eid = items[0][1] if items and isinstance(items[0], tuple) else ""
-            oz = self._fmt_state(domain, rep_eid, old_s)
-            nz = self._fmt_state(domain, rep_eid, new_s)
-            names = [it[0] if isinstance(it, tuple) else it for it in items]
-            if len(names) == 1:
-                lines.append(f"[{src}] {dz}「{names[0]}」{oz}→{nz}")
-            else:
-                # 多个设备同向变化：使用第一个设备名称带「」标记以保留房间信息，
-                # 确保 inference.py 中 r"「\[(.*?)\]" 能正确提取 trigger_room，
-                # 避免区域隔离和 per-room lock 因 trigger_room 为空而失效。
-                first_name = names[0]
-                rest_names = "、".join(names[1:3])
-                suffix = f"等{len(names)}台" if len(names) > 2 else (f"、{rest_names}" if rest_names else "")
-                lines.append(f"[{src}] {dz}「{first_name}」{suffix} {oz}→{nz}")
-
-        lines.extend(unparsed)
-        result = "同时发生：\n" + "\n".join(f"  · {l}" for l in lines)
-        # 超 220 字则截取并提示
-        if len(result) > 220:
-            result = result[:218] + "…"
-        return result
+        return compact_listener_triggers(self, texts)
 
     # ── 快速通道 ──────────────────────────────────────────────────────────────
 
@@ -1498,13 +745,39 @@ class ListenersMixin:
             return
         self._correction_suppressions_cache = self._normalize_correction_suppressions(rows)
 
-    def _build_addon_fast_path_snapshot(self, entity_id: str) -> dict[str, Any]:
+    def _build_addon_fast_path_snapshot(
+        self,
+        entity_id: str,
+        *,
+        include_environment_devices: bool = False,
+    ) -> dict[str, Any]:
         """Build the plain snapshot consumed by add-on Core fast-path decisions."""
         raw_device_info = getattr(self, "device_info", {}) or {}
-        device_info = {
-            str(entity_id): dict(info) if isinstance(info, dict) else {}
-            for entity_id, info in raw_device_info.items()
-        } if isinstance(raw_device_info, dict) else {}
+        environment_device_info = (
+            getattr(self, "_environment_context_device_info", {}) or {}
+        )
+        include_environment_devices = bool(include_environment_devices) or (
+            isinstance(environment_device_info, dict)
+            and str(entity_id or "") in environment_device_info
+        )
+        if (
+            include_environment_devices
+            and isinstance(raw_device_info, dict)
+            and isinstance(environment_device_info, dict)
+        ):
+            raw_device_info = {
+                **raw_device_info,
+                **environment_device_info,
+            }
+        device_info: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_device_info, dict):
+            for snapshot_entity_id, raw_info in raw_device_info.items():
+                projected_info = dict(raw_info) if isinstance(raw_info, dict) else {}
+                # The server-issued sampling contract is consumed only by the HA
+                # collection gate.  It is not machine evidence and must not be
+                # echoed back into the decision snapshot/model input.
+                projected_info.pop("signal_sampling_contract", None)
+                device_info[str(snapshot_entity_id)] = projected_info
         now_ts = time.time()
         observed_at = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
         states: dict[str, str] = {}
@@ -1516,7 +789,14 @@ class ListenersMixin:
             if state is not None:
                 state_value = str(state.state or "")
                 states[eid] = state_value
-                observation = {"state": state_value}
+                observation = {
+                    "state": state_value,
+                    "quality": (
+                        "invalid"
+                        if state_value.strip().lower() in {"", "unknown", "unavailable"}
+                        else "good"
+                    ),
+                }
                 for timestamp_key in ("last_changed", "last_updated"):
                     timestamp = getattr(state, timestamp_key, None)
                     if timestamp in (None, ""):
@@ -1525,12 +805,23 @@ class ListenersMixin:
                     observation[timestamp_key] = (
                         str(isoformat()) if callable(isoformat) else str(timestamp)
                     )
+                observed_at_value = str(
+                    observation.get("last_updated")
+                    or observation.get("last_changed")
+                    or ""
+                ).strip()
+                if observed_at_value:
+                    observation["observed_at"] = observed_at_value
+                    observation["source_event_id"] = f"ha_state:{eid}:{observed_at_value}"
                 state_observations[eid] = observation
                 attributes = getattr(state, "attributes", None)
                 if isinstance(attributes, dict):
                     device_class = str(attributes.get("device_class") or "").strip().lower()
                     if device_class and not device_info[eid].get("device_class"):
                         device_info[eid]["device_class"] = device_class
+                    unit = str(attributes.get("unit_of_measurement") or "").strip()
+                    if unit and not device_info[eid].get("unit_of_measurement"):
+                        device_info[eid]["unit_of_measurement"] = unit
 
         topology: dict[str, list[str]] = {}
         for room, neighbors in (getattr(self, "_room_topology_cache", {}) or {}).items():
@@ -1570,6 +861,16 @@ class ListenersMixin:
                     "canonical_source": "addon_presence_engine",
                     "fallback_consumer": "none",
                 }
+
+        presence_getter = getattr(self, "get_presence_snapshot", None)
+        if callable(presence_getter):
+            try:
+                presence_snapshot = presence_getter()
+            except Exception as exc:
+                _LOGGER.debug("[Listeners] get_presence_snapshot failed for add-on snapshot: %s", exc)
+                presence_snapshot = None
+            if isinstance(presence_snapshot, dict):
+                snapshot["presence_snapshot"] = presence_snapshot
 
         rules_getter = getattr(self, "_build_locked_people_rules", None)
         if callable(rules_getter):
@@ -1673,6 +974,54 @@ class ListenersMixin:
         actions = result.get("actions", [])
         scene = result.get("scene", source_label)
         confidence = result.get("confidence", 90)
+        decision_request = (
+            result.get("decision_request")
+            if isinstance(result.get("decision_request"), dict)
+            else {}
+        )
+        plan_sketch = (
+            result.get("plan_sketch")
+            if isinstance(result.get("plan_sketch"), dict)
+            else {}
+        )
+        policy_evaluation = (
+            result.get("policy_evaluation")
+            if isinstance(result.get("policy_evaluation"), dict)
+            else {}
+        )
+        decision_event_claim_ids: list[str] = []
+        causal_event_rows = decision_request.get("causal_events")
+        if isinstance(causal_event_rows, list):
+            for row in causal_event_rows:
+                if not isinstance(row, dict):
+                    continue
+                claim_id = str(row.get("claim_id") or "").strip()
+                if claim_id and claim_id not in decision_event_claim_ids:
+                    decision_event_claim_ids.append(claim_id)
+        decision_contract_lineage = {
+            "decision_transaction_id": str(transaction_id or "").strip(),
+            "decision_request_id": str(
+                decision_request.get("request_id") or ""
+            ).strip(),
+            "plan_fingerprint": str(
+                plan_sketch.get("semantic_fingerprint") or ""
+            ).strip(),
+            "policy_evaluation_id": str(
+                policy_evaluation.get("evaluation_id") or ""
+            ).strip(),
+            "policy_evaluation_digest": str(
+                policy_evaluation.get("evaluation_digest") or ""
+            ).strip(),
+            "policy_aggregate_decision": str(
+                policy_evaluation.get("aggregate_decision") or ""
+            ).strip().lower(),
+            "decision_event_claim_ids": decision_event_claim_ids,
+        }
+        decision_contract_lineage = {
+            key: value
+            for key, value in decision_contract_lineage.items()
+            if value
+        }
         device_info = getattr(self, "device_info", {})
         if not isinstance(device_info, dict):
             device_info = {}
@@ -1708,6 +1057,7 @@ class ListenersMixin:
                     if pending_selection
                     else "no_actions"
                 ),
+                decision_contract_lineage=decision_contract_lineage,
             )
         candidate_actions = (
             result.get("rollout_original_actions")
@@ -1814,6 +1164,7 @@ class ListenersMixin:
                 execution_result=0,
                 execution_suppressed_reason=rollout_decision.reason,
                 rollout=rollout_decision.as_trace(),
+                decision_contract_lineage=decision_contract_lineage,
             )
         if any(action_requires_presence_refresh(action) for action in valid_actions):
             refresh_presence = getattr(self, "_async_refresh_presence_snapshot_cache", None)
@@ -1846,6 +1197,7 @@ class ListenersMixin:
                     execution_result=0,
                     execution_suppressed_reason="presence_refresh_failed",
                     rollout=rollout_decision.as_trace(),
+                    decision_contract_lineage=decision_contract_lineage,
                 )
         execution_result = await self._execute_actions(
             valid_actions,
@@ -1859,8 +1211,13 @@ class ListenersMixin:
             world_snapshot_id=world_snapshot_id,
             correlation_id=correlation_id,
             active_space_id=trigger_space_id,
-            decision_time=datetime.now(timezone.utc).isoformat(),
+            decision_time=str(result.get("decision_time") or "").strip(),
             require_world_snapshot_guard=True,
+            # The fast-path result is already a canonical Core command.  Keep
+            # HA as the exact transport/effect adapter instead of routing by
+            # entity names to a legacy scene or script.
+            direct_entity_only=True,
+            decision_contract_lineage=decision_contract_lineage,
         )
         audit_context = self._enqueue_fast_path_execution_audit(
             transaction_id=transaction_id,
@@ -1875,6 +1232,7 @@ class ListenersMixin:
             rollout_blocked_actions=rollout_blocked_actions,
             execution_result=execution_result,
             enqueue_event=False,
+            decision_contract_lineage=decision_contract_lineage,
         )
         return await self._persist_fast_path_execution_audit(audit_context)
 
@@ -1895,6 +1253,7 @@ class ListenersMixin:
         execution_suppressed_reason: str = "",
         rollout: dict[str, Any] | None = None,
         enqueue_event: bool = True,
+        decision_contract_lineage: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         transaction_id = str(transaction_id or "").strip()
         if not transaction_id:
@@ -2008,6 +1367,12 @@ class ListenersMixin:
             "action_results": action_results,
             "pre_states": pre_states,
         }
+        if isinstance(decision_contract_lineage, dict) and decision_contract_lineage:
+            audit_context["lineage"] = {
+                str(key): str(value)[:512]
+                for key, value in decision_contract_lineage.items()
+                if str(key).strip() and str(value).strip()
+            }
         if execution_suppressed_reason:
             audit_context["execution_suppressed_reason"] = execution_suppressed_reason
         if isinstance(rollout, dict):
@@ -3455,1735 +2820,45 @@ class ListenersMixin:
         trigger_context: dict[str, Any] | None = None,
         suppress_slow_fallback: bool = False,
     ) -> None:
-        should_fail_closed = True
-        if normalize_active_ai_mode(
-            getattr(self, "_active_ai_mode", DEFAULT_ACTIVE_AI_MODE)
-        ) == "off":
-            self._sys_log(
-                "INFO",
-                f"[Add-on FastPath] active_ai_off | entity={entity_id}",
-            )
-            self._emit_addon_fast_path_event(
-                {
-                    "source": "addon_fast_path",
-                    "entity_id": entity_id,
-                    "old_state": old_state,
-                    "new_state": new_state,
-                    "status": 200,
-                    "matched": False,
-                    "path_taken": "active_ai_rollout_gate",
-                    "reason": "active_ai_off",
-                    "executed": False,
-                    "fail_closed": True,
-                }
-            )
-            return
-        if str(new_state or "").strip().lower() in {
-            "on",
-            "open",
-            "home",
-            "occupied",
-            "present",
-            "detected",
-            "motion",
-            "person",
-        }:
-            self._cancel_presence_temporal_recheck(entity_id)
-        addon_client = getattr(self, "_addon_client", None)
-        if addon_client is not None:
-            await self._refresh_correction_suppressions_cache(addon_client)
-        snapshot = self._build_addon_fast_path_snapshot(entity_id)
-        enrich_fast_path_presence_timing(self, snapshot, trigger_context)
-        snapshot["occupancy_cycle_id"] = str(occupancy_cycle_id).strip()
-        request_id = self._new_addon_fast_path_request_id(entity_id, old_state, new_state)
-        snapshot["request_id"] = request_id
-        snapshot_diag = self._addon_fast_path_snapshot_diagnostics(snapshot, entity_id)
-        self._sys_log(
-            "INFO",
-            "[Add-on FastPath] request "
-            f"entity={entity_id} old={old_state} new={new_state} "
-            f"request_id={request_id} "
-            f"active_space={snapshot_diag.get('active_space') or '-'} "
-            f"capability_rows={snapshot_diag.get('capability_rows', 0)} "
-            f"device_info_count={snapshot_diag.get('device_info_count', 0)} "
-            f"topology_count={snapshot_diag.get('topology_count', 0)}",
+        await run_addon_fast_path_fail_closed(
+            self,
+            entity_id,
+            new_state,
+            old_state,
+            occupancy_cycle_id=occupancy_cycle_id,
+            trigger_context=trigger_context,
+            suppress_slow_fallback=suppress_slow_fallback,
         )
-        if addon_client is not None:
-            try:
-                response = await addon_client.run_decision_fast_path(
-                    entity_id=entity_id,
-                    new_state=new_state,
-                    old_state=old_state,
-                    snapshot=snapshot,
-                    request_id=request_id,
-                )
-            except Exception as exc:
-                response = None
-                _LOGGER.debug("[Listeners] add-on fast-path decision failed: %s", exc)
-                self._sys_log(
-                    "ERROR",
-                    f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} "
-                    f"reason=exception exception_type={type(exc).__name__} request_id={request_id}",
-                )
-                self._emit_addon_fast_path_event(
-                    {
-                        "source": "addon_fast_path",
-                        "entity_id": entity_id,
-                        "old_state": old_state,
-                        "new_state": new_state,
-                        "status": 0,
-                        "matched": False,
-                        "path_taken": "none",
-                        "reason": "exception",
-                        "exception_type": type(exc).__name__,
-                        "correlation_id": request_id,
-                        "fail_closed": True,
-                        "snapshot": snapshot_diag,
-                    }
-                )
-                return
-            else:
-                if isinstance(response, dict):
-                    status = int(response.get("__status") or 0)
-                    result = response.get("result")
-                    matched = response.get("matched") is True
-                    arbitration_validation = validate_auto_execution_arbitration(
-                        response,
-                        context_snapshot=snapshot,
-                    )
-                    arbitration_fail_closed = matched and arbitration_validation.reason in {
-                        "confidence_arbitration_missing",
-                        "confidence_arbitration_invalid",
-                    }
-                    details = response.get("details") if isinstance(response.get("details"), dict) else {}
-                    presence_details = details.get("presence") if isinstance(details.get("presence"), dict) else {}
-                    self._schedule_presence_temporal_recheck(
-                        entity_id,
-                        old_state=old_state,
-                        new_state=new_state,
-                        presence=presence_details,
-                    )
-                    path_taken = str(response.get("path_taken") or details.get("path_taken") or "none")
-                    result_payload = result if isinstance(result, dict) else {}
-                    decision_reason = str(
-                        response.get("decision_reason")
-                        or result_payload.get("decision_reason")
-                        or details.get("decision_reason")
-                        or ""
-                    )
-                    arbitration_reason = str(
-                        response.get("arbitration_reason")
-                        or result_payload.get("arbitration_reason")
-                        or details.get("arbitration_reason")
-                        or ""
-                    )
-                    reason = str(
-                        response.get("reason")
-                        or decision_reason
-                        or details.get("reason")
-                        or response.get("error")
-                        or ""
-                    )
-                    confirm_required = response.get("confirm_required") is True or details.get("confirm_required") is True
-                    confirm_suppressed_reason = str(details.get("confirm_suppressed_reason") or "")
-                    addon_learning_mode = details.get("learning_mode")
-                    addon_habit_proactive = details.get("habit_proactive")
-                    execution_suppressed_reason = (
-                        "learning_mode" if matched and addon_learning_mode is True else ""
-                    )
-                    if matched and not arbitration_validation.allowed and not execution_suppressed_reason:
-                        execution_suppressed_reason = arbitration_validation.reason
-                    if arbitration_fail_closed:
-                        confirm_required = False
-                        reason = arbitration_validation.reason
-                        execution_suppressed_reason = arbitration_validation.reason
-                    if confirm_required and confirm_suppressed_reason:
-                        confirm_required = False
-                    confidence_auto = response.get("confidence_auto", details.get("confidence_auto"))
-                    confidence_notify = response.get("confidence_notify", details.get("confidence_notify"))
-                    threshold = response.get("threshold", details.get("threshold"))
-                    arbitration_result = str(
-                        response.get("arbitration_result")
-                        or details.get("arbitration_result")
-                        or ""
-                    )
-                    scene = ""
-                    confidence = response.get("confidence", details.get("confidence"))
-                    action_count = 0
-                    actions: list[Any] = []
-                    decision_trace = response.get("decision_trace") if isinstance(response.get("decision_trace"), dict) else {}
-                    transaction_id = str(
-                        response.get("transaction_id")
-                        or details.get("transaction_id")
-                        or (decision_trace.get("transaction_id") if isinstance(decision_trace, dict) else "")
-                        or ""
-                    )
-                    correlation_id = str(
-                        response.get("correlation_id")
-                        or details.get("correlation_id")
-                        or response.get("request_id")
-                        or request_id
-                    )
-                    world_snapshot_id = str(response.get("world_snapshot_id") or details.get("world_snapshot_id") or "")
-
-                    def _fast_path_handoff_context(source: str) -> dict[str, Any]:
-                        context = {
-                            "source": source,
-                            "transaction_id": transaction_id,
-                            "correlation_id": correlation_id,
-                            "world_snapshot_id": world_snapshot_id,
-                            "reason": reason or "",
-                            "decision_trace": dict(decision_trace) if isinstance(decision_trace, dict) else {},
-                        }
-                        attach_occupancy_cycle(context, snapshot)
-                        if decision_reason:
-                            context["decision_reason"] = decision_reason
-                        if arbitration_reason:
-                            context["arbitration_reason"] = arbitration_reason
-                        return context
-
-                    if isinstance(result, dict):
-                        scene = str(result.get("scene") or result.get("source") or "")
-                        if confidence is None:
-                            confidence = result.get("confidence")
-                        raw_actions = result.get("actions")
-                        if isinstance(raw_actions, list):
-                            actions = raw_actions
-                            action_count = len(raw_actions)
-                        elif result.get("action"):
-                            action_count = 1
-                        transaction_id = transaction_id or str(result.get("transaction_id") or result.get("txn_id") or "")
-                    rollout_payload = (
-                        response.get("active_ai_rollout")
-                        if isinstance(response.get("active_ai_rollout"), dict)
-                        else {}
-                    )
-                    rollout_flags = (
-                        rollout_payload.get("execution_flags")
-                        if isinstance(rollout_payload.get("execution_flags"), dict)
-                        else {}
-                    )
-                    device_info = getattr(self, "device_info", {})
-                    if not isinstance(device_info, dict):
-                        device_info = {}
-                    is_enabled = getattr(self, "_is_enabled", None)
-                    rollout_actions = enrich_active_ai_action_spaces(actions, device_info)
-                    original_actions = list(actions)
-                    rollout_config = ActiveAiRolloutConfig.from_mapping(
-                        rollout_payload
-                    )
-                    scoped_actions = scope_active_ai_canary_actions(
-                        original_actions,
-                        rollout_config,
-                    )
-                    rollout_scope_filtered_entity_ids = list(
-                        scoped_actions.blocked_entity_ids
-                    )
-                    authorized_actions = list(actions)
-                    if not scoped_actions.entity_missing:
-                        authorized_actions = list(scoped_actions.actions)
-                        rollout_actions = enrich_active_ai_action_spaces(
-                            authorized_actions,
-                            device_info,
-                        )
-                    blocked_entity_ids = set(rollout_scope_filtered_entity_ids)
-                    rollout_blocked_actions = []
-                    for action in original_actions:
-                        if not isinstance(action, dict):
-                            continue
-                        action_entity_id = str(
-                            action.get("entity_id")
-                            or action.get("entity")
-                            or (
-                                action.get("target", {}).get("entity_id")
-                                if isinstance(action.get("target"), dict)
-                                else ""
-                            )
-                            or ""
-                        ).strip().lower()
-                        if action_entity_id not in blocked_entity_ids:
-                            continue
-                        rollout_blocked_actions.append(
-                            {
-                                **action,
-                                "status": "blocked_by_rollout",
-                                "reason": "active_ai_canary_entity_not_allowed",
-                            }
-                        )
-                    trigger_info = device_info.get(entity_id, {})
-                    if not isinstance(trigger_info, dict):
-                        trigger_info = {}
-                    rollout_decision = evaluate_active_ai_execution_gate(
-                        ai_enabled=bool(is_enabled()) if callable(is_enabled) else False,
-                        config=rollout_config,
-                        trigger_space_id=str(
-                            (result.get("trigger_space_id") if isinstance(result, dict) else "")
-                            or trigger_info.get("space_id")
-                            or trigger_info.get("room_id")
-                            or trigger_info.get("area_id")
-                            or (result.get("trigger_room") if isinstance(result, dict) else "")
-                            or device_info.get(entity_id, {}).get("room", "")
-                        ),
-                        actions=rollout_actions,
-                        execution_flags=rollout_flags,
-                    )
-                    if matched and not rollout_decision.allow_execution and not execution_suppressed_reason:
-                        execution_suppressed_reason = rollout_decision.reason
-                    rollout_trace = rollout_decision.as_trace()
-                    execution_result_payload = (
-                        dict(result) if isinstance(result, dict) else {}
-                    )
-                    execution_result_payload["actions"] = authorized_actions
-                    if rollout_blocked_actions:
-                        execution_result_payload["rollout_original_actions"] = (
-                            original_actions
-                        )
-                        execution_result_payload["rollout_blocked_actions"] = (
-                            rollout_blocked_actions
-                        )
-                    audit_pending = bool(
-                        matched
-                        and arbitration_validation.allowed
-                        and not execution_suppressed_reason
-                        and self._fast_path_result_allows_slow_audit(
-                            authorized_actions
-                        )
-                    )
-                    self._sys_log(
-                        "INFO",
-                        "[Add-on FastPath] result "
-                        f"status={status} matched={matched} path_taken={path_taken} "
-                        f"reason={reason or '-'} scene={scene or '-'} "
-                        f"decision_reason={decision_reason or '-'} "
-                        f"arbitration_reason={arbitration_reason or '-'} "
-                        f"confidence={confidence if confidence is not None else '-'} "
-                        f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
-                        f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
-                        f"confirm_required={confirm_required} "
-                        f"confirm_suppressed_reason={confirm_suppressed_reason or '-'} "
-                        f"learning_mode={addon_learning_mode if addon_learning_mode is not None else '-'} "
-                        f"habit_proactive={addon_habit_proactive if addon_habit_proactive is not None else '-'} "
-                        f"action_count={action_count} entity={entity_id} correlation_id={correlation_id}",
-                    )
-                    self._emit_addon_fast_path_event(
-                        {
-                            "source": "addon_fast_path",
-                            "entity_id": entity_id,
-                            "old_state": old_state,
-                            "new_state": new_state,
-                            "status": status,
-                            "matched": matched,
-                            "path_taken": path_taken,
-                            "reason": reason,
-                            "decision_reason": decision_reason,
-                            "arbitration_reason": arbitration_reason,
-                            "scene": scene,
-                            "confidence": confidence,
-                            "confidence_auto": confidence_auto,
-                            "confidence_notify": confidence_notify,
-                            "threshold": threshold,
-                            "auto_execute": arbitration_validation.allowed,
-                            "arbitration_result": arbitration_result,
-                            "confirm_required": confirm_required,
-                            "confirm_suppressed_reason": confirm_suppressed_reason,
-                            "action_count": action_count,
-                            "actions": original_actions,
-                            "authorized_action_count": len(authorized_actions),
-                            "authorized_actions": authorized_actions,
-                            "rollout_blocked_actions": rollout_blocked_actions,
-                            "transaction_id": transaction_id,
-                            "decision_trace": decision_trace,
-                            "correlation_id": correlation_id,
-                            "world_snapshot_id": world_snapshot_id,
-                            "executed": False,
-                            "execution_status": "pending" if audit_pending else "not_started",
-                            "provisional_execution": audit_pending,
-                            "audit_pending": audit_pending,
-                            "rollback_allowed": audit_pending,
-                            "execution_suppressed_reason": execution_suppressed_reason,
-                            "rollout": rollout_trace,
-                            "rollout_scope_filtered_entity_ids": (
-                                rollout_scope_filtered_entity_ids
-                            ),
-                            "fail_closed": arbitration_fail_closed or not (200 <= status < 300),
-                            "snapshot": snapshot_diag,
-                        }
-                    )
-                    if 200 <= status < 300 and matched and confirm_required and isinstance(result, dict):
-                        confirm_payload = {
-                            "source": "addon_fast_path",
-                            "entity_id": entity_id,
-                            "old_state": old_state,
-                            "new_state": new_state,
-                            "scene": scene,
-                            "confidence": confidence,
-                            "confidence_auto": confidence_auto,
-                            "confidence_notify": confidence_notify,
-                            "action_count": action_count,
-                            "actions": actions,
-                            "trigger": f"{entity_id}: {old_state} -> {new_state}",
-                            "reply": "AI 已命中候选动作，但置信度低于自动执行阈值，等待用户确认。",
-                            "reason": reason,
-                            "decision_reason": decision_reason,
-                            "arbitration_reason": arbitration_reason,
-                            "path_taken": path_taken,
-                            "result": result,
-                            "txn_id": transaction_id or None,
-                        }
-                        try:
-                            self.hass.bus.async_fire("smart_agent_confirm_required", confirm_payload)
-                        except Exception as exc:
-                            _LOGGER.debug("[Listeners] smart_agent_confirm_required emit failed: %s", exc)
-                        self._sys_log(
-                            "INFO",
-                            f"[Add-on FastPath] confirm_required | entity={entity_id} "
-                            f"confidence={confidence if confidence is not None else '-'} "
-                            f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
-                            f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
-                            f"actions={action_count}",
-                        )
-                    if 200 <= status < 300 and matched and isinstance(result, dict):
-                        if execution_suppressed_reason:
-                            self._sys_log(
-                                "INFO",
-                                f"[Add-on FastPath] execution suppressed | entity={entity_id} reason={execution_suppressed_reason}",
-                            )
-                            if execution_suppressed_reason.startswith("active_ai_"):
-                                await self._execute_fast_path_decision_result(
-                                    execution_result_payload,
-                                    entity_id=entity_id,
-                                    source_label="AddonFastPath",
-                                    transaction_id=transaction_id,
-                                    correlation_id=correlation_id,
-                                    world_snapshot_id=world_snapshot_id,
-                                    decision_trace=decision_trace,
-                                    trigger=f"{entity_id}: {old_state} -> {new_state}",
-                                    active_ai_rollout=rollout_payload,
-                                )
-                            else:
-                                self._enqueue_fast_path_execution_audit(
-                                    transaction_id=transaction_id,
-                                    correlation_id=correlation_id,
-                                    world_snapshot_id=world_snapshot_id,
-                                    decision_trace=decision_trace,
-                                    trigger=f"{entity_id}: {old_state} -> {new_state}",
-                                    scene=scene,
-                                    confidence=confidence,
-                                    actions=actions,
-                                    execution_result=0,
-                                    execution_suppressed_reason=execution_suppressed_reason,
-                                    rollout=rollout_trace,
-                                )
-                            return
-                        self._sys_log("INFO", f"[Add-on FastPath] 命中规则: {result.get('scene', 'FastPath')}")
-                        previous_batch_trigger_controllable = getattr(
-                            self,
-                            "_batch_trigger_controllable",
-                            set(),
-                        )
-                        domain = entity_id.split(".")[0]
-                        if domain in ("light", "switch", "fan", "cover", "climate", "media_player"):
-                            self._batch_trigger_controllable = {entity_id}
-                            self._sys_log(
-                                "INFO",
-                                f"[自触发保护] FastPath 可控设备触发: {entity_id}，AI 不可反向操作该设备",
-                            )
-                        try:
-                            execution_audit_context = await self._execute_fast_path_decision_result(
-                                execution_result_payload,
-                                entity_id=entity_id,
-                                source_label="AddonFastPath",
-                                transaction_id=transaction_id,
-                                correlation_id=correlation_id,
-                                world_snapshot_id=world_snapshot_id,
-                                decision_trace=decision_trace,
-                                trigger=f"{entity_id}: {old_state} -> {new_state}",
-                                active_ai_rollout=rollout_payload,
-                            )
-                        finally:
-                            self._batch_trigger_controllable = previous_batch_trigger_controllable
-                        if (
-                            audit_pending
-                            and execution_audit_context.get("final_outcome") == "succeeded"
-                        ):
-                            self._schedule_inference(
-                                entity_id,
-                                f"{entity_id}: {old_state} -> {new_state}",
-                                new_state,
-                                one_off_prompt=self._fast_path_slow_audit_prompt(),
-                                _allow_learning_mode_inference=True,
-                                source_trace_context=execution_audit_context,
-                            )
-                        return
-                    if 200 <= status < 300:
-                        should_fail_closed = False
-                        if reason == "local_fast_brain_disabled" or response.get("fast_path_disabled") is True:
-                            self._sys_log(
-                                "INFO",
-                                f"[Add-on FastPath] disabled; scheduling slow inference | entity={entity_id}",
-                            )
-                            self._schedule_inference(
-                                entity_id,
-                                f"{entity_id}: {old_state} -> {new_state}",
-                                new_state,
-                                source_trace_context=_fast_path_handoff_context("addon_fast_path_disabled"),
-                            )
-                            return
-                        if reason == "no_match":
-                            if slow_fallback_allowed(suppress_slow_fallback, self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)):
-                                self._sys_log(
-                                    "INFO",
-                                    f"[Add-on FastPath] no_match; scheduling slow inference | entity={entity_id} "
-                                    f"active_space={snapshot_diag.get('active_space') or '-'}",
-                                )
-                                self._schedule_inference(
-                                    entity_id,
-                                    f"{entity_id}: {old_state} -> {new_state}",
-                                    new_state,
-                                    source_trace_context=_fast_path_handoff_context("addon_fast_path_no_match"),
-                                )
-                                return
-                            info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
-                            if not isinstance(info, dict):
-                                info = {}
-                            skip_reason = self._fast_path_no_match_slow_inference_skip_reason(
-                                entity_id,
-                                new_state,
-                                snapshot,
-                            )
-                            self._sys_log(
-                                "INFO",
-                                f"[Add-on FastPath] no_match; slow inference not scheduled | "
-                                f"reason={skip_reason or 'not_presence_arrival'} entity={entity_id} state={new_state} "
-                                f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
-                            )
-                        if reason == "confidence_below_auto_threshold" and not confirm_required:
-                            if slow_fallback_allowed(suppress_slow_fallback, (
-                                action_count > 0
-                                or self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)
-                            )):
-                                self._sys_log(
-                                    "INFO",
-                                    f"[Add-on FastPath] confidence_below_auto_threshold; scheduling slow inference | "
-                                    f"entity={entity_id} confidence={confidence if confidence is not None else '-'} "
-                                    f"confidence_auto={confidence_auto if confidence_auto is not None else '-'} "
-                                    f"confidence_notify={confidence_notify if confidence_notify is not None else '-'} "
-                                    f"actions={action_count} "
-                                    f"confirm_suppressed_reason={confirm_suppressed_reason or '-'} "
-                                    f"active_space={snapshot_diag.get('active_space') or '-'}",
-                                )
-                                self._schedule_inference(
-                                    entity_id,
-                                    f"{entity_id}: {old_state} -> {new_state}",
-                                    new_state,
-                                    _allow_learning_mode_inference=(confirm_suppressed_reason == "learning_mode"),
-                                    source_trace_context=_fast_path_handoff_context("addon_fast_path_low_confidence"),
-                                )
-                                return
-                            info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
-                            if not isinstance(info, dict):
-                                info = {}
-                            self._sys_log(
-                                "INFO",
-                                f"[Add-on FastPath] confidence_below_auto_threshold; slow inference not scheduled | "
-                                f"reason=no_action_candidate_or_not_presence_arrival entity={entity_id} state={new_state} "
-                                f"sensor_type={info.get('sensor_type') or '-'} name={info.get('name') or '-'}",
-                            )
-                        self._sys_log(
-                            "INFO",
-                            f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
-                        )
-                    elif status == 409:
-                        self._sys_log(
-                            "WARN",
-                            f"[Add-on FastPath] addon_fast_path_input_incomplete fail-closed | "
-                            f"status={status} reason={reason or 'input_incomplete'} entity={entity_id}",
-                        )
-                        if slow_fallback_allowed(suppress_slow_fallback, self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)):
-                            self._sys_log(
-                                "INFO",
-                                f"[Add-on FastPath] 409 input incomplete; scheduling slow inference | "
-                                f"entity={entity_id} reason={reason or 'input_incomplete'} "
-                                f"active_space={snapshot_diag.get('active_space') or '-'}",
-                            )
-                            self._schedule_inference(
-                                entity_id,
-                                f"{entity_id}: {old_state} -> {new_state}",
-                                new_state,
-                                source_trace_context={
-                                    "source": "addon_fast_path_409",
-                                    "transaction_id": transaction_id,
-                                    "correlation_id": correlation_id,
-                                    "world_snapshot_id": world_snapshot_id,
-                                    "reason": reason or "input_incomplete",
-                                    "decision_trace": dict(decision_trace) if isinstance(decision_trace, dict) else {},
-                                },
-                            )
-                        return
-                    elif status > 0:
-                        self._sys_log(
-                            "INFO",
-                            f"[Add-on FastPath] addon_unreachable fail-closed | "
-                            f"status={status} matched={response.get('matched')} reason={reason or '-'}",
-                        )
-                        return
-
-        if should_fail_closed:
-            self._sys_log(
-                "ERROR",
-                f"[Add-on FastPath] addon_unreachable fail-closed | entity={entity_id} reason=unreachable",
-            )
-            self._emit_addon_fast_path_event(
-                {
-                    "source": "addon_fast_path",
-                    "entity_id": entity_id,
-                    "old_state": old_state,
-                    "new_state": new_state,
-                    "status": 0,
-                    "matched": False,
-                    "path_taken": "none",
-                    "reason": "unreachable",
-                    "fail_closed": True,
-                    "snapshot": snapshot_diag,
-                }
-            )
-        return
 
     def _make_state_handler(self):
         """Build the state-change callback."""
+
         @callback
         def _state_changed(ev) -> None:
-            data = ev.data
-            entity_id = data.get("entity_id")
-            if not entity_id:
-                return
-            new = data.get("new_state")
-            old = data.get("old_state")
-            new_s = new.state if new else ""
-            old_s = old.state if old else ""
+            handle_listener_state_changed(self, ev, logger=_LOGGER)
 
-            source_type = "物理/自动"
-            if new and new.context:
-                if new.context.user_id:
-                    source_type = "用户界面"
-                elif new.context.parent_id:
-                    source_type = "自动化/脚本"
-
-            domain = entity_id.split(".")[0]
-            device_info_snapshot = getattr(self, "device_info", {}) or {}
-            if not isinstance(device_info_snapshot, dict):
-                device_info_snapshot = {}
-            if entity_id not in device_info_snapshot:
-                try:
-                    if self._reconcile_device_info_entity_ids_from_ha_registry():
-                        device_info_snapshot = getattr(self, "device_info", {}) or {}
-                except Exception as exc:
-                    _LOGGER.debug("[Listeners] state-handler reconciliation skipped for %s: %s", entity_id, exc)
-            if entity_id not in device_info_snapshot:
-                unmanaged_filter_reason = "unmanaged_entity"
-                self._last_listener_filter_reason = unmanaged_filter_reason
-                _LOGGER.debug(
-                    "[ListenerFilter] managed=false filter_reason=unmanaged_entity "
-                    "path=state_handler entity=%s old_state=%s new_state=%s source_type=%s reason=%s",
-                    entity_id,
-                    old_s,
-                    new_s,
-                    source_type,
-                    unmanaged_filter_reason,
-                )
-                warned = getattr(self, "_unmanaged_listener_entity_warned", set())
-                if not isinstance(warned, set):
-                    warned = set()
-                if entity_id not in warned:
-                    warned.add(entity_id)
-                    self._unmanaged_listener_entity_warned = warned
-                    log = getattr(self, "_sys_log", None)
-                    message = (
-                        "[监听器] 收到未纳管实体状态变化，未触发 AI 决策: "
-                        f"{entity_id} {old_s}->{new_s}。请在设备页纳管该实体，或检查 HA 实体 ID 是否已改名。"
-                    )
-                    if callable(log):
-                        log("WARN", message)
-                    else:
-                        _LOGGER.warning(message)
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason=unmanaged_filter_reason,
-                    source_type=source_type,
-                )
-                return
-
-            if domain == "sensor":
-                environment_metadata = self._listener_entity_metadata(
-                    entity_id,
-                    info=device_info_snapshot.get(entity_id),
-                    state_obj=new,
-                )
-                environment_filter = getattr(self, "_environment_telemetry_event_filter", None)
-                if not isinstance(environment_filter, EnvironmentTelemetryFilter):
-                    environment_filter = EnvironmentTelemetryFilter()
-                    self._environment_telemetry_event_filter = environment_filter
-                environment_decision = environment_filter.evaluate(
-                    entity_id,
-                    old_s,
-                    new_s,
-                    metadata=environment_metadata,
-                    now=time.monotonic(),
-                )
-                if environment_decision.tracked and not environment_decision.forward:
-                    self._last_listener_filter_reason = (
-                        f"environment_telemetry_{environment_decision.reason}"
-                    )
-                    _LOGGER.debug(
-                        "[ListenerFilter] environment telemetry sampled entity=%s kind=%s "
-                        "reason=%s delta=%s threshold=%s elapsed=%s",
-                        entity_id,
-                        environment_decision.sensor_kind,
-                        environment_decision.reason,
-                        environment_decision.delta,
-                        environment_decision.threshold,
-                        environment_decision.elapsed,
-                    )
-                    return
-
-            _LOGGER.debug("[事件] %s: %s -> %s (来源: %s)", entity_id, old_s, new_s, source_type)
-            self._emit_listener_event(
-                listener_action="received",
-                entity_id=entity_id,
-                old_state=old_s,
-                new_state=new_s,
-                source_type=source_type,
-            )
-
-            # ── 传感器静默 ──
-            if self._sensors_muted and domain in ("binary_sensor", "sensor"):
-                self._sys_log("INFO", f"[传感器静默] {entity_id} {old_s}→{new_s}，静默中跳过")
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="sensors_muted",
-                    source_type=source_type,
-                )
-                return
-
-            if domain == "sensor" and old_s and new_s:
-                try:
-                    delta = abs(float(new_s) - float(old_s))
-                    eid_lower = entity_id.lower()
-                    # Frigate person_count：启用 Frigate 时降低触发阈值到 1（0→1 是关键事件）
-                    frigate_on = getattr(self, "_frigate_enabled", False)
-                    is_person_count = frigate_on and any(kw in eid_lower for kw in self._PERSON_COUNT_KW)
-                    threshold = 1 if is_person_count else 5
-                    if delta < threshold:
-                        _LOGGER.debug(
-                            "[ListenerFilter] numeric deadband entity=%s delta=%.3f threshold=%s",
-                            entity_id,
-                            delta,
-                            threshold,
-                        )
-                        self._emit_listener_event(
-                            listener_action="filtered",
-                            entity_id=entity_id,
-                            old_state=old_s,
-                            new_state=new_s,
-                            filter_reason="numeric_deadband",
-                            source_type=source_type,
-                            delta=delta,
-                            threshold=threshold,
-                        )
-                        return
-                except (ValueError, TypeError):
-                    pass
-
-            # P0修复：AI 主开关检查必须先于 add-on 快路，
-            # 否则关闭 AI 仍会执行设备控制动作。
-            if not self._is_enabled():
-                self._sys_log("INFO", f"[过滤] AI 已暂停，跳过 add-on 快路: {entity_id}")
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="ai_disabled",
-                    source_type=source_type,
-                )
-                return
-            # 启动冷却保护：系统初始化期间也不执行快路
-            _startup_elapsed = time.time() - self._startup_time
-            if _startup_elapsed < self._startup_grace:
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="startup_cooldown",
-                    source_type=source_type,
-                    startup_remaining=max(0, int(self._startup_grace - _startup_elapsed)),
-                )
-                return
-
-            if new_s in ("unavailable", "unknown"):
-                self._sys_log("INFO", f"[过滤] 设备状态变为 {new_s}，跳过 add-on 快路: {entity_id}")
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="state_unavailable_unknown",
-                    source_type=source_type,
-                )
-                return
-
-            if old_s in ("unavailable", "unknown"):
-                self._sys_log(
-                    "INFO",
-                    f"[过滤] 设备从 {old_s} 恢复为 {new_s}，跳过 add-on 快路: {entity_id}",
-                )
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="state_recovery_unknown_unavailable",
-                    source_type=source_type,
-                )
-                return
-
-            last_ai_actions = getattr(self, "_last_ai_actions", {})
-            last_ai = last_ai_actions.get(entity_id) if isinstance(last_ai_actions, dict) else None
-            if isinstance(last_ai, dict):
-                expected_ai_state = str(last_ai.get("state") or "").strip().lower()
-                try:
-                    stability_deadline = float(last_ai.get("learning_stability_deadline") or 0)
-                except (TypeError, ValueError):
-                    stability_deadline = 0
-                if (
-                    expected_ai_state
-                    and new_s != expected_ai_state
-                    and time.time() <= stability_deadline
-                ):
-                    last_ai["reverse_user_action"] = True
-                    last_ai["reverse_user_action_state"] = new_s
-                    last_ai["reverse_user_action_source"] = source_type
-            if isinstance(last_ai, dict) and str(last_ai.get("state") or "") == new_s:
-                try:
-                    ai_action_age = time.time() - float(last_ai.get("time") or 0)
-                except (TypeError, ValueError):
-                    ai_action_age = self._AI_ACTION_SKIP_WINDOW + 1
-                if 0 <= ai_action_age < self._AI_ACTION_SKIP_WINDOW:
-                    self._record_presence_interaction_trace(
-                        entity_id,
-                        domain,
-                        new_s,
-                        source_type,
-                        source=SOURCE_AUTOMATION,
-                    )
-                    self._sys_log(
-                        "INFO",
-                        f"[过滤] AI 操作后 {int(ai_action_age)}s 内同向变化，跳过 add-on 快路: {entity_id} -> {new_s}",
-                    )
-                    self._emit_listener_event(
-                        listener_action="filtered",
-                        entity_id=entity_id,
-                        old_state=old_s,
-                        new_state=new_s,
-                        filter_reason="ai_self_action",
-                        source_type=source_type,
-                        ai_action_age=int(ai_action_age),
-                    )
-                    return
-
-            self._record_arrival_manual_action_evidence(
-                entity_id=entity_id,
-                old_state=old_s,
-                new_state=new_s,
-                new_state_obj=new,
-                source_type=source_type,
-                device_info=dict(device_info_snapshot.get(entity_id) or {}),
-            )
-
-            if new and new.context and new.context.user_id:
-                record_operation = getattr(self, "_record_device_operation", None)
-                if callable(record_operation):
-                    record_operation(entity_id, SOURCE_DASHBOARD, new_s)
-
-                user_overrides = getattr(self, "_user_overrides", None)
-                user_overrides_lock = getattr(self, "_user_overrides_lock", None)
-                if isinstance(user_overrides, dict) and user_overrides_lock is not None:
-                    with user_overrides_lock:
-                        user_overrides[entity_id] = {
-                            "state": new_s,
-                            "time": time.time(),
-                        }
-
-                user_manual_actions = getattr(self, "_user_manual_actions", None)
-                user_manual_actions_lock = getattr(self, "_user_manual_actions_lock", None)
-                if isinstance(user_manual_actions, dict) and user_manual_actions_lock is not None:
-                    with user_manual_actions_lock:
-                        user_manual_actions[entity_id] = {
-                            "state": new_s,
-                            "time": time.time(),
-                        }
-
-            implicit_correction_recorded = self._record_implicit_reverse_correction(
-                entity_id=entity_id,
-                domain=domain,
-                old_state=old_s,
-                new_state=new_s,
-                new_state_obj=new,
-                source_type=source_type,
-                device_info=dict(device_info_snapshot.get(entity_id) or {}),
-            )
-            self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type, old, new)
-            self._record_presence_interaction_trace(entity_id, domain, new_s, source_type)
-
-            if domain in self._CONTROL_EVENT_DOMAINS:
-                filter_reason = (
-                    "implicit_reverse_correction"
-                    if implicit_correction_recorded
-                    else "controllable_state_feedback"
-                )
-                self._last_listener_filter_reason = filter_reason
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason=filter_reason,
-                    source_type=source_type,
-                )
-                return
-
-            info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}
-            info = self._listener_entity_metadata(entity_id, info=info, state_obj=new)
-            is_presence_sensor = self._is_presence_listener_entity(entity_id, info)
-            if domain == "binary_sensor" and not is_presence_sensor:
-                if self._is_actionable_contact_arrival_for_slow_inference(entity_id, new_s):
-                    self._last_listener_filter_reason = "contact_slow_path_only"
-                    self._emit_listener_event(
-                        listener_action="slow_path_scheduled",
-                        entity_id=entity_id,
-                        old_state=old_s,
-                        new_state=new_s,
-                        filter_reason="contact_not_presence",
-                        source_type=source_type,
-                    )
-                    self._schedule_inference(
-                        entity_id,
-                        f"{entity_id}: {old_s} -> {new_s}",
-                        new_s,
-                    )
-                else:
-                    self._last_listener_filter_reason = "non_presence_binary_sensor"
-                    self._emit_listener_event(
-                        listener_action="filtered",
-                        entity_id=entity_id,
-                        old_state=old_s,
-                        new_state=new_s,
-                        filter_reason="non_presence_binary_sensor",
-                        source_type=source_type,
-                        device_class=str(info.get("device_class") or ""),
-                        sensor_type=str(info.get("sensor_type") or ""),
-                    )
-                return
-            old_presence_state = str(old_s or "").strip().lower()
-            new_presence_state = str(new_s or "").strip().lower()
-            if (
-                is_presence_sensor
-                and old_presence_state != new_presence_state
-                and old_presence_state in {"on", "off"}
-                and new_presence_state in {"on", "off"}
-            ):
-                suppressed, remaining = self._is_presence_flap_suppressed(entity_id)
-                if suppressed:
-                    self._sys_log("INFO", f"[存在去抖] {entity_id} 抖动抑制中，剩余 {remaining}s，跳过 add-on 快路")
-                    self._emit_listener_event(
-                        listener_action="filtered",
-                        entity_id=entity_id,
-                        old_state=old_s,
-                        new_state=new_s,
-                        filter_reason="presence_flap_suppressed",
-                        source_type=source_type,
-                        suppress_remaining=remaining,
-                    )
-                    return
-                self._record_presence_flap(entity_id)
-
-            occupancy_cycle_id, arrival_started, duplicate_arrival, learning_cycle_status = occupancy_cycle_outcome(
-                self, entity_id, old_s, new_s,
-                is_presence_sensor=is_presence_sensor,
-                old_presence_state=old_presence_state,
-                new_presence_state=new_presence_state,
-            )
-
-            if is_presence_sensor and duplicate_arrival:
-                self._cancel_presence_temporal_recheck(entity_id)
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state=old_s,
-                    new_state=new_s,
-                    filter_reason="duplicate_occupancy_cycle",
-                    source_type=source_type,
-                    occupancy_cycle_id=occupancy_cycle_id,
-                    learning_cycle_status=learning_cycle_status,
-                )
-                return
-
-            schedule_arrival_baseline_sample(
-                self, entity_id, old_s, new_s,
-                is_presence_sensor=is_presence_sensor,
-                arrival_started=arrival_started,
-                occupancy_cycle_id=occupancy_cycle_id,
-            )
-            self._emit_listener_event(
-                listener_action="fast_path_scheduled",
-                entity_id=entity_id,
-                old_state=old_s,
-                new_state=new_s,
-                source_type=source_type,
-                occupancy_cycle_id=occupancy_cycle_id,
-                learning_cycle_status=learning_cycle_status,
-            )
-            try:
-                fast_path_coro = self._run_addon_fast_path_fail_closed(
-                    entity_id,
-                    new_s,
-                    old_s,
-                    occupancy_cycle_id=occupancy_cycle_id,
-                )
-            except TypeError as exc:
-                if "occupancy_cycle_id" not in str(exc):
-                    raise
-                fast_path_coro = self._run_addon_fast_path_fail_closed(
-                    entity_id,
-                    new_s,
-                    old_s,
-                )
-            self._spawn_addon_fast_path_task(
-                fast_path_coro,
-                entity_id=entity_id,
-                old_state=old_s,
-                new_state=new_s,
-            )
-            return
         return _state_changed
 
-    def _listener_entity_metadata(
-        self,
-        entity_id: str,
-        *,
-        info: dict[str, Any] | None = None,
-        state_obj: Any | None = None,
-    ) -> dict[str, Any]:
-        row = dict(info) if isinstance(info, dict) else {}
-        if not row:
-            device_info = getattr(self, "device_info", {})
-            stored = device_info.get(entity_id) if isinstance(device_info, dict) else None
-            if isinstance(stored, dict):
-                row.update(stored)
-        if state_obj is None:
-            states = getattr(getattr(self, "hass", None), "states", None)
-            get_state = getattr(states, "get", None)
-            state_obj = get_state(entity_id) if callable(get_state) else None
-        attributes = getattr(state_obj, "attributes", None)
-        if isinstance(attributes, dict):
-            for key in ("device_class", "friendly_name", "entity_category"):
-                if not row.get(key) and attributes.get(key) not in (None, ""):
-                    row[key] = attributes.get(key)
-        return row
-
-    def _is_presence_listener_entity(self, entity_id: str, info: dict[str, Any] | None = None) -> bool:
-        """Return True for managed entities that can represent human presence."""
-        domain = str(entity_id or "").split(".", 1)[0]
-        if domain != "binary_sensor":
-            return False
-        row = self._listener_entity_metadata(entity_id, info=info)
-        sensor_type = str(row.get("sensor_type") or row.get("presence_sensor_type") or "").strip().lower()
-        return sensor_type in self._ACTIONABLE_SENSOR_TYPES
-
-    def _get_live_presence_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
-        """Read current HA states for Core-authorized, fresh guard evidence."""
-        self._last_live_presence_guard_status = {
-            "ok": False,
-            "reason": "presence_snapshot_unavailable",
-        }
-        snapshot_getter = getattr(self, "get_presence_snapshot", None)
-        if not callable(snapshot_getter):
-            return {}
-        try:
-            snapshot = snapshot_getter()
-        except Exception:
-            return {}
-        rooms = snapshot.get("rooms") if isinstance(snapshot, dict) else None
-        if not isinstance(rooms, dict):
-            self._last_live_presence_guard_status["reason"] = "presence_rooms_unavailable"
-            return {}
-        states = getattr(getattr(self, "hass", None), "states", None)
-        get_state = getattr(states, "get", None)
-        if not callable(get_state):
-            self._last_live_presence_guard_status["reason"] = "ha_states_unavailable"
-            return {}
-
-        now = datetime.now(timezone.utc)
-        occupancy: dict[str, list[tuple[str, str]]] = {}
-
-        def _append_entry(
-            room_candidates: list[str],
-            entity_id: str,
-            state: str,
-        ) -> None:
-            entry = (entity_id, state)
-            for room in room_candidates:
-                room_entries = occupancy.setdefault(room, [])
-                if entry not in room_entries:
-                    room_entries.append(entry)
-
-        for room_id, payload in rooms.items():
-            if not isinstance(payload, dict):
-                continue
-            room_candidates: list[str] = []
-            for raw_value in (room_id, payload.get("localized_spaces")):
-                values = (
-                    raw_value
-                    if isinstance(raw_value, (list, tuple, set))
-                    else (raw_value,)
-                )
-                for value in values:
-                    room = str(value or "").strip()
-                    if room and room not in room_candidates:
-                        room_candidates.append(room)
-
-            evidence_rows = payload.get("presence_evidence")
-            if not isinstance(evidence_rows, (list, tuple)):
-                continue
-            for evidence in evidence_rows:
-                if not isinstance(evidence, dict) or evidence.get("stale") is True:
-                    continue
-                use_for_raw = evidence.get("use_for")
-                if isinstance(use_for_raw, str):
-                    use_for = {
-                        item.strip()
-                        for item in use_for_raw.split(",")
-                        if item.strip()
-                    }
-                elif isinstance(use_for_raw, (list, tuple, set)):
-                    use_for = {
-                        str(item or "").strip()
-                        for item in use_for_raw
-                        if str(item or "").strip()
-                    }
-                else:
-                    use_for = set()
-                if "guard" not in use_for:
-                    continue
-
-                entity_id = str(
-                    evidence.get("entity_id")
-                    or evidence.get("id")
-                    or ""
-                ).strip()
-                sensor_type = str(
-                    evidence.get("sensor_type")
-                    or evidence.get("presence_sensor_type")
-                    or ""
-                ).strip().lower()
-                if not entity_id or sensor_type in self._ACTIONABLE_CONTACT_SENSOR_TYPES:
-                    continue
-                if sensor_type not in self._ACTIONABLE_SENSOR_TYPES:
-                    continue
-
-                ttl_invalid = False
-                try:
-                    freshness_ttl_secs = float(
-                        evidence.get("freshness_ttl_secs") or 0
-                    )
-                except (TypeError, ValueError):
-                    freshness_ttl_secs = 0.0
-                    ttl_invalid = True
-                if not isfinite(freshness_ttl_secs) or freshness_ttl_secs < 0:
-                    ttl_invalid = True
-                if ttl_invalid:
-                    _append_entry(room_candidates, entity_id, "unknown")
-                    continue
-                if freshness_ttl_secs > 0:
-                    observed_text = str(
-                        evidence.get("last_observed_at")
-                        or evidence.get("observed_at")
-                        or ""
-                    ).strip()
-                    try:
-                        observed_at = datetime.fromisoformat(
-                            observed_text.replace("Z", "+00:00")
-                        )
-                        if observed_at.tzinfo is None:
-                            observed_at = observed_at.replace(tzinfo=timezone.utc)
-                    except (TypeError, ValueError):
-                        observed_at = None
-                    if observed_at is None:
-                        _append_entry(room_candidates, entity_id, "unknown")
-                        continue
-                    age_secs = (
-                        now - observed_at.astimezone(timezone.utc)
-                    ).total_seconds()
-                    if age_secs < -60:
-                        _append_entry(room_candidates, entity_id, "unknown")
-                        continue
-                    if age_secs > freshness_ttl_secs:
-                        continue
-                try:
-                    state_obj = get_state(entity_id)
-                except Exception:
-                    state_obj = None
-                raw_state = str(
-                    getattr(state_obj, "state", "") or ""
-                ).strip().lower()
-                if raw_state in {
-                    "on",
-                    "occupied",
-                    "present",
-                    "home",
-                    "motion",
-                    "person",
-                }:
-                    state = "on"
-                elif raw_state in {
-                    "off",
-                    "vacant",
-                    "clear",
-                    "away",
-                    "none",
-                    "idle",
-                    "empty",
-                }:
-                    state = "off"
-                elif raw_state in {"unknown", "unavailable"}:
-                    state = raw_state
-                elif sensor_type in {"person_count", "object_count", "frigate"}:
-                    try:
-                        numeric_state = float(raw_state)
-                    except (TypeError, ValueError):
-                        state = "unknown"
-                    else:
-                        if not isfinite(numeric_state) or numeric_state < 0:
-                            state = "unknown"
-                        else:
-                            state = "on" if numeric_state > 0 else "off"
-                else:
-                    state = "unknown"
-
-                _append_entry(room_candidates, entity_id, state)
-        self._last_live_presence_guard_status = {"ok": True, "reason": ""}
-        return occupancy
-
+    _listener_entity_metadata = listener_entity_metadata
+    _is_presence_listener_entity = is_presence_listener_entity
+    _get_live_presence_occupancy_map = get_live_presence_occupancy_map
     def _reconcile_active_listener_states(self, entity_ids: list[str]) -> None:
-        """Catch up active managed presence sensors that were already on before listener binding."""
-        if not entity_ids:
-            return
-        states = getattr(getattr(self, "hass", None), "states", None)
-        get_state = getattr(states, "get", None)
-        if not callable(get_state):
-            return
-        reconciled = getattr(self, "_listener_active_state_reconciled", None)
-        if not isinstance(reconciled, dict):
-            reconciled = {}
-            self._listener_active_state_reconciled = reconciled
-        device_info = getattr(self, "device_info", {}) or {}
-        if not isinstance(device_info, dict):
-            device_info = {}
-
-        for entity_id in entity_ids:
-            raw_info = device_info.get(entity_id)
-            info = raw_info if isinstance(raw_info, dict) else {}
-            if not self._is_presence_listener_entity(entity_id, info):
-                continue
-            try:
-                state_obj = get_state(entity_id)
-            except Exception as exc:
-                _LOGGER.debug("[Listeners] active state reconcile read failed for %s: %s", entity_id, exc)
-                continue
-            state = str(getattr(state_obj, "state", "") or "").strip().lower()
-            if state != "on":
-                reconciled.pop(entity_id, None)
-                continue
-            state_marker = str(
-                getattr(state_obj, "last_changed", "")
-                or getattr(state_obj, "last_updated", "")
-                or state
-            )
-            reconcile_marker = f"{state}:{state_marker}"
-            if reconciled.get(entity_id) == reconcile_marker:
-                continue
-
-            if not self._is_enabled():
-                reconciled.pop(entity_id, None)
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state="unknown",
-                    new_state=state,
-                    filter_reason="ai_disabled",
-                    source_type="state_reconcile",
-                    reconcile_reason="listener_refresh_active_state",
-                )
-                continue
-            if getattr(self, "_sensors_muted", False):
-                reconciled.pop(entity_id, None)
-                self._emit_listener_event(
-                    listener_action="filtered",
-                    entity_id=entity_id,
-                    old_state="unknown",
-                    new_state=state,
-                    filter_reason="sensors_muted",
-                    source_type="state_reconcile",
-                    reconcile_reason="listener_refresh_active_state",
-                )
-                continue
-
-            reconciled[entity_id] = reconcile_marker
-            self._emit_listener_event(
-                listener_action="filtered",
-                entity_id=entity_id,
-                old_state="unknown",
-                new_state=state,
-                filter_reason="state_recovery_unknown_unavailable",
-                source_type="state_reconcile",
-                reconcile_reason="listener_refresh_active_state",
-            )
-            schedule_startup_presence_reconciliation(
-                self, entity_id, reconcile_marker=reconcile_marker, schedule=async_call_later,
-            )
-
-    async def _async_refresh_device_info_from_addon_devices(self, *, reason: str = "") -> bool:
-        """Refresh runtime listener device_info from the add-on device projection."""
-        status = {
-            "ok": False,
-            "source": "addon_devices",
-            "reason": str(reason or "manual"),
-            "count": 0,
-        }
-        client = getattr(self, "_addon_client", None)
-        get_devices = getattr(client, "get_devices", None)
-        if not callable(get_devices):
-            status["reason"] = "addon_client_unavailable"
-            self._last_addon_device_sync_status = status
-            return False
-
-        try:
-            rows = await get_devices()
-        except Exception as exc:
-            status["reason"] = "addon_exception"
-            status["error"] = str(exc)
-            self._last_addon_device_sync_status = status
-            return False
-
-        if rows is None:
-            status["reason"] = "addon_not_available"
-            self._last_addon_device_sync_status = status
-            return False
-        if isinstance(rows, dict):
-            status["reason"] = "addon_error"
-            if rows.get("__status") is not None:
-                status["status"] = rows.get("__status")
-            if rows.get("error") is not None:
-                status["error"] = str(rows.get("error"))
-            self._last_addon_device_sync_status = status
-            return False
-        if not isinstance(rows, list):
-            status["reason"] = "invalid_payload"
-            status["payload_type"] = type(rows).__name__
-            self._last_addon_device_sync_status = status
-            return False
-
-        next_device_info: dict[str, dict[str, Any]] = {}
-        next_environment_context_info: dict[str, dict[str, Any]] = {}
-        skipped = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                skipped += 1
-                continue
-            mapped = self._managed_device_info_row_from_addon_device(row)
-            if mapped is None:
-                skipped += 1
-                continue
-            entity_id, info = mapped
-            if self._is_listener_runtime_entity(entity_id, info):
-                next_device_info[entity_id] = info
-            else:
-                skipped += 1
-            if environment_sensor_kind(entity_id, info):
-                next_environment_context_info[entity_id] = info
-
-        current = getattr(self, "device_info", {}) or {}
-        if not isinstance(current, dict):
-            current = {}
-        current_environment = getattr(self, "_environment_context_device_info", {}) or {}
-        if not isinstance(current_environment, dict):
-            current_environment = {}
-        changed = current != next_device_info or current_environment != next_environment_context_info
-        self.device_info = next_device_info
-        self._environment_context_device_info = next_environment_context_info
-        if changed:
-            reconciled = getattr(self, "_listener_active_state_reconciled", None)
-            if isinstance(reconciled, dict):
-                for entity_id in list(reconciled):
-                    if entity_id not in next_device_info:
-                        reconciled.pop(entity_id, None)
-            presence_inference = getattr(self, "_presence_inference", None)
-            if presence_inference is not None and hasattr(presence_inference, "device_info"):
-                try:
-                    presence_inference.device_info = self.device_info
-                except Exception:
-                    pass
-            updater = getattr(self, "async_set_updated_data", None)
-            if callable(updater):
-                try:
-                    updater({})
-                except Exception:
-                    pass
-
-        status.update(
-            {
-                "ok": True,
-                "reason": str(reason or "manual"),
-                "count": len(next_device_info),
-                "environment_context_count": len(next_environment_context_info),
-                "skipped": skipped,
-                "changed": changed,
-            }
+        reconcile_active_listener_states(
+            self,
+            entity_ids,
+            schedule=async_call_later,
         )
-        self._device_info_source = "addon_devices"
-        self._last_addon_device_sync_status = status
-        return changed
-
-    def _is_actionable_sensor_runtime_entity(self, entity_id: str, info: dict[str, Any]) -> bool:
-        sensor_type = str((info or {}).get("sensor_type") or "").strip().lower()
-        if sensor_type in self._ACTIONABLE_SENSOR_TYPES:
-            return True
-        text = " ".join(
-            str((info or {}).get(key) or "")
-            for key in ("name", "type", "capability", "device_class")
-        ).lower()
-        text = f"{entity_id.lower()} {text}"
-        return any(str(kw).lower() in text for kw in (*self._PRESENCE_KW, *self._PERSON_COUNT_KW))
-
-    def _is_listener_runtime_entity(self, entity_id: str, info: dict[str, Any]) -> bool:
-        domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
-        if domain not in self._LISTENER_DOMAINS:
-            return False
-        if domain != "sensor":
-            return True
-        return self._is_actionable_sensor_runtime_entity(entity_id, info)
-
-    def _managed_device_info_row_from_addon_device(
-        self,
-        row: dict[str, Any],
-    ) -> tuple[str, dict[str, Any]] | None:
-        if row.get("managed") is False or row.get("in_sa") is False:
-            return None
-        entity_id = str(row.get("entity_id") or row.get("id") or "").strip()
-        if "." not in entity_id:
-            return None
-        ops = str(row.get("ops") or "").strip()
-        if ops == "__smartagent_deleted__":
-            return None
-        domain = entity_id.split(".", 1)[0]
-        if domain not in self._LISTENER_DOMAINS:
-            return None
-
-        mode = str(row.get("control_mode") or row.get("policy") or "shared").strip() or "shared"
-        valid_modes = DEVICE_CONTROL_MODES
-        if mode not in valid_modes:
-            mode = "shared"
-
-        room = (
-            row.get("room")
-            or row.get("area")
-            or row.get("space_id")
-            or row.get("space")
-            or ""
-        )
-        if isinstance(room, (list, tuple)):
-            room = next((str(item).strip() for item in room if str(item).strip()), "")
-        space_id = row.get("space_id") or row.get("space") or ""
-        if isinstance(space_id, (list, tuple)):
-            space_id = next((str(item).strip() for item in space_id if str(item).strip()), "")
-        name = (
-            row.get("name")
-            or row.get("friendly_name")
-            or row.get("display_name")
-            or entity_id
-        )
-        dev_type = (
-            row.get("type")
-            or row.get("dev_type")
-            or row.get("capability")
-            or row.get("domain")
-            or domain
-        )
-        vacant_action = str(row.get("vacant_action") or "preserve").strip().lower()
-        info = {
-            "name": str(name or entity_id),
-            "room": str(room or ""),
-            "space_id": str(space_id or ""),
-            "type": str(dev_type or domain),
-            "capability": str(row.get("capability") or dev_type or domain),
-            "ops": ops,
-            "control_mode": mode,
-            "managed": True,
-            "vacant_action": vacant_action,
-            "sensor_type": str(row.get("sensor_type") or ""),
-            "device_class": str(row.get("device_class") or ""),
-            "unit_of_measurement": str(row.get("unit_of_measurement") or row.get("unit") or ""),
-            "ha_unique_id": str(row.get("ha_unique_id") or row.get("unique_id") or ""),
-            "ha_device_id": str(row.get("ha_device_id") or row.get("device_id") or ""),
-        }
-        return entity_id, info
-
-    def _device_info_row_from_addon_device(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
-        mapped = self._managed_device_info_row_from_addon_device(row)
-        if mapped is None:
-            return None
-        entity_id, info = mapped
-        if not self._is_listener_runtime_entity(entity_id, info):
-            return None
-        return entity_id, info
-
-    def _managed_listener_entity_ids(self) -> list[str]:
-        """Return managed entity ids that should receive HA state listeners."""
-        try:
-            self._reconcile_device_info_entity_ids_from_ha_registry()
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] entity registry reconciliation failed: %s", exc)
-        device_info = getattr(self, "device_info", {}) or {}
-        if not isinstance(device_info, dict):
-            return []
-        return [
-            eid
-            for eid in device_info
-            if isinstance(eid, str)
-            and self._is_listener_runtime_entity(eid, device_info.get(eid) if isinstance(device_info.get(eid), dict) else {})
-        ]
-
-    def _reconcile_device_info_entity_ids_from_ha_registry(self) -> bool:
-        """Migrate managed entity ids when HA's entity registry renamed them."""
-        device_info = getattr(self, "device_info", {}) or {}
-        if not isinstance(device_info, dict) or not device_info:
-            return False
-
-        hass = getattr(self, "hass", None)
-        if hass is None:
-            return False
-        states = getattr(hass, "states", None)
-
-        try:
-            from homeassistant.helpers import entity_registry as er
-            entity_reg = er.async_get(hass)
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] entity registry unavailable for reconciliation: %s", exc)
-            return False
-
-        def _state_obj(entity_id: str) -> Any:
-            getter = getattr(states, "get", None)
-            if not callable(getter):
-                return None
-            try:
-                return getter(entity_id)
-            except Exception:
-                return None
-
-        def _entry_obj(entity_id: str) -> Any:
-            getter = getattr(entity_reg, "async_get", None)
-            if not callable(getter):
-                return None
-            try:
-                return getter(entity_id)
-            except Exception:
-                return None
-
-        raw_entries = getattr(entity_reg, "entities", {}) or {}
-        if isinstance(raw_entries, dict):
-            registry_entries = list(raw_entries.values())
-        elif isinstance(raw_entries, (list, tuple, set)):
-            registry_entries = list(raw_entries)
-        else:
-            registry_entries = []
-
-        def _entry_entity_id(entry: Any) -> str:
-            return str(getattr(entry, "entity_id", "") or "").strip()
-
-        def _entry_unique_id(entry: Any) -> str:
-            return str(getattr(entry, "unique_id", "") or "").strip()
-
-        def _entry_device_id(entry: Any) -> str:
-            return str(getattr(entry, "device_id", "") or "").strip()
-
-        by_unique_id: dict[str, list[Any]] = {}
-        for entry in registry_entries:
-            unique_id = _entry_unique_id(entry)
-            entity_id = _entry_entity_id(entry)
-            if unique_id and entity_id:
-                by_unique_id.setdefault(unique_id, []).append(entry)
-
-        def _friendly_name(entity_id: str) -> str:
-            state = _state_obj(entity_id)
-            attrs = getattr(state, "attributes", None)
-            if isinstance(attrs, dict):
-                return str(attrs.get("friendly_name") or "").strip()
-            return ""
-
-        def _find_legacy_name_match(old_entity_id: str, info: dict[str, Any]) -> Any | None:
-            old_domain = old_entity_id.split(".", 1)[0] if "." in old_entity_id else ""
-            old_name = str(info.get("name") or info.get("friendly_name") or "").strip()
-            if not old_domain or not old_name:
-                return None
-            matches: list[Any] = []
-            for entry in registry_entries:
-                new_entity_id = _entry_entity_id(entry)
-                if not new_entity_id or new_entity_id == old_entity_id or new_entity_id in device_info:
-                    continue
-                if new_entity_id.split(".", 1)[0] != old_domain:
-                    continue
-                if _state_obj(new_entity_id) is None:
-                    continue
-                if _friendly_name(new_entity_id) == old_name:
-                    matches.append(entry)
-            return matches[0] if len(matches) == 1 else None
-
-        changed = False
-        for old_entity_id, raw_info in list(device_info.items()):
-            if not isinstance(old_entity_id, str) or "." not in old_entity_id:
-                continue
-            info = raw_info if isinstance(raw_info, dict) else {}
-            current_entry = _entry_obj(old_entity_id)
-            if _state_obj(old_entity_id) is not None or current_entry is not None:
-                self._persist_ha_registry_metadata(old_entity_id, info, current_entry)
-                continue
-
-            match_entry = None
-            match_reason = ""
-            unique_id = str(info.get("ha_unique_id") or info.get("unique_id") or "").strip()
-            if unique_id:
-                unique_matches = [
-                    entry
-                    for entry in by_unique_id.get(unique_id, [])
-                    if _entry_entity_id(entry) and _entry_entity_id(entry) not in device_info
-                ]
-                if len(unique_matches) == 1:
-                    match_entry = unique_matches[0]
-                    match_reason = "unique_id"
-            if match_entry is None:
-                match_entry = _find_legacy_name_match(old_entity_id, info)
-                if match_entry is not None:
-                    match_reason = "legacy_name_match"
-            if match_entry is None:
-                continue
-
-            new_entity_id = _entry_entity_id(match_entry)
-            if not new_entity_id or new_entity_id in device_info:
-                continue
-            migrated = dict(info)
-            migrated["entity_id"] = new_entity_id
-            if _entry_unique_id(match_entry):
-                migrated["ha_unique_id"] = _entry_unique_id(match_entry)
-            if _entry_device_id(match_entry):
-                migrated["ha_device_id"] = _entry_device_id(match_entry)
-            device_info.pop(old_entity_id, None)
-            device_info[new_entity_id] = migrated
-            self._persist_device_entity_id_migration(old_entity_id, new_entity_id, migrated)
-            changed = True
-            log = getattr(self, "_sys_log", None)
-            message = (
-                f"[监听器] HA 实体 ID 已对账迁移: {old_entity_id} -> {new_entity_id} "
-                f"({match_reason})"
-            )
-            if callable(log):
-                log("WARN", message)
-            else:
-                _LOGGER.warning(message)
-        if changed:
-            updater = getattr(self, "async_set_updated_data", None)
-            if callable(updater):
-                try:
-                    updater({})
-                except Exception:
-                    pass
-        return changed
-
-    def _persist_ha_registry_metadata(self, entity_id: str, info: dict[str, Any], entry: Any) -> None:
-        """Remember HA registry identity metadata so future HA-side renames can be reconciled."""
-        if not isinstance(info, dict) or entry is None:
-            return
-        unique_id = str(getattr(entry, "unique_id", "") or "").strip()
-        device_id = str(getattr(entry, "device_id", "") or "").strip()
-        if not unique_id and not device_id:
-            return
-        changed = False
-        if unique_id and info.get("ha_unique_id") != unique_id:
-            info["ha_unique_id"] = unique_id
-            changed = True
-        if device_id and info.get("ha_device_id") != device_id:
-            info["ha_device_id"] = device_id
-            changed = True
-        if changed:
-            self._persist_device_registry_metadata(entity_id, info)
-
-    def _persist_device_registry_metadata(self, entity_id: str, info: dict[str, Any]) -> None:
-        if not callable(getattr(self, "_db_exec", None)):
-            return
-        now = self._listener_db_now_text()
-        try:
-            self._db_exec(
-                "UPDATE devices SET ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
-                (
-                    str(info.get("ha_unique_id") or ""),
-                    str(info.get("ha_device_id") or ""),
-                    now,
-                    entity_id,
-                ),
-            )
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] device registry metadata persist skipped for %s: %s", entity_id, exc)
-
-    def _persist_device_entity_id_migration(self, old_entity_id: str, new_entity_id: str, info: dict[str, Any]) -> None:
-        if not callable(getattr(self, "_db_exec", None)):
-            return
-        now = self._listener_db_now_text()
-        try:
-            self._db_exec(
-                "UPDATE devices SET entity_id=?, updated=? WHERE entity_id=?",
-                (new_entity_id, now, old_entity_id),
-            )
-        except Exception as exc:
-            _LOGGER.warning("[Listeners] device entity_id migration persist failed %s -> %s: %s", old_entity_id, new_entity_id, exc)
-            return
-        try:
-            self._db_exec(
-                "UPDATE devices SET ha_unique_id=?, ha_device_id=?, updated=? WHERE entity_id=?",
-                (
-                    str(info.get("ha_unique_id") or ""),
-                    str(info.get("ha_device_id") or ""),
-                    now,
-                    new_entity_id,
-                ),
-            )
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] migrated registry metadata persist skipped for %s: %s", new_entity_id, exc)
-
-    def _refresh_listeners_if_entity_set_changed(self) -> bool:
-        """Refresh HA state listeners when the managed entity id set drifts."""
-        next_ids = set(self._managed_listener_entity_ids())
-        current_ids = set(getattr(self, "_listener_entity_ids", set()) or set())
-        if next_ids == current_ids:
-            self._reconcile_active_listener_states(sorted(next_ids))
-            return False
-        self._refresh_listeners()
-        return True
+    _async_refresh_device_info_from_addon_devices = async_refresh_device_info_from_addon_devices
+    _is_actionable_sensor_runtime_entity = is_actionable_sensor_runtime_entity
+    _is_listener_runtime_entity = is_listener_runtime_entity
+    _managed_device_info_row_from_addon_device = managed_device_info_row_from_addon_device
+    _device_info_row_from_addon_device = device_info_row_from_addon_device
+    _managed_listener_entity_ids = managed_listener_entity_ids
+    _reconcile_device_info_entity_ids_from_ha_registry = reconcile_device_info_entity_ids_from_ha_registry
+    _persist_ha_registry_metadata = persist_ha_registry_metadata
+    _persist_device_registry_metadata = persist_device_registry_metadata
+    _persist_device_entity_id_migration = persist_device_entity_id_migration
+    _refresh_listeners_if_entity_set_changed = refresh_listeners_if_entity_set_changed
 
     def _refresh_listeners(self) -> None:
         """Re-register state-change listeners after device list changes."""

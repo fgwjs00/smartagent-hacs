@@ -35,7 +35,6 @@ _ADDON_REPAIR_ISSUE_ID = "addon_unreachable"
 _ADDON_REPAIR_NOTIFICATION_ID = "smart_agent_addon_unreachable"
 _ADDON_REPAIR_HEALTH_CHECK_INTERVAL = 60
 _ADDON_REPAIR_MIN_FAILURE_SECONDS = 300
-_PRESENCE_SNAPSHOT_CACHE_TTL_SECONDS = 15.0
 _ADDON_REPAIR_UNREACHABLE_CODES = frozenset(
     {
         "addon_unreachable",
@@ -70,23 +69,33 @@ from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .actions import ActionsMixin
-from .active_ai_rollout import (
-    ActiveAiRolloutConfig,
-    enrich_active_ai_action_spaces,
-    evaluate_active_ai_execution_gate,
-    evaluate_active_ai_model_gate,
-    normalize_active_ai_mode,
-    scope_active_ai_canary_actions,
-)
+from .active_ai_rollout import normalize_active_ai_mode
 from .database import DatabaseMixin
-from .devices import DevicesMixin
-from .confidence_arbitration_contract import apply_arrival_lighting_confirmation_gate, pending_confirmation_allowed, validate_auto_execution_arbitration
-from .execution_gate import (
-    evaluate_priority_arbitration,
-    evaluate_slow_brain_confidence_gate,
+from .decision_runtime import (
+    build_patrol_environment_projection,
+    build_patrol_task_occurrence,
+    run_addon_decision,
+    scope_patrol_snapshot_projection,
 )
+from .devices import DevicesMixin
+from .execution_gate import evaluate_priority_arbitration
 from .frigate import FrigateMixin
 from .ha_adapter import async_call_service
+from .presence_snapshot_view import build_presence_snapshot
+from .patrol_runtime import (
+    filter_patrol_reconciliation_actions,
+    run_ai_patrol,
+    submit_patrol_safety_net_plan,
+)
+from .snapshot_cache_runtime import fetch_presence_snapshot, fetch_room_topology
+from .slow_decision_bundle_runtime import (
+    build_addon_slow_decision_bundle as build_slow_decision_bundle_projection,
+)
+from .addon_settings_runtime import apply_addon_system_settings
+from .decision_audit_projection import (
+    build_decision_trace_lineage,
+    build_training_sample_payload,
+)
 from .license import LicenseMixin
 from .listeners import ListenersMixin
 from .presence_runtime import apply_presence_timing_settings, async_restore_occupancy_cycles, room_candidates
@@ -159,6 +168,10 @@ from .const import (
     DEFAULT_FILE_LOG_LEVEL,
     CONF_ADDON_AUTH_TOKEN,
     CONF_ADDON_BASE_URL,
+    CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED,
+    CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET,
+    CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET,
+    CONF_USER_INTENT_DELEGATION_SECRET,
     DB_FILENAME,
     DOMAIN,
     LOG_FILENAME,
@@ -358,6 +371,9 @@ class SmartAgentCoordinator(
         self._patrol_quiet_hours_end = ""
         self._patrol_low_risk_entity_ids: tuple[str, ...] = ()
         self._patrol_last_automatic_submit_monotonic = 0.0
+        self._ai_patrol_last_automatic_submit_monotonic = 0.0
+        self._ai_patrol_retry_space_ids: tuple[str, ...] = ()
+        self._ai_patrol_retry_not_before_monotonic = 0.0
         self._frigate_enabled = bool(data.get(CONF_FRIGATE_ENABLED, False))  # 默认关闭，需手动启用
         # Phase 5: 联网工具与知识库
         from .tools import ToolRegistry
@@ -369,6 +385,9 @@ class SmartAgentCoordinator(
         # License
         self._init_license()
         self._license_key = (data.get(CONF_LICENSE_KEY) or "").strip()
+        self._user_intent_delegation_secret = (
+            data.get(CONF_USER_INTENT_DELEGATION_SECRET) or ""
+        ).strip()
         # Add-on 客户端（显式 URL 优先；留空时按端口回退）
         from .addon_client import AddOnClient, derive_addon_gateway_base_url
         from .const import CONF_ADDON_PORT, DEFAULT_ADDON_PORT
@@ -377,7 +396,29 @@ class SmartAgentCoordinator(
         if not _addon_base_url:
             _addon_base_url = derive_addon_gateway_base_url(self._get_ha_url())
         _addon_port = int(data.get(CONF_ADDON_PORT) or DEFAULT_ADDON_PORT)
-        self._addon_client = AddOnClient(base_url=_addon_base_url, port=_addon_port, auth_token=_addon_token)
+        self._addon_client = AddOnClient(
+            base_url=_addon_base_url,
+            port=_addon_port,
+            auth_token=_addon_token,
+            field_canary_host_dispatch_proof_enabled=(
+                data.get(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED, False)
+                is True
+            ),
+            field_canary_host_dispatch_proof_secret=(
+                data.get(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET) or ""
+            ),
+            field_canary_previous_host_dispatch_proof_secret=(
+                data.get(CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET)
+                or ""
+            ),
+        )
+        from .output_ledger_publisher import OutputLedgerPublisher
+        from .maintenance_delegation_publisher import MaintenanceDelegationPublisher
+
+        self._output_ledger_publisher = OutputLedgerPublisher(hass, entry)
+        self._maintenance_delegation_publisher = MaintenanceDelegationPublisher(
+            hass, entry
+        )
         self._addon_repair_issue_active = False
         self._addon_repair_first_failure_at: float | None = None
         self._addon_repair_failure_count = 0
@@ -397,9 +438,6 @@ class SmartAgentCoordinator(
         self._env_feedback_tasks: list[dict] = []
         self._env_feedback_lock = asyncio.Lock()
         # Phase A: DeviceAdapter — AI Core 与 HA 设备层解耦（可测试化）
-        # 当前唯一实现：HAAdapter（通过 SmartAgent command envelope）
-        from .device_adapter import HAAdapter
-        self._device_adapter = HAAdapter(hass)
         # 全局推理互斥锁：作为无法提取房间名时的兜底（如巡检、定时、位置变化触发）
         self._inference_lock = asyncio.Lock()
         # 按房间隔离的推理锁：不同房间的 LLM 推理可并发执行，互不阻塞
@@ -479,16 +517,7 @@ class SmartAgentCoordinator(
         self.hass.http.register_view(SmartAgentPairConfirmView(self))
 
         # 注册配对授权服务
-        self.hass.services.async_register(
-            DOMAIN, "authorize_pairing", self.async_svc_authorize_pairing
-        )
-
         # 注册忽略服务：从近期操作列表移除条目（不记入学习）
-        self.hass.services.async_register(
-            DOMAIN, "dismiss_ai_action",
-            self.async_svc_dismiss_ai_action,
-        )
-
         # 巡检设备状态快照（用于检测是否有变化，无变化则跳过推理节省算力）
         self._last_patrol_snapshot: str = ""
         self._patrol_no_change_count: int = 0
@@ -767,6 +796,9 @@ class SmartAgentCoordinator(
                 "persistent_notification",
                 "create",
                 {"message": message, "title": title},
+                execution_class="notification",
+                actor_ref="coordinator.notify",
+                output_ledger_publisher=self._output_ledger_publisher,
             ),
             "notify_dedup_persistent_notification",
         )
@@ -957,6 +989,9 @@ class SmartAgentCoordinator(
                     ),
                     "notification_id": _ADDON_REPAIR_NOTIFICATION_ID,
                 },
+                execution_class="notification",
+                actor_ref="coordinator.addon_repair",
+                output_ledger_publisher=self._output_ledger_publisher,
             )
         except Exception as exc:
             _LOGGER.warning("[Repair] create add-on notification failed: %s", exc, exc_info=True)
@@ -975,12 +1010,21 @@ class SmartAgentCoordinator(
                 "persistent_notification",
                 "dismiss",
                 {"notification_id": _ADDON_REPAIR_NOTIFICATION_ID},
+                execution_class="notification",
+                actor_ref="coordinator.addon_repair",
+                output_ledger_publisher=self._output_ledger_publisher,
             )
         except Exception as exc:
             _LOGGER.warning("[Repair] dismiss add-on notification failed: %s", exc, exc_info=True)
         self._addon_repair_issue_active = False
 
-    async def _tts_speak(self, text: str, min_level: int = 1) -> None:
+    async def _tts_speak(
+        self,
+        text: str,
+        min_level: int = 1,
+        *,
+        authority: Any = None,
+    ) -> None:
         """通用 TTS 播报接口。
 
         当 _tts_level >= min_level 且已配置 TTS 服务/目标实体时发送语音播报。
@@ -999,14 +1043,27 @@ class SmartAgentCoordinator(
                 return
         domain, service = svc.split(".", 1)
         try:
-            await async_call_service(
+            receipt = await async_call_service(
                 self.hass,
                 domain, service,
                 {"entity_id": target, "message": text},
+                execution_class="user_explicit_output",
+                authority=authority,
+                output_ledger_publisher=self._output_ledger_publisher,
             )
-            self._sys_log("INFO", f"[TTS] 播报: {text[:60]}")
+            receipt_id = str(getattr(receipt, "receipt_id", "") or "")
+            self._sys_log(
+                "INFO",
+                f"[TTS] HA 已接收请求，播放状态未验证 | receipt_id={receipt_id or '-'}",
+            )
         except Exception as exc:
-            self._sys_log("WARN", f"[TTS] 播报失败: {exc}")
+            receipt = getattr(exc, "smartagent_output_receipt", None)
+            receipt_id = str((receipt or {}).get("receipt_id") or "") if isinstance(receipt, dict) else ""
+            self._sys_log(
+                "WARN",
+                "[TTS] 传输结果不确定，未声明已播放 | "
+                f"receipt_id={receipt_id or '-'} error_type={exc.__class__.__name__}",
+            )
 
     def _init_priority_system(self) -> None:
         self._device_priority_map: dict[str, dict] = {}
@@ -1417,188 +1474,12 @@ class SmartAgentCoordinator(
         return True
 
     async def _async_apply_addon_system_settings(self) -> bool:
-        """Pull canonical system settings from add-on and apply to coordinator state.
+        """Consume the canonical add-on settings through the portable runtime."""
+        return await apply_addon_system_settings(
+            self,
+            apply_presence_timing=apply_presence_timing_settings,
+        )
 
-        add-on 是真源；HA 仅作消费方。本函数在启动时和收到 settings 变更广播时调用。
-        失败时不抛出，保留现有内存态（来自 config_entry 的初始化值）。
-        """
-        addon_client = getattr(self, "_addon_client", None)
-        if addon_client is None:
-            return False
-        try:
-            payload = await addon_client.get_system_settings()
-        except Exception as exc:
-            _LOGGER.debug("[AddonSettings] get_system_settings 失败: %s", exc)
-            return False
-        if not isinstance(payload, dict):
-            return False
-        # 兼容旧字段名 habit_proactive_ask
-        habit_value = payload.get("habit_proactive")
-        if habit_value is None:
-            habit_value = payload.get("habit_proactive_ask")
-        applied: list[str] = []
-        frigate_runtime_action: str | None = None
-        if "engine" in payload:
-            new_value = "online" if str(payload.get("engine") or "").strip().lower() == "online" else "local"
-            if new_value != self.engine:
-                self.engine = new_value
-                applied.append(f"engine={new_value}")
-        if "ollama_url" in payload:
-            new_value = str(payload.get("ollama_url") or "").strip() or "http://127.0.0.1:11434"
-            if new_value != self.ollama_url:
-                self.ollama_url = new_value
-                applied.append("ollama_url=updated")
-        if "ollama_model" in payload:
-            new_value = str(payload.get("ollama_model") or "").strip()
-            if new_value and new_value != self.ollama_model:
-                self.ollama_model = new_value
-                applied.append(f"ollama_model={new_value}")
-        if "online_base_url" in payload:
-            new_value = str(payload.get("online_base_url") or "").strip()
-            if new_value and new_value != self.online_base_url:
-                self.online_base_url = new_value
-                applied.append("online_base_url=updated")
-        if "online_model" in payload:
-            new_value = str(payload.get("online_model") or "").strip()
-            if new_value and new_value != self.online_model:
-                self.online_model = new_value
-                applied.append(f"online_model={new_value}")
-        if "online_api_key" in payload:
-            new_value = str(payload.get("online_api_key") or "").strip()
-            if new_value and set(new_value) != {"*"} and new_value != self._online_api_key:
-                self._online_api_key = new_value
-                applied.append("online_api_key=updated")
-        if "cloud_fallback" in payload:
-            new_value = bool(payload.get("cloud_fallback"))
-            if new_value != self._cloud_fallback:
-                self._cloud_fallback = new_value
-                applied.append(f"cloud_fallback={new_value}")
-        if "confidence_auto" in payload:
-            try:
-                new_value = int(float(payload.get("confidence_auto")))
-            except (TypeError, ValueError):
-                new_value = self.confidence_auto
-            if new_value != self.confidence_auto:
-                self.confidence_auto = new_value
-                applied.append(f"confidence_auto={new_value}")
-        if "confidence_notify" in payload:
-            try:
-                new_value = int(float(payload.get("confidence_notify")))
-            except (TypeError, ValueError):
-                new_value = self.confidence_notify
-            if new_value != self.confidence_notify:
-                self.confidence_notify = new_value
-                applied.append(f"confidence_notify={new_value}")
-        if "cooldown" in payload:
-            try:
-                new_value = int(float(payload.get("cooldown")))
-            except (TypeError, ValueError):
-                new_value = self.cooldown
-            if new_value != self.cooldown:
-                self.cooldown = new_value
-                applied.append(f"cooldown={new_value}")
-        apply_presence_timing_settings(self, payload, applied)
-        if "mode" in payload:
-            new_value = "showroom" if str(payload.get("mode") or "").strip().lower() == "showroom" else "home"
-            if new_value != self._mode:
-                self._mode = new_value
-                applied.append(f"mode={new_value}")
-        if "learning_mode" in payload:
-            new_value = bool(payload.get("learning_mode"))
-            if new_value != self._learning_mode:
-                self._learning_mode = new_value
-                applied.append(f"learning_mode={new_value}")
-        if habit_value is not None:
-            new_value = bool(habit_value)
-            if new_value != self._habit_proactive:
-                self._habit_proactive = new_value
-                applied.append(f"habit_proactive={new_value}")
-        if "patrol_enabled" in payload:
-            new_value = bool(payload.get("patrol_enabled"))
-            if new_value != self._patrol_enabled:
-                self._patrol_enabled = new_value
-                applied.append(f"patrol_enabled={new_value}")
-        if "patrol_interval_minutes" in payload:
-            try:
-                new_value = int(float(payload.get("patrol_interval_minutes")))
-            except (TypeError, ValueError):
-                new_value = self._patrol_interval_minutes
-            if not 5 <= new_value <= 1440:
-                new_value = self._patrol_interval_minutes
-            if new_value != self._patrol_interval_minutes:
-                self._patrol_interval_minutes = new_value
-                applied.append(f"patrol_interval_minutes={new_value}")
-
-        def _patrol_identifiers(key: str) -> tuple[str, ...] | None:
-            if key not in payload:
-                return None
-            raw_values = payload.get(key)
-            if not isinstance(raw_values, (list, tuple, set)):
-                return ()
-            return tuple(
-                dict.fromkeys(
-                    str(value or "").strip()
-                    for value in raw_values
-                    if str(value or "").strip()
-                )
-            )
-
-        def _patrol_hhmm(key: str) -> str | None:
-            if key not in payload:
-                return None
-            value = str(payload.get(key) or "").strip()
-            if not value:
-                return ""
-            parts = value.split(":", 1)
-            if len(parts) != 2 or not all(part.isdigit() for part in parts):
-                return ""
-            hour, minute = (int(part) for part in parts)
-            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-                return ""
-            return f"{hour:02d}:{minute:02d}"
-
-        scope_space_ids = _patrol_identifiers("patrol_scope_space_ids")
-        if scope_space_ids is not None and scope_space_ids != self._patrol_scope_space_ids:
-            self._patrol_scope_space_ids = scope_space_ids
-            applied.append(f"patrol_scope_space_ids={len(scope_space_ids)}")
-        excluded_space_ids = _patrol_identifiers("patrol_excluded_space_ids")
-        if excluded_space_ids is not None and excluded_space_ids != self._patrol_excluded_space_ids:
-            self._patrol_excluded_space_ids = excluded_space_ids
-            applied.append(f"patrol_excluded_space_ids={len(excluded_space_ids)}")
-        quiet_hours_start = _patrol_hhmm("patrol_quiet_hours_start")
-        if quiet_hours_start is not None and quiet_hours_start != self._patrol_quiet_hours_start:
-            self._patrol_quiet_hours_start = quiet_hours_start
-            applied.append(f"patrol_quiet_hours_start={bool(quiet_hours_start)}")
-        quiet_hours_end = _patrol_hhmm("patrol_quiet_hours_end")
-        if quiet_hours_end is not None and quiet_hours_end != self._patrol_quiet_hours_end:
-            self._patrol_quiet_hours_end = quiet_hours_end
-            applied.append(f"patrol_quiet_hours_end={bool(quiet_hours_end)}")
-        low_risk_entity_ids = _patrol_identifiers("patrol_low_risk_entity_ids")
-        if low_risk_entity_ids is not None and low_risk_entity_ids != self._patrol_low_risk_entity_ids:
-            self._patrol_low_risk_entity_ids = low_risk_entity_ids
-            applied.append(f"patrol_low_risk_entity_ids={len(low_risk_entity_ids)}")
-        if "vision_enabled" in payload:
-            new_value = bool(payload.get("vision_enabled"))
-            if new_value != self._vision_enabled:
-                self._vision_enabled = new_value
-                applied.append(f"vision_enabled={new_value}")
-        if "frigate_enabled" in payload:
-            new_value = bool(payload.get("frigate_enabled"))
-            if new_value != self._frigate_enabled:
-                self._frigate_enabled = new_value
-                frigate_runtime_action = "start" if new_value else "stop"
-                applied.append(f"frigate_enabled={new_value}")
-        if frigate_runtime_action == "start":
-            await self._async_start_frigate_mqtt()
-        elif frigate_runtime_action == "stop":
-            await self._async_stop_frigate_mqtt()
-        if applied:
-            self._sys_log(
-                "INFO",
-                "[AddonSettings] 已从 add-on 同步策略开关：" + ", ".join(applied),
-            )
-            self.async_set_updated_data({})
-        return True
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
@@ -1646,9 +1527,15 @@ class SmartAgentCoordinator(
         try:
             async def _patrol_safety_net_periodic(_now: Any) -> None:
                 try:
-                    await self._async_submit_patrol_safety_net_plan(source="ha_low_frequency_patrol")
+                    await self._async_submit_patrol_safety_net_plan(
+                        source="ha_low_frequency_patrol"
+                    )
                 except Exception as exc:
                     _LOGGER.debug("[PatrolSafetyNet] periodic plan failed: %s", exc)
+                try:
+                    await self._async_run_ai_patrol(source="ha_low_frequency_patrol")
+                except Exception as exc:
+                    _LOGGER.debug("[AIPatrol] periodic decision failed: %s", exc)
 
             self._listener_removers.append(
                 async_track_time_interval(
@@ -1768,19 +1655,13 @@ class SmartAgentCoordinator(
             "license_startup_check",
         )
 
-        async def _startup_state_refresh() -> None:
+        async def _startup_post_init() -> None:
             await asyncio.sleep(10)
-            refreshed = 0
-            failed = 0
-            for eid in self.device_info:
-                try:
-                    await async_call_service(self.hass, "homeassistant", "update_entity", {"entity_id": eid})
-                    refreshed += 1
-                except Exception:
-                    failed += 1
-                if refreshed % 5 == 0:
-                    await asyncio.sleep(0.5)
-            self._sys_log("INFO", f"[启动] 设备状态强制刷新完成: 成功={refreshed}, 失败={failed}")
+            self._sys_log(
+                "INFO",
+                "[启动] 主动状态刷新保持关闭：等待 ObservationRefresh manager、"
+                "可信 EvidenceWorld 与 exact Provider binding 完整接线",
+            )
             area_updated = await self.async_refresh_device_areas()
             if area_updated:
                 self._sys_log("INFO", f"[启动] 自动补全 {area_updated} 个设备的区域信息")
@@ -1788,8 +1669,8 @@ class SmartAgentCoordinator(
             await self._async_update_status("正在监控", "系统初始化完成")
 
         self._spawn_background_task(
-            _startup_state_refresh(),
-            "startup_state_refresh",
+            _startup_post_init(),
+            "startup_post_init",
         )
 
         async def _startup_unavail_check() -> None:
@@ -1947,28 +1828,115 @@ class SmartAgentCoordinator(
         device_info: dict[str, Any],
         states: dict[str, str],
         *,
+        state_observations: dict[str, dict[str, Any]] | None = None,
         trigger_room: str = "",
+        trigger_space_id: str = "",
         max_rows: int = 48,
     ) -> str:
         rows: list[str] = []
+        observations = (
+            state_observations if isinstance(state_observations, dict) else {}
+        )
         for entity_id, raw_info in sorted(device_info.items()):
             if not entity_id:
                 continue
             info = raw_info if isinstance(raw_info, dict) else {}
             room = str(info.get("room") or info.get("area") or "").strip()
             domain = entity_id.split(".", 1)[0]
-            if trigger_room and room and room != trigger_room and domain not in {"light", "switch", "binary_sensor", "sensor"}:
+            entity_spaces = {
+                str(info.get(key) or "").strip()
+                for key in ("space_id", "room_id", "area_id", "room", "area")
+                if str(info.get(key) or "").strip()
+            }
+            requested_space = str(trigger_space_id or trigger_room or "").strip()
+            if (
+                requested_space
+                and entity_spaces
+                and requested_space not in entity_spaces
+                and domain not in {"light", "switch", "binary_sensor", "sensor"}
+            ):
                 continue
             name = str(info.get("name") or entity_id).strip()
             control_mode = str(info.get("control_mode") or "").strip()
+            space_id = str(
+                info.get("space_id")
+                or info.get("room_id")
+                or info.get("area_id")
+                or ""
+            ).strip()
+            capability = str(info.get("capability") or info.get("type") or "").strip()
+            unit = str(info.get("unit_of_measurement") or info.get("unit") or "").strip()
             state = str(states.get(entity_id) or "").strip()
+            observation = (
+                observations.get(entity_id)
+                if isinstance(observations.get(entity_id), dict)
+                else {}
+            )
+            last_updated = str(
+                observation.get("last_updated")
+                or observation.get("last_changed")
+                or ""
+            ).strip()
+            freshness_status = str(
+                observation.get("freshness_status") or ""
+            ).strip()
+            freshness_reason = str(
+                observation.get("freshness_reason") or ""
+            ).strip()
+            age_seconds = observation.get("age_seconds")
             rows.append(
                 f"- [{room or '未分配'}] {name} ({entity_id}) state={state or 'unknown'}"
+                f"{f' space_id={space_id}' if space_id else ''}"
+                f"{f' capability={capability}' if capability else ''}"
+                f"{f' unit={unit}' if unit else ''}"
+                f"{f' last_updated={last_updated}' if last_updated else ''}"
+                f"{f' freshness={freshness_status}' if freshness_status else ''}"
+                f"{f' freshness_reason={freshness_reason}' if freshness_reason else ''}"
+                f"{f' age_seconds={age_seconds}' if age_seconds is not None else ''}"
                 f"{f' control_mode={control_mode}' if control_mode else ''}"
             )
             if len(rows) >= max_rows:
                 break
         return "【设备状态表】\n" + "\n".join(rows) if rows else ""
+
+    @staticmethod
+    def _patrol_quiet_hours_active(
+        now: datetime,
+        start: str,
+        end: str,
+    ) -> bool:
+        """Return whether ``now`` falls in the configured local quiet window."""
+
+        def _minutes(value: str) -> int | None:
+            try:
+                hour_text, minute_text = str(value or "").strip().split(":", 1)
+                hour = int(hour_text)
+                minute = int(minute_text)
+            except (TypeError, ValueError):
+                return None
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                return None
+            return hour * 60 + minute
+
+        start_minutes = _minutes(start)
+        end_minutes = _minutes(end)
+        if (
+            start_minutes is None
+            or end_minutes is None
+            or start_minutes == end_minutes
+        ):
+            return False
+        now_minutes = now.hour * 60 + now.minute
+        if start_minutes < end_minutes:
+            return start_minutes <= now_minutes < end_minutes
+        return now_minutes >= start_minutes or now_minutes < end_minutes
+
+    @staticmethod
+    def _filter_patrol_reconciliation_actions(
+        actions: list[dict[str, Any]],
+        bundle: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        return filter_patrol_reconciliation_actions(actions, bundle)
 
     @staticmethod
     def _render_addon_decision_occupancy_section(
@@ -2160,6 +2128,26 @@ class SmartAgentCoordinator(
         if decision_trace:
             audit["decision_trace"] = decision_trace
 
+        raw_event_claim = source_trace_context.get("event_claim")
+        if isinstance(raw_event_claim, dict):
+            event_claim = {
+                key: str(raw_event_claim.get(key) or "")[:512]
+                for key in (
+                    "schema_version",
+                    "claim_id",
+                    "continuation_token",
+                    "event_kind",
+                    "provider_id",
+                    "stream_id",
+                    "source_event_id",
+                    "current_stage",
+                    "expires_at",
+                )
+                if str(raw_event_claim.get(key) or "").strip()
+            }
+            if event_claim.get("claim_id") and event_claim.get("continuation_token"):
+                audit["event_claim"] = event_claim
+
         pre_states: dict[str, Any] = {}
         raw_pre_states = source_trace_context.get("pre_states")
         if isinstance(raw_pre_states, dict):
@@ -2234,229 +2222,30 @@ class SmartAgentCoordinator(
         *,
         one_off_prompt: str = "",
         source: str = "listener",
+        user_explicit_voice: bool = False,
         source_trace_context: dict[str, Any] | None = None,
+        trigger_space_id: str = "",
+        causal_events: list[dict[str, Any]] | None = None,
+        task_occurrence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build the rich bundle used by add-on slow decisions."""
-        parsed = self._parse_addon_decision_trigger(trigger)
-        audit_pending = self._is_fast_path_audit_prompt(one_off_prompt)
-        raw_source_trace_context = (
-            dict(source_trace_context)
-            if isinstance(source_trace_context, dict)
-            else {}
-        )
-        fast_path_execution_audit = self._normalize_fast_path_execution_audit(
-            raw_source_trace_context
-        )
-        if fast_path_execution_audit:
-            source_trace_context = dict(fast_path_execution_audit)
-        elif str(raw_source_trace_context.get("source") or "").strip() in {
-            "addon_fast_path_409",
-            "addon_fast_path_disabled",
-            "addon_fast_path_low_confidence",
-            "addon_fast_path_no_match",
-        }:
-            source_trace_context = {
-                key: json.loads(json.dumps(value, ensure_ascii=False, default=str))
-                if isinstance(value, (dict, list))
-                else value
-                for key in (
-                    "source",
-                    "transaction_id",
-                    "correlation_id",
-                    "world_snapshot_id",
-                    "occupancy_cycle_id",
-                    "reason",
-                    "decision_trace",
-                )
-                if (value := raw_source_trace_context.get(key)) not in (None, "")
-            }
-        else:
-            source_trace_context = {}
-        entity_id = parsed.get("trigger_entity_id", "")
-        snapshot: dict[str, Any] = {}
-        if entity_id:
-            snapshot_builder = getattr(self, "_build_addon_fast_path_snapshot", None)
-            if callable(snapshot_builder):
-                try:
-                    snapshot = snapshot_builder(entity_id)
-                except Exception as exc:
-                    _LOGGER.debug("[决策] 慢脑快照构建失败: %s", exc)
-                    snapshot = {}
-
-        raw_device_info = snapshot.get("device_info") if isinstance(snapshot.get("device_info"), dict) else getattr(self, "device_info", {})
-        device_info = dict(raw_device_info or {}) if isinstance(raw_device_info, dict) else {}
-        raw_states = snapshot.get("states") if isinstance(snapshot.get("states"), dict) else {}
-        states = dict(raw_states or {}) if isinstance(raw_states, dict) else {}
+        """Build the rich bundle through the portable projection runtime."""
         state_store = getattr(getattr(self, "hass", None), "states", None)
         state_get = getattr(state_store, "get", None)
-        if callable(state_get):
-            for managed_entity_id in device_info:
-                if str(states.get(managed_entity_id) or "").strip():
-                    continue
-                state_obj = state_get(managed_entity_id)
-                if state_obj is not None:
-                    states[managed_entity_id] = str(getattr(state_obj, "state", "") or "")
-        raw_capability_snapshot = (
-            snapshot.get("device_capability_snapshot")
-            if isinstance(snapshot.get("device_capability_snapshot"), dict)
-            else {}
-        )
-        if not raw_capability_snapshot:
-            capability_snapshot_getter = getattr(self, "get_device_capability_snapshot", None)
-            if callable(capability_snapshot_getter):
-                try:
-                    candidate_capability_snapshot = capability_snapshot_getter()
-                    if isinstance(candidate_capability_snapshot, dict):
-                        raw_capability_snapshot = candidate_capability_snapshot
-                except Exception as exc:
-                    _LOGGER.debug("[决策] 慢脑设备能力快照构建失败: %s", exc)
-        raw_environment_context = (
-            snapshot.get("environment_context")
-            if isinstance(snapshot.get("environment_context"), dict)
-            else {}
-        )
-        environment_context = dict(raw_environment_context or {}) if isinstance(raw_environment_context, dict) else {}
-        trigger_info = device_info.get(entity_id, {}) if entity_id else {}
-        if not isinstance(trigger_info, dict):
-            trigger_info = {}
-        trigger_room = str(
-            trigger_info.get("room")
-            or trigger_info.get("area")
-            or snapshot.get("trigger_room")
-            or ""
-        ).strip()
-        trigger_space_id = str(
-            trigger_info.get("space_id")
-            or trigger_info.get("room_id")
-            or trigger_info.get("area_id")
-            or trigger_room
-            or ""
-        ).strip()
-        if not trigger_room and entity_id:
-            area_lookup = getattr(self, "_get_entity_area", None)
-            if callable(area_lookup):
-                try:
-                    trigger_room = str(area_lookup(entity_id) or "").strip()
-                except Exception:
-                    trigger_room = ""
-
-        presence_snapshot = snapshot.get("presence_snapshot") if isinstance(snapshot.get("presence_snapshot"), dict) else {}
-        device_table = self._render_addon_decision_device_table(
-            device_info,
-            states,
-            trigger_room=trigger_room,
-        )
-        occupancy_section = self._render_addon_decision_occupancy_section(
-            presence_snapshot,
-            trigger_room=trigger_room,
-        )
-        automation_policy_section = self._render_addon_decision_automation_policy_section(
-            getattr(self, "_ai_scenes_cache", []),
-            getattr(self, "_ha_scenes", []),
-            getattr(self, "_ha_scripts", []),
-            trigger_room=trigger_room,
+        return build_slow_decision_bundle_projection(
+            self,
+            trigger,
+            scope_patrol_snapshot=scope_patrol_snapshot_projection,
+            build_patrol_environment=build_patrol_environment_projection,
+            state_get=state_get if callable(state_get) else None,
+            one_off_prompt=one_off_prompt,
+            source=source,
+            user_explicit_voice=user_explicit_voice,
+            source_trace_context=source_trace_context,
+            trigger_space_id=trigger_space_id,
+            causal_events=causal_events,
+            task_occurrence=task_occurrence,
         )
 
-        context_parts = [
-            str(one_off_prompt or "").strip(),
-            f"触发事件：{trigger}",
-        ]
-        if audit_pending:
-            fast_path_audit_marker = "[fast_path_audit]"
-            context_parts.append(
-                f"{fast_path_audit_marker} Fast path already executed a provisional low-risk action. "
-                "Audit the action, do not repeat identical light actions, and return approve/adjust/observe_only."
-            )
-        if fast_path_execution_audit:
-            context_parts.append(
-                "[fast_path_execution_audit] "
-                + json.dumps(
-                    fast_path_execution_audit,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-        elif source_trace_context.get("source") == "addon_fast_path_409":
-            context_parts.append(
-                "[fast_path_409_trace] "
-                f"transaction_id={source_trace_context.get('transaction_id') or '-'} "
-                f"correlation_id={source_trace_context.get('correlation_id') or '-'} "
-                f"world_snapshot_id={source_trace_context.get('world_snapshot_id') or '-'} "
-                f"reason={source_trace_context.get('reason') or '-'}"
-            )
-        elif str(source_trace_context.get("source") or "").strip() in {
-            "addon_fast_path_disabled",
-            "addon_fast_path_low_confidence",
-            "addon_fast_path_no_match",
-        }:
-            context_parts.append(
-                "[fast_path_handoff] "
-                f"correlation_id={source_trace_context.get('correlation_id') or '-'} "
-                f"reason={source_trace_context.get('reason') or '-'}"
-            )
-        if automation_policy_section:
-            context_parts.append(automation_policy_section)
-        if entity_id:
-            context_parts.append(f"触发实体：{entity_id}")
-        if trigger_room:
-            context_parts.append(f"触发空间：{trigger_room}")
-        if parsed.get("old_state") or parsed.get("new_state"):
-            context_parts.append(f"状态变化：{parsed.get('old_state') or '?'} -> {parsed.get('new_state') or '?'}")
-        if self._is_addon_presence_clear(parsed):
-            context_parts.append(
-                "触发约束：占用清除。binary_sensor on->off 只表示近期未检测到活动，"
-                "不等于确认无人，不等于确认有人离开；没有 leave_qualified 或多源确认时，"
-                "不要生成“有人离开，准备关闭灯光”的场景。"
-            )
-
-        _now = self._ha_local_now()
-        _weekdays = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
-        time_str = _now.strftime("%H:%M")
-        day_str = f"{_now.strftime('%Y-%m-%d')} {_weekdays[_now.weekday()]}"
-        normalized_source = str(source or "").strip().lower()
-        is_voice = normalized_source == "voice" or normalized_source.startswith("voice_")
-        is_user_explicit = is_voice or normalized_source == "manual"
-
-        bundle = {
-            "trigger": str(trigger or ""),
-            "context_text": "\n".join(part for part in context_parts if part),
-            "source": f"ha_bridge_{source}",
-            "is_voice": is_voice,
-            "cmd_source": "USER_EXPLICIT" if is_user_explicit else "SENSOR",
-            "time_str": time_str,
-            "day_str": day_str,
-            "mode": self._mode,
-            "engine": self.engine,
-            "confidence_auto": self.confidence_auto,
-            "confidence_notify": self.confidence_notify,
-            "trigger_entity_id": entity_id,
-            "old_state": parsed.get("old_state", ""),
-            "new_state": parsed.get("new_state", ""),
-            "trigger_room": trigger_room,
-            "trigger_space_id": trigger_space_id,
-            "audit_pending": audit_pending,
-            "provisional_execution": audit_pending,
-            "audit_source": "fast_path" if audit_pending else "",
-            "device_info": device_info,
-            "states": states,
-            "environment_context": environment_context,
-            "presence_snapshot": presence_snapshot,
-            "space_snapshot": snapshot.get("space_snapshot") if isinstance(snapshot.get("space_snapshot"), dict) else {},
-            "device_capability_snapshot": raw_capability_snapshot,
-            "room_topology": snapshot.get("room_topology") if isinstance(snapshot.get("room_topology"), dict) else {},
-            "device_table": device_table,
-            "occupancy_section": occupancy_section,
-            "automation_policy_section": automation_policy_section,
-            "source_trace_context": source_trace_context,
-            "fast_path_execution_audit": fast_path_execution_audit,
-            "parent_transaction_id": str(source_trace_context.get("transaction_id") or ""),
-            "parent_execution_transaction_id": str(source_trace_context.get("execution_transaction_id") or ""),
-            "parent_decision_trace": source_trace_context.get("decision_trace") if isinstance(source_trace_context.get("decision_trace"), dict) else {},
-            "parent_correlation_id": str(source_trace_context.get("correlation_id") or ""),
-            "parent_world_snapshot_id": str(source_trace_context.get("world_snapshot_id") or ""),
-            "occupancy_cycle_id": str(snapshot.get("occupancy_cycle_id") or source_trace_context.get("occupancy_cycle_id") or "").strip(),
-        }
-        return bundle
 
     def _ha_local_now(self) -> datetime:
         configured_timezone = str(
@@ -2499,94 +2288,11 @@ class SmartAgentCoordinator(
         result: dict[str, Any],
         actions: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        nested_result = result.get("result") if isinstance(result.get("result"), dict) else {}
-        details = result.get("details") if isinstance(result.get("details"), dict) else {}
-        source_context = (
-            bundle.get("source_trace_context")
-            if isinstance(bundle.get("source_trace_context"), dict)
-            else {}
+        return build_decision_trace_lineage(
+            bundle=bundle,
+            result=result,
+            actions=actions,
         )
-        context_snapshot = (
-            result.get("context_snapshot")
-            if isinstance(result.get("context_snapshot"), dict)
-            else nested_result.get("context_snapshot")
-            if isinstance(nested_result.get("context_snapshot"), dict)
-            else {}
-        )
-        llm_request = (
-            result.get("llm_request")
-            if isinstance(result.get("llm_request"), dict)
-            else nested_result.get("llm_request")
-            if isinstance(nested_result.get("llm_request"), dict)
-            else details.get("llm_request")
-            if isinstance(details.get("llm_request"), dict)
-            else {}
-        )
-
-        raw_evidence_ids = (
-            result.get("source_evidence_ids")
-            or nested_result.get("source_evidence_ids")
-            or context_snapshot.get("source_evidence_ids")
-            or bundle.get("source_evidence_ids")
-            or source_context.get("source_evidence_ids")
-        )
-        if isinstance(raw_evidence_ids, str):
-            raw_evidence_ids = [raw_evidence_ids]
-        source_evidence_ids: list[str] = []
-        if isinstance(raw_evidence_ids, (list, tuple, set)):
-            for item in raw_evidence_ids:
-                evidence_id = str(item or "").strip()
-                if evidence_id and evidence_id not in source_evidence_ids:
-                    source_evidence_ids.append(evidence_id)
-        trigger_entity_id = str(bundle.get("trigger_entity_id") or "").strip()
-        if not source_evidence_ids and trigger_entity_id:
-            source_evidence_ids.append(trigger_entity_id)
-
-        action_sequences: list[int] = []
-        for index, action in enumerate(actions, start=1):
-            raw_sequence = (
-                action.get("sequence")
-                or action.get("action_sequence")
-                or action.get("sequence_id")
-                or index
-            )
-            try:
-                sequence = int(raw_sequence)
-            except (TypeError, ValueError, OverflowError):
-                sequence = index
-            action_sequences.append(sequence)
-
-        return {
-            "world_snapshot_id": str(
-                result.get("world_snapshot_id")
-                or nested_result.get("world_snapshot_id")
-                or context_snapshot.get("world_snapshot_id")
-                or bundle.get("world_snapshot_id")
-                or bundle.get("parent_world_snapshot_id")
-                or "unknown"
-            ).strip()
-            or "unknown",
-            "source_evidence_ids": source_evidence_ids,
-            "parent_transaction_id": str(
-                bundle.get("parent_transaction_id")
-                or result.get("parent_transaction_id")
-                or nested_result.get("parent_transaction_id")
-                or ""
-            ).strip(),
-            "action_sequences": action_sequences,
-            "llm_provider": str(
-                result.get("llm_provider")
-                or nested_result.get("llm_provider")
-                or llm_request.get("provider")
-                or ""
-            ).strip(),
-            "llm_model": str(
-                result.get("llm_model")
-                or nested_result.get("llm_model")
-                or llm_request.get("model")
-                or ""
-            ).strip(),
-        }
 
     def _build_training_sample_payload(
         self,
@@ -2603,123 +2309,23 @@ class SmartAgentCoordinator(
         executed_count: int | None = None,
         action_results: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
-        if final_outcome not in {"succeeded", "partial"} or not actions:
-            return None
-
-        planned = max(0, int(len(actions) if planned_count is None else planned_count))
-        executed = max(
-            0,
-            int(planned if executed_count is None and final_outcome == "succeeded" else executed_count or 0),
-        )
-        if executed == 0:
-            return None
-
-        sample_actions: list[dict[str, Any]] = []
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            entity_id = str(action.get("entity_id") or action.get("entity") or "").strip()
-            service = str(action.get("service") or "").strip()
-            if not entity_id or not service:
-                continue
-            domain = str(action.get("domain") or entity_id.split(".", 1)[0]).strip()
-            normalized_service = service.lower()
-            if normalized_service == "turn_on":
-                desired_state = "on"
-            elif normalized_service == "turn_off":
-                desired_state = "off"
-            elif normalized_service in {"open_cover", "open"}:
-                desired_state = "open"
-            elif normalized_service in {"close_cover", "close"}:
-                desired_state = "closed"
-            else:
-                params = action.get("params") if isinstance(action.get("params"), dict) else {}
-                desired_state = str(
-                    params.get("hvac_mode")
-                    or params.get("temperature")
-                    or params.get("position")
-                    or normalized_service
-                ).strip().lower()
-            sample_actions.append(
-                {
-                    "domain": domain,
-                    "service": service,
-                    "entity_id": entity_id,
-                    "desired_state": desired_state,
-                    "confidence": max(0.0, min(float(confidence or 0) / 100.0, 1.0)),
-                }
-            )
-        if not sample_actions:
-            return None
-
         now = self._ha_local_now()
-        trigger_entity = str(bundle.get("trigger_entity_id") or "").strip()
-        trigger_domain = trigger_entity.split(".", 1)[0] if "." in trigger_entity else ""
-        trigger_room = str(bundle.get("trigger_room") or "").strip()
-        old_state = str(bundle.get("old_state") or "").strip().lower()
-        new_state = str(bundle.get("new_state") or "").strip().lower()
-        if trigger_domain == "binary_sensor" and old_state == "off" and new_state == "on":
-            trigger_type = "arrival"
-        elif trigger_domain == "binary_sensor" and old_state == "on" and new_state == "off":
-            trigger_type = "departure"
-        else:
-            trigger_type = "state_change"
-        presence_snapshot = bundle.get("presence_snapshot") if isinstance(bundle.get("presence_snapshot"), dict) else {}
-        room_presence = {}
-        rooms = presence_snapshot.get("rooms") if isinstance(presence_snapshot, dict) else {}
-        if isinstance(rooms, dict) and trigger_room:
-            room_presence = rooms.get(trigger_room) if isinstance(rooms.get(trigger_room), dict) else {}
-        room_state = str(room_presence.get("state") or room_presence.get("presence") or "").strip().lower()
-        room_person_count = 1 if room_state in {"occupied", "present", "on", "home"} else 0
-        season = _ha_season_for_datetime(now)
-        quality_score = max(0.0, min(float(confidence or 0) / 100.0, 1.0))
-        source_id = str(transaction_id or "unknown")
-        return {
-            "source": "ha_slow_decision",
-            "source_id": source_id,
-            "feature_json": {
-                "time_hour": now.hour,
-                "is_weekend": now.weekday() >= 5,
-                "trigger_domain": trigger_domain or "unknown",
-                "space": trigger_room or "unknown",
-                "trigger_room": trigger_room or "unknown",
-                "trigger_type": trigger_type,
-                "local_date": now.strftime("%Y-%m-%d"),
-                "weekday": now.weekday(),
-                "confidence_auto": int(bundle.get("confidence_auto") or getattr(self, "confidence_auto", 0) or 0),
-                "room_person_count": room_person_count,
-                "outdoor_temp": None,
-                "season_encoding": season,
-            },
-            "decision_json": {"actions": sample_actions},
-            "label": None,
-            "preference_label": "unknown",
-            "quality_score": quality_score,
-            "is_verified": False,
-            "lifecycle_state": "observe_only",
-            "evidence": {
-                "service_acknowledged": True,
-                "post_state_verified": False,
-                "stable_seconds": 0,
-                "confidence": int(confidence or 0),
-                "confidence_auto": int(bundle.get("confidence_auto") or getattr(self, "confidence_auto", 0) or 0),
-                "world_snapshot_id": str(world_snapshot_id or "unknown"),
-                "execution_transaction_id": str(execution_transaction_id or "unknown"),
-                "partial_execution": final_outcome == "partial" or executed < planned,
-                "planned_count": planned,
-                "executed_count": executed,
-                "action_results": [
-                    dict(item) for item in (action_results or []) if isinstance(item, dict)
-                ],
-            },
-            "privacy_tier": "derived_private",
-            "model_schema_version": "system1_v1",
-            "origin": "smartagent",
-            "actor": "smartagent:ha_slow_decision",
-            "decision_id": str(decision_id or "unknown"),
-            "transaction_id": str(transaction_id or "unknown"),
-            "world_snapshot_id": str(world_snapshot_id or "unknown"),
-        }
+        return build_training_sample_payload(
+            bundle=bundle,
+            actions=actions,
+            confidence=confidence,
+            final_outcome=final_outcome,
+            now=now,
+            season=_ha_season_for_datetime(now),
+            default_confidence_auto=int(getattr(self, "confidence_auto", 0) or 0),
+            decision_id=decision_id,
+            transaction_id=transaction_id,
+            execution_transaction_id=execution_transaction_id,
+            world_snapshot_id=world_snapshot_id,
+            planned_count=planned_count,
+            executed_count=executed_count,
+            action_results=action_results,
+        )
 
     def _record_learning_post_state_verification(
         self,
@@ -2802,1035 +2408,41 @@ class SmartAgentCoordinator(
         *,
         one_off_prompt: str = "",
         source: str = "listener",
+        user_explicit_voice: bool = False,
         source_trace_context: dict[str, Any] | None = None,
+        trigger_space_id: str = "",
+        causal_events: list[dict[str, Any]] | None = None,
+        task_occurrence: dict[str, Any] | None = None,
+        user_intent_authority: Any | None = None,
     ) -> dict[str, Any]:
-        bundle = self._build_addon_slow_decision_bundle(
+        return await run_addon_decision(
+            self,
             trigger,
             one_off_prompt=one_off_prompt,
             source=source,
+            user_explicit_voice=user_explicit_voice,
             source_trace_context=source_trace_context,
-        )
-        policy_unauthorized_speech = "当前策略未授权执行"
-        explicit_voice_control = bool(
-            bundle.get("is_voice")
-            and str(bundle.get("cmd_source") or "").strip().upper() == "USER_EXPLICIT"
-        )
-        addon_client = getattr(self, "_addon_client", None)
-        self._sys_log(
-            "INFO",
-            "[决策] 慢脑上下文 "
-            f"entity={bundle.get('trigger_entity_id') or '-'} "
-            f"room={bundle.get('trigger_room') or '-'} "
-            f"state={bundle.get('old_state') or '?'}->{bundle.get('new_state') or '?'} "
-            f"devices={len(bundle.get('device_info') or {})}",
-        )
-        trigger_public_summary = self._trigger_public_summary(
-            trigger,
-            entity_id=str(bundle.get("trigger_entity_id") or ""),
-            old_state=str(bundle.get("old_state") or ""),
-            new_state=str(bundle.get("new_state") or ""),
+            trigger_space_id=trigger_space_id,
+            causal_events=causal_events,
+            task_occurrence=task_occurrence,
+            user_intent_authority=user_intent_authority,
         )
 
-        def _emit_slow_decision_bubble(
-            *,
-            result_payload: dict[str, Any] | None = None,
-            status_code: int = 200,
-            matched: bool = False,
-            reason: str = "",
-            scene_desc: str = "",
-            confidence_value: int = 0,
-            actions_payload: list[dict[str, Any]] | None = None,
-            transaction_id_value: str = "",
-            executed_count: int = 0,
-            final_outcome_value: str = "no_actions",
-            fail_closed: bool = False,
-            record_decision_log: bool = False,
-        ) -> None:
-            result_payload = result_payload if isinstance(result_payload, dict) else {}
-            actions_payload = actions_payload if isinstance(actions_payload, list) else []
-            transaction_id_value = str(
-                transaction_id_value
-                or result_payload.get("transaction_id")
-                or result_payload.get("decision_id")
-                or result_payload.get("id")
-                or ""
-            ).strip()
-            path_taken = str(result_payload.get("path_taken") or "llm")
-            reason_value = str(reason or result_payload.get("reason") or ("matched" if matched else "no_actions"))
-            scene_value = str(scene_desc or result_payload.get("scene") or "")
-            event_payload = {
-                "source": "ha_slow_decision",
-                "entity_id": str(bundle.get("trigger_entity_id") or ""),
-                "trigger_entity_id": str(bundle.get("trigger_entity_id") or ""),
-                "old_state": str(bundle.get("old_state") or ""),
-                "new_state": str(bundle.get("new_state") or ""),
-                "trigger": trigger_public_summary,
-                "trigger_summary": trigger_public_summary,
-                "status": status_code,
-                "matched": matched,
-                "path_taken": path_taken,
-                "reason": reason_value,
-                "scene": scene_value,
-                "confidence": confidence_value,
-                "confidence_auto": result_payload.get("confidence_auto"),
-                "confidence_notify": result_payload.get("confidence_notify"),
-                "threshold": result_payload.get("threshold"),
-                "auto_execute": result_payload.get("auto_execute") is True,
-                "confirm_required": result_payload.get("confirm_required") is True,
-                "arbitration_result": str(result_payload.get("arbitration_result") or ""),
-                "action_count": len(actions_payload),
-                "actions": actions_payload,
-                "transaction_id": transaction_id_value,
-                "parent_transaction_id": str(bundle.get("parent_transaction_id") or ""),
-                "parent_decision_trace": bundle.get("parent_decision_trace") if isinstance(bundle.get("parent_decision_trace"), dict) else {},
-                "source_trace_context": bundle.get("source_trace_context") if isinstance(bundle.get("source_trace_context"), dict) else {},
-                "parent_correlation_id": str(bundle.get("parent_correlation_id") or ""),
-                "parent_world_snapshot_id": str(bundle.get("parent_world_snapshot_id") or ""),
-                "executed": bool(actions_payload and executed_count >= len(actions_payload)),
-                "executed_count": executed_count,
-                "final_outcome": final_outcome_value,
-                "fail_closed": fail_closed,
-            }
-            try:
-                self.hass.bus.async_fire("smart_agent_decision_bubble", event_payload)
-            except Exception as exc:
-                _LOGGER.debug("[Coordinator] slow decision bubble emit failed: %s", exc)
-            if record_decision_log:
-                log_result = dict(result_payload)
-                log_result.setdefault("source", "ha_slow_decision")
-                log_result.setdefault("path_taken", path_taken)
-                log_result.setdefault("reason", reason_value)
-                log_result.setdefault("scene", scene_value)
-                log_result.setdefault("actions", actions_payload)
-                log_result["trigger"] = trigger_public_summary
-                log_result["trigger_summary"] = trigger_public_summary
-                log_result["matched"] = bool(matched)
-                log_result["final_outcome"] = final_outcome_value
-                log_result["fail_closed"] = bool(fail_closed)
-                log_payload: dict[str, Any] = {
-                    "trigger": trigger_public_summary,
-                    "trigger_summary": trigger_public_summary,
-                    "scene": scene_value,
-                    "source": "ha_slow_decision",
-                    "path_taken": path_taken,
-                    "confidence": confidence_value,
-                    "confidence_auto": result_payload.get("confidence_auto"),
-                    "confidence_notify": result_payload.get("confidence_notify"),
-                    "threshold": result_payload.get("threshold"),
-                    "auto_execute": result_payload.get("auto_execute") is True,
-                    "confirm_required": result_payload.get("confirm_required") is True,
-                    "arbitration_result": str(result_payload.get("arbitration_result") or ""),
-                    "matched": bool(matched),
-                    "action_count": len(actions_payload),
-                    "reason": reason_value,
-                    "actions": actions_payload,
-                    "result": log_result,
-                }
-                if transaction_id_value:
-                    log_payload["id"] = transaction_id_value
-                enqueue = getattr(self, "_enqueue_internal_event", None)
-                if not callable(enqueue) or not enqueue("decision_log", log_payload):
-                    self._sys_log(
-                        "WARN",
-                        f"[决策] decision_log 回写入队失败 reason={reason_value or '-'} trigger={trigger_public_summary or '-'}",
-                    )
-
-        def _rollout_public_reason(reason: str) -> str:
-            if reason == "active_ai_shadow":
-                return "主动 AI 当前处于影子模式，仅记录决策，不执行设备"
-            if reason in {"active_ai_global_disabled", "active_ai_off"}:
-                return "主动 AI 已关闭，本次不执行设备"
-            if reason in {
-                "active_ai_canary_space_not_allowed",
-                "active_ai_canary_domain_not_allowed",
-            }:
-                return "本次动作不在主动 AI 灰度范围内，已阻止执行"
-            if reason in {
-                "active_ai_domain_execution_disabled",
-                "active_ai_lighting_execution_disabled",
-            }:
-                return "主动 AI 真实执行开关未开启，本次仅记录决策"
-            return "主动 AI 灰度门禁未允许执行"
-
-        pre_rollout_config = ActiveAiRolloutConfig.from_values(
-            mode=getattr(self, "_active_ai_mode", DEFAULT_ACTIVE_AI_MODE)
+    async def _run_voice_inference(
+        self,
+        text: str,
+        source: str = "touch",
+        *,
+        user_explicit_voice: bool = False,
+        user_intent_authority: Any | None = None,
+    ) -> dict:
+        """Handle voice text without deriving user authority from source labels."""
+        return await self._run_addon_decision(
+            text,
+            source=f"voice_{source}",
+            user_explicit_voice=user_explicit_voice is True,
+            user_intent_authority=user_intent_authority,
         )
-        pre_rollout = evaluate_active_ai_model_gate(
-            ai_enabled=bool(getattr(self, "_enabled", False)),
-            config=pre_rollout_config,
-        )
-        if not pre_rollout.allow_model and not explicit_voice_control:
-            public_reason = _rollout_public_reason(pre_rollout.reason)
-            rollout_trace = pre_rollout.as_trace()
-            _emit_slow_decision_bubble(
-                result_payload={
-                    "path_taken": "active_ai_rollout_gate",
-                    "rollout": rollout_trace,
-                    "rollout_reason": pre_rollout.reason,
-                },
-                status_code=200,
-                matched=False,
-                reason=public_reason,
-                scene_desc="主动 AI 灰度门禁",
-                final_outcome_value="blocked",
-                fail_closed=True,
-                record_decision_log=True,
-            )
-            blocked_response = {
-                "status": "ok",
-                "matched": False,
-                "actions": [],
-                "executed_count": 0,
-                "reason": pre_rollout.reason,
-                "rollout": rollout_trace,
-                "final_outcome": "blocked",
-            }
-            if bundle.get("is_voice"):
-                blocked_response["reply"] = policy_unauthorized_speech
-                blocked_response["speak"] = policy_unauthorized_speech
-            return blocked_response
-
-        if addon_client is None:
-            self._sys_log("WARN", "[决策] add-on decision provider unavailable")
-            _emit_slow_decision_bubble(
-                status_code=502,
-                matched=False,
-                reason="addon_decision_provider_unavailable",
-                scene_desc="add-on decision provider unavailable",
-                final_outcome_value="failed",
-                fail_closed=True,
-                record_decision_log=True,
-            )
-            return {"status": "error", "message": "add-on decision provider unavailable"}
-
-        # ── 空设备表防裸推：无已同步设备时直接判无动作，避免模型在零设备上凭空幻觉 ──
-        if not str(bundle.get("device_table") or "").strip():
-            self._sys_log(
-                "WARN",
-                "[决策] 设备表为空（无已同步设备），跳过在线慢脑以防模型幻觉编造设备",
-            )
-            _emit_slow_decision_bubble(
-                status_code=200,
-                matched=False,
-                reason="empty_device_table_no_action",
-                scene_desc="无已同步设备，跳过决策",
-                final_outcome_value="no_actions",
-                fail_closed=True,
-                record_decision_log=True,
-            )
-            return {
-                "status": "ok",
-                "matched": False,
-                "actions": [],
-                "scene": "无已同步设备，跳过决策",
-                "confidence": 0,
-                "reason": "empty_device_table_no_action",
-            }
-        room_lock_key = str(bundle.get("trigger_room") or "").strip()
-        inference_lock = self._get_room_lock(room_lock_key) if room_lock_key else getattr(self, "_inference_lock", None)
-        if inference_lock is None:
-            self._inference_lock = asyncio.Lock()
-            inference_lock = self._inference_lock
-        if hasattr(inference_lock, "locked") and inference_lock.locked():
-            self._sys_log("INFO", f"[决策] 同空间推理进行中，等待: {room_lock_key or 'global'}")
-        async with inference_lock:
-            try:
-                result = await addon_client.run_decision(
-                    trigger=str(trigger or ""),
-                    bundle=bundle,
-                    request_id=str(bundle.get("parent_correlation_id") or "") or None,
-                    user_explicit_voice=explicit_voice_control,
-                )
-            except Exception as exc:
-                self._sys_log("WARN", f"[决策] add-on decision provider 调用失败: {exc}")
-                _emit_slow_decision_bubble(
-                    status_code=502,
-                    matched=False,
-                    reason="addon_decision_provider_error",
-                    scene_desc="线上大模型调用失败",
-                    final_outcome_value="failed",
-                    fail_closed=True,
-                    record_decision_log=True,
-                )
-                return {"status": "error", "message": str(exc)}
-            if not isinstance(result, dict):
-                self._sys_log("WARN", "[决策] add-on decision provider 无响应")
-                _emit_slow_decision_bubble(
-                    status_code=502,
-                    matched=False,
-                    reason="addon_decision_provider_unavailable",
-                    scene_desc="线上大模型无响应",
-                    final_outcome_value="failed",
-                    fail_closed=True,
-                    record_decision_log=True,
-                )
-                return {"status": "error", "message": "add-on decision provider unavailable"}
-            status = int(result.get("__status", 200) or 200)
-            if status >= 400 or result.get("ok") is False:
-                error = result.get("error") or result.get("error_type") or f"http_{status}"
-                self._sys_log("WARN", f"[决策] add-on decision provider 返回失败: {error}")
-                _emit_slow_decision_bubble(
-                    result_payload=result,
-                    status_code=status,
-                    matched=False,
-                    reason=str(error),
-                    scene_desc=str(result.get("scene") or "线上大模型返回失败"),
-                    confidence_value=0,
-                    actions_payload=[],
-                    transaction_id_value=str(result.get("transaction_id") or ""),
-                    executed_count=0,
-                    final_outcome_value="failed",
-                    fail_closed=True,
-                    record_decision_log=True,
-                )
-                policy_rejected = bool(
-                    str(result.get("error_type") or "").strip() == "policy_rejected"
-                    or str(error).strip().startswith(("active_ai_", "policy_"))
-                )
-                error_response = {"status": "error", **result}
-                error_response["status"] = "error"
-                error_response["message"] = (
-                    policy_unauthorized_speech
-                    if bundle.get("is_voice") and policy_rejected
-                    else str(error)
-                )
-                if bundle.get("is_voice") and policy_rejected:
-                    error_response["reply"] = policy_unauthorized_speech
-                    error_response["speak"] = policy_unauthorized_speech
-                return error_response
-
-            actions = result.get("actions") if isinstance(result.get("actions"), list) else []
-            valid_actions = [item for item in actions if isinstance(item, dict)]
-            candidate_actions = [dict(item) for item in valid_actions]
-            scene = str(result.get("scene") or "")
-            transaction_id = str(
-                result.get("transaction_id")
-                or result.get("decision_id")
-                or result.get("id")
-                or ""
-            ).strip()
-            decision_id = str(result.get("decision_id") or transaction_id or "unknown").strip() or "unknown"
-            nested_result = result.get("result") if isinstance(result.get("result"), dict) else {}
-            world_snapshot_id = str(
-                result.get("world_snapshot_id")
-                or nested_result.get("world_snapshot_id")
-                or "unknown"
-            ).strip() or "unknown"
-            decision_lineage = self._build_decision_trace_lineage(
-                bundle=bundle,
-                result=result,
-                actions=valid_actions,
-            )
-            try:
-                confidence = int(float(result.get("confidence") or 0))
-            except (TypeError, ValueError, OverflowError):
-                confidence = 0
-            learning_observe_only = bool(getattr(self, "_learning_mode", False)) and source == "listener"
-            executed = 0
-            final_outcome = "no_actions"
-            action_results: list[dict[str, Any]] = []
-            if valid_actions:
-                rollout_payload = (
-                    result.get("active_ai_rollout")
-                    if isinstance(result.get("active_ai_rollout"), dict)
-                    else {}
-                )
-                rollout_config = ActiveAiRolloutConfig.from_mapping(rollout_payload)
-                execution_flags = (
-                    rollout_payload.get("execution_flags")
-                    if isinstance(rollout_payload.get("execution_flags"), dict)
-                    else {}
-                )
-                rollout_actions = enrich_active_ai_action_spaces(
-                    valid_actions,
-                    bundle.get("device_info")
-                    if isinstance(bundle.get("device_info"), dict)
-                    else {},
-                )
-                scoped_actions = (
-                    None
-                    if explicit_voice_control
-                    else scope_active_ai_canary_actions(
-                        rollout_actions,
-                        rollout_config,
-                    )
-                )
-                blocked_entity_ids = (
-                    set(scoped_actions.blocked_entity_ids)
-                    if scoped_actions is not None
-                    else set()
-                )
-                if scoped_actions is not None and not scoped_actions.entity_missing and blocked_entity_ids:
-                    valid_actions = [
-                        action
-                        for action in valid_actions
-                        if str(
-                            action.get("entity_id")
-                            or action.get("entity")
-                            or (
-                                action.get("target", {}).get("entity_id")
-                                if isinstance(action.get("target"), dict)
-                                else ""
-                            )
-                            or ""
-                        ).strip().lower()
-                        not in blocked_entity_ids
-                    ]
-                    rollout_actions = enrich_active_ai_action_spaces(
-                        valid_actions,
-                        bundle.get("device_info")
-                        if isinstance(bundle.get("device_info"), dict)
-                        else {},
-                    )
-                rollout_blocked_actions = []
-                for action in candidate_actions:
-                    action_entity_id = str(
-                        action.get("entity_id")
-                        or action.get("entity")
-                        or (
-                            action.get("target", {}).get("entity_id")
-                            if isinstance(action.get("target"), dict)
-                            else ""
-                        )
-                        or ""
-                    ).strip().lower()
-                    if action_entity_id not in blocked_entity_ids:
-                        continue
-                    rollout_blocked_actions.append(
-                        {
-                            **action,
-                            "status": "blocked_by_rollout",
-                            "reason": "active_ai_canary_entity_not_allowed",
-                        }
-                    )
-                result["candidate_action_count"] = len(candidate_actions)
-                result["authorized_action_count"] = len(valid_actions)
-                result["authorized_actions"] = list(valid_actions)
-                result["rollout_blocked_actions"] = rollout_blocked_actions
-                active_execution_space_id = str(
-                    bundle.get("trigger_space_id")
-                    or result.get("trigger_space_id")
-                    or bundle.get("trigger_room")
-                    or result.get("trigger_room")
-                    or ""
-                ).strip()
-                if (
-                    not active_execution_space_id
-                    and bool(bundle.get("is_voice"))
-                    and str(bundle.get("cmd_source") or result.get("cmd_source") or "").strip()
-                    == "USER_EXPLICIT"
-                ):
-                    action_space_ids = {
-                        str(
-                            action.get("target_space_id")
-                            or action.get("space_id")
-                            or ""
-                        ).strip()
-                        for action in rollout_actions
-                        if isinstance(action, dict)
-                    }
-                    if "" not in action_space_ids and len(action_space_ids) == 1:
-                        active_execution_space_id = next(iter(action_space_ids))
-                if explicit_voice_control:
-                    action_domains = sorted({
-                        str(action.get("domain") or "").strip().lower()
-                        for action in rollout_actions
-                        if isinstance(action, dict) and str(action.get("domain") or "").strip()
-                    })
-                    action_space_ids = sorted({
-                        str(action.get("target_space_id") or action.get("space_id") or "").strip()
-                        for action in rollout_actions
-                        if isinstance(action, dict) and str(action.get("target_space_id") or action.get("space_id") or "").strip()
-                    })
-                    action_entity_ids = sorted({
-                        str(action.get("entity_id") or action.get("entity") or "").strip().lower()
-                        for action in rollout_actions
-                        if isinstance(action, dict) and str(action.get("entity_id") or action.get("entity") or "").strip()
-                    })
-                    rollout_reason = "user_explicit_rollout_bypass"
-                    rollout_trace = {
-                        "mode": rollout_config.mode,
-                        "allow_model": True,
-                        "allow_execution": True,
-                        "reason": rollout_reason,
-                        "trigger_space_id": active_execution_space_id,
-                        "action_domains": action_domains,
-                        "blocked_domains": [],
-                        "action_space_ids": action_space_ids,
-                        "blocked_space_ids": [],
-                        "action_entity_ids": action_entity_ids,
-                        "blocked_entity_ids": [],
-                        "bypass_scope": "authenticated_user_explicit_voice",
-                    }
-                    rollout_allow_execution = True
-                else:
-                    rollout_decision = evaluate_active_ai_execution_gate(
-                        ai_enabled=bool(getattr(self, "_enabled", False)),
-                        config=rollout_config,
-                        trigger_space_id=active_execution_space_id,
-                        actions=rollout_actions,
-                        execution_flags=execution_flags,
-                    )
-                    rollout_trace = rollout_decision.as_trace()
-                    rollout_reason = rollout_decision.reason
-                    rollout_allow_execution = rollout_decision.allow_execution
-                result["rollout"] = rollout_trace
-                result["rollout_reason"] = rollout_reason
-                if not rollout_allow_execution:
-                    is_shadow = rollout_reason == "active_ai_shadow"
-                    final_outcome = "observe_only" if is_shadow else "blocked"
-                    action_status = "not_executed" if is_shadow else "blocked"
-                    public_reason = _rollout_public_reason(rollout_reason)
-                    result["matched"] = True
-                    result["executed_count"] = 0
-                    result["auto_execute"] = False
-                    result["confirm_required"] = False
-                    result["arbitration_result"] = "blocked_by_rollout"
-                    result["execution_suppressed_reason"] = public_reason
-                    result["final_outcome"] = final_outcome
-                    result["execution_status"] = final_outcome
-                    action_results = [
-                        {
-                            "domain": str(action.get("domain") or ""),
-                            "service": str(action.get("service") or ""),
-                            "entity_id": str(action.get("entity_id") or ""),
-                            "status": action_status,
-                            "reason": rollout_reason,
-                        }
-                        for action in valid_actions
-                    ]
-                    if transaction_id:
-                        execution_event_enqueued = self._enqueue_internal_event(
-                            "decision_execution",
-                            {
-                                "transaction_id": transaction_id,
-                                "trigger": str(trigger or ""),
-                                "scene": scene,
-                                "confidence": confidence,
-                                "confidence_auto": result.get("confidence_auto"),
-                                "confidence_notify": result.get("confidence_notify"),
-                                "threshold": result.get("threshold"),
-                                "auto_execute": False,
-                                "confirm_required": False,
-                                "arbitration_result": "blocked_by_rollout",
-                                "reason": rollout_reason,
-                                "planned_count": len(valid_actions),
-                                "candidate_action_count": len(candidate_actions),
-                                "authorized_action_count": len(valid_actions),
-                                "executed_count": 0,
-                                "final_outcome": final_outcome,
-                                "actions": valid_actions,
-                                "candidate_actions": candidate_actions,
-                                "authorized_actions": valid_actions,
-                                "rollout_blocked_actions": rollout_blocked_actions,
-                                "action_results": [
-                                    *action_results,
-                                    *rollout_blocked_actions,
-                                ],
-                                "training_sample": None,
-                                "source": "ha_slow_decision",
-                                "origin": "smartagent",
-                                "actor": "smartagent:ha_slow_decision",
-                                "decision_id": decision_id,
-                                "world_snapshot_id": world_snapshot_id,
-                                "lineage": decision_lineage,
-                                "rollout": rollout_trace,
-                            },
-                        )
-                        if not execution_event_enqueued:
-                            self._sys_log(
-                                "WARN",
-                                f"[决策] rollout decision_execution 回写入队失败 transaction_id={transaction_id}",
-                            )
-                    self._sys_log(
-                        "INFO",
-                        f"[决策] 主动 AI 灰度门禁阻止执行 mode={rollout_trace.get('mode')} "
-                        f"reason={rollout_reason} transaction_id={transaction_id or '-'}",
-                    )
-                    _emit_slow_decision_bubble(
-                        result_payload=result,
-                        status_code=status,
-                        matched=True,
-                        reason=public_reason,
-                        scene_desc=scene,
-                        confidence_value=confidence,
-                        actions_payload=valid_actions,
-                        transaction_id_value=transaction_id,
-                        executed_count=0,
-                        final_outcome_value=final_outcome,
-                        fail_closed=not is_shadow,
-                        record_decision_log=not bool(transaction_id),
-                    )
-                    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-                    if bundle.get("is_voice"):
-                        result["reply"] = policy_unauthorized_speech
-                        result["speak"] = policy_unauthorized_speech
-                    else:
-                        result.setdefault("reply", nested.get("reply") or public_reason)
-                    result.setdefault("status", "ok")
-                    return result
-
-                apply_arrival_lighting_confirmation_gate(result, actions=valid_actions, context_snapshot=bundle)
-
-                arbitration_result = str(result.get("arbitration_result") or "").strip()
-                confidence_gate = evaluate_slow_brain_confidence_gate(
-                    confidence=result.get("confidence"),
-                    threshold=self.confidence_auto,
-                )
-                arbitration_validation = validate_auto_execution_arbitration(result if confidence_gate.log_code != "confidence_invalid" else {}, context_snapshot=bundle)
-                local_confidence_block = not confidence_gate.allowed
-                auto_execute = arbitration_validation.allowed and confidence_gate.allowed
-                confirm_required = pending_confirmation_allowed(arbitration_validation.reason, local_confidence_block=local_confidence_block, payload=result)
-                if not auto_execute:
-                    decision_reason = str(result.get("reason") or "").strip()
-                    if local_confidence_block:
-                        suppressed_reason = confidence_gate.log_code or "confidence_invalid"
-                    elif arbitration_validation.reason in {
-                        "confidence_arbitration_missing",
-                        "confidence_arbitration_invalid",
-                    }:
-                        suppressed_reason = arbitration_validation.reason
-                        if decision_reason and decision_reason != suppressed_reason:
-                            result.setdefault("decision_reason", decision_reason)
-                    else:
-                        suppressed_reason = arbitration_validation.reason
-                    public_reason = (
-                        "置信度未达到自动执行阈值"
-                        if local_confidence_block
-                        else suppressed_reason
-                    )
-                    if local_confidence_block:
-                        final_outcome = "blocked"
-                    elif confirm_required:
-                        final_outcome = "pending_confirmation"
-                    else:
-                        final_outcome = "observe_only"
-                    result["matched"] = True
-                    result["executed_count"] = 0
-                    result["execution_suppressed_reason"] = public_reason
-                    result["final_outcome"] = final_outcome
-                    result["execution_status"] = final_outcome
-                    if local_confidence_block:
-                        result["confidence_auto"] = self.confidence_auto
-                        result["threshold"] = self.confidence_auto
-                        result["auto_execute"] = False
-                        result["confirm_required"] = False
-                        result["arbitration_result"] = "blocked"
-                        result["reason"] = public_reason
-                        arbitration_result = "blocked"
-                    action_results = [
-                        {
-                            "domain": str(action.get("domain") or ""),
-                            "service": str(action.get("service") or ""),
-                            "entity_id": str(action.get("entity_id") or ""),
-                            "status": "blocked" if local_confidence_block else "not_executed",
-                            "reason": suppressed_reason,
-                        }
-                        for action in valid_actions
-                    ]
-                    if transaction_id:
-                        execution_event_enqueued = self._enqueue_internal_event(
-                            "decision_execution",
-                            {
-                                "transaction_id": transaction_id,
-                                "trigger": str(trigger or ""),
-                                "scene": scene,
-                                "confidence": confidence,
-                                "confidence_auto": result.get("confidence_auto"),
-                                "confidence_notify": result.get("confidence_notify"),
-                                "threshold": result.get("threshold"),
-                                "auto_execute": False,
-                                "confirm_required": confirm_required,
-                                "arbitration_result": arbitration_result or "missing",
-                                "reason": suppressed_reason,
-                                "planned_count": len(valid_actions),
-                                "candidate_action_count": len(candidate_actions),
-                                "authorized_action_count": len(valid_actions),
-                                "executed_count": 0,
-                                "final_outcome": final_outcome,
-                                "actions": valid_actions,
-                                "candidate_actions": candidate_actions,
-                                "authorized_actions": valid_actions,
-                                "rollout_blocked_actions": rollout_blocked_actions,
-                                "action_results": [
-                                    *action_results,
-                                    *rollout_blocked_actions,
-                                ],
-                                "training_sample": None,
-                                "source": "ha_slow_decision",
-                                "origin": "smartagent",
-                                "actor": "smartagent:ha_slow_decision",
-                                "decision_id": decision_id,
-                                "world_snapshot_id": world_snapshot_id,
-                                "lineage": decision_lineage,
-                            },
-                        )
-                        if not execution_event_enqueued:
-                            self._sys_log(
-                                "WARN",
-                                f"[决策] decision_execution 回写入队失败 transaction_id={transaction_id}",
-                            )
-                    if confirm_required:
-                        try:
-                            self.hass.bus.async_fire(
-                                "smart_agent_confirm_required",
-                                {
-                                    "source": "ha_slow_decision",
-                                    "trigger": trigger_public_summary,
-                                    "scene": scene,
-                                    "confidence": confidence,
-                                    "confidence_auto": result.get("confidence_auto"),
-                                    "confidence_notify": result.get("confidence_notify"),
-                                    "threshold": result.get("threshold"),
-                                    "arbitration_result": arbitration_result,
-                                    "confirm_required": True,
-                                    "reason": suppressed_reason,
-                                    "actions": valid_actions,
-                                    "action_count": len(valid_actions),
-                                    "transaction_id": transaction_id,
-                                    "result": result,
-                                },
-                            )
-                        except Exception as exc:
-                            _LOGGER.debug("[Coordinator] slow confirmation emit failed: %s", exc)
-                    self._sys_log(
-                        "INFO",
-                        f"[决策] 置信度仲裁禁止自动执行 result={arbitration_result or 'missing'} "
-                        f"confidence={confidence} threshold={result.get('threshold')} reason={suppressed_reason}",
-                    )
-                    _emit_slow_decision_bubble(
-                        result_payload=result,
-                        status_code=status,
-                        matched=True,
-                        reason=public_reason,
-                        scene_desc=scene,
-                        confidence_value=confidence,
-                        actions_payload=valid_actions,
-                        transaction_id_value=transaction_id,
-                        executed_count=0,
-                        final_outcome_value=final_outcome,
-                        fail_closed=(
-                            confidence_gate.log_code == "confidence_invalid"
-                            if local_confidence_block
-                            else arbitration_validation.reason in {
-                                "confidence_arbitration_missing",
-                                "confidence_arbitration_invalid",
-                            }
-                        ),
-                        record_decision_log=not bool(transaction_id),
-                    )
-                    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-                    if local_confidence_block:
-                        result["reply"] = public_reason
-                    else:
-                        result.setdefault(
-                            "reply",
-                            nested.get("reply")
-                            or ("等待用户确认" if confirm_required else "置信度不足，仅记录未执行"),
-                        )
-                    result.setdefault("status", "ok")
-                    return result
-                if learning_observe_only:
-                    result["matched"] = True
-                    result["executed_count"] = 0
-                    result["execution_suppressed_reason"] = "learning_mode"
-                    result.setdefault("reason", "learning_mode_observe_only")
-                    final_outcome = "observe_only"
-                    result["final_outcome"] = final_outcome
-                    result["execution_status"] = final_outcome
-                    action_results = []
-                    for action in valid_actions:
-                        if not isinstance(action, dict):
-                            continue
-                        action_results.append(
-                            {
-                                "domain": str(action.get("domain") or ""),
-                                "service": str(action.get("service") or ""),
-                                "entity_id": str(action.get("entity_id") or ""),
-                                "status": "not_executed",
-                                "reason": "learning_mode_observe_only",
-                            }
-                        )
-                    if transaction_id:
-                        execution_event_enqueued = self._enqueue_internal_event(
-                            "decision_execution",
-                            {
-                                "transaction_id": transaction_id,
-                                "trigger": str(trigger or ""),
-                                "scene": scene,
-                                "confidence": confidence,
-                                "confidence_auto": result.get("confidence_auto"),
-                                "confidence_notify": result.get("confidence_notify"),
-                                "threshold": result.get("threshold"),
-                                "auto_execute": False,
-                                "confirm_required": False,
-                                "arbitration_result": "observe_only",
-                                "reason": "learning_mode_observe_only",
-                                "planned_count": len(valid_actions),
-                                "candidate_action_count": len(candidate_actions),
-                                "authorized_action_count": len(valid_actions),
-                                "executed_count": 0,
-                                "final_outcome": final_outcome,
-                                "actions": valid_actions,
-                                "candidate_actions": candidate_actions,
-                                "authorized_actions": valid_actions,
-                                "rollout_blocked_actions": rollout_blocked_actions,
-                                "action_results": [
-                                    *action_results,
-                                    *rollout_blocked_actions,
-                                ],
-                                "training_sample": None,
-                                "source": "ha_slow_decision",
-                                "origin": "smartagent",
-                                "actor": "smartagent:ha_slow_decision",
-                                "decision_id": decision_id,
-                                "world_snapshot_id": world_snapshot_id,
-                                "lineage": decision_lineage,
-                            },
-                        )
-                        if not execution_event_enqueued:
-                            self._sys_log(
-                                "WARN",
-                                f"[Decision] decision_execution enqueue failed transaction_id={transaction_id}",
-                            )
-                    self._sys_log(
-                        "INFO",
-                        f"[Decision] learning observe-only: received {len(valid_actions)} action(s), executed 0",
-                    )
-                    _emit_slow_decision_bubble(
-                        result_payload=result,
-                        status_code=status,
-                        matched=True,
-                        reason=str(result.get("reason") or "learning_mode_observe_only"),
-                        scene_desc=scene,
-                        confidence_value=confidence,
-                        actions_payload=valid_actions,
-                        transaction_id_value=transaction_id,
-                        executed_count=0,
-                        final_outcome_value=final_outcome,
-                        fail_closed=False,
-                        record_decision_log=not bool(transaction_id),
-                    )
-                    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-                    result.setdefault("reply", nested.get("reply") or "learning_mode_observe_only")
-                    result.setdefault("status", "ok")
-                    return result
-                response_details = result.get("details") if isinstance(result.get("details"), dict) else {}
-                execution_correlation_id = str(
-                    result.get("correlation_id")
-                    or response_details.get("correlation_id")
-                    or bundle.get("parent_correlation_id")
-                    or ""
-                ).strip()
-                execution_result = await self._execute_actions(
-                    valid_actions,
-                    trigger_summary=str(trigger or ""),
-                    scene_desc=scene,
-                    confidence=confidence,
-                    trigger_room=str(bundle.get("trigger_room") or result.get("trigger_room") or ""),
-                    parent_transaction_id=transaction_id,
-                    cmd_source=str(bundle.get("cmd_source") or result.get("cmd_source") or ""),
-                    world_snapshot_id=world_snapshot_id,
-                    correlation_id=execution_correlation_id,
-                    active_space_id=active_execution_space_id,
-                    decision_time=datetime.now(timezone.utc).isoformat(),
-                    require_world_snapshot_guard=True,
-                    direct_entity_only=explicit_voice_control,
-                )
-                executed = int(execution_result)
-                execution_transaction_id = str(
-                    getattr(execution_result, "transaction_id", "") or "unknown"
-                ).strip() or "unknown"
-                result["executed_count"] = executed
-                final_outcome = (
-                    "succeeded"
-                    if executed >= len(valid_actions)
-                    else "partial"
-                    if executed > 0
-                    else "failed"
-                )
-                raw_action_results = getattr(execution_result, "action_results", None)
-                action_results = list(raw_action_results) if isinstance(raw_action_results, list) else []
-                for index, action in enumerate(valid_actions):
-                    if not isinstance(action, dict):
-                        continue
-                    params = action.get("params")
-                    action_reason = str(action.get("reason") or "").strip()
-                    if index < len(action_results) and isinstance(action_results[index], dict):
-                        merged = {
-                            **action_results[index],
-                            "domain": str(action_results[index].get("domain") or action.get("domain") or ""),
-                            "service": str(action_results[index].get("service") or action.get("service") or ""),
-                            "entity_id": str(action_results[index].get("entity_id") or action.get("entity_id") or ""),
-                        }
-                        if isinstance(params, dict) and params and not isinstance(merged.get("params"), dict):
-                            merged["params"] = dict(params)
-                        if action_reason and not str(merged.get("action_reason") or "").strip():
-                            merged["action_reason"] = action_reason
-                        if execution_correlation_id:
-                            merged["correlation_id"] = execution_correlation_id
-                        action_results[index] = merged
-                        continue
-                    fallback_result = {
-                        "domain": str(action.get("domain") or ""),
-                        "service": str(action.get("service") or ""),
-                        "entity_id": str(action.get("entity_id") or ""),
-                        "status": "executed" if index < executed else "not_executed",
-                        "reason": "ha_execute_actions_missing_structured_result",
-                    }
-                    if isinstance(params, dict) and params:
-                        fallback_result["params"] = dict(params)
-                    if action_reason:
-                        fallback_result["action_reason"] = action_reason
-                    if execution_correlation_id:
-                        fallback_result["correlation_id"] = execution_correlation_id
-                    action_results.append(fallback_result)
-                audit_action_results = [
-                    dict(item)
-                    for item in [*action_results, *rollout_blocked_actions]
-                    if isinstance(item, dict)
-                ]
-                training_sample_payload = self._build_training_sample_payload(
-                    bundle=bundle,
-                    actions=valid_actions,
-                    confidence=confidence,
-                    final_outcome=final_outcome,
-                    decision_id=decision_id,
-                    transaction_id=transaction_id,
-                    execution_transaction_id=execution_transaction_id,
-                    world_snapshot_id=world_snapshot_id,
-                    planned_count=len(valid_actions),
-                    executed_count=executed,
-                    action_results=action_results,
-                )
-                if transaction_id:
-                    execution_event_enqueued = self._enqueue_internal_event(
-                        "decision_execution",
-                        {
-                            "transaction_id": transaction_id,
-                            "trigger": str(trigger or ""),
-                            "scene": scene,
-                            "confidence": confidence,
-                            "confidence_auto": result.get("confidence_auto"),
-                            "confidence_notify": result.get("confidence_notify"),
-                            "threshold": result.get("threshold"),
-                            "auto_execute": True,
-                            "confirm_required": False,
-                            "arbitration_result": arbitration_result,
-                            "reason": str(result.get("reason") or "confidence_threshold_met"),
-                            "planned_count": len(valid_actions),
-                            "candidate_action_count": len(candidate_actions),
-                            "authorized_action_count": len(valid_actions),
-                            "executed_count": executed,
-                            "final_outcome": final_outcome,
-                            "actions": valid_actions,
-                            "candidate_actions": candidate_actions,
-                            "authorized_actions": valid_actions,
-                            "rollout_blocked_actions": rollout_blocked_actions,
-                            "action_results": audit_action_results,
-                            "training_sample": training_sample_payload,
-                            "source": "ha_slow_decision",
-                            "origin": "smartagent",
-                            "actor": "smartagent:ha_slow_decision",
-                            "decision_id": decision_id,
-                            "execution_transaction_id": execution_transaction_id,
-                            "world_snapshot_id": world_snapshot_id,
-                            "correlation_id": execution_correlation_id,
-                            "lineage": decision_lineage,
-                        },
-                    )
-                    if not execution_event_enqueued:
-                        self._sys_log(
-                            "WARN",
-                            f"[决策] decision_execution 回写入队失败 transaction_id={transaction_id}",
-                        )
-                self._sys_log("INFO", f"[决策] add-on 返回 {len(valid_actions)} 个动作，已执行 {executed} 个")
-            else:
-                self._sys_log("INFO", f"[决策] add-on 未返回可执行动作: {result.get('reason') or 'no_actions'}")
-            _emit_slow_decision_bubble(
-                result_payload=result,
-                status_code=status,
-                matched=bool(valid_actions),
-                reason=str(result.get("reason") or ("matched" if valid_actions else "no_actions")),
-                scene_desc=scene,
-                confidence_value=confidence,
-                actions_payload=valid_actions,
-                transaction_id_value=transaction_id,
-                executed_count=executed,
-                final_outcome_value=final_outcome,
-                fail_closed=False,
-                record_decision_log=not bool(transaction_id),
-            )
-            nested = result.get("result") if isinstance(result.get("result"), dict) else {}
-            desired_states = result.get("desired_states")
-            if not isinstance(desired_states, list):
-                desired_states = nested.get("desired_states") if isinstance(nested.get("desired_states"), list) else []
-            reply_text = next(
-                (
-                    str(value).strip()
-                    for value in (
-                        result.get("reply"),
-                        result.get("speak"),
-                        nested.get("reply"),
-                        nested.get("speak"),
-                    )
-                    if str(value or "").strip()
-                ),
-                "",
-            )
-            policy_rejected_action = any(
-                isinstance(item, dict)
-                and (
-                    str(item.get("error_type") or "").strip() == "policy_rejected"
-                    or str(item.get("error") or item.get("reason") or "").strip().startswith(("active_ai_", "policy_", "world_snapshot_"))
-                )
-                for item in action_results
-            )
-            policy_rejected_result = bool(
-                str(result.get("error_type") or "").strip() == "policy_rejected"
-                or (
-                    str(result.get("reason") or result.get("error") or "").strip().startswith(("active_ai_", "policy_", "world_snapshot_"))
-                    and str(result.get("final_outcome") or final_outcome).strip().lower()
-                    in {"blocked", "observe_only", "failed"}
-                )
-            )
-            if bundle.get("is_voice") and (policy_rejected_action or policy_rejected_result):
-                reply_text = policy_unauthorized_speech
-            elif bundle.get("is_voice") and desired_states:
-                if not valid_actions:
-                    reply_text = (
-                        "目标设备已经处于所需状态。"
-                        if str(result.get("reason") or "") == "desired_state_already_satisfied"
-                        else "已理解语音控制指令，但没有生成可安全执行的设备动作。"
-                    )
-                elif executed < len(valid_actions):
-                    reply_text = (
-                        "语音控制只执行了部分设备动作，请检查设备状态。"
-                        if executed > 0
-                        else "语音控制未实际执行成功，请检查设备状态。"
-                    )
-            if not reply_text:
-                if bundle.get("is_voice") and not valid_actions:
-                    reply_text = (
-                        "已理解语音控制指令，但没有生成可安全执行的设备动作。"
-                        if desired_states
-                        else "查询已完成，但没有可播报的结果。"
-                    )
-                else:
-                    reply_text = "已处理" if valid_actions else "未命中可执行动作"
-            result["reply"] = reply_text
-            if bundle.get("is_voice") and (policy_rejected_action or policy_rejected_result):
-                result["speak"] = policy_unauthorized_speech
-            elif bundle.get("is_voice") and desired_states:
-                result["speak"] = reply_text
-            elif bundle.get("is_voice") and not str(result.get("speak") or "").strip():
-                result["speak"] = reply_text
-            result.setdefault("status", "ok")
-            return result
-
-    async def _run_voice_inference(self, text: str, source: str = "touch") -> dict:
-        """Handle voice text through add-on owned decision provider."""
-        return await self._run_addon_decision(text, source=f"voice_{source}")
 
     async def async_run_pattern_analysis(self) -> None:
         """Delegate behavior analysis to the add-on owned AI-scene provider."""
@@ -4250,6 +2862,9 @@ class SmartAgentCoordinator(
                         "title": "✅ 配对就绪",
                         "notification_id": "smart_agent_pairing",
                     },
+                    execution_class="notification",
+                    actor_ref="coordinator.pairing",
+                    output_ledger_publisher=self._output_ledger_publisher,
                 )
             else:
                 self._pairing_mode_end_time = 0
@@ -4262,6 +2877,9 @@ class SmartAgentCoordinator(
                         "title": "❌ 配对失败",
                         "notification_id": "smart_agent_pairing",
                     },
+                    execution_class="notification",
+                    actor_ref="coordinator.pairing",
+                    output_ledger_publisher=self._output_ledger_publisher,
                 )
             return
 
@@ -4504,240 +3122,16 @@ class SmartAgentCoordinator(
         return result
 
     async def _async_refresh_presence_snapshot_cache(self) -> bool:
-        """Refresh the add-on-owned Presence projection for synchronous guards."""
+        """Refresh and commit the add-on-owned Presence projection."""
         request_id = int(
             getattr(self, "_presence_snapshot_refresh_request_id", 0) or 0
         ) + 1
         self._presence_snapshot_refresh_request_id = request_id
-        addon_client = getattr(self, "_addon_client", None)
-        get_rooms = getattr(addon_client, "get_rooms", None)
-        if not callable(get_rooms):
+        normalized_rooms = await fetch_presence_snapshot(
+            getattr(self, "_addon_client", None)
+        )
+        if normalized_rooms is None:
             return False
-
-        try:
-            payload = await get_rooms()
-        except Exception:
-            return False
-
-        def _is_error_payload(value: dict[str, Any]) -> bool:
-            if value.get("ok") is False:
-                return True
-            try:
-                return int(value.get("__status", 200) or 200) >= 400
-            except (TypeError, ValueError):
-                return True
-
-        rows: Any = payload
-        if isinstance(payload, dict):
-            if _is_error_payload(payload):
-                return False
-            if isinstance(payload.get("data"), list):
-                rows = payload.get("data")
-            elif isinstance(payload.get("rooms"), list):
-                rows = payload.get("rooms")
-            else:
-                return False
-        if not isinstance(rows, (list, tuple)):
-            return False
-
-        def _unknown_room_payload(
-            localized_spaces: list[str],
-            reason: str,
-        ) -> dict[str, Any]:
-            return {
-                "state": "unknown",
-                "confidence": 0.0,
-                "reasons": [reason],
-                "enter_qualified": False,
-                "leave_qualified": False,
-                "localized_spaces": localized_spaces,
-                "blocked_actions": ["turn_off"],
-                "occupied_evidence_ids": [],
-                "vacant_evidence_ids": [],
-                "evidence_ids": [],
-                "metadata": {"presence_contract_source": "addon_presence_engine"},
-            }
-
-        normalized_rooms: dict[str, dict[str, Any]] = {}
-        alias_owners: dict[str, set[str]] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            room_id = str(
-                row.get("id")
-                or row.get("space_id")
-                or row.get("room_id")
-                or row.get("area_id")
-                or row.get("name")
-                or ""
-            ).strip()
-            if not room_id:
-                continue
-
-            localized_spaces: list[str] = []
-
-            def _add_localized(value: Any) -> None:
-                if isinstance(value, (list, tuple, set)):
-                    for item in value:
-                        _add_localized(item)
-                    return
-                text = str(value or "").strip()
-                if text and text not in localized_spaces:
-                    localized_spaces.append(text)
-
-            for key in ("id", "space_id", "room_id", "area_id", "room", "name", "localized_spaces"):
-                _add_localized(row.get(key))
-            _add_localized(room_id)
-            for localized in localized_spaces:
-                alias_owners.setdefault(localized.casefold(), set()).add(room_id)
-
-            source = str(row.get("presence_source") or "").strip()
-            state = str(
-                row.get("presence_state")
-                or row.get("occupancy_state")
-                or ""
-            ).strip().lower()
-            canonical = source == "addon_presence_engine" and state in {
-                "occupied",
-                "vacant",
-                "unknown",
-            }
-            reason = str(row.get("presence_reason") or "").strip()
-            evidence_raw = row.get("presence_evidence_ids")
-            if isinstance(evidence_raw, str):
-                evidence_values = [evidence_raw]
-            elif isinstance(evidence_raw, (list, tuple, set)):
-                evidence_values = list(evidence_raw)
-            else:
-                evidence_values = []
-            evidence_ids: list[str] = []
-            for raw_id in evidence_values:
-                evidence_id = str(raw_id or "").strip()
-                if evidence_id and evidence_id not in evidence_ids:
-                    evidence_ids.append(evidence_id)
-
-            presence_evidence: list[dict[str, Any]] = []
-            raw_presence_evidence = row.get("presence_evidence")
-            if isinstance(raw_presence_evidence, (list, tuple)):
-                allowed_evidence_fields = (
-                    "entity_id",
-                    "sensor_type",
-                    "state",
-                    "use_for",
-                    "confidence",
-                    "freshness_ttl_secs",
-                    "battery_powered",
-                    "last_observed_at",
-                    "stale",
-                    "stale_reason",
-                )
-                for raw_evidence in raw_presence_evidence:
-                    if not isinstance(raw_evidence, dict):
-                        continue
-                    evidence_entity_id = str(
-                        raw_evidence.get("entity_id")
-                        or raw_evidence.get("id")
-                        or ""
-                    ).strip()
-                    if not evidence_entity_id:
-                        continue
-                    evidence_row = {
-                        key: raw_evidence.get(key)
-                        for key in allowed_evidence_fields
-                        if key in raw_evidence
-                    }
-                    evidence_row["entity_id"] = evidence_entity_id
-                    use_for = evidence_row.get("use_for")
-                    if isinstance(use_for, (list, tuple, set)):
-                        evidence_row["use_for"] = [
-                            str(item or "").strip()
-                            for item in use_for
-                            if str(item or "").strip()
-                        ]
-                    elif isinstance(use_for, str):
-                        evidence_row["use_for"] = [
-                            item.strip()
-                            for item in use_for.split(",")
-                            if item.strip()
-                        ]
-                    else:
-                        evidence_row["use_for"] = []
-                    presence_evidence.append(evidence_row)
-
-            confidence = 0.0
-            if canonical:
-                raw_confidence = (
-                    row.get("presence_confidence")
-                    if row.get("presence_confidence") is not None
-                    else row.get("occupancy_confidence", 0.0)
-                )
-                try:
-                    confidence = float(raw_confidence)
-                except (TypeError, ValueError):
-                    canonical = False
-                if (
-                    isinstance(raw_confidence, bool)
-                    or not math.isfinite(confidence)
-                    or not 0.0 <= confidence <= 1.0
-                ):
-                    canonical = False
-
-            if canonical:
-                reason = reason or f"canonical_presence_{state}"
-            else:
-                state = "unknown"
-                confidence = 0.0
-                reason = "canonical_presence_contract_invalid"
-                evidence_ids = []
-
-            room_payload = {
-                "state": state,
-                "confidence": confidence,
-                "reasons": [reason],
-                "enter_qualified": False,
-                "leave_qualified": False,
-                "localized_spaces": localized_spaces,
-                "blocked_actions": ["turn_off"] if state != "vacant" else [],
-                "occupied_evidence_ids": evidence_ids if state == "occupied" else [],
-                "vacant_evidence_ids": evidence_ids if state == "vacant" else [],
-                "evidence_ids": evidence_ids,
-                "metadata": {"presence_contract_source": "addon_presence_engine"},
-            }
-            if canonical and presence_evidence:
-                room_payload["presence_evidence"] = presence_evidence
-            previous_payload = normalized_rooms.get(room_id)
-            if previous_payload is not None:
-                merged_spaces: list[str] = []
-                for values in (
-                    previous_payload.get("localized_spaces", []),
-                    localized_spaces,
-                ):
-                    if not isinstance(values, list):
-                        continue
-                    for localized in values:
-                        if localized and localized not in merged_spaces:
-                            merged_spaces.append(localized)
-                room_payload = _unknown_room_payload(
-                    merged_spaces,
-                    "canonical_presence_duplicate_room",
-                )
-            normalized_rooms[room_id] = room_payload
-
-        conflicting_room_ids = {
-            room_id
-            for owners in alias_owners.values()
-            if len(owners) > 1
-            for room_id in owners
-        }
-        for room_id in conflicting_room_ids:
-            payload = normalized_rooms.get(room_id)
-            if not isinstance(payload, dict):
-                continue
-            localized_spaces = payload.get("localized_spaces")
-            normalized_rooms[room_id] = _unknown_room_payload(
-                list(localized_spaces) if isinstance(localized_spaces, list) else [room_id],
-                "canonical_presence_room_alias_conflict",
-            )
 
         committed_request_id = int(
             getattr(self, "_presence_snapshot_refresh_committed_request_id", 0) or 0
@@ -4753,71 +3147,13 @@ class SmartAgentCoordinator(
         return True
 
     async def _async_refresh_room_topology_cache(self) -> None:
-        """Refresh room topology from add-on without exposing failures to callers."""
-        addon_client = getattr(self, "_addon_client", None)
-        get_topology = getattr(addon_client, "get_rooms_topology", None)
-        if not callable(get_topology):
+        """Refresh and commit room topology without exposing fetch failures."""
+        topology = await fetch_room_topology(getattr(self, "_addon_client", None))
+        if topology is None:
             return
-
-        try:
-            payload = await get_topology()
-        except Exception:
-            return
-
-        def _text(value: Any) -> str:
-            return str(value or "").strip()
-
-        topology: dict[str, set[str]] = {}
-
-        def _add_edge(left: Any, right: Any) -> None:
-            room_a = _text(left)
-            room_b = _text(right)
-            if not room_a or not room_b or room_a == room_b:
-                return
-            topology.setdefault(room_a, set()).add(room_b)
-            topology.setdefault(room_b, set()).add(room_a)
-
-        def _is_error_payload(value: dict[str, Any]) -> bool:
-            if value.get("ok") is False:
-                return True
-            try:
-                return int(value.get("__status", 200) or 200) >= 400
-            except (TypeError, ValueError):
-                return True
-
-        rows: Any = payload
-        if isinstance(payload, dict) and _is_error_payload(payload):
-            return
-        if isinstance(payload, dict) and isinstance(payload.get("topology"), (dict, list, tuple, set)):
-            rows = payload.get("topology")
-        elif isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list, tuple, set)):
-            rows = payload.get("data")
-
-        if isinstance(rows, dict):
-            if _is_error_payload(rows):
-                return
-            for room, raw_neighbors in rows.items():
-                if str(room).startswith("__") or room in {"ok", "error", "error_type", "retryable"}:
-                    continue
-                if isinstance(raw_neighbors, (list, tuple, set)):
-                    for neighbor in raw_neighbors:
-                        _add_edge(room, neighbor)
-                else:
-                    _add_edge(room, raw_neighbors)
-        elif isinstance(rows, (list, tuple, set)):
-            for item in rows:
-                if not isinstance(item, dict):
-                    continue
-                room_a = item.get("room_a") or item.get("room") or item.get("from") or item.get("source")
-                room_b = item.get("room_b") or item.get("neighbor") or item.get("to") or item.get("target")
-                _add_edge(room_a, room_b)
-        elif rows is None:
-            return
-        else:
-            return
-
         self._room_topology_cache = topology
         self._room_topology_cache_updated_at = time.monotonic()
+
 
     def _build_patrol_safety_net_payload(self, *, source: str) -> dict[str, Any]:
         raw_capability_snapshot = self.get_device_capability_snapshot()
@@ -4911,152 +3247,27 @@ class SmartAgentCoordinator(
             },
         }
 
+    async def _async_run_ai_patrol(
+        self,
+        *,
+        source: str = "ha_low_frequency_patrol",
+    ) -> dict[str, Any] | None:
+        return await run_ai_patrol(
+            self,
+            source=source,
+            build_task_occurrence=build_patrol_task_occurrence,
+        )
+
     async def _async_submit_patrol_safety_net_plan(
         self,
         *,
         source: str = "ha_low_frequency_patrol",
     ) -> dict[str, Any] | None:
-        if not self._is_enabled():
-            return None
-        if bool(getattr(self, "_learning_mode", False)):
-            return None
-        if not bool(getattr(self, "_patrol_enabled", False)):
-            return None
-        addon_client = getattr(self, "_addon_client", None)
-        if addon_client is None:
-            return None
-        automatic_submit_at: float | None = None
-        if source == "ha_low_frequency_patrol":
-            def _quiet_minutes(value: Any) -> int | None:
-                parts = str(value or "").strip().split(":", 1)
-                if len(parts) != 2 or not all(part.isdigit() for part in parts):
-                    return None
-                hour, minute = (int(part) for part in parts)
-                if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-                    return None
-                return hour * 60 + minute
-
-            quiet_start = _quiet_minutes(getattr(self, "_patrol_quiet_hours_start", ""))
-            quiet_end = _quiet_minutes(getattr(self, "_patrol_quiet_hours_end", ""))
-            if quiet_start is not None and quiet_end is not None and quiet_start != quiet_end:
-                now = self._ha_local_now()
-                now_minutes = int(now.hour) * 60 + int(now.minute)
-                in_quiet_hours = (
-                    quiet_start <= now_minutes < quiet_end
-                    if quiet_start < quiet_end
-                    else now_minutes >= quiet_start or now_minutes < quiet_end
-                )
-                if in_quiet_hours:
-                    return None
-            try:
-                interval_minutes = int(getattr(self, "_patrol_interval_minutes", 15) or 15)
-            except (TypeError, ValueError):
-                interval_minutes = 15
-            interval_seconds = max(5, min(interval_minutes, 1440)) * 60
-            automatic_submit_at = time.monotonic()
-            try:
-                last_submit_at = float(
-                    getattr(self, "_patrol_last_automatic_submit_monotonic", 0.0) or 0.0
-                )
-            except (TypeError, ValueError):
-                last_submit_at = 0.0
-            if last_submit_at > 0 and automatic_submit_at - last_submit_at < interval_seconds:
-                return None
-
-        payload = self._build_patrol_safety_net_payload(source=source)
-        fingerprint = json.dumps(
-            {
-                "devices": sorted((payload.get("device_capability_snapshot") or {}).keys()),
-                "states": payload.get("states") or {},
-            },
-            ensure_ascii=False,
-            sort_keys=True,
+        return await submit_patrol_safety_net_plan(
+            self,
+            source=source,
+            build_task_occurrence=build_patrol_task_occurrence,
         )
-        if fingerprint == self._last_patrol_snapshot:
-            self._patrol_no_change_count += 1
-        else:
-            self._last_patrol_snapshot = fingerprint
-            self._patrol_no_change_count = 0
-
-        plan_request = {
-            "domain": "patrol",
-            "action": "trigger",
-            "payload": payload,
-            "reason": "low frequency vacant lighting safety net",
-            "requested_by": "ha_patrol_scheduler",
-            "dry_run": True,
-        }
-        result = await addon_client.post_operations_action_plan(plan_request)
-        if not isinstance(result, dict):
-            return None
-        if automatic_submit_at is not None:
-            self._patrol_last_automatic_submit_monotonic = automatic_submit_at
-
-        sensorless = (
-            result.get("sensorless_confirmations")
-            if isinstance(result.get("sensorless_confirmations"), dict)
-            else {}
-        )
-        created_confirmations = [
-            item
-            for item in list(sensorless.get("created") or [])
-            if isinstance(item, dict)
-        ]
-        if int(sensorless.get("created_count") or 0) > 0 and created_confirmations:
-            confirmation_item = created_confirmations[0]
-            action_rows = [
-                item
-                for item in list(confirmation_item.get("actions") or [])
-                if isinstance(item, dict)
-            ]
-            entity_names = [
-                str(item.get("entity_id") or "").strip()
-                for item in action_rows
-                if str(item.get("entity_id") or "").strip()
-            ]
-            space_name = str(confirmation_item.get("space_id") or "该区域").strip() or "该区域"
-            target_names = "、".join(entity_names) or "相关设备"
-            self._notify_dedup(
-                f"{space_name} 的 {target_names} 可能可以关闭。"
-                "请在 SmartAgent AI 决策中确认；未回复不会执行。",
-                "SmartAgent 设备关闭确认",
-            )
-
-        status = int(result.get("__status") or 0)
-        plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
-        safety = plan.get("safety_net") if isinstance(plan.get("safety_net"), dict) else {}
-        candidate_count = int(safety.get("candidate_count") or 0) if safety else 0
-        gate = result.get("execution_gate") if isinstance(result.get("execution_gate"), dict) else {}
-        blockers = [str(item) for item in list(gate.get("blockers") or []) if str(item)]
-        confirmation = result.get("confirmation") if isinstance(result.get("confirmation"), dict) else {}
-        token = str(confirmation.get("token") or "").strip()
-        token_issued = confirmation.get("token_issued") is True and bool(token)
-        executable_blockers = [item for item in blockers if item != "confirmation_token_required"]
-        self._sys_log(
-            "INFO",
-            f"[PatrolSafetyNet] plan submitted | status={status} candidates={candidate_count} source={source}",
-        )
-        if candidate_count <= 0 or not token_issued or executable_blockers:
-            return result
-
-        execute_request = {
-            **plan_request,
-            "dry_run": False,
-            "confirmation_token": token,
-        }
-        execution = await addon_client.post_operations_action_execute(execute_request)
-        if not isinstance(execution, dict):
-            return result
-        execution_status = int(execution.get("__status") or 0)
-        transaction_id = str(execution.get("transaction_id") or "")
-        provider_result = execution.get("result") if isinstance(execution.get("result"), dict) else {}
-        executed_count = int(provider_result.get("executed_count") or 0)
-        self._sys_log(
-            "INFO",
-            "[PatrolSafetyNet] controlled execution | "
-            f"status={execution_status} executed={executed_count} transaction_id={transaction_id or '-'} source={source}",
-        )
-        return execution
 
     def get_space_runtime_snapshot(self) -> dict[str, Any]:
         """返回空间运行时快照（只读内存态，不触发 DB 热路径）。"""
@@ -5122,125 +3333,14 @@ class SmartAgentCoordinator(
 
     def get_presence_snapshot(self) -> dict[str, Any]:
         """Return the latest add-on Presence projection without blocking I/O."""
-
-        record = getattr(self, "_presence_snapshot_cache_record", None)
-        if isinstance(record, tuple) and len(record) == 2 and isinstance(record[0], dict):
-            cached = record[0]
-            updated_at_raw = record[1]
-        else:
-            cached = getattr(self, "_presence_snapshot_cache", {}) or {}
-            updated_at_raw = getattr(self, "_presence_snapshot_cache_updated_at", 0.0)
-        if not isinstance(cached, dict):
-            cached = {}
-        try:
-            updated_at = float(updated_at_raw or 0.0)
-        except (TypeError, ValueError):
-            updated_at = 0.0
-        now_value = time.monotonic()
-        cache_age = now_value - updated_at if updated_at > 0 else None
-        cache_fresh = (
-            cache_age is not None
-            and cache_age >= 0.0
-            and cache_age <= _PRESENCE_SNAPSHOT_CACHE_TTL_SECONDS
+        return build_presence_snapshot(
+            cache_record=getattr(self, "_presence_snapshot_cache_record", None),
+            fallback_cache=getattr(self, "_presence_snapshot_cache", {}),
+            fallback_updated_at=getattr(
+                self,
+                "_presence_snapshot_cache_updated_at",
+                0.0,
+            ),
+            device_info=getattr(self, "device_info", {}),
+            now_monotonic=time.monotonic(),
         )
-
-        known_rooms = {
-            str(room or "").strip()
-            for room in cached
-            if str(room or "").strip()
-        }
-        device_info = getattr(self, "device_info", {}) or {}
-        if isinstance(device_info, dict):
-            for info in device_info.values():
-                if not isinstance(info, dict):
-                    continue
-                room = str(
-                    info.get("space_id")
-                    or info.get("room")
-                    or info.get("area")
-                    or ""
-                ).strip()
-                if room:
-                    known_rooms.add(room)
-
-        def _unknown_payload(room: str, reason: str) -> dict[str, Any]:
-            return {
-                "state": "unknown",
-                "confidence": 0.0,
-                "reasons": [reason],
-                "enter_qualified": False,
-                "leave_qualified": False,
-                "localized_spaces": [room],
-                "blocked_actions": ["turn_off"],
-                "occupied_evidence_ids": [],
-                "vacant_evidence_ids": [],
-                "evidence_ids": [f"presence.{room}"],
-                "metadata": {"presence_contract_source": "addon_presence_engine"},
-            }
-
-        def _copy_payload(payload: Any) -> dict[str, Any] | None:
-            if not isinstance(payload, dict):
-                return None
-            copied = dict(payload)
-            for key in (
-                "reasons",
-                "localized_spaces",
-                "blocked_actions",
-                "occupied_evidence_ids",
-                "vacant_evidence_ids",
-                "evidence_ids",
-            ):
-                value = copied.get(key)
-                if isinstance(value, (list, tuple, set)):
-                    copied[key] = list(value)
-            evidence_rows = copied.get("presence_evidence")
-            if isinstance(evidence_rows, (list, tuple)):
-                copied["presence_evidence"] = [
-                    {
-                        key: list(value)
-                        if isinstance(value, (list, tuple, set))
-                        else value
-                        for key, value in row.items()
-                    }
-                    for row in evidence_rows
-                    if isinstance(row, dict)
-                ]
-            metadata = copied.get("metadata")
-            if isinstance(metadata, dict):
-                copied["metadata"] = dict(metadata)
-            return copied
-
-        rooms: dict[str, dict[str, Any]] = {}
-        if cache_fresh:
-            for room in sorted(known_rooms):
-                payload = _copy_payload(cached.get(room))
-                rooms[room] = payload or _unknown_payload(
-                    room,
-                    "canonical_presence_room_missing",
-                )
-            source = "addon_presence_engine"
-            reason = "canonical_presence_snapshot_fresh"
-        else:
-            reason = (
-                "canonical_presence_snapshot_stale"
-                if updated_at > 0
-                else "canonical_presence_snapshot_unavailable"
-            )
-            rooms = {
-                room: _unknown_payload(room, reason)
-                for room in sorted(known_rooms)
-            }
-            source = "ha_presence_snapshot_fail_closed"
-
-        return {
-            "version": "1.0",
-            "source": source,
-            "rooms": rooms,
-            "metadata": {
-                "presence_contract_source": "addon_presence_engine",
-                "reason": reason,
-                "cache_fresh": cache_fresh,
-                "cache_age_secs": round(cache_age, 3) if cache_age is not None else None,
-                "cache_ttl_secs": _PRESENCE_SNAPSHOT_CACHE_TTL_SECONDS,
-            },
-        }

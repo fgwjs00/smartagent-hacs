@@ -1,8 +1,8 @@
 # Changelog
 
-## Beta 0.0.212 - 2026-08-14
+## Beta 0.0.215 - 2026-08-24
 
-Beta 0.0.212 修复显式语音控制被自主 AI 灰度误拦截与错误成功播报，并修复 AI 场景手动触发因世界快照缺失返回 503；归一化中控屏 Workbox 产物、保留 AI 场景真实接口来源说明，并关闭当前阿里云 ACR 不支持的 OCI provenance/SBOM 附加清单；用户明确语音只绕过自主 AI 灰度，仍保留纳管、精确实体、服务白名单、世界状态与执行回执门禁，自主传感器控制继续仅限精确 canary。
+Beta 0.0.215 继承 COMPAT-001～006 运行兼容主线，并修复干净标签检出、Linux 路径与时钟相关发布门禁；显式语音、单次准入、canonical executor/Host Proof、人工 R2 确认和 Host 精确命令边界保持闭环；主动 Agent 学习仍只接收 canonical ExecutionReceipt 与派发后物理状态读回共同验证的结果，保持 shadow，不直接开启主动执行；正式构建面仅包含 V3 和中控屏。
 
 - 发布最新 SmartAgent Home Assistant 集成。
-- 同步公开版本 `0.0.212`，用于 Home Assistant 更新检测。
+- 同步公开版本 `0.0.215`，用于 Home Assistant 更新检测。

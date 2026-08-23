@@ -104,6 +104,10 @@
       },
       "additionalProperties": false
     },
+    "vacuum.start": {"required": [], "properties": {}, "additionalProperties": false},
+    "vacuum.pause": {"required": [], "properties": {}, "additionalProperties": false},
+    "vacuum.stop": {"required": [], "properties": {}, "additionalProperties": false},
+    "vacuum.return_to_base": {"required": [], "properties": {}, "additionalProperties": false},
     "media_player.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
     "media_player.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
     "media_player.toggle": {"required": [], "properties": {}, "additionalProperties": false},

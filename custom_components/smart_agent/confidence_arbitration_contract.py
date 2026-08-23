@@ -23,10 +23,21 @@ _REQUIRED_FIELDS = (
 )
 _QUALIFIED_AUTO_EXECUTE_REASONS = frozenset({"confirmed_presence_lighting"})
 _ARRIVAL_LIGHTING_POLICY_VERSION = "arrival_lighting_auto_v1"
+_ARRIVAL_LIGHTING_POLICY_VERSIONS = frozenset(
+    {_ARRIVAL_LIGHTING_POLICY_VERSION, "arrival_lighting_auto_v2"}
+)
 _ARRIVAL_LIGHTING_CONFIRMATION_POLICY_VERSION = "arrival_lighting_confirmation_v1"
+_ARRIVAL_PREFERENCE_POLICY_VERSION = "arrival_preference_v1"
+_ARRIVAL_TRIAL_POLICY_VERSION = "arrival_lighting_trial_v1"
 _ARRIVAL_LIGHTING_REQUIRED_EVIDENCE_COUNT = 3
 _ARRIVAL_LIGHTING_TYPED_THRESHOLD = 70.0
-_ARRIVAL_LIGHTING_EVIDENCE_SOURCES = frozenset({"decision_cache_confirmations"})
+_ARRIVAL_LIGHTING_EVIDENCE_SOURCES = frozenset(
+    {
+        "decision_cache_confirmations",
+        "arrival_preference_certificate",
+        "cold_start_trial_lease",
+    }
+)
 _ARRIVAL_LIGHTING_CONFIRMATION_GATE = "arrival_lighting_owner_confirmation"
 
 
@@ -217,7 +228,8 @@ def _valid_arrival_lighting_typed_policy(
 ) -> bool:
     if not isinstance(policy, dict):
         return False
-    if str(policy.get("policy_version") or "") != _ARRIVAL_LIGHTING_POLICY_VERSION:
+    policy_version = str(policy.get("policy_version") or "")
+    if policy_version not in _ARRIVAL_LIGHTING_POLICY_VERSIONS:
         return False
     evidence_source = str(policy.get("evidence_source") or "")
     if evidence_source not in _ARRIVAL_LIGHTING_EVIDENCE_SOURCES:
@@ -231,10 +243,7 @@ def _valid_arrival_lighting_typed_policy(
         parsed_required_count = int(required_count)
     except (TypeError, ValueError):
         return False
-    if (
-        parsed_required_count != _ARRIVAL_LIGHTING_REQUIRED_EVIDENCE_COUNT
-        or parsed_evidence_count < parsed_required_count
-    ):
+    if parsed_required_count < 1 or parsed_evidence_count < parsed_required_count:
         return False
     configured_auto = _finite_percent(policy.get("configured_confidence_auto"))
     effective_auto = _finite_percent(policy.get("effective_confidence_auto"))
@@ -267,13 +276,68 @@ def _valid_arrival_lighting_typed_policy(
             return False
         if not _actions_match_policy_space(actions, context_snapshot, policy_space):
             return False
-    if not str(policy.get("confirmation_key") or "").strip():
+    confirmation_key = str(policy.get("confirmation_key") or "").strip()
+    if not confirmation_key:
         return False
-    if (
-        str(policy.get("confirmation_policy_version") or "")
-        != _ARRIVAL_LIGHTING_CONFIRMATION_POLICY_VERSION
-    ):
-        return False
+    proof = policy.get("proof") if isinstance(policy.get("proof"), dict) else {}
+    confirmation_policy_version = str(policy.get("confirmation_policy_version") or "")
+    if evidence_source == "decision_cache_confirmations":
+        if policy_version != _ARRIVAL_LIGHTING_POLICY_VERSION:
+            return False
+        if parsed_required_count != _ARRIVAL_LIGHTING_REQUIRED_EVIDENCE_COUNT:
+            return False
+        if confirmation_policy_version != _ARRIVAL_LIGHTING_CONFIRMATION_POLICY_VERSION:
+            return False
+    elif evidence_source == "arrival_preference_certificate":
+        if policy_version != "arrival_lighting_auto_v2":
+            return False
+        if confirmation_policy_version != _ARRIVAL_PREFERENCE_POLICY_VERSION:
+            return False
+        preference_keys = proof.get("preference_keys") if isinstance(proof.get("preference_keys"), list) else []
+        if not preference_keys or confirmation_key != ",".join(str(item) for item in preference_keys):
+            return False
+        if str(proof.get("certificate_policy_version") or "") != _ARRIVAL_PREFERENCE_POLICY_VERSION:
+            return False
+        try:
+            certificate_count = int(proof.get("certificate_count") or 0)
+        except (TypeError, ValueError):
+            return False
+        if certificate_count != len(preference_keys):
+            return False
+        if parsed_required_count not in {1, _ARRIVAL_LIGHTING_REQUIRED_EVIDENCE_COUNT}:
+            return False
+        proof_confidence = _finite_percent(proof.get("confidence"))
+        if proof_confidence is None or proof_confidence < _ARRIVAL_LIGHTING_TYPED_THRESHOLD:
+            return False
+    elif evidence_source == "cold_start_trial_lease":
+        if policy_version != "arrival_lighting_auto_v2" or parsed_required_count != 1:
+            return False
+        if confirmation_policy_version != _ARRIVAL_TRIAL_POLICY_VERSION:
+            return False
+        if str(proof.get("policy_version") or "") != _ARRIVAL_TRIAL_POLICY_VERSION:
+            return False
+        if str(proof.get("lease_id") or "") != confirmation_key:
+            return False
+        if len(actions or []) != 1:
+            return False
+        action = actions[0] if isinstance(actions[0], dict) else {}
+        data = action.get("data") if isinstance(action.get("data"), dict) else action.get("params")
+        data = data if isinstance(data, dict) else {}
+        try:
+            brightness_pct = int(data.get("brightness_pct", proof.get("brightness_pct", 100)))
+        except (TypeError, ValueError):
+            return False
+        if brightness_pct < 1 or brightness_pct > 30:
+            return False
+        if str(proof.get("space_id") or "") != policy_space:
+            return False
+        if str(proof.get("entity_id") or "") != str(action.get("entity_id") or action.get("entity") or ""):
+            return False
+        if isinstance(context_snapshot, dict):
+            if str(proof.get("world_snapshot_id") or "") != str(context_snapshot.get("world_snapshot_id") or ""):
+                return False
+            if str(proof.get("occupancy_cycle_id") or "") != str(context_snapshot.get("occupancy_cycle_id") or ""):
+                return False
     return True
 
 

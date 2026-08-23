@@ -16,6 +16,14 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
 from homeassistant.exceptions import ServiceNotFound
 
+from .action_execution_runtime import ActionExecutionRuntimeMixin
+from .action_receipts import (
+    ActionExecutionResult,
+    ActionResultCollector,
+    action_execution_result,
+    active_ai_authorization_ref,
+    decision_action_result_from_ha_result,
+)
 from .action_normalization import (
     action_domain,
     action_entity_id,
@@ -46,33 +54,14 @@ from .execution_gate import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class ActionsMixin:
+class ActionsMixin(ActionExecutionRuntimeMixin):
     """Mixin: 动作执行 — 路由 / 保护 / 验证 / 重试。"""
 
     def _get_showroom_light_tier_v2(self, entity_id: str) -> str:
         """Return the neutral tier after HA-local showroom preference storage removal."""
         return "core"
 
-    class _ActionExecutionResult(int):
-        """Int-compatible execution summary with per-action trace results."""
-
-        def __new__(
-            cls,
-            executed_count: int = 0,
-            *,
-            action_results: list[dict[str, Any]] | None = None,
-            transaction_id: int = 0,
-            raw_results: list[dict[str, Any]] | None = None,
-            pre_states: dict[str, str] | None = None,
-        ):
-            value = max(0, int(executed_count or 0))
-            obj = int.__new__(cls, value)
-            obj.executed_count = value
-            obj.action_results = list(action_results or [])
-            obj.transaction_id = int(transaction_id or 0)
-            obj.raw_results = list(raw_results or [])
-            obj.pre_states = dict(pre_states or {})
-            return obj
+    _ActionExecutionResult = ActionExecutionResult
 
     # 合法的设备管辖域值（DatabaseMixin 也定义了此常量，MRO 取第一个即可）
     _VALID_CONTROL_MODES = DEVICE_CONTROL_MODES
@@ -90,6 +79,34 @@ class ActionsMixin:
     _VERIFY_QUEUE_MAX = 50      # 待验证队列上限
     _VERIFY_EXPIRE_SEC = 120    # 超过 N 秒未验证完成的条目强制丢弃
 
+    def _issue_user_intent_delegation(
+        self,
+        envelope: dict[str, Any],
+        authority: Any | None,
+    ) -> dict[str, Any] | None:
+        """Mint one bound delegation only from the trusted HA authority fact."""
+        if authority is None:
+            raise RuntimeError("user_intent_authority_missing")
+        from .user_intent_delegation import (
+            AuthenticatedUserIntentAuthority,
+            issue_user_intent_delegation,
+        )
+
+        if type(authority) is not AuthenticatedUserIntentAuthority:
+            raise RuntimeError("user_intent_authority_invalid")
+        secret = str(getattr(self, "_user_intent_delegation_secret", "") or "").strip()
+        if not secret:
+            raise RuntimeError("user_intent_delegation_secret_missing")
+        try:
+            return issue_user_intent_delegation(
+                envelope,
+                secret=secret,
+                user_id=authority.user_id,
+                session_id=authority.session_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
+
     # 场景/脚本重复执行冷却
     _SCENE_COOLDOWN = 60        # 同一场景/脚本 N 秒内不重复执行
     _DIM_TO_OFF_BRIGHTNESS_PCT = 5
@@ -98,6 +115,8 @@ class ActionsMixin:
     _DAYLIGHT_FALLBACK_START_HOUR = 8
     _DAYLIGHT_FALLBACK_END_HOUR = 20
     _PROTECTED_NIGHT_START_HOUR = 22
+
+    _active_ai_authorization_ref = staticmethod(active_ai_authorization_ref)
     _PROTECTED_NIGHT_END_HOUR = 6
     _DAYLIGHT_SUN_STATES = frozenset({"above_horizon", "day", "daylight"})
     _DARK_SUN_STATES = frozenset({"below_horizon", "night", "dark"})
@@ -110,119 +129,8 @@ class ActionsMixin:
             dim_to_off_brightness_pct=cls._DIM_TO_OFF_BRIGHTNESS_PCT,
         )
 
-    @classmethod
-    def _action_execution_result(
-        cls,
-        executed_count: int = 0,
-        *,
-        transaction_id: int = 0,
-        results: list[dict[str, Any]] | None = None,
-        pre_states: dict[str, str] | None = None,
-        correlation_id: str = "",
-    ) -> int:
-        normalized_correlation_id = str(correlation_id or "").strip()
-        raw_results = [
-            {
-                **dict(item),
-                **({"correlation_id": normalized_correlation_id} if normalized_correlation_id else {}),
-            }
-            for item in results or []
-            if isinstance(item, dict)
-        ]
-        action_results = [
-            cls._decision_action_result_from_ha_result(item)
-            for item in raw_results
-        ]
-        return cls._ActionExecutionResult(
-            executed_count,
-            action_results=action_results,
-            transaction_id=transaction_id,
-            raw_results=raw_results,
-            pre_states=pre_states,
-        )
-
-    @staticmethod
-    def _decision_action_result_from_ha_result(item: dict[str, Any]) -> dict[str, Any]:
-        ha_status = str(item.get("status") or "").strip()
-        if ha_status == "ok":
-            status = "executed"
-            reason = "ha_service_call_ok"
-        elif ha_status == "scheduled":
-            status = "scheduled"
-            reason = "delayed_action_scheduled"
-        elif ha_status == "skip":
-            status = "skipped"
-            reason = str(item.get("msg") or "already_in_target_state")
-        elif ha_status == "blocked_or_error":
-            status = "failed"
-            reason = str(item.get("msg") or "ha_service_returned_false")
-        elif ha_status.startswith("blocked"):
-            status = "blocked"
-            reason = str(item.get("msg") or ha_status)
-        else:
-            status = "unknown"
-            reason = str(item.get("msg") or ha_status or "unknown_action_result")
-        entity_id = str(item.get("entity_id") or "")
-        result = {
-            "domain": str(item.get("domain") or (entity_id.split(".", 1)[0] if "." in entity_id else "")),
-            "service": str(item.get("service") or ""),
-            "entity_id": entity_id,
-            "status": status,
-            "reason": reason,
-            "ha_status": ha_status,
-        }
-        if isinstance(item.get("params"), dict) and item.get("params"):
-            result["params"] = dict(item.get("params") or {})
-        error = str(item.get("error") or "").strip()
-        if error:
-            result["error"] = error
-        error_type = str(item.get("error_type") or "").strip()
-        if error_type:
-            result["error_type"] = error_type
-        action_reason = str(item.get("reason") or "").strip()
-        if action_reason:
-            result["action_reason"] = action_reason
-        scene_desc = str(item.get("scene_desc") or "").strip()
-        if scene_desc:
-            result["scene_desc"] = scene_desc
-        trigger_summary = str(item.get("trigger_summary") or "").strip()
-        if trigger_summary:
-            result["trigger_summary"] = trigger_summary
-        execution_transaction_id = item.get("execution_transaction_id")
-        if execution_transaction_id not in (None, ""):
-            result["execution_transaction_id"] = execution_transaction_id
-        parent_transaction_id = str(item.get("parent_transaction_id") or "").strip()
-        if parent_transaction_id:
-            result["parent_transaction_id"] = parent_transaction_id
-        correlation_id = str(item.get("correlation_id") or "").strip()
-        if correlation_id:
-            result["correlation_id"] = correlation_id
-        decision_trace = item.get("decision_trace")
-        if isinstance(decision_trace, dict) and decision_trace:
-            result["decision_trace"] = dict(decision_trace)
-        presence_source = str(item.get("presence_source") or "").strip()
-        if presence_source:
-            result["presence_source"] = presence_source
-        presence_reason = str(item.get("presence_reason") or "").strip()
-        if presence_reason:
-            result["presence_reason"] = presence_reason
-        presence_room = str(item.get("presence_room") or "").strip()
-        if presence_room:
-            result["presence_room"] = presence_room
-        presence_evidence_ids = item.get("presence_evidence_ids")
-        if isinstance(presence_evidence_ids, list):
-            result["presence_evidence_ids"] = [
-                str(eid or "") for eid in presence_evidence_ids if str(eid or "").strip()
-            ]
-        presence_states = item.get("presence_states")
-        if isinstance(presence_states, list):
-            result["presence_states"] = [
-                dict(row) for row in presence_states if isinstance(row, dict)
-            ]
-        presence_conflict = item.get("presence_conflict")
-        if isinstance(presence_conflict, dict) and presence_conflict:
-            result["presence_conflict"] = dict(presence_conflict)
-        return result
+    _action_execution_result = staticmethod(action_execution_result)
+    _decision_action_result_from_ha_result = staticmethod(decision_action_result_from_ha_result)
 
     @staticmethod
     def _service_call_error_key(transaction_id: int, action_seq: int, entity_id: str) -> str:
@@ -1293,8 +1201,19 @@ class ActionsMixin:
 
     # ── 动作标准化 ────────────────────────────────────────────────────────────
 
-    def _normalize_action(self, action: dict) -> dict:
-        """Normalize AI action dict to canonical field names."""
+    def _normalize_action(
+        self,
+        action: dict,
+        *,
+        allow_fuzzy_entity_match: bool = True,
+    ) -> dict:
+        """Normalize an action while preserving canonical entity identity.
+
+        Legacy callers may still opt into the historical name-to-entity
+        compatibility match.  A canonical action must instead retain its
+        exact supplied entity id so the execution gate can reject an invalid
+        target before any HA I/O.
+        """
         _target = action.get("target")
         _target_eid = _target.get("entity_id", "") if isinstance(_target, dict) else ""
         entity_id = action.get("entity_id") or action.get("entity") or _target_eid
@@ -1311,15 +1230,22 @@ class ActionsMixin:
 
         # entity_id 校验与修正：AI 有时返回设备名而非合法 entity_id
         if entity_id and not self.hass.states.get(entity_id):
-            matched = self._fuzzy_match_entity(entity_id, domain)
-            if matched:
-                self._sys_log("WARN", f"[动作修正] AI 返回无效 entity_id「{entity_id}」→ 修正为「{matched}」")
-                entity_id = matched
-                domain = entity_id.split(".")[0]
+            if not allow_fuzzy_entity_match:
+                self._sys_log(
+                    "ERROR",
+                    f"[动作修正] canonical action returned invalid entity_id「{entity_id}」; "
+                    "refusing host-side fuzzy remap",
+                )
             else:
-                # 保留原始（疑似幻觉）entity_id，交由执行层防幻觉硬闸显式拒绝并记入 rejected，
-                # 以便 AI 决策页能呈现“为什么没动”，而不是在此静默置空丢弃。
-                self._sys_log("ERROR", f"[动作修正] AI 返回无效 entity_id「{entity_id}」且无法匹配到已知设备，交由执行层硬闸拒绝")
+                matched = self._fuzzy_match_entity(entity_id, domain)
+                if matched:
+                    self._sys_log("WARN", f"[动作修正] AI 返回无效 entity_id「{entity_id}」→ 修正为「{matched}」")
+                    entity_id = matched
+                    domain = entity_id.split(".")[0]
+                else:
+                    # 保留原始（疑似幻觉）entity_id，交由执行层防幻觉硬闸显式拒绝并记入 rejected，
+                    # 以便 AI 决策页能呈现“为什么没动”，而不是在此静默置空丢弃。
+                    self._sys_log("ERROR", f"[动作修正] AI 返回无效 entity_id「{entity_id}」且无法匹配到已知设备，交由执行层硬闸拒绝")
 
         # 极低亮度的 turn_on 等同于关灯，规范化为 turn_off 以统一走守卫逻辑。
         # AI 有时用此手段绕过 Product Rule P1 "禁止 turn_off 展厅灯" 的限制，必须在此拦截。
@@ -1470,1176 +1396,6 @@ class ActionsMixin:
 
     # ── 动作执行主入口 ────────────────────────────────────────────────────────
 
-    async def _execute_actions(
-        self,
-        actions: list,
-        trigger_summary: str = "",
-        scene_desc: str = "",
-        confidence: int = 0,
-        trigger_room: str = "",
-        is_global_cmd: bool = False,
-        cmd_source: str = "",
-        parent_transaction_id: str = "",
-        world_snapshot_id: str = "",
-        correlation_id: str = "",
-        active_space_id: str = "",
-        decision_time: str = "",
-        require_world_snapshot_guard: bool = False,
-        direct_entity_only: bool = False,
-    ) -> int:
-        """Execute a list of AI actions with transaction tracking."""
-        import json as _json
-
-        correlation_id = str(correlation_id or "").strip()
-
-        if not actions:
-            return self._action_execution_result(0, correlation_id=correlation_id)
-
-        original_actions = list(actions)
-        action_positions: dict[int, list[int]] = {}
-        for original_index, original_action in enumerate(original_actions):
-            action_positions.setdefault(id(original_action), []).append(original_index)
-        claimed_positions: set[int] = set()
-        ordered_result_slots: dict[int, dict[str, Any]] = {}
-        guard_pre_states: dict[str, str] = {}
-
-        def _claim_action_position(action: Any) -> int:
-            for position in action_positions.get(id(action), []):
-                if position not in claimed_positions:
-                    claimed_positions.add(position)
-                    return position
-            for position in range(len(original_actions)):
-                if position not in claimed_positions:
-                    claimed_positions.add(position)
-                    return position
-            return len(original_actions) + len(claimed_positions)
-
-        def _remember_result(position: int, result: dict[str, Any]) -> None:
-            if correlation_id:
-                result["correlation_id"] = correlation_id
-            ordered_result_slots[position] = result
-
-        def _ordered_results() -> list[dict[str, Any]]:
-            return [
-                ordered_result_slots[position]
-                for position in sorted(ordered_result_slots)
-            ]
-
-        def _remember_guard_pre_state(action: dict[str, Any]) -> None:
-            entity_id = action_entity_id(action)
-            if not isinstance(entity_id, str) or "." not in entity_id:
-                return
-            state = self.hass.states.get(entity_id)
-            if state:
-                guard_pre_states[entity_id] = state.state
-
-        # ── 区域隔离守卫校验 (AI-03) ──
-        # 若有明确触发区域且非全局指令，过滤掉不属于该区域且非全局属性的动作
-        # 允许的例外：巡检、位置变化、Frigate视觉触发（通常涉及多区域）
-        # USER_EXPLICIT（用户主动指令/一次性场景/语音）豁免区域隔离，与 IntentVerifier 保持一致
-        _SKIP_ISOLATION = ("巡检", "位置变化", "视觉检测")
-        _USER_EXPLICIT = "USER_EXPLICIT"
-        _is_user_explicit = (cmd_source == _USER_EXPLICIT)
-        should_isolate = bool(
-            trigger_room
-            and not is_global_cmd
-            and not _is_user_explicit
-            and not any(k in trigger_summary for k in _SKIP_ISOLATION)
-        )
-        
-        if should_isolate:
-            filtered_actions = []
-            for a in actions:
-                eid = action_entity_id(a)
-                if not eid: continue
-                cap = self._get_action_device_capability(eid)
-                dev_room = (cap.get("room") or "").strip()
-                if not dev_room and hasattr(self, "_get_entity_area"):
-                    dev_room = (self._get_entity_area(eid) or "").strip()
-                cap = {**cap, "room": dev_room}
-
-                # 隔离规则（与 IntentVerifier._stage1_semantic_check 保持完全一致）：
-                # 1. 设备所在房间匹配触发房间 -> 放行
-                # 2. 豁免域 (climate/cover/scene/script/vacuum) -> 放行
-                # 3. action 本身标记了 is_global (LLM 合法跨区指令) -> 放行
-                # 4. 房间信息经 device_info + Registry 双重查找后仍为空 -> 放行（全局设备）
-                #    注意：仅靠 device_info 为空就豁免是不安全的，已在 _get_entity_area 回退后才豁免
-                _domain = action_domain(a)
-                is_cross_zone = self._is_cross_zone_action(trigger_room, cap)
-                control_spaces = self._resolve_action_control_spaces(cap)
-                has_adjacent_space = any(
-                    hasattr(self, "_is_adjacent_room") and self._is_adjacent_room(trigger_room, space)
-                    for space in control_spaces
-                    if space
-                )
-                is_exempt = (
-                    (not dev_room and not cap.get("control_zone"))
-                    or not is_cross_zone
-                    or _domain in ("climate", "cover", "scene", "script", "vacuum")
-                    or a.get("is_global", False)
-                    or has_adjacent_space
-                )
-
-                if is_exempt:
-                    filtered_actions.append(a)
-                else:
-                    self._sys_log("WARN", f"[区域隔离] 拦截跨区域操作: {eid}(属于{dev_room})，本次触发于「{trigger_room}」")
-                    _msg = f"cross_zone_isolation: {eid} belongs to {dev_room or 'unknown'}; trigger_room={trigger_room}"
-                    _result = {
-                        "domain": str(_domain or ""),
-                        "service": str(
-                            a.get("service")
-                            or a.get("action")
-                            or a.get("command")
-                            or ""
-                        ).split(".", 1)[-1],
-                        "entity_id": str(eid or ""),
-                        "status": "blocked_cross_zone_isolation",
-                        "msg": _msg,
-                        "error": _msg,
-                        "error_type": "cross_zone_isolation",
-                    }
-                    if scene_desc:
-                        _result["scene_desc"] = scene_desc
-                    if trigger_summary:
-                        _result["trigger_summary"] = trigger_summary
-                    _remember_result(_claim_action_position(a), _result)
-                    _remember_guard_pre_state(a)
-            
-            if len(filtered_actions) < len(actions):
-                self._sys_log("INFO", f"[区域隔离] 动作集已精简: {len(actions)} -> {len(filtered_actions)} (拦截了 {len(actions)-len(filtered_actions)} 个跨区域动作)")
-                actions = filtered_actions
-                if not actions:
-                    ordered_guard_results = _ordered_results()
-                    txn_id: int = await self.hass.async_add_executor_job(
-                        self._begin_transaction_db,
-                        trigger_summary,
-                        scene_desc,
-                        confidence,
-                        len(original_actions),
-                        _json.dumps(guard_pre_states, ensure_ascii=False),
-                        _json.dumps(original_actions, ensure_ascii=False, default=str),
-                    )
-                    if not txn_id:
-                        return self._action_execution_result(
-                            0,
-                            results=ordered_guard_results,
-                            pre_states=guard_pre_states,
-                            correlation_id=correlation_id,
-                        )
-                    await self.hass.async_add_executor_job(
-                        self._complete_transaction_db,
-                        txn_id,
-                        0,
-                        len(ordered_guard_results),
-                        0,
-                        _json.dumps(ordered_guard_results, ensure_ascii=False),
-                    )
-                    return self._action_execution_result(
-                        0,
-                        transaction_id=txn_id,
-                        results=ordered_guard_results,
-                        pre_states=guard_pre_states,
-                        correlation_id=correlation_id,
-                    )
-
-        if not actions:
-            return self._action_execution_result(0, correlation_id=correlation_id)
-
-        # ── 自触发保护快速预过滤 ────────────────────────────────────────────────
-        # 在动作执行前提前过滤掉触发了本次推理的可控设备，避免浪费完整 LLM 推理后才在
-        # _do_call_service 逐设备拦截（该拦截仍保留作最后一道防线）。
-        # 注意：仅过滤 turn_on（防止触发灯被 AI 原地开回）；turn_off 通常是合理的关灯指令。
-        if self._batch_trigger_controllable:
-            _pre_filtered = []
-            _pre_blocked = []
-            for _a in actions:
-                _eid = action_entity_id(_a)
-                _svc = str(
-                    _a.get("service")
-                    or _a.get("action")
-                    or _a.get("command")
-                    or ""
-                ).split(".", 1)[-1]
-                if _eid and _svc == "turn_on" and _eid in self._batch_trigger_controllable:
-                    _pre_blocked.append(_eid)
-                    _domain = action_domain(_a)
-                    _guard = evaluate_self_trigger_protection(
-                        entity_id=_eid,
-                        service=_svc,
-                        trigger_entities=self._batch_trigger_controllable,
-                    )
-                    _msg = _guard.msg or f"self_trigger_protection: {_eid} triggered current inference; rejected {_svc}"
-                    _result = {
-                        "domain": _domain,
-                        "service": str(_svc or ""),
-                        "entity_id": str(_eid or ""),
-                        "status": _guard.status or "blocked_self_trigger",
-                        "msg": _msg,
-                        "error": _msg,
-                        "error_type": _guard.error_type or "self_trigger_protection",
-                    }
-                    if scene_desc:
-                        _result["scene_desc"] = scene_desc
-                    if trigger_summary:
-                        _result["trigger_summary"] = trigger_summary
-                    _remember_result(_claim_action_position(_a), _result)
-                    _remember_guard_pre_state(_a)
-                else:
-                    _pre_filtered.append(_a)
-            if _pre_blocked:
-                self._sys_log("INFO",
-                    f"[自触发预过滤] 移除 {len(_pre_blocked)} 个自触发设备的 turn_on 动作: "
-                    f"{', '.join(_pre_blocked)}"
-                )
-                actions = _pre_filtered
-            if not actions:
-                self._sys_log("INFO", "[自触发预过滤] 所有动作均为自触发设备，跳过执行")
-                ordered_guard_results = _ordered_results()
-                _txn_id: int = await self.hass.async_add_executor_job(
-                    self._begin_transaction_db,
-                    trigger_summary,
-                    scene_desc,
-                    confidence,
-                    len(original_actions),
-                    _json.dumps(guard_pre_states, ensure_ascii=False),
-                    _json.dumps(original_actions, ensure_ascii=False, default=str),
-                )
-                if not _txn_id:
-                    return self._action_execution_result(
-                        0,
-                        results=ordered_guard_results,
-                        pre_states=guard_pre_states,
-                        correlation_id=correlation_id,
-                    )
-                await self.hass.async_add_executor_job(
-                    self._complete_transaction_db,
-                    _txn_id,
-                    0,
-                    len(ordered_guard_results),
-                    0,
-                    _json.dumps(ordered_guard_results, ensure_ascii=False),
-                )
-                return self._action_execution_result(
-                    0,
-                    transaction_id=_txn_id,
-                    results=ordered_guard_results,
-                    pre_states=guard_pre_states,
-                    correlation_id=correlation_id,
-                )
-
-        # ── 1. 执行前：快照目标设备当前状态 ─────────────────────────────────
-        pre_states: dict[str, str] = dict(guard_pre_states)
-        normalized_actions: list[tuple[int, dict, dict]] = []
-        for raw in actions:
-            action = self._normalize_action(raw)
-            normalized_actions.append((_claim_action_position(raw), raw, action))
-            eid = action.get("entity_id", "")
-            if eid and isinstance(eid, str) and "." in eid:
-                st = self.hass.states.get(eid)
-                if st:
-                    pre_states[eid] = st.state
-
-        # ── 2. 写入事务记录（pending）────────────────────────────────────────
-        txn_id: int = await self.hass.async_add_executor_job(
-            self._begin_transaction_db,
-            trigger_summary,
-            scene_desc,
-            confidence,
-            len(original_actions),
-            _json.dumps(pre_states, ensure_ascii=False),
-            _json.dumps(original_actions, ensure_ascii=False, default=str),
-        )
-        if not txn_id:
-            self._sys_log("WARN", "[事务] 事务记录写入失败（DB锁/磁盘等），已中止动作执行以保持审计一致性")
-            for _position, _raw_action, _action in normalized_actions:
-                _entity_id = str(_action.get("entity_id") or "")
-                _params = _action.get("params")
-                _result = {
-                    "domain": str(_action.get("domain") or ""),
-                    "service": str(_action.get("service") or ""),
-                    "entity_id": _entity_id,
-                    "status": "blocked_or_error",
-                    "msg": "transaction_start_failed",
-                    "error": "transaction_start_failed",
-                    "error_type": "transaction_start_failed",
-                    "ha_command_status": "not_dispatched",
-                }
-                if isinstance(_params, dict) and _params:
-                    _result["params"] = dict(_params)
-                _reason = str(_action.get("reason") or "").strip()
-                if _reason:
-                    _result["reason"] = _reason
-                if scene_desc:
-                    _result["scene_desc"] = scene_desc
-                if trigger_summary:
-                    _result["trigger_summary"] = trigger_summary
-                _remember_result(_position, _result)
-            ordered_failure_results = _ordered_results()
-            return self._action_execution_result(
-                0,
-                results=ordered_failure_results,
-                pre_states=pre_states,
-                correlation_id=correlation_id,
-            )
-
-        # ── 3. 执行所有动作，收集结果 ────────────────────────────────────────
-        executed = 0
-        blocked_count = len(ordered_result_slots)
-        failed_count = 0
-        guard_result_count = len(ordered_result_slots)
-        results: list[dict] = _ordered_results()
-        parent_transaction_id = str(parent_transaction_id or "").strip()
-        parent_decision_trace: dict[str, Any] = {}
-        if parent_transaction_id:
-            parent_decision_trace = {
-                "available": True,
-                "transaction_id": parent_transaction_id,
-                "url": f"/decision-trace/{parent_transaction_id}",
-            }
-
-        # Product Rule P1 优化：提前获取展厅兼容在场证据、灯光层级与人数锁定规则，避免循环内重复调用
-        # Contract: legacy_presence_evidence_only; canonical presence guards use _room_occupancy_entries().
-        legacy_occ_map = self._get_room_occupancy_map()
-        people_counts_by_room = self._get_room_person_counts() if hasattr(self, "_get_room_person_counts") else {}
-        parsed_people_rules = self._build_locked_people_rules() if hasattr(self, "_build_locked_people_rules") else []
-
-        _now_min = self._ha_local_minute_of_day()
-        is_working_hour = (
-            _now_min is not None
-            and self.showroom_biz_start_min <= _now_min < self.showroom_biz_end_min
-        )
-        
-        # 预取展厅有人状态
-        is_showroom_occupied = False
-        showroom_light_tiers = {}
-        if self._mode == MODE_SHOWROOM:
-            _showroom_area = self.showroom_area_name
-            showroom_sensors = legacy_occ_map.get(_showroom_area, []) if _showroom_area else []
-            if not showroom_sensors:
-                is_showroom_occupied = True
-            else:
-                is_showroom_occupied = any(s == "on" for _, s in showroom_sensors)
-                if not is_showroom_occupied and all(s in ("unknown", "unavailable") for _, s in showroom_sensors):
-                    is_showroom_occupied = True
-
-            # 预取所有展厅灯的层级信息（v2：优先使用基线分数）
-            for eid, info in self.device_info.items():
-                if not eid.startswith("light."):
-                    continue
-                _room = info.get("room", "")
-                if _showroom_area and _room == _showroom_area and _room not in self.showroom_excluded_subareas:
-                    showroom_light_tiers[eid] = await self.hass.async_add_executor_job(self._get_showroom_light_tier_v2, eid)
-
-        # ── Product Rule P2: 动作节拍控制 (Action Pacing) ──
-        # 若动作数较多，每个动作之间加入微小延迟，缓解 Zigbee 拥塞
-        _is_bulk = len(actions) > 5
-        _pacing_delay = 0.2 if _is_bulk else 0.0
-
-        def _result_counts_from_current_results() -> tuple[int, int, int]:
-            dispatched_now = sum(1 for item in results if item.get("status") == "ok")
-            blocked_now = sum(
-                1
-                for item in results
-                if str(item.get("status") or "").startswith("blocked")
-                and item.get("status") != "blocked_or_error"
-            )
-            failed_now = sum(1 for item in results if item.get("status") == "blocked_or_error")
-            return dispatched_now, blocked_now, failed_now
-
-        async def _refresh_transaction_from_results() -> None:
-            dispatched_now, blocked_now, failed_now = _result_counts_from_current_results()
-            await self.hass.async_add_executor_job(
-                self._complete_transaction_db,
-                txn_id,
-                dispatched_now,
-                blocked_now,
-                failed_now,
-                _json.dumps(results, ensure_ascii=False),
-            )
-
-        def _refresh_transaction_from_results_sync() -> None:
-            dispatched_now, blocked_now, failed_now = _result_counts_from_current_results()
-            self._complete_transaction_db(
-                txn_id,
-                dispatched_now,
-                blocked_now,
-                failed_now,
-                _json.dumps(results, ensure_ascii=False),
-            )
-
-        def _pop_service_call_error_or_unknown(txid: int, aseq: int, eid: str) -> dict[str, Any]:
-            detail = self._pop_service_call_error(txid, aseq, eid)
-            if detail:
-                return detail
-            return {
-                "msg": "ha_service_returned_false",
-                "error": "ha_service_returned_false",
-                "error_type": "ha_service_unknown_failure",
-                "ha_command_status": "failed",
-            }
-
-        for idx, (original_position, raw_action, action) in enumerate(normalized_actions):
-            action_seq = original_position + 1
-            if idx > 0 and _pacing_delay > 0:
-                await asyncio.sleep(_pacing_delay)
-
-            domain = action.get("domain")
-            service = action.get("service")
-            entity_id = action.get("entity_id")
-            params = action.get("params", {})
-            reason = action.get("reason", "")
-            priority_override_claim = action.get("priority_override_claim")
-            target_info = self.device_info.get(entity_id, {}) if isinstance(self.device_info, dict) else {}
-            if not isinstance(target_info, dict):
-                target_info = {}
-            authoritative_target_space_id = str(
-                target_info.get("space_id")
-                or target_info.get("room_id")
-                or target_info.get("area_id")
-                or ""
-            ).strip()
-            target_space_id = str(
-                authoritative_target_space_id
-                or action.get("target_space_id")
-                or action.get("space_id")
-                or (
-                    priority_override_claim.get("space_id")
-                    if isinstance(priority_override_claim, dict)
-                    else ""
-                )
-                or target_info.get("space_id")
-                or target_info.get("room_id")
-                or target_info.get("area_id")
-                or target_info.get("room")
-                or target_info.get("area")
-                or ""
-            ).strip()
-            action_result_context = {
-                "domain": domain,
-                "service": service,
-                "entity_id": entity_id,
-            }
-            if correlation_id:
-                action_result_context["correlation_id"] = correlation_id
-            if parent_transaction_id:
-                action_result_context["execution_transaction_id"] = txn_id
-                action_result_context["parent_transaction_id"] = parent_transaction_id
-                action_result_context["decision_trace"] = dict(parent_decision_trace)
-            if isinstance(params, dict) and params:
-                action_result_context["params"] = dict(params)
-            if scene_desc:
-                action_result_context["scene_desc"] = scene_desc
-            if trigger_summary:
-                action_result_context["trigger_summary"] = trigger_summary
-            if reason:
-                action_result_context["reason"] = reason
-            raw_target = raw_action.get("target") if isinstance(raw_action, dict) else None
-            raw_entity_id = (
-                raw_action.get("entity_id")
-                or raw_action.get("entity")
-                or (raw_target.get("entity_id") if isinstance(raw_target, dict) else None)
-            )
-            try:
-                delay = max(0, int(action.get("delay_seconds", 0)))
-            except (ValueError, TypeError):
-                delay = 0
-            raw_entity_exists = True
-            if (
-                isinstance(raw_entity_id, str)
-                and "." in raw_entity_id
-                and domain not in THIN_GATE_STATELESS_DOMAINS
-            ):
-                raw_entity_exists = self.hass.states.get(raw_entity_id) is not None
-            entity_exists = True
-            if isinstance(entity_id, str) and domain not in THIN_GATE_STATELESS_DOMAINS:
-                entity_exists = self.hass.states.get(entity_id) is not None
-            thin_gate = evaluate_thin_execution_gate(
-                domain=domain,
-                service=service,
-                entity_id=entity_id,
-                raw_entity_id=raw_entity_id,
-                entity_exists=entity_exists,
-                raw_entity_exists=raw_entity_exists,
-            )
-            if not thin_gate.allowed:
-                blocked_count += 1
-                results.append(thin_gate.to_action_result())
-                if thin_gate.log_code == "missing_required_action_fields":
-                    self._sys_log("WARN", f"[动作] 字段缺失，跳过: {raw_action} → 标准化后: {action}")
-                elif thin_gate.log_code == "domain_not_allowed":
-                    self._sys_log("WARN", f"[安全] 拒绝 AI 操作不在白名单中的域: {domain}.{service}({entity_id})")
-                elif thin_gate.log_code == "service_blocked":
-                    self._sys_log("WARN", f"[安全] 拒绝 AI 执行危险服务: {domain}.{service}({entity_id})")
-                elif thin_gate.log_code == "raw_entity_not_found":
-                    self._sys_log("WARN", f"[安全] 拒绝原始动作中不存在的实体（防幻觉）: {domain}.{service}({raw_entity_id})")
-                elif thin_gate.log_code == "entity_not_found":
-                    self._sys_log("WARN", f"[安全] 拒绝操作不存在的实体（防幻觉）: {domain}.{service}({entity_id})")
-                continue
-            # ─── 设备管辖域 (Action Router) ───────────────────────────────────
-            # Run daylight guard before Action Router can rewrite a simple
-            # light.turn_on into scene.turn_on/script.turn_on. The guard must
-            # evaluate the original light entity and its room context.
-            pre_router_auto_presence_lighting = (
-                service == "turn_on"
-                and self._entity_looks_like_lighting(
-                    entity_id,
-                    domain,
-                    reason=str(reason or ""),
-                    scene_desc=str(scene_desc or ""),
-                    trigger_summary=str(trigger_summary or ""),
-                )
-                and self._looks_like_automatic_presence_lighting(
-                    reason=str(reason or ""),
-                    scene_desc=str(scene_desc or ""),
-                    trigger_summary=str(trigger_summary or ""),
-                    cmd_source=str(cmd_source or ""),
-                )
-            )
-            if pre_router_auto_presence_lighting:
-                daylight_reason = self._daylight_auto_lighting_suppressed_reason(entity_id)
-                if daylight_reason:
-                    self._sys_log(
-                        "WARN",
-                        f"[DaylightGuard] blocked daytime automatic presence lighting {domain}.turn_on({entity_id}): {daylight_reason}",
-                    )
-                    blocked_count += 1
-                    results.append({
-                        **action_result_context,
-                        "status": "blocked_daylight_auto_lighting",
-                        "msg": daylight_reason,
-                    })
-                    continue
-            if domain not in ("script", "scene"):
-                ctrl_mode = self.device_info.get(entity_id, {}).get("control_mode", "shared")
-                if ctrl_mode == "ha":
-                    results.append({
-                        "entity_id": entity_id,
-                        "service": service,
-                        "status": "skip",
-                        "msg": "ha_control_mode",
-                    })
-                    # HA 优先模式：AI 不直接操作，仅记录建议
-                    self._sys_log("INFO", f"[管辖域] {entity_id} 为 HA优先模式，AI 跳过直接操作（建议: {service}）")
-                    continue
-                elif ctrl_mode in ("ai", "shared"):
-                    # AI全权 或 共享模式：shared 时尝试关联脚本/场景。
-                    # 若是灯光精细参数（亮度/色温/颜色），优先直控设备，避免语义被场景路由吞掉。
-                    _is_simple_off_with_params = (
-                        service in ("turn_off", "close") and params
-                    )
-                    _has_precise_light_params = (
-                        domain == "light" and service == "turn_on" and any(
-                            k in params
-                            for k in (
-                                "brightness_pct", "brightness", "color_temp", "color_temp_kelvin",
-                                "rgb_color", "hs_color", "xy_color", "effect",
-                            )
-                        )
-                    )
-                    if not direct_entity_only and ctrl_mode == "shared" and domain in ("light", "switch", "cover", "fan", "climate") \
-                            and service in ("turn_on", "turn_off", "open", "close", "toggle") \
-                            and not _is_simple_off_with_params and not _has_precise_light_params \
-                            and not (domain in ("light", "switch") and service == "turn_off"):
-                        assoc_script = self._find_associated_script(entity_id, service)
-                        if assoc_script:
-                            # 安全检查：若 AI 意图是 turn_off 且关联脚本名称含"关"/"turn_off"/"guan"，
-                            # 该类脚本通常会关闭一批设备（全关脚本）；
-                            # 仅当当前设备与脚本高度对应时才路由，否则跳过 Action Router 直接控制设备，
-                            # 避免"降低亮度"等精细操作被全关脚本覆盖。
-                            _script_local = assoc_script.split(".", 1)[-1].lower()
-                            _IS_TURNOFF_SCRIPT = any(kw in _script_local for kw in
-                                                     ("turn_off", "guan_deng", "guan_bi", "all_off", "quan_guan"))
-                            if service == "turn_off" and _IS_TURNOFF_SCRIPT:
-                                # 只路由当前设备唯一对应该脚本时才放行（脚本名称本地部分包含 entity_id 本地部分）
-                                _eid_local = entity_id.split(".", 1)[-1].lower()
-                                _script_parts = set(_script_local.replace("turn_off_", "").replace("_lights", "").split("_"))
-                                _eid_parts = set(_eid_local.split("_"))
-                                _overlap_ratio = len(_script_parts & _eid_parts) / max(len(_eid_parts), 1)
-                                if _overlap_ratio < 0.8:
-                                    self._sys_log("INFO",
-                                        f"[Action Router] 跳过路由 {entity_id} → {assoc_script}"
-                                        f"（turn_off 全关脚本保护，重叠率={_overlap_ratio:.0%} < 80%，直接控制单个设备）")
-                                    assoc_script = None
-
-                            if assoc_script:
-                                assoc_domain = assoc_script.split(".")[0]
-                                _had_params = bool(params)
-                                _keep_precise = (assoc_domain == "scene" and domain == "light" and service == "turn_on")
-                                self._sys_log("INFO",
-                                    f"[Action Router] {entity_id} → 路由至 {assoc_domain}: {assoc_script}"
-                                    f"（优先使用脚本/场景"
-                                    f"{', 保留灯光精细参数' if (_had_params and _keep_precise) else (', 丢弃 AI params' if _had_params else '')}）")
-                                orig_domain = domain
-                                orig_service = service
-                                domain = assoc_domain
-                                entity_id = assoc_script
-                                service = "turn_on"
-                                params = {
-                                    k: v
-                                    for k, v in params.items()
-                                    if k in ACTION_PARAM_KEYS_LIGHT_SCENE
-                                } if (assoc_domain == "scene" and orig_domain == "light" and orig_service == "turn_on") else {}
-            # ─────────────────────────────────────────────────────────────────
-
-            runtime_hints = action.get("runtime_hints") or {}
-            service, params = self._apply_sleep_reentry_low_disturbance(
-                entity_id, domain, service, params, runtime_hints
-            )
-
-            # script / scene pass the pre-guards here, then continue through
-            # _do_call_service so service errors and action trace stay unified.
-            if domain in ("script", "scene"):
-                # 拦截全局场景：entity_id 的本地部分（domain 后）以全局关键词开头才拦截
-                # 例如 scene.quan_bu_off / scene.all_off → 拦截
-                # 例如 scene.yi_lou_zhan_ting_suo_you_deng_guang_0_scene_0 → 放行（含房间前缀）
-                _eid_local = entity_id.split(".", 1)[-1].lower()
-                _GLOBAL_KW = ("turn_all", "all_on", "all_off", "quan_bu", "suo_you", "全部", "所有")
-                if any(_eid_local == kw or _eid_local.startswith(kw + "_") for kw in _GLOBAL_KW):
-                    blocked_count += 1
-                    results.append({
-                        "entity_id": entity_id,
-                        "service": service,
-                        "status": "blocked_global_scene",
-                        "msg": "global_scene_blocked",
-                    })
-                    self._sys_log("WARN", f"[全局场景拦截] 拒绝执行 {entity_id}（以全局关键词开头），请使用区域场景替代")
-                    continue
-                # 场景/脚本人员在场守卫（家庭模式）
-                if self._mode != MODE_SHOWROOM:
-                    scene_room = self._guess_scene_room(entity_id)
-                    if scene_room:
-                        sensors = self._room_occupancy_entries(scene_room)
-                        if sensors:
-                            occupied = any(s == "on" for _, s in sensors)
-                            uncertain = any(s in ("unknown", "unavailable") for _, s in sensors)
-                            if not occupied and not uncertain:
-                                blocked_count += 1
-                                results.append({
-                                    "entity_id": entity_id,
-                                    "service": service,
-                                    "status": "blocked_scene_vacant",
-                                    "msg": f"scene_room_vacant:{scene_room}",
-                                })
-                                sensor_str = ", ".join(f"{eid}={s}" for eid, s in sensors[:2])
-                                self._sys_log("WARN", f"[场景守卫] 拒绝 {domain}.turn_on({entity_id})：区域「{scene_room}」无人（{sensor_str}）")
-                                continue
-                # 场景/脚本重复执行冷却
-                now_ts = time.time()
-                last_exec = self._scene_last_exec.get(entity_id, 0)
-                if now_ts - last_exec < self._SCENE_COOLDOWN:
-                    results.append({
-                        "entity_id": entity_id,
-                        "service": service,
-                        "status": "skip",
-                        "msg": "scene_cooldown",
-                    })
-                    remain = int(self._SCENE_COOLDOWN - (now_ts - last_exec))
-                    self._sys_log("INFO", f"[场景冷却] {entity_id} 距上次执行 {int(now_ts - last_exec)}s < {self._SCENE_COOLDOWN}s，跳过（{remain}s 后可再执行）")
-                    continue
-                self._sys_log("INFO", f"[动作] 场景/脚本通过前置守卫，转交统一保护链: {domain}.{service}({entity_id})")
-
-            self._sys_log("INFO", f"[动作] 准备执行: {domain}.{service}({entity_id}) params={params} reason={reason}")
-            is_automatic_presence_lighting = (
-                service == "turn_on"
-                and self._entity_looks_like_lighting(
-                    entity_id,
-                    domain,
-                    reason=str(reason or ""),
-                    scene_desc=str(scene_desc or ""),
-                    trigger_summary=str(trigger_summary or ""),
-                )
-                and self._looks_like_automatic_presence_lighting(
-                    reason=str(reason or ""),
-                    scene_desc=str(scene_desc or ""),
-                    trigger_summary=str(trigger_summary or ""),
-                    cmd_source=str(cmd_source or ""),
-                )
-            )
-            is_presence_departure_turnoff = (
-                service == "turn_off"
-                and self._looks_like_presence_departure_turnoff(
-                    reason=str(reason or ""),
-                    scene_desc=str(scene_desc or ""),
-                    trigger_summary=str(trigger_summary or ""),
-                    cmd_source=str(cmd_source or ""),
-                )
-            )
-            state = self.hass.states.get(entity_id)
-            if state:
-                if service == "turn_off" and state.state == "off" and not is_presence_departure_turnoff:
-                    self._sys_log("INFO", f"[动作] 跳过(已是off): {entity_id}")
-                    results.append({
-                        **action_result_context,
-                        "status": "skip",
-                        "msg": "already off",
-                        "ha_command_status": "not_dispatched",
-                    })
-                    continue
-                if service == "turn_on" and state.state == "on" and (not params or is_automatic_presence_lighting):
-                    self._sys_log("INFO", f"[动作] 跳过(已是on): {entity_id}")
-                    results.append({**action_result_context, "status": "skip", "msg": "already on"})
-                    continue
-            # 人员在场守卫：light/switch turn_on 前确认区域有人（仅家庭模式）
-            if domain in ("light", "switch") and self._mode != MODE_SHOWROOM:
-                if service == "turn_on":
-                    refresh_presence = getattr(
-                        self,
-                        "_async_refresh_presence_snapshot_cache",
-                        None,
-                    )
-                    if callable(refresh_presence):
-                        try:
-                            presence_refreshed = bool(await refresh_presence())
-                        except Exception:
-                            presence_refreshed = False
-                        if not presence_refreshed:
-                            blocked_count += 1
-                            results.append(
-                                {
-                                    **action_result_context,
-                                    "status": "blocked_person",
-                                    "msg": "presence_refresh_failed",
-                                    "ha_command_status": "not_dispatched",
-                                    "presence_source": "addon_presence_engine",
-                                    "presence_reason": "presence_refresh_failed",
-                                    "presence_evidence_ids": [],
-                                    "presence_states": [],
-                                }
-                            )
-                            continue
-                guard_blocked, guard_reason = self._occupancy_guard_check(entity_id, service)
-                if guard_blocked:
-                    self._sys_log("WARN", f"[人员守卫] 拒绝 {domain}.turn_on({entity_id})：{guard_reason}（无人区域禁止开灯）")
-                    blocked_count += 1
-                    results.append({"entity_id": entity_id, "service": service, "status": "blocked", "msg": guard_reason})
-                    continue
-
-            if (
-                service == "turn_on"
-                and is_automatic_presence_lighting
-            ):
-                daylight_reason = self._daylight_auto_lighting_suppressed_reason(entity_id)
-                if daylight_reason:
-                    self._sys_log(
-                        "WARN",
-                        f"[日照守卫] 拒绝白天自动开灯 {domain}.turn_on({entity_id})：{daylight_reason}",
-                    )
-                    blocked_count += 1
-                    results.append({
-                        **action_result_context,
-                        "status": "blocked_daylight_auto_lighting",
-                        "msg": daylight_reason,
-                    })
-                    continue
-
-            # 展厅模式人数阈值锁定规则（统一执行层）：
-            # 无论动作来自反射弧/快脑/慢脑，只要命中“>N人才能开X”锁定规则，
-            # 且当前人数不满足阈值，就阻止自动 turn_on。
-            if (
-                domain == "light"
-                and service == "turn_on"
-                and not _is_user_explicit
-            ):
-                _room = ((self.device_info.get(entity_id) or {}).get("room") or "").strip()
-                if not _room and hasattr(self, "_get_entity_area"):
-                    _room = (self._get_entity_area(entity_id) or "").strip()
-                if _room:
-                    _person_count = int((people_counts_by_room or {}).get(_room, 0) or 0)
-                    _blocked_by_rule, _rule_text = self._is_light_blocked_by_people_rule(
-                        entity_id=entity_id,
-                        room=_room,
-                        person_count=_person_count,
-                        parsed_rules=parsed_people_rules,
-                    )
-                    if _blocked_by_rule:
-                        self._sys_log(
-                            "WARN",
-                            f"[P1人数阈值] 阻止 turn_on({entity_id})：{_room} 当前人数={_person_count}，未满足锁定规则({_rule_text}人)",
-                        )
-                        blocked_count += 1
-                        results.append({
-                            "entity_id": entity_id,
-                            "service": service,
-                            "status": "blocked_p1_people",
-                            "msg": f"{_room}人数{_person_count}未满足锁定阈值",
-                        })
-                        continue
-            # 展厅代码层硬保护：展厅模式下上班时间实施分层保护。
-            # 这是确定性执行守卫，不是交给 LLM 遵守的 Product Rule P1 运行时规则。
-            # 有人时全保，无人时按学习到的层级（Core/Display/Auxiliary）进行差异化保护。
-            if self._mode == MODE_SHOWROOM and domain == "light":
-                _info = self.device_info.get(entity_id, {})
-                _room = (_info.get("room") or "").strip()
-                _showroom_area = self.showroom_area_name
-                # 完全基于 HA Area Registry 中的 room 字段判断，不依赖实体 ID 拼音
-                _is_showroom_light = (
-                    bool(_showroom_area)
-                    and _room == _showroom_area
-                    and _room not in self.showroom_excluded_subareas
-                )
-
-                if _is_showroom_light:
-                    # B. 获取设备层级（优先从基线分数，兜底旧 tier 表）
-                    tier = showroom_light_tiers.get(entity_id) or await self.hass.async_add_executor_job(self._get_showroom_light_tier_v2, entity_id)
-
-                    # C. 分层保护逻辑
-                    from .const import (
-                        SHOWROOM_DISPLAY_DIM_PCT, SHOWROOM_OCCUPIED_PCT, SHOWROOM_CORE_MIN_PCT,
-                    )
-                    if is_showroom_occupied:
-                        # 【有人状态】Core/Display 层：禁止关闭；AI turn_off → 转换为有人亮度
-                        if service == "turn_off":
-                            if tier in ("core", "display"):
-                                self._sys_log("INFO",
-                                    f"[展厅P1] {entity_id}({tier}) 展厅有人，turn_off 转为 turn_on {SHOWROOM_OCCUPIED_PCT}%")
-                                service = "turn_on"
-                                params = {"brightness_pct": SHOWROOM_OCCUPIED_PCT}
-                            # Auxiliary 层有人时也不应随意关灯，但允许 AI 决定
-                        elif service == "turn_on":
-                            bri = params.get("brightness_pct")
-                            if tier == "core" and bri is not None and bri < SHOWROOM_CORE_MIN_PCT:
-                                # Core 层：有人时不得低于最低亮度
-                                self._sys_log("INFO",
-                                    f"[展厅P1] {entity_id}(core) 亮度下限保护：{bri}% → {SHOWROOM_CORE_MIN_PCT}%")
-                                params["brightness_pct"] = SHOWROOM_CORE_MIN_PCT
-                            elif bri is None:
-                                # 无亮度参数时注入有人默认亮度
-                                params["brightness_pct"] = SHOWROOM_OCCUPIED_PCT
-                    elif is_working_hour:
-                        # 【营业时间 + 无人状态】根据层级差异化节能
-                        if tier == "core":
-                            # 🟢 Core（常用灯）：即便无人也不关闭，维持最低展示亮度
-                            if service == "turn_off":
-                                self._sys_log("WARN",
-                                    f"[展厅P1] 阻止 turn_off({entity_id})：Core 层在营业时间内禁止关闭")
-                                blocked_count += 1
-                                results.append({"entity_id": entity_id, "service": service, "status": "blocked_p1", "msg": "P1 core"})
-                                continue
-                            if service == "turn_on" and params.get("brightness_pct") is not None and params["brightness_pct"] < SHOWROOM_CORE_MIN_PCT:
-                                self._sys_log("INFO",
-                                    f"[展厅P1] {entity_id}(core) 无人亮度下限：{params['brightness_pct']}% → {SHOWROOM_CORE_MIN_PCT}%")
-                                params["brightness_pct"] = SHOWROOM_CORE_MIN_PCT
-
-                        elif tier == "display":
-                            # 🟡 Display（展示灯）：无人时调暗至 DIM_PCT，不允许彻底关闭
-                            if service == "turn_off":
-                                self._sys_log("INFO",
-                                    f"[展厅分层] {entity_id}(display) 无人节能：turn_off → turn_on {SHOWROOM_DISPLAY_DIM_PCT}%")
-                                service = "turn_on"
-                                params = {"brightness_pct": SHOWROOM_DISPLAY_DIM_PCT}
-                            elif service == "turn_on" and params.get("brightness_pct") is not None and params["brightness_pct"] < SHOWROOM_DISPLAY_DIM_PCT:
-                                self._sys_log("INFO",
-                                    f"[展厅分层] {entity_id}(display) 无人节能：亮度限制至 {SHOWROOM_DISPLAY_DIM_PCT}%")
-                                params["brightness_pct"] = SHOWROOM_DISPLAY_DIM_PCT
-
-                        # 🔴 Auxiliary（辅助灯）：无人时允许 AI 自由执行 turn_off，不予拦截
-                    else:
-                        # 【非营业时间 + 无人状态】完全释放 Product Rule P1 保护，允许 AI 关闭所有灯光
-                        self._sys_log("INFO", f"[展厅下班] 非营业时间且无人，放行对 {entity_id} 的操作")
-
-            # 关灯安全守卫：light/switch turn_off 前双重确认区域无人
-            # 因 Frigate 存在漏检，优先以物理人体传感器为准；任意一路检测到有人则阻止关灯
-            if (
-                domain in ("light", "switch")
-                and self._mode != MODE_SHOWROOM
-                and not _is_user_explicit
-            ):
-                if service == "turn_off":
-                    refresh_presence = getattr(
-                        self,
-                        "_async_refresh_presence_snapshot_cache",
-                        None,
-                    )
-                    if callable(refresh_presence):
-                        try:
-                            presence_refreshed = bool(await refresh_presence())
-                        except Exception:
-                            presence_refreshed = False
-                        if not presence_refreshed:
-                            blocked_count += 1
-                            results.append(
-                                {
-                                    **action_result_context,
-                                    "status": "blocked_person",
-                                    "msg": "presence_refresh_failed",
-                                    "ha_command_status": "not_dispatched",
-                                    "presence_source": "addon_presence_engine",
-                                    "presence_reason": "presence_refresh_failed",
-                                    "presence_evidence_ids": [],
-                                    "presence_states": [],
-                                }
-                            )
-                            continue
-                off_blocked, off_reason = self._turnoff_presence_guard(entity_id, service)
-                presence_detail = getattr(self, "_last_turnoff_presence_guard_detail", {})
-                if not isinstance(presence_detail, dict):
-                    presence_detail = {}
-                if off_blocked:
-                    self._sys_log("WARN",
-                        f"[关灯守卫] 阻止 {domain}.turn_off({entity_id})：{off_reason}")
-                    blocked_count += 1
-                    results.append({"entity_id": entity_id, "service": service,
-                                    "status": "blocked_person", "msg": off_reason,
-                                    **presence_detail})
-                    continue
-                if presence_detail:
-                    action_result_context.update(presence_detail)
-            if entity_id in self._active_timers:
-                try:
-                    self._active_timers[entity_id]()
-                except Exception as exc:
-                    _LOGGER.debug("[Actions] 取消定时任务失败 %s: %s", entity_id, exc)
-                del self._active_timers[entity_id]
-            if delay > 0:
-                # 在闭包中捕获 scene_desc/trigger_summary，保证延迟执行时仍用正确的上下文
-                # 避免并发推理时 self._current_scene_desc 被其他房间的推理覆盖
-                result_entry = {
-                    "entity_id": entity_id,
-                    "service": service,
-                    "status": "scheduled",
-                    "delay": delay,
-                }
-                result_entry.update(action_result_context)
-                results.append(result_entry)
-
-                async def _run_delayed(
-                    d: str, s: str, eid: str, p: dict, r: str,
-                    sc: str, trig: str, txid: int, aseq: int, parent_txid: str,
-                    corr_id: str, target_sid: str, override_claim: dict, result: dict,
-                ) -> None:
-                    try:
-                        state = self.hass.states.get(eid)
-                        if (
-                            state
-                            and s == "turn_off"
-                            and getattr(state, "state", None) == "off"
-                            and not self._looks_like_presence_departure_turnoff(
-                                reason=str(r or ""),
-                                scene_desc=str(sc or ""),
-                                trigger_summary=str(trig or ""),
-                            )
-                        ):
-                            result.update({
-                                "status": "skip",
-                                "msg": "already off",
-                                "ha_command_status": "not_dispatched",
-                            })
-                            await _refresh_transaction_from_results()
-                            return
-                        if (
-                            d in ("light", "switch")
-                            and s == "turn_off"
-                            and self._mode != MODE_SHOWROOM
-                        ):
-                            refresh_presence = getattr(
-                                self,
-                                "_async_refresh_presence_snapshot_cache",
-                                None,
-                            )
-                            if callable(refresh_presence):
-                                try:
-                                    presence_refreshed = bool(
-                                        await refresh_presence()
-                                    )
-                                except Exception:
-                                    presence_refreshed = False
-                                if not presence_refreshed:
-                                    result.update(
-                                        {
-                                            "status": "blocked_person",
-                                            "msg": "presence_refresh_failed",
-                                            "ha_command_status": "not_dispatched",
-                                            "presence_source": "addon_presence_engine",
-                                            "presence_reason": "presence_refresh_failed",
-                                            "presence_evidence_ids": [],
-                                            "presence_states": [],
-                                        }
-                                    )
-                                    await _refresh_transaction_from_results()
-                                    return
-                            off_blocked, off_reason = self._turnoff_presence_guard(
-                                eid,
-                                s,
-                            )
-                            presence_detail = getattr(
-                                self,
-                                "_last_turnoff_presence_guard_detail",
-                                {},
-                            )
-                            if isinstance(presence_detail, dict):
-                                result.update(presence_detail)
-                            if off_blocked:
-                                result.update(
-                                    {
-                                        "status": "blocked_person",
-                                        "msg": off_reason,
-                                        "ha_command_status": "not_dispatched",
-                                    }
-                                )
-                                await _refresh_transaction_from_results()
-                                return
-                        ok = await self._do_call_service(
-                            d,
-                            s,
-                            eid,
-                            p,
-                            r,
-                            sc,
-                            trig,
-                            txid,
-                            aseq,
-                            parent_txid,
-                            world_snapshot_id,
-                            corr_id,
-                            active_space_id=active_space_id,
-                            decision_time=decision_time,
-                            target_space_id=target_sid,
-                            cmd_source=cmd_source,
-                            require_world_snapshot_guard=require_world_snapshot_guard,
-                            priority_override_claim=override_claim,
-                        )
-                    except Exception as exc:
-                        _LOGGER.debug("[Actions] 延迟动作执行失败 %s.%s(%s): %s", d, s, eid, exc)
-                        ok = False
-                    if ok:
-                        result["status"] = "ok"
-                    else:
-                        service_error = _pop_service_call_error_or_unknown(txid, aseq, eid)
-                        result.update(service_error)
-                        result["status"] = (
-                            "skip"
-                            if service_error.get("ha_command_status") == "skipped"
-                            else "blocked_or_error"
-                        )
-                    try:
-                        await _refresh_transaction_from_results()
-                    except Exception as exc:
-                        _LOGGER.warning(
-                            "[Actions] delayed action transaction refresh failed %s.%s(%s): %s",
-                            d,
-                            s,
-                            eid,
-                            exc,
-                            exc_info=True,
-                        )
-
-                @callback
-                def _delayed(
-                    _: datetime,
-                    d: str = domain,
-                    s: str = service,
-                    eid: str = entity_id,
-                    p: dict = params,
-                    r: str = reason,
-                    sc: str = scene_desc,
-                    trig: str = trigger_summary,
-                    txid: int = txn_id,
-                    aseq: int = action_seq,
-                    parent_txid: str = parent_transaction_id,
-                    corr_id: str = correlation_id,
-                    target_sid: str = target_space_id,
-                    override_claim: dict = priority_override_claim,
-                    result: dict = result_entry,
-                ) -> None:
-                    coro = _run_delayed(
-                        d, s, eid, p, r, sc, trig, txid, aseq, parent_txid,
-                        corr_id, target_sid, override_claim, result,
-                    )
-                    try:
-                        self.hass.async_create_task(coro)
-                    except Exception as exc:
-                        close = getattr(coro, "close", None)
-                        if callable(close):
-                            close()
-                        _LOGGER.warning(
-                            "[Actions] delayed action task create failed %s.%s(%s): %s",
-                            d,
-                            s,
-                            eid,
-                            exc,
-                            exc_info=True,
-                        )
-                        result.update(
-                            {
-                                "status": "blocked_or_error",
-                                "msg": f"task_create_failed: {exc}",
-                                "error": "task_create_failed",
-                                "error_type": "task_create_failed",
-                                "ha_command_status": "not_dispatched",
-                                "exception_type": type(exc).__name__,
-                            }
-                        )
-                        try:
-                            _refresh_transaction_from_results_sync()
-                        except Exception as refresh_exc:
-                            _LOGGER.warning(
-                                "[Actions] delayed action task create failure transaction refresh failed %s.%s(%s): %s",
-                                d,
-                                s,
-                                eid,
-                                refresh_exc,
-                                exc_info=True,
-                            )
-
-                handle = async_call_later(
-                    self.hass,
-                    delay,
-                    _delayed,
-                )
-                self._active_timers[entity_id] = handle
-            else:
-                ok = await self._do_call_service(
-                    domain, service, entity_id, params, reason, scene_desc, trigger_summary, txn_id, action_seq,
-                    parent_transaction_id, world_snapshot_id, correlation_id,
-                    active_space_id=active_space_id,
-                    decision_time=decision_time,
-                    target_space_id=target_space_id,
-                    cmd_source=cmd_source,
-                    require_world_snapshot_guard=require_world_snapshot_guard,
-                    priority_override_claim=priority_override_claim,
-                )
-                if ok:
-                    executed += 1
-                    results.append({**action_result_context, "status": "ok"})
-                else:
-                    service_error = _pop_service_call_error_or_unknown(txn_id, action_seq, entity_id)
-                    if service_error.get("ha_command_status") == "skipped":
-                        results.append({**action_result_context, **service_error, "status": "skip"})
-                    else:
-                        failed_count += 1
-                        results.append({**action_result_context, **service_error, "status": "blocked_or_error"})
-
-        for (original_position, _raw_action, _action), result in zip(
-            normalized_actions,
-            results[guard_result_count:],
-        ):
-            _remember_result(original_position, result)
-        results[:] = _ordered_results()
-        if correlation_id:
-            for item in results:
-                item["correlation_id"] = correlation_id
-
-        # ── 4. 提交事务结果 ────────────────────────────────────────────────────
-        if txn_id:
-            await self.hass.async_add_executor_job(
-                self._complete_transaction_db,
-                txn_id,
-                executed,
-                blocked_count,
-                failed_count,
-                _json.dumps(results, ensure_ascii=False),
-            )
-        return self._action_execution_result(
-            executed,
-            transaction_id=txn_id,
-            results=results,
-            pre_states=pre_states,
-            correlation_id=correlation_id,
-        )
-
-    # ── 服务调用 + 保护机制 ───────────────────────────────────────────────────
-
     async def _execute_enveloped_service(
         self,
         domain: str,
@@ -2656,8 +1412,21 @@ class ActionsMixin:
         target_space_id: str = "",
         cmd_source: str = "",
         require_world_snapshot_guard: bool = False,
+        decision_contract_lineage: dict[str, Any] | None = None,
+        user_intent_authority: Any | None = None,
+        commands_override: list[dict[str, Any]] | None = None,
+        target_space_ids_override: list[str] | None = None,
+        return_failed_result: bool = False,
+        correlation_id_override: str = "",
     ) -> dict[str, Any]:
-        """Execute one HA command envelope and preserve structured failure detail."""
+        """Execute one canonical command envelope and preserve failure detail.
+
+        ``commands_override`` is reserved for a decision-linked batch whose
+        complete ordered command set has already passed every HA-host guard.
+        The add-on then authorizes and dispatches that exact set under one
+        durable decision grant.  Ordinary callers continue to use the
+        single-command projection below.
+        """
         from .ha_adapter import async_execute_command_envelope
 
         payload = call_params if isinstance(call_params, dict) else {}
@@ -2668,12 +1437,64 @@ class ActionsMixin:
             if isinstance(active_correlations, dict)
             else ""
         )
-        normalized_correlation_id = str(active_correlation_id or "").strip()
+        normalized_correlation_id = str(
+            correlation_id_override or active_correlation_id or ""
+        ).strip()
         request_id = (
             f"{normalized_correlation_id}:action:{transaction_id}:{action_seq}:{time.time_ns()}"
             if normalized_correlation_id
             else f"legacy-action:{transaction_id}:{action_seq}:{entity_id}"
         )
+        if commands_override is None:
+            commands = [{
+                "entity_id": entity_id,
+                "domain": domain,
+                "service": service,
+                "data": payload,
+            }]
+        else:
+            if type(commands_override) is not list or not commands_override or any(
+                type(command) is not dict for command in commands_override
+            ):
+                raise RuntimeError("decision_linked_batch_commands_invalid")
+            commands = []
+            for command in commands_override:
+                command_data = command.get("data")
+                if type(command_data) is not dict:
+                    raise RuntimeError("decision_linked_batch_command_data_invalid")
+                normalized_command = {
+                    "entity_id": str(command.get("entity_id") or "").strip(),
+                    "domain": str(command.get("domain") or "").strip(),
+                    "service": str(command.get("service") or "").strip(),
+                    "data": dict(command_data),
+                }
+                if (
+                    not normalized_command["entity_id"]
+                    or not normalized_command["domain"]
+                    or not normalized_command["service"]
+                ):
+                    raise RuntimeError("decision_linked_batch_command_invalid")
+                commands.append(normalized_command)
+        if target_space_ids_override is None:
+            target_space_ids = (
+                [str(target_space_id or "").strip()]
+                if str(target_space_id or "").strip()
+                else []
+            )
+        else:
+            if type(target_space_ids_override) is not list:
+                raise RuntimeError("decision_linked_batch_target_spaces_invalid")
+            target_space_ids = []
+            for raw_space_id in target_space_ids_override:
+                if type(raw_space_id) is not str or not raw_space_id.strip():
+                    raise RuntimeError("decision_linked_batch_target_space_invalid")
+                normalized_space_id = raw_space_id.strip()
+                if normalized_space_id not in target_space_ids:
+                    target_space_ids.append(normalized_space_id)
+        authorization_ref = self._active_ai_authorization_ref(
+            decision_contract_lineage,
+            commands,
+        ) if require_world_snapshot_guard else None
         envelope = {
             "request_id": request_id,
             "source": (
@@ -2684,12 +1505,7 @@ class ActionsMixin:
                 else "smartagent_ha_host"
             ),
             "scope": "home_control",
-            "commands": [{
-                "entity_id": entity_id,
-                "domain": domain,
-                "service": service,
-                "data": payload,
-            }],
+            "commands": commands,
             "execution_policy": {"stop_on_first_error": True},
             "safety": {
                 "risk_level": "safe",
@@ -2716,9 +1532,7 @@ class ActionsMixin:
                             "active_space_id": str(active_space_id or "").strip(),
                             "cmd_source": str(cmd_source or "").strip(),
                             "decision_time": str(decision_time or "").strip(),
-                            "target_space_ids": [str(target_space_id or "").strip()]
-                            if str(target_space_id or "").strip()
-                            else [],
+                            "target_space_ids": target_space_ids,
                         }
                         if require_world_snapshot_guard
                         else {}
@@ -2726,6 +1540,8 @@ class ActionsMixin:
                 },
             },
         }
+        if authorization_ref is not None:
+            envelope["authorization_ref"] = authorization_ref
         result: dict[str, Any] | None
         if require_world_snapshot_guard:
             is_enabled = getattr(self, "_is_enabled", None)
@@ -2762,10 +1578,17 @@ class ActionsMixin:
                     "error_type": "policy_rejected",
                     "status": "blocked",
                 }
-            elif not str(target_space_id or "").strip():
+            elif not target_space_ids:
                 result = {
                     "ok": False,
                     "error": "active_ai_action_space_missing",
+                    "error_type": "policy_rejected",
+                    "status": "blocked",
+                }
+            elif authorization_ref is None:
+                result = {
+                    "ok": False,
+                    "error": "active_ai_authorization_ref_missing",
                     "error_type": "policy_rejected",
                     "status": "blocked",
                 }
@@ -2780,11 +1603,27 @@ class ActionsMixin:
                         "status": "failed",
                     }
                 else:
-                    result = (
-                        await execute(envelope, user_explicit=True)
-                        if is_user_explicit
-                        else await execute(envelope)
-                    )
+                    try:
+                        delegation = (
+                            self._issue_user_intent_delegation(
+                                envelope,
+                                user_intent_authority,
+                            )
+                            if is_user_explicit
+                            else None
+                        )
+                    except RuntimeError as exc:
+                        result = {
+                            "ok": False,
+                            "error": str(exc),
+                            "error_type": "policy_rejected",
+                            "status": "blocked",
+                        }
+                    else:
+                        execute_kwargs: dict[str, Any] = {}
+                        if delegation is not None:
+                            execute_kwargs["user_intent_delegation"] = delegation
+                        result = await execute(envelope, **execute_kwargs)
                     if not isinstance(result, dict):
                         result = {
                             "ok": False,
@@ -2821,7 +1660,120 @@ class ActionsMixin:
             error_type=error_type,
             status=status,
         )
+        if return_failed_result and isinstance(result, dict):
+            return result
         raise RuntimeError(msg)
+
+    async def _record_prepared_service_success(
+        self,
+        *,
+        domain: str,
+        service: str,
+        entity_id: str,
+        params: dict[str, Any],
+        reason: str,
+        scene_desc: str,
+        trigger_text: str,
+        transaction_id: int,
+        action_seq: int,
+        parent_transaction_id: str,
+        world_snapshot_id: str,
+        correlation_id: str,
+        now_ts: float,
+        ai_source: str,
+        ai_new_state: str,
+    ) -> None:
+        """Apply post-dispatch bookkeeping for one verified batch receipt."""
+        self._last_inference[entity_id] = now_ts
+        if domain in ("scene", "script") and service == "turn_on":
+            self._scene_last_exec[entity_id] = time.time()
+        self._last_ai_actions[entity_id] = {
+            "state": ai_new_state,
+            "time": now_ts,
+            "service": f"{domain}.{service}",
+            "scene": scene_desc,
+            "trigger": trigger_text,
+            "origin": "smartagent",
+            "actor": "smartagent:execution",
+            "decision_id": str(parent_transaction_id or "unknown"),
+            "transaction_id": str(parent_transaction_id or "unknown"),
+            "execution_transaction_id": str(transaction_id or "unknown"),
+            "world_snapshot_id": str(world_snapshot_id or "unknown"),
+            "correlation_id": correlation_id,
+        }
+        with self._user_overrides_lock:
+            self._user_overrides.pop(entity_id, None)
+        self._record_device_operation(entity_id, ai_source, ai_new_state, params)
+        normalized_parent_transaction_id = str(parent_transaction_id or "").strip()
+        event_detail = f"{entity_id} -> {service}"
+        event_metadata: dict[str, Any] = {
+            "detail": event_detail,
+            "domain": domain,
+            "service": service,
+            "entity_id": entity_id,
+        }
+        if params:
+            event_metadata["params"] = dict(params)
+        if reason:
+            event_metadata["reason"] = reason
+        if scene_desc:
+            event_metadata["scene_desc"] = scene_desc
+        if trigger_text:
+            event_metadata["trigger_summary"] = trigger_text
+        if transaction_id:
+            event_metadata["execution_transaction_id"] = int(transaction_id)
+        if normalized_parent_transaction_id:
+            event_metadata["parent_transaction_id"] = normalized_parent_transaction_id
+            event_metadata["decision_trace"] = {
+                "available": True,
+                "transaction_id": normalized_parent_transaction_id,
+                "url": f"/decision-trace/{normalized_parent_transaction_id}",
+            }
+        if correlation_id:
+            event_metadata["correlation_id"] = correlation_id
+        self.hass.async_add_executor_job(
+            self._record_event,
+            "AI_Action",
+            event_detail,
+            entity_id,
+            "on" if "turn_on" in service else "off",
+            "ai",
+            None,
+            transaction_id,
+            action_seq,
+            event_metadata,
+        )
+        if service == "turn_off" and trigger_text:
+            trigger_lower = trigger_text.lower()
+            if any(
+                keyword in trigger_lower
+                for keyword in ("离开", "departure", "无人", "empty", "人员离开")
+            ):
+                room = (self.device_info.get(entity_id) or {}).get("room", "")
+                if room and hasattr(self, "_last_departure_turnoff_time"):
+                    self._last_departure_turnoff_time[room] = time.time()
+        await self._async_update_status(
+            "运行中",
+            f"{self.get_device_name(entity_id)} -> {service} ({reason[:30]})",
+        )
+        expected = "on" if ("turn_on" in service or "open" in service) else "off"
+        if len(self._pending_verifications) < self._VERIFY_QUEUE_MAX:
+            self._pending_verifications.append({
+                "entity_id": entity_id,
+                "domain": domain,
+                "service": service,
+                "expected_state": expected,
+                "reason": reason,
+                "fire_time": time.time(),
+                "retry": 0,
+                "transaction_id": transaction_id,
+                "action_seq": action_seq,
+                "parent_transaction_id": str(parent_transaction_id or "unknown"),
+                "world_snapshot_id": str(world_snapshot_id or "unknown"),
+                "correlation_id": correlation_id,
+            })
+        if domain == "climate" and "turn_on" in service:
+            await self._register_env_feedback(entity_id)
 
     async def _do_call_service(
         self,
@@ -2844,7 +1796,10 @@ class ActionsMixin:
         cmd_source: str = "",
         require_world_snapshot_guard: bool = False,
         priority_override_claim: dict[str, Any] | None = None,
-    ) -> bool:
+        decision_contract_lineage: dict[str, Any] | None = None,
+        user_intent_authority: Any | None = None,
+        prepare_only: bool = False,
+    ) -> bool | dict[str, Any]:
         """Call HA service and record AI action for override detection. Returns True if executed.
 
         Args:
@@ -2854,6 +1809,15 @@ class ActionsMixin:
         """
         correlation_id = str(correlation_id or "").strip()
         is_user_explicit = str(cmd_source or "").strip().upper() == "USER_EXPLICIT"
+        # Host-side AI guards may be bypassed only for the already-authenticated
+        # canonical user path.  A raw command-source string is not authority.
+        authenticated_user_explicit = False
+        if is_user_explicit and require_world_snapshot_guard:
+            from .user_intent_delegation import AuthenticatedUserIntentAuthority
+
+            authenticated_user_explicit = (
+                type(user_intent_authority) is AuthenticatedUserIntentAuthority
+            )
         state = self.hass.states.get(entity_id)
         is_presence_departure_turnoff = (
             service == "turn_off"
@@ -2958,7 +1922,7 @@ class ActionsMixin:
             service=service,
             trigger_entities=self._batch_trigger_controllable,
         )
-        if not self_trigger_guard.allowed:
+        if not self_trigger_guard.allowed and not authenticated_user_explicit:
             self._sys_log("WARN", f"[自触发保护] {entity_id} 触发了本次推理，拒绝 AI 操作该设备 → {service}（防止死循环）")
             return _fail_before_service(
                 self_trigger_guard.msg,
@@ -2968,7 +1932,7 @@ class ActionsMixin:
         now_ts = time.time()
         # ── 自动化冲突硬拦截：若设备被 HA 自动化管辖且自动化近期执行过，拒绝 AI 操作 ──
         auto_names = self._automation_managed_devices.get(entity_id)
-        if auto_names:
+        if auto_names and not authenticated_user_explicit:
             automation_records: list[dict[str, Any]] = []
             for a_state in self.hass.states.async_all("automation"):
                 a_name = a_state.attributes.get("friendly_name", "")
@@ -3053,7 +2017,7 @@ class ActionsMixin:
                 ),
                 max_age_seconds=30,
             )
-            if is_user_explicit:
+            if authenticated_user_explicit:
                 self._sys_log(
                     "INFO",
                     f"[priority] explicit user command bypassed AI anti-flap guard: {entity_id}.{service}",
@@ -3083,7 +2047,7 @@ class ActionsMixin:
                 off_states=self._OFF_STATES,
                 window_seconds=self._USER_OVERRIDE_PROTECTION,
             )
-            if not manual_guard.allowed:
+            if not manual_guard.allowed and not authenticated_user_explicit:
                 self._sys_log("WARN", f"[manual override protection] {manual_guard.msg}")
                 return _fail_before_service(
                     manual_guard.msg,
@@ -3095,7 +2059,6 @@ class ActionsMixin:
                     current_override = self._user_overrides.get(entity_id)
                     if current_override is override or current_override == override:
                         self._user_overrides.pop(entity_id, None)
-        self._last_inference[entity_id] = now_ts
         ai_new_state = "on" if "turn_on" in service else "off"
         safe_params = {k: v for k, v in params.items() if k != "entity_id"}
         # HA 2024+ 已废弃 color_temp(mireds)，统一改为 color_temp_kelvin(Kelvin)
@@ -3120,6 +2083,19 @@ class ActionsMixin:
                           f" → color_temp_kelvin({color_temp_guard.color_temp_kelvin}K) 自动转换")
         self._clear_service_call_error(transaction_id, action_seq, entity_id)
 
+        if prepare_only:
+            return {
+                "domain": str(domain or "").strip(),
+                "service": str(service or "").strip(),
+                "entity_id": str(entity_id or "").strip(),
+                "data": dict(safe_params),
+                "now_ts": float(now_ts),
+                "ai_source": str(ai_source or ""),
+                "ai_new_state": str(ai_new_state or ""),
+            }
+
+        self._last_inference[entity_id] = now_ts
+
         def _is_param_rejection(exc: Exception | str) -> bool:
             text = str(exc).lower()
             return "extra keys" in text or "not allowed" in text or "unexpected" in text
@@ -3142,6 +2118,8 @@ class ActionsMixin:
                         "target_space_id": target_space_id,
                         "cmd_source": cmd_source,
                         "require_world_snapshot_guard": True,
+                        "decision_contract_lineage": decision_contract_lineage,
+                        "user_intent_authority": user_intent_authority,
                     }
                     if require_world_snapshot_guard
                     else {}
@@ -3166,6 +2144,18 @@ class ActionsMixin:
         try:
             envelope_result = await _call_enveloped_service(safe_params)
         except Exception as call_err:
+            # Canonical active-AI commands are already admitted against an
+            # exact command envelope.  Retrying with stripped parameters
+            # would change the approved physical effect after admission.
+            # Preserve the first failure; only the legacy host path below may
+            # retain its historical compatibility fallback.
+            if require_world_snapshot_guard:
+                if _is_service_missing_error(call_err):
+                    self._sys_log("ERROR", f"[动作] {domain}.{service}({entity_id}) 实体/服务不存在，跳过。"
+                                  f"请检查设备是否在线或名称是否正确。原始错误: {call_err}")
+                    return _fail_after_service(str(call_err), error_type="service_missing")
+                self._sys_log("ERROR", f"[动作] {entity_id} canonical 服务调用失败: {call_err}")
+                return _fail_after_service(str(call_err))
             err_str = str(call_err).lower()
             # 部分设备不支持某些扩展参数，尝试智能降级：
             # 优先仅剔除色温参数保留亮度，若仍失败再去除全部扩展参数
@@ -3479,30 +2469,11 @@ class ActionsMixin:
                 if callable(record_learning_verification):
                     record_learning_verification(item, actual)
             else:
-                if item["retry"] < self._ACTION_RETRY_MAX:
-                    self._sys_log("WARN", f"[验证✗] {eid} 期望={expected} 实际={actual}，自动重试第 {item['retry']+1} 次")
-                    try:
-                        # 临时记住队列长度，_do_call_service 会追加新验证条目，需在调用后删除
-                        q_len_before = len(self._pending_verifications)
-                        ok_retry = await self._do_call_service(
-                            item["domain"], item["service"], eid, {}, f"验证重试({expected})",
-                            transaction_id=item.get("transaction_id", 0),
-                            action_seq=item.get("action_seq", 0),
-                            parent_transaction_id=item.get("parent_transaction_id", ""),
-                            world_snapshot_id=item.get("world_snapshot_id", ""),
-                            correlation_id=item.get("correlation_id", ""),
-                        )
-                        # 删除 _do_call_service 追加的重复验证条目
-                        if len(self._pending_verifications) > q_len_before:
-                            self._pending_verifications = self._pending_verifications[:q_len_before]
-                        if ok_retry:
-                            item["retry"] += 1
-                            item["fire_time"] = time.time()
-                            remaining.append(item)
-                        else:
-                            self._sys_log("WARN", f"[验证重试] {eid} 被保护机制拦截，放弃重试")
-                    except Exception as e:
-                        self._sys_log("ERROR", f"[验证重试] {eid} 重试失败: {e}")
-                else:
-                    self._sys_log("ERROR", f"[验证✗] {eid} 期望={expected} 实际={actual}，已达最大重试次数")
+                # Verification failure is new world evidence, not authority to
+                # replay the old command. The next reconciliation/patrol run
+                # must re-read state and obtain a fresh Decision/Policy grant.
+                self._sys_log(
+                    "ERROR",
+                    f"[验证✗] {eid} 期望={expected} 实际={actual}，禁止直接自动重试，等待重新规划",
+                )
         self._pending_verifications = remaining
