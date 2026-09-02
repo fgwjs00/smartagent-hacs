@@ -523,6 +523,17 @@ def managed_device_info_row_from_addon_device(
     sampling_contract = row.get("signal_sampling_contract")
     if isinstance(sampling_contract, dict):
         info["signal_sampling_contract"] = copy.deepcopy(sampling_contract)
+    if "supported_services" in row:
+        supported_services = row.get("supported_services")
+        info["supported_services"] = (
+            copy.deepcopy(supported_services)
+            if isinstance(supported_services, (list, tuple))
+            else []
+        )
+    for key in ("behavior_dims", "capability_snapshot", "runtime_capability_binding"):
+        value = row.get(key)
+        if isinstance(value, (dict, list, tuple)):
+            info[key] = copy.deepcopy(value)
     return entity_id, info
 
 def device_info_row_from_addon_device(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:

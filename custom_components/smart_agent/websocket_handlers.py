@@ -14,14 +14,6 @@ from homeassistant.util import dt as dt_util
 from .admin_actor import is_current_human_admin
 from .const import DOMAIN
 from .coordinator import SmartAgentCoordinator
-from .field_canary_operator_identity_publisher import (
-    FieldCanaryOperatorIdentityPublisherError,
-    async_commit_current_operator_promotion_grant_revocation,
-    async_issue_current_operator_promotion_grant,
-    async_prepare_current_operator_promotion_grant_revocation,
-    async_publish_current_operator_approval,
-    async_publish_current_operator_identity,
-)
 from .ha_adapter import (
     get_ai_scenes_cache_snapshot,
     get_device_info_snapshot,
@@ -790,6 +782,11 @@ def build_smart_agent_websocket_commands(
     ) -> None:
         """Persist the exact current admin-session identity; never an approval."""
 
+        from .field_canary_operator_identity_publisher import (
+            FieldCanaryOperatorIdentityPublisherError,
+            async_publish_current_operator_identity,
+        )
+
         if not _require_admin(connection, msg["id"]):
             return
         coord = _get_coord(hass)
@@ -839,6 +836,11 @@ def build_smart_agent_websocket_commands(
         hass: HomeAssistant, connection, msg: dict
     ) -> None:
         """Explicitly approve one server-owned proposal as the current admin."""
+
+        from .field_canary_operator_identity_publisher import (
+            FieldCanaryOperatorIdentityPublisherError,
+            async_publish_current_operator_approval,
+        )
 
         if not _require_admin(connection, msg["id"]):
             return
@@ -896,6 +898,11 @@ def build_smart_agent_websocket_commands(
     ) -> None:
         """Issue one exact non-executable Grant from the current admin gesture."""
 
+        from .field_canary_operator_identity_publisher import (
+            FieldCanaryOperatorIdentityPublisherError,
+            async_issue_current_operator_promotion_grant,
+        )
+
         if not _require_admin(connection, msg["id"]):
             return
         coord = _get_coord(hass)
@@ -949,6 +956,11 @@ def build_smart_agent_websocket_commands(
         hass: HomeAssistant, connection, msg: dict
     ) -> None:
         """Prepare current-admin approval only; never revoke the Grant."""
+
+        from .field_canary_operator_identity_publisher import (
+            FieldCanaryOperatorIdentityPublisherError,
+            async_prepare_current_operator_promotion_grant_revocation,
+        )
 
         if not _require_admin(connection, msg["id"]):
             return
@@ -1011,6 +1023,11 @@ def build_smart_agent_websocket_commands(
         hass: HomeAssistant, connection, msg: dict
     ) -> None:
         """Commit one approval-bound current-admin Grant revocation."""
+
+        from .field_canary_operator_identity_publisher import (
+            FieldCanaryOperatorIdentityPublisherError,
+            async_commit_current_operator_promotion_grant_revocation,
+        )
 
         if not _require_admin(connection, msg["id"]):
             return
@@ -1093,10 +1110,5 @@ def build_smart_agent_websocket_commands(
         ws_save_sensor_type,
         ws_get_room_topology,
         ws_list_backups,
-        ws_attest_field_canary_operator_identity,
-        ws_publish_field_canary_operator_approval,
-        ws_issue_field_canary_promotion_grant,
-        ws_prepare_field_canary_promotion_grant_revocation,
-        ws_commit_field_canary_promotion_grant_revocation,
     )
 

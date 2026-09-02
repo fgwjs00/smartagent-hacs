@@ -23,6 +23,7 @@ from .presence_runtime import (
     enrich_fast_path_presence_timing,
     slow_fallback_allowed,
 )
+from .service_contracts import STATEFUL_EXECUTION_DOMAINS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -558,7 +559,7 @@ async def run_addon_fast_path_fail_closed(
                         set(),
                     )
                     domain = entity_id.split(".")[0]
-                    if domain in ("light", "switch", "fan", "cover", "climate", "media_player"):
+                    if domain in STATEFUL_EXECUTION_DOMAINS:
                         self._batch_trigger_controllable = {entity_id}
                         self._sys_log(
                             "INFO",

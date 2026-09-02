@@ -1,14 +1,14 @@
 product: SmartAgent
-release_version: 0.0.215
-display_version: Beta 0.0.215
+release_version: 0.0.219
+display_version: Beta 0.0.219
 channel: beta
-release_date: '2026-08-24'
+release_date: '2026-09-02'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.215 继承 COMPAT-001～006 运行兼容主线，并修复干净标签检出、Linux 路径与时钟相关发布门禁；显式语音、单次准入、canonical
-    executor/Host Proof、人工 R2 确认和 Host 精确命令边界保持闭环；主动 Agent 学习仍只接收 canonical ExecutionReceipt
-    与派发后物理状态读回共同验证的结果，保持 shadow，不直接开启主动执行；正式构建面仅包含 V3 和中控屏。
-  customer_visible_version: Beta 0.0.215
+  summary: Beta 0.0.219 将主动 AI 产品开关收口到 SmartAgent V4 设置页：业主可选关闭、观察学习或主动执行。主动执行默认覆盖全屋所有已纳管且能力合同完整的设备，不再要求业主维护
+    canary 房间、domain 和实体清单；能力、风险、幂等、preflight、一次性执行证明、Receipt 与物理读回仍强制生效。全新安装仍以 shadow
+    起步，canary 仅作为不可见的工程迁移兼容。0.0.219 同时补齐正式镜像对 Supervisor/Host Proof 启动合同的冒烟验证。公开发布不等于部署或现场验收，家庭设备仍需部署后按空间自然进出验证。
+  customer_visible_version: Beta 0.0.219

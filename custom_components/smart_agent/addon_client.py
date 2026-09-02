@@ -96,6 +96,9 @@ class AddOnClient:
         base_url: str = "",
         auth_token: str = "",
         port: int = _DEFAULT_ADDON_PORT,
+        host_dispatch_proof_enabled: bool = False,
+        host_dispatch_proof_current_secret: str = "",
+        host_dispatch_proof_staged_secret: str = "",
         field_canary_host_dispatch_proof_enabled: bool = False,
         field_canary_host_dispatch_proof_secret: str = "",
         field_canary_previous_host_dispatch_proof_secret: str = "",
@@ -106,6 +109,11 @@ class AddOnClient:
         :param auth_token: 内部认证令牌（对应 Add-on 环境变量 SA_AUTH_TOKEN），
                            空字符串表示不发送认证头（向后兼容）
         :param port: Add-on 内部 API 端口，默认 18099。base_url 非空时忽略此参数。
+        :param host_dispatch_proof_enabled: 是否启用独立 Host Proof v3
+                           验证 keyring。
+        :param host_dispatch_proof_current_secret: 当前 v3 验证密钥。
+        :param host_dispatch_proof_staged_secret: 轮换期间仅用于验证的
+                           staged v3 密钥，不用于签发。
         :param field_canary_host_dispatch_proof_enabled: 是否启用独立的 v2
                            Field Canary host-proof 验证 keyring。
         :param field_canary_host_dispatch_proof_secret: 当前 v2 proof secret；
@@ -115,6 +123,37 @@ class AddOnClient:
         """
         self._base = (base_url.rstrip("/") if base_url else _build_addon_base_url(port))
         self._auth_token: str = auth_token.strip()
+        if type(host_dispatch_proof_enabled) is not bool:
+            raise ValueError("host_dispatch_proof_enabled_invalid")
+        host_proof_secrets = (
+            host_dispatch_proof_current_secret,
+            host_dispatch_proof_staged_secret,
+        )
+        if any(type(secret) is not str for secret in host_proof_secrets):
+            raise ValueError("host_dispatch_proof_secret_invalid")
+        normalized_host_proof_secrets = tuple(
+            secret.strip() for secret in host_proof_secrets
+        )
+        if any(
+            secret != normalized
+            or (secret and len(secret) < 32)
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in secret
+            )
+            for secret, normalized in zip(
+                host_proof_secrets,
+                normalized_host_proof_secrets,
+            )
+        ):
+            raise ValueError("host_dispatch_proof_secret_invalid")
+        current_host_proof_secret, staged_host_proof_secret = (
+            normalized_host_proof_secrets
+        )
+        if (
+            host_dispatch_proof_enabled or staged_host_proof_secret
+        ) and not current_host_proof_secret:
+            raise ValueError("host_dispatch_proof_current_secret_required")
         if type(field_canary_host_dispatch_proof_enabled) is not bool:
             raise ValueError("field_canary_host_dispatch_proof_enabled_invalid")
         proof_secrets = (
@@ -135,13 +174,21 @@ class AddOnClient:
         if field_canary_host_dispatch_proof_enabled and not current_proof_secret:
             raise ValueError("field_canary_host_dispatch_proof_secret_required")
         nonempty_proof_secrets = tuple(
-            secret for secret in normalized_proof_secrets if secret
+            secret
+            for secret in (
+                *normalized_host_proof_secrets,
+                *normalized_proof_secrets,
+            )
+            if secret
         )
         if (
             len(set(nonempty_proof_secrets)) != len(nonempty_proof_secrets)
             or self._auth_token in nonempty_proof_secrets
         ):
-            raise ValueError("field_canary_host_dispatch_proof_secret_reuse_forbidden")
+            raise ValueError("host_dispatch_proof_secret_reuse_forbidden")
+        self._host_dispatch_proof_enabled = host_dispatch_proof_enabled
+        self._host_dispatch_proof_current_secret = current_host_proof_secret
+        self._host_dispatch_proof_staged_secret = staged_host_proof_secret
         self._field_canary_host_dispatch_proof_enabled = (
             field_canary_host_dispatch_proof_enabled
         )
@@ -215,6 +262,8 @@ class AddOnClient:
             token_mask = "***" if len(self._auth_token) <= 16 else self._auth_token[:4] + "***" + self._auth_token[-4:]
             out = out.replace(self._auth_token, token_mask)
         for secret in (
+            self._host_dispatch_proof_current_secret,
+            self._host_dispatch_proof_staged_secret,
             self._field_canary_host_dispatch_proof_secret,
             self._field_canary_previous_host_dispatch_proof_secret,
         ):
@@ -441,7 +490,6 @@ class AddOnClient:
         envelope: dict[str, Any],
         *,
         user_explicit: bool = False,
-        user_intent_delegation: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Run the authoritative add-on preflight before HA execution."""
         # Compatibility-only.  The gateway transport cannot self-attest a
@@ -450,18 +498,6 @@ class AddOnClient:
         del user_explicit
         request_id = str(envelope.get("request_id") or "").strip() or None
         body = dict(envelope)
-        if user_intent_delegation is not None:
-            # Import lazily so legacy test harnesses that load addon_client.py
-            # without the package path still exercise the non-delegated path.
-            from .user_intent_delegation import (
-                TRANSPORT_FIELD,
-                validate_transport_binding,
-            )
-
-            body[TRANSPORT_FIELD] = validate_transport_binding(
-                body,
-                user_intent_delegation,
-            )
         result = await self.request_json(
             "POST",
             "/ha/execute",

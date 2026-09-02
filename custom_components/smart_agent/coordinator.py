@@ -23,6 +23,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -106,6 +107,7 @@ from .const import (
     CONF_ACTIVE_AI_MODE,
     CONF_AI_ENABLED,
     CONF_COOLDOWN,
+    CONF_MANUAL_OVERRIDE_PROTECTION_SECONDS,
     CONF_ENGINE,
     CONF_FRIGATE_ENABLED,
     DOMAIN,
@@ -171,7 +173,6 @@ from .const import (
     CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED,
     CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET,
     CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET,
-    CONF_USER_INTENT_DELEGATION_SECRET,
     DB_FILENAME,
     DOMAIN,
     LOG_FILENAME,
@@ -182,7 +183,7 @@ from .const import (
     MODE_HOME,
     MODE_SHOWROOM,
     NOTIFY_DEDUP_SECONDS,
-    OVERRIDE_WINDOW_SECONDS,
+    PRIORITY_AI_LOCKED,
     PRIORITY_AI_LEARNED,
     PRIORITY_GUARD_WINDOWS,
     PRIORITY_LABELS,
@@ -264,10 +265,15 @@ class SmartAgentCoordinator(
 
     _OFF_STATES = frozenset(("off", "closed", "idle", "standby", "locked"))
     _AUTOMATION_EXEC_WINDOW = 30
-    _USER_OVERRIDE_PROTECTION = 120
     _USER_MANUAL_WINDOW = 1800
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        *,
+        host_dispatch_proof_material: Mapping[str, object],
+    ) -> None:
         """Initialize and load config from entry (data + options)."""
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=5))
         self._entry = entry
@@ -293,6 +299,15 @@ class SmartAgentCoordinator(
         self.confidence_auto = int(data.get(CONF_CONFIDENCE_AUTO, DEFAULT_CONFIDENCE_AUTO))
         self.confidence_notify = int(data.get(CONF_CONFIDENCE_NOTIFY, DEFAULT_CONFIDENCE_NOTIFY))
         self.cooldown = int(data.get(CONF_COOLDOWN, 60))
+        try:
+            manual_override_seconds = int(
+                data.get(CONF_MANUAL_OVERRIDE_PROTECTION_SECONDS, 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            manual_override_seconds = 0
+        self._manual_override_protection_seconds = max(
+            0, min(manual_override_seconds, 86400)
+        )
         self.showroom_biz_start_min: int = parse_biz_time(data.get(CONF_SHOWROOM_BIZ_START, DEFAULT_SHOWROOM_BIZ_START))
         self.showroom_biz_end_min: int   = parse_biz_time(data.get(CONF_SHOWROOM_BIZ_END, DEFAULT_SHOWROOM_BIZ_END))
         # 兼容旧版：保留整数小时属性，供仍引用旧属性的代码过渡（将逐步废弃）
@@ -385,9 +400,6 @@ class SmartAgentCoordinator(
         # License
         self._init_license()
         self._license_key = (data.get(CONF_LICENSE_KEY) or "").strip()
-        self._user_intent_delegation_secret = (
-            data.get(CONF_USER_INTENT_DELEGATION_SECRET) or ""
-        ).strip()
         # Add-on 客户端（显式 URL 优先；留空时按端口回退）
         from .addon_client import AddOnClient, derive_addon_gateway_base_url
         from .const import CONF_ADDON_PORT, DEFAULT_ADDON_PORT
@@ -400,6 +412,15 @@ class SmartAgentCoordinator(
             base_url=_addon_base_url,
             port=_addon_port,
             auth_token=_addon_token,
+            host_dispatch_proof_enabled=(
+                host_dispatch_proof_material.get("enabled") is True
+            ),
+            host_dispatch_proof_current_secret=str(
+                host_dispatch_proof_material.get("current_secret") or ""
+            ),
+            host_dispatch_proof_staged_secret=str(
+                host_dispatch_proof_material.get("staged_secret") or ""
+            ),
             field_canary_host_dispatch_proof_enabled=(
                 data.get(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED, False)
                 is True
@@ -413,12 +434,8 @@ class SmartAgentCoordinator(
             ),
         )
         from .output_ledger_publisher import OutputLedgerPublisher
-        from .maintenance_delegation_publisher import MaintenanceDelegationPublisher
 
         self._output_ledger_publisher = OutputLedgerPublisher(hass, entry)
-        self._maintenance_delegation_publisher = MaintenanceDelegationPublisher(
-            hass, entry
-        )
         self._addon_repair_issue_active = False
         self._addon_repair_first_failure_at: float | None = None
         self._addon_repair_failure_count = 0
@@ -1252,11 +1269,24 @@ class SmartAgentCoordinator(
             return SOURCE_VOICE
         return SOURCE_PHYSICAL
 
-    def _record_device_operation(self, entity_id: str, source: str, new_state: str, params: dict | None = None) -> dict:
+    def _record_device_operation(
+        self,
+        entity_id: str,
+        source: str,
+        new_state: str,
+        params: dict | None = None,
+        *,
+        occupancy_cycle_id: str = "",
+    ) -> dict:
         now = time.time()
         priority = SOURCE_PRIORITY_MAP.get(source, PRIORITY_AI_LEARNED)
-        guard_until = now + PRIORITY_GUARD_WINDOWS.get(priority, 120)
-        if priority == 1:
+        guard_seconds = (
+            self._manual_override_protection_seconds
+            if priority == 1
+            else PRIORITY_GUARD_WINDOWS.get(priority, 0)
+        )
+        guard_until = now + max(0, int(guard_seconds))
+        if priority == 1 and guard_seconds > 0:
             history = self._user_op_history.setdefault(entity_id, [])
             cutoff = now - ESCALATION_WINDOW_MIN * 60
             history[:] = [t for t in history if t > cutoff]
@@ -1274,6 +1304,9 @@ class SmartAgentCoordinator(
             "params": comparable_action_params(entity_id.split(".", 1)[0], params),
             "guard_until": guard_until,
         }
+        normalized_cycle_id = str(occupancy_cycle_id or "").strip()
+        if priority in {PRIORITY_AI_LOCKED, PRIORITY_AI_LEARNED} and normalized_cycle_id:
+            record["occupancy_cycle_id"] = normalized_cycle_id
         self._device_priority_map[entity_id] = record
         self._enforce_priority_storage_limits()
         return record
@@ -1326,7 +1359,15 @@ class SmartAgentCoordinator(
 
     def _cleanup_expired_priorities(self) -> None:
         now = time.time()
-        for eid in [eid for eid, rec in self._device_priority_map.items() if now > rec.get("guard_until", 0)]:
+        for eid in [
+            eid
+            for eid, rec in self._device_priority_map.items()
+            if now > rec.get("guard_until", 0)
+            and not (
+                rec.get("priority") in {PRIORITY_AI_LOCKED, PRIORITY_AI_LEARNED}
+                and str(rec.get("occupancy_cycle_id") or "").strip()
+            )
+        ]:
             del self._device_priority_map[eid]
         cutoff = now - ESCALATION_WINDOW_MIN * 60
         for eid, history in list(self._user_op_history.items()):
@@ -1334,13 +1375,18 @@ class SmartAgentCoordinator(
             if not history:
                 del self._user_op_history[eid]
 
-    def _get_priority_summary(self) -> list[dict]:
+    def _get_priority_summary(self, *, include_lineage: bool = False) -> list[dict]:
         now = time.time()
         result = []
         for eid, rec in self._device_priority_map.items():
-            if now > rec.get("guard_until", 0):
+            active = now <= rec.get("guard_until", 0)
+            is_ai_lineage = (
+                rec.get("priority") in {PRIORITY_AI_LOCKED, PRIORITY_AI_LEARNED}
+                and bool(str(rec.get("occupancy_cycle_id") or "").strip())
+            )
+            if not active and not (include_lineage and is_ai_lineage):
                 continue
-            result.append({
+            row = {
                 "entity_id": eid,
                 "name": self.device_info.get(eid, {}).get("name", eid),
                 "priority": rec["priority"],
@@ -1348,8 +1394,13 @@ class SmartAgentCoordinator(
                 "source": rec["source"],
                 "source_label": rec["source_label"],
                 "state": rec["state"],
-                "remaining_sec": int(rec["guard_until"] - now),
-            })
+                "remaining_sec": max(0, int(rec["guard_until"] - now)),
+                "guard_until": rec.get("guard_until", 0),
+            }
+            occupancy_cycle_id = str(rec.get("occupancy_cycle_id") or "").strip()
+            if occupancy_cycle_id:
+                row["occupancy_cycle_id"] = occupancy_cycle_id
+            result.append(row)
         result.sort(key=lambda x: (x["priority"], -x["remaining_sec"]))
         return result
 

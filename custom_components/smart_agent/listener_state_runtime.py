@@ -106,6 +106,33 @@ def handle_listener_state_changed(
         )
         return
 
+    # Persist every managed entity's authoritative HA State projection before
+    # the downstream decision filters can return early.  This keeps the
+    # canonical control registry synchronized with real capability removals,
+    # zero feature masks and entity deletion without granting execution.
+    persist_device = getattr(self, "_persist_device_record", None)
+    create_task = getattr(getattr(self, "hass", None), "async_create_task", None)
+    if callable(persist_device) and callable(create_task):
+        try:
+            create_task(
+                persist_device(
+                    entity_id,
+                    device_info_snapshot.get(entity_id),
+                    state_obj=new,
+                ),
+                f"smartagent_runtime_capability_{entity_id}",
+            )
+        except TypeError:
+            create_task(
+                persist_device(
+                    entity_id,
+                    device_info_snapshot.get(entity_id),
+                    state_obj=new,
+                )
+            )
+        except Exception as exc:
+            logger.debug("[Listeners] runtime capability persistence skipped for %s: %s", entity_id, exc)
+
     environment_telemetry_tracked = False
     if domain == "sensor":
         environment_metadata = self._listener_entity_metadata(
@@ -264,6 +291,28 @@ def handle_listener_state_changed(
             old_state=old_s,
             new_state=new_s,
             filter_reason="state_recovery_unknown_unavailable",
+            source_type=source_type,
+        )
+        return
+
+    if self._is_inflight_smartagent_state_feedback(entity_id, new_s):
+        self._record_presence_interaction_trace(
+            entity_id,
+            domain,
+            new_s,
+            source_type,
+            source=SOURCE_AUTOMATION,
+        )
+        self._sys_log(
+            "INFO",
+            f"[过滤] SmartAgent 在途动作状态回流，跳过人工纠错学习: {entity_id} -> {new_s}",
+        )
+        self._emit_listener_event(
+            listener_action="filtered",
+            entity_id=entity_id,
+            old_state=old_s,
+            new_state=new_s,
+            filter_reason="smartagent_inflight_state_feedback",
             source_type=source_type,
         )
         return

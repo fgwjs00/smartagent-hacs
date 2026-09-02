@@ -1,5 +1,36 @@
 {
   "version": 1,
+  "domains": {
+    "alarm_control_panel": {"capability": "security", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r3", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "binary_sensor": {"capability": "sensor", "catalog": true, "managed_discovery": true, "execution": false, "risk_floor": "r0", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "button": {"capability": "scene", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r2", "manifest": "scene", "batch_control": false, "energy_relevant": false, "stateless": true},
+    "camera": {"capability": "security", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r3", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "climate": {"capability": "climate", "catalog": true, "managed_discovery": true, "execution": true, "risk_floor": "r2", "manifest": "climate", "batch_control": false, "energy_relevant": true, "stateless": false},
+    "cover": {"capability": "cover", "catalog": true, "managed_discovery": true, "execution": true, "risk_floor": "r2", "manifest": "cover", "batch_control": false, "energy_relevant": true, "stateless": false},
+    "dehumidifier": {"capability": "appliance", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r2", "manifest": "", "batch_control": false, "energy_relevant": true, "stateless": false},
+    "device_tracker": {"capability": "device_tracker", "catalog": true, "managed_discovery": true, "execution": false, "risk_floor": "r0", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "fan": {"capability": "fan", "catalog": true, "managed_discovery": true, "execution": true, "risk_floor": "r1", "manifest": "fan", "batch_control": true, "energy_relevant": true, "stateless": false},
+    "humidifier": {"capability": "appliance", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r2", "manifest": "", "batch_control": false, "energy_relevant": true, "stateless": false},
+    "input_boolean": {"capability": "switch", "catalog": true, "managed_discovery": false, "execution": true, "risk_floor": "r2", "manifest": "switch", "batch_control": true, "energy_relevant": false, "stateless": false},
+    "input_button": {"capability": "scene", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r2", "manifest": "scene", "batch_control": false, "energy_relevant": false, "stateless": true},
+    "input_number": {"capability": "number", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r1", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "input_select": {"capability": "select", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r1", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "input_text": {"capability": "text", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r1", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "light": {"capability": "lighting", "catalog": true, "managed_discovery": true, "execution": true, "risk_floor": "r0", "manifest": "lighting", "batch_control": true, "energy_relevant": true, "stateless": false},
+    "lock": {"capability": "security", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r3", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "media_player": {"capability": "media", "catalog": true, "managed_discovery": true, "execution": true, "risk_floor": "r1", "manifest": "media", "batch_control": false, "energy_relevant": true, "stateless": false},
+    "number": {"capability": "number", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r1", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "remote": {"capability": "remote", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r2", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": true},
+    "scene": {"capability": "scene", "catalog": true, "managed_discovery": false, "execution": true, "risk_floor": "r2", "manifest": "scene", "batch_control": false, "energy_relevant": false, "stateless": true},
+    "script": {"capability": "scene", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r2", "manifest": "scene", "batch_control": false, "energy_relevant": false, "stateless": true},
+    "select": {"capability": "select", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r1", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "sensor": {"capability": "sensor", "catalog": true, "managed_discovery": true, "execution": false, "risk_floor": "r0", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "siren": {"capability": "security", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r3", "manifest": "", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "switch": {"capability": "switch", "catalog": true, "managed_discovery": true, "execution": true, "risk_floor": "r2", "manifest": "switch", "batch_control": true, "energy_relevant": true, "stateless": false},
+    "vacuum": {"capability": "vacuum", "catalog": true, "managed_discovery": true, "execution": true, "risk_floor": "r2", "manifest": "vacuum", "batch_control": false, "energy_relevant": true, "stateless": false},
+    "valve": {"capability": "valve", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r3", "manifest": "valve", "batch_control": false, "energy_relevant": false, "stateless": false},
+    "water_heater": {"capability": "water_heater", "catalog": true, "managed_discovery": false, "execution": false, "risk_floor": "r3", "manifest": "water_heater", "batch_control": false, "energy_relevant": true, "stateless": false}
+  },
   "services": {
     "light.turn_on": {
       "required": [],
@@ -16,20 +47,43 @@
         "flash": {"type": "string", "enum": ["short", "long"]},
         "effect": {"type": "string", "minLength": 1}
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "on",
+        "state": {"operator": "equals", "value": "on"},
+        "non_effect_fields": ["transition"],
+        "attribute_checks": [
+          {"command_field": "brightness_pct", "state_attribute": "brightness", "comparison": "brightness_pct", "tolerance": 1},
+          {"command_field": "brightness", "state_attribute": "brightness", "comparison": "numeric", "tolerance": 1},
+          {"command_field": "color_temp_kelvin", "state_attribute": "color_temp_kelvin", "fallback_attribute": "color_temp", "comparison": "color_temp_kelvin", "tolerance": 100},
+          {"command_field": "color_temp", "state_attribute": "color_temp", "fallback_attribute": "color_temp_kelvin", "comparison": "color_temp_mired", "tolerance": 2},
+          {"command_field": "effect", "state_attribute": "effect", "comparison": "string"},
+          {"command_field": "rgb_color", "state_attribute": "rgb_color", "comparison": "integer_vector", "length": 3, "tolerance": 2},
+          {"command_field": "hs_color", "state_attribute": "hs_color", "comparison": "numeric_vector", "length": 2, "tolerance": 2},
+          {"command_field": "xy_color", "state_attribute": "xy_color", "comparison": "numeric_vector", "length": 2, "tolerance": 0.02}
+        ]
+      }
     },
     "light.turn_off": {
       "required": [],
       "properties": {"transition": {"type": "number", "minimum": 0, "maximum": 300}},
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "off",
+        "state": {"operator": "equals", "value": "off"},
+        "non_effect_fields": ["transition"],
+        "attribute_checks": []
+      }
     },
     "light.toggle": {
       "required": [],
       "properties": {"transition": {"type": "number", "minimum": 0, "maximum": 300}},
       "additionalProperties": false
     },
-    "switch.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
-    "switch.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "switch.turn_on": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "on", "state": {"operator": "equals", "value": "on"}, "attribute_checks": []}},
+    "switch.turn_off": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "off", "state": {"operator": "equals", "value": "off"}, "attribute_checks": []}},
     "switch.toggle": {"required": [], "properties": {}, "additionalProperties": false},
     "input_boolean.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
     "input_boolean.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
@@ -39,8 +93,8 @@
       "properties": {"transition": {"type": "number", "minimum": 0, "maximum": 300}},
       "additionalProperties": false
     },
-    "cover.open_cover": {"required": [], "properties": {}, "additionalProperties": false},
-    "cover.close_cover": {"required": [], "properties": {}, "additionalProperties": false},
+    "cover.open_cover": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "open", "state": {"operator": "equals", "value": "open"}, "attribute_checks": []}},
+    "cover.close_cover": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "closed", "state": {"operator": "equals", "value": "closed"}, "attribute_checks": []}},
     "cover.stop_cover": {"required": [], "properties": {}, "additionalProperties": false},
     "cover.set_cover_position": {
       "required": ["position"],
@@ -48,7 +102,17 @@
         "position": {"type": "integer", "minimum": 0, "maximum": 100},
         "tilt_position": {"type": "integer", "minimum": 0, "maximum": 100}
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "attribute_contract",
+        "state": {"operator": "readable"},
+        "requires_attribute_check": true,
+        "attribute_checks": [
+          {"command_field": "position", "state_attribute": "current_position", "receipt_key": "current_position", "comparison": "numeric", "tolerance": 1},
+          {"command_field": "tilt_position", "state_attribute": "current_tilt_position", "receipt_key": "current_tilt_position", "comparison": "numeric", "tolerance": 1}
+        ]
+      }
     },
     "fan.turn_on": {
       "required": [],
@@ -56,27 +120,63 @@
         "percentage": {"type": "integer", "minimum": 0, "maximum": 100},
         "preset_mode": {"type": "string", "minLength": 1}
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "on",
+        "state": {"operator": "equals", "value": "on"},
+        "attribute_checks": [
+          {"command_field": "percentage", "state_attribute": "percentage", "comparison": "numeric", "tolerance": 1},
+          {"command_field": "preset_mode", "state_attribute": "preset_mode", "comparison": "string"}
+        ]
+      }
     },
-    "fan.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "fan.turn_off": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "off", "state": {"operator": "equals", "value": "off"}, "attribute_checks": []}},
     "fan.toggle": {"required": [], "properties": {}, "additionalProperties": false},
     "fan.set_percentage": {
       "required": ["percentage"],
       "properties": {"percentage": {"type": "integer", "minimum": 0, "maximum": 100}},
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "attribute_contract",
+        "state": {"operator": "readable"},
+        "requires_attribute_check": true,
+        "attribute_checks": [
+          {"command_field": "percentage", "state_attribute": "percentage", "comparison": "numeric", "tolerance": 1}
+        ]
+      }
     },
     "fan.set_preset_mode": {
       "required": ["preset_mode"],
       "properties": {"preset_mode": {"type": "string", "minLength": 1}},
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "attribute_contract",
+        "state": {"operator": "readable"},
+        "requires_attribute_check": true,
+        "attribute_checks": [
+          {"command_field": "preset_mode", "state_attribute": "preset_mode", "comparison": "string"}
+        ]
+      }
     },
     "fan.oscillate": {
       "required": ["oscillating"],
       "properties": {"oscillating": {"type": "boolean"}},
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "attribute_contract",
+        "state": {"operator": "readable"},
+        "requires_attribute_check": true,
+        "attribute_checks": [
+          {"command_field": "oscillating", "state_attribute": "oscillating", "comparison": "boolean"}
+        ]
+      }
     },
-    "climate.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
-    "climate.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "climate.turn_on": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "active", "state": {"operator": "not_in", "values": ["off"]}, "attribute_checks": []}},
+    "climate.turn_off": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "off", "state": {"operator": "equals", "value": "off"}, "attribute_checks": []}},
     "climate.set_temperature": {
       "required": [],
       "requiredOneOf": [["temperature"], ["target_temp_low", "target_temp_high"]],
@@ -88,31 +188,57 @@
       "relations": [
         {"left": "target_temp_low", "operator": "<=", "right": "target_temp_high"}
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "attribute_contract",
+        "state": {"operator": "readable"},
+        "requires_attribute_check": true,
+        "attribute_checks": [
+          {"command_field": "temperature", "state_attribute": "temperature", "comparison": "numeric", "tolerance": 0.5},
+          {"command_field": "target_temp_low", "state_attribute": "target_temp_low", "comparison": "numeric", "tolerance": 0.5},
+          {"command_field": "target_temp_high", "state_attribute": "target_temp_high", "comparison": "numeric", "tolerance": 0.5}
+        ]
+      }
     },
     "climate.set_hvac_mode": {
       "required": ["hvac_mode"],
       "properties": {
         "hvac_mode": {"type": "string", "minLength": 1, "capabilityValues": "hvac_modes"}
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "command_field",
+        "state": {"operator": "command_field", "field": "hvac_mode"},
+        "attribute_checks": []
+      }
     },
     "climate.set_preset_mode": {
       "required": ["preset_mode"],
       "properties": {
         "preset_mode": {"type": "string", "minLength": 1, "capabilityValues": "preset_modes"}
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "readback": {
+        "schema_version": "ha_post_state.v1",
+        "expected": "attribute_contract",
+        "state": {"operator": "readable"},
+        "requires_attribute_check": true,
+        "attribute_checks": [
+          {"command_field": "preset_mode", "state_attribute": "preset_mode", "comparison": "string"}
+        ]
+      }
     },
-    "vacuum.start": {"required": [], "properties": {}, "additionalProperties": false},
-    "vacuum.pause": {"required": [], "properties": {}, "additionalProperties": false},
-    "vacuum.stop": {"required": [], "properties": {}, "additionalProperties": false},
-    "vacuum.return_to_base": {"required": [], "properties": {}, "additionalProperties": false},
+    "vacuum.start": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "cleaning", "state": {"operator": "equals", "value": "cleaning"}, "attribute_checks": []}},
+    "vacuum.pause": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "paused", "state": {"operator": "equals", "value": "paused"}, "attribute_checks": []}},
+    "vacuum.stop": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "idle", "state": {"operator": "equals", "value": "idle"}, "attribute_checks": []}},
+    "vacuum.return_to_base": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "returning|docked", "state": {"operator": "one_of", "values": ["returning", "docked"]}, "attribute_checks": []}},
     "media_player.turn_on": {"required": [], "properties": {}, "additionalProperties": false},
-    "media_player.turn_off": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.turn_off": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "off", "state": {"operator": "equals", "value": "off"}, "attribute_checks": []}},
     "media_player.toggle": {"required": [], "properties": {}, "additionalProperties": false},
-    "media_player.media_play": {"required": [], "properties": {}, "additionalProperties": false},
-    "media_player.media_pause": {"required": [], "properties": {}, "additionalProperties": false},
+    "media_player.media_play": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "playing", "state": {"operator": "equals", "value": "playing"}, "attribute_checks": []}},
+    "media_player.media_pause": {"required": [], "properties": {}, "additionalProperties": false, "readback": {"schema_version": "ha_post_state.v1", "expected": "paused", "state": {"operator": "equals", "value": "paused"}, "attribute_checks": []}},
     "media_player.media_stop": {"required": [], "properties": {}, "additionalProperties": false},
     "media_player.volume_mute": {
       "required": ["is_volume_muted"],

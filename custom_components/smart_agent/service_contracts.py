@@ -18,6 +18,8 @@ if not isinstance(_CONTRACT_PAYLOAD, dict):
     raise RuntimeError("HA service contract must be an object")
 if int(_CONTRACT_PAYLOAD.get("version") or 0) != 1:
     raise RuntimeError("unsupported HA service contract version")
+if not isinstance(_CONTRACT_PAYLOAD.get("domains"), dict):
+    raise RuntimeError("HA service contract domains must be an object")
 if not isinstance(_CONTRACT_PAYLOAD.get("services"), dict):
     raise RuntimeError("HA service contract services must be an object")
 
@@ -28,6 +30,122 @@ SERVICE_CONTRACTS: dict[str, dict[str, Any]] = {
     for key, value in _CONTRACT_PAYLOAD["services"].items()
     if isinstance(value, dict)
 }
+
+
+@dataclass(frozen=True, slots=True)
+class DomainDescriptor:
+    domain: str
+    capability: str
+    catalog: bool
+    managed_discovery: bool
+    execution: bool
+    risk_floor: str
+    manifest: str
+    batch_control: bool
+    energy_relevant: bool
+    stateless: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+_DOMAIN_DESCRIPTOR_FIELDS = frozenset(
+    {
+        "capability",
+        "catalog",
+        "managed_discovery",
+        "execution",
+        "risk_floor",
+        "manifest",
+        "batch_control",
+        "energy_relevant",
+        "stateless",
+    }
+)
+_RISK_FLOORS = frozenset({"r0", "r1", "r2", "r3"})
+
+
+def _load_domain_descriptors(raw_domains: dict[str, Any]) -> dict[str, DomainDescriptor]:
+    descriptors: dict[str, DomainDescriptor] = {}
+    for raw_domain, raw in raw_domains.items():
+        domain = str(raw_domain or "").strip().lower()
+        if not domain or not isinstance(raw, dict):
+            raise RuntimeError("HA domain descriptor invalid")
+        if set(raw) != _DOMAIN_DESCRIPTOR_FIELDS:
+            raise RuntimeError(f"HA domain descriptor fields invalid: {domain}")
+        capability = str(raw.get("capability") or "").strip().lower()
+        manifest = str(raw.get("manifest") or "").strip().lower()
+        risk_floor = str(raw.get("risk_floor") or "").strip().lower()
+        boolean_fields = (
+            "catalog",
+            "managed_discovery",
+            "execution",
+            "batch_control",
+            "energy_relevant",
+            "stateless",
+        )
+        if not capability or risk_floor not in _RISK_FLOORS:
+            raise RuntimeError(f"HA domain descriptor semantics invalid: {domain}")
+        if any(type(raw.get(field)) is not bool for field in boolean_fields):
+            raise RuntimeError(f"HA domain descriptor boolean invalid: {domain}")
+        if raw["execution"] is True and not manifest:
+            raise RuntimeError(f"HA executable domain manifest missing: {domain}")
+        if raw["batch_control"] is True and raw["execution"] is not True:
+            raise RuntimeError(f"HA batch domain execution disabled: {domain}")
+        descriptors[domain] = DomainDescriptor(
+            domain=domain,
+            capability=capability,
+            catalog=raw["catalog"],
+            managed_discovery=raw["managed_discovery"],
+            execution=raw["execution"],
+            risk_floor=risk_floor,
+            manifest=manifest,
+            batch_control=raw["batch_control"],
+            energy_relevant=raw["energy_relevant"],
+            stateless=raw["stateless"],
+        )
+    return descriptors
+
+
+DOMAIN_DESCRIPTORS = _load_domain_descriptors(_CONTRACT_PAYLOAD["domains"])
+REGISTERED_CAPABILITY_IDS = frozenset(
+    descriptor.capability for descriptor in DOMAIN_DESCRIPTORS.values()
+)
+CATALOG_DOMAINS = frozenset(
+    domain for domain, descriptor in DOMAIN_DESCRIPTORS.items() if descriptor.catalog
+)
+DISCOVERY_DOMAINS = frozenset(
+    domain
+    for domain, descriptor in DOMAIN_DESCRIPTORS.items()
+    if descriptor.managed_discovery
+)
+EXECUTION_DOMAINS = frozenset(
+    domain for domain, descriptor in DOMAIN_DESCRIPTORS.items() if descriptor.execution
+)
+BATCH_CONTROL_DOMAINS = frozenset(
+    domain for domain, descriptor in DOMAIN_DESCRIPTORS.items() if descriptor.batch_control
+)
+ENERGY_RELEVANT_DOMAINS = frozenset(
+    domain for domain, descriptor in DOMAIN_DESCRIPTORS.items() if descriptor.energy_relevant
+)
+STATELESS_DOMAINS = frozenset(
+    domain for domain, descriptor in DOMAIN_DESCRIPTORS.items() if descriptor.stateless
+)
+STATEFUL_EXECUTION_DOMAINS = EXECUTION_DOMAINS - STATELESS_DOMAINS
+
+
+def domain_descriptor(domain: Any) -> DomainDescriptor | None:
+    return DOMAIN_DESCRIPTORS.get(str(domain or "").strip().lower())
+
+
+def capability_for_domain(domain: Any) -> str:
+    descriptor = domain_descriptor(domain)
+    return descriptor.capability if descriptor is not None else "unknown"
+
+
+def risk_floor_for_domain(domain: Any) -> str:
+    descriptor = domain_descriptor(domain)
+    return descriptor.risk_floor if descriptor is not None else "r3"
 
 ALLOWED_COMMAND_SERVICES: dict[str, frozenset[str]] = {}
 _services_by_domain: dict[str, set[str]] = {}
@@ -44,6 +162,8 @@ SERVICES_TO_DOMAINS: dict[str, frozenset[str]] = {
     service: frozenset(domains)
     for service, domains in _domains_by_service.items()
 }
+if set(_services_by_domain) != set(EXECUTION_DOMAINS):
+    raise RuntimeError("HA executable domain and service contract sets diverged")
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,10 +435,23 @@ def validate_service_call(
 
 __all__ = [
     "ALLOWED_COMMAND_SERVICES",
+    "BATCH_CONTROL_DOMAINS",
+    "CATALOG_DOMAINS",
     "CONTRACT_HASH",
     "CONTRACT_VERSION",
+    "DISCOVERY_DOMAINS",
+    "DOMAIN_DESCRIPTORS",
+    "DomainDescriptor",
+    "ENERGY_RELEVANT_DOMAINS",
+    "EXECUTION_DOMAINS",
+    "REGISTERED_CAPABILITY_IDS",
     "SERVICE_CONTRACTS",
     "SERVICES_TO_DOMAINS",
+    "STATEFUL_EXECUTION_DOMAINS",
+    "STATELESS_DOMAINS",
     "ServiceContractResult",
+    "capability_for_domain",
+    "domain_descriptor",
+    "risk_floor_for_domain",
     "validate_service_call",
 ]

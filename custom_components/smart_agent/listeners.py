@@ -74,6 +74,7 @@ from .listener_registry_runtime import (
 )
 from .presence_runtime import DEFAULT_COLD_START_RECHECK_SECONDS, advance_occupancy_cycle, async_restore_occupancy_cycles, cleanup_startup_reconciliation, learning_space_identity, occupancy_cycle_outcome, persist_occupancy_cycles, resolve_space_id, room_candidates, room_snapshot, schedule_arrival_baseline_sample, schedule_startup_presence_reconciliation
 from .sensor_event_filter import EnvironmentTelemetryFilter, environment_sensor_kind
+from .service_contracts import DISCOVERY_DOMAINS, STATEFUL_EXECUTION_DOMAINS
 from .const import (
     FRIGATE_PERSON_COUNT_KW as _FRIGATE_PERSON_COUNT_KW,
     AI_ACTION_SKIP_WINDOW, URGENT_MERGE_WINDOW, NORMAL_MERGE_WINDOW,
@@ -189,21 +190,8 @@ class ListenersMixin:
     _PROTECTED_NIGHT_START_HOUR = 22
     _PROTECTED_NIGHT_END_HOUR = 6
     _CORRECTION_SUPPRESSIONS_CACHE_TTL = 60.0
-    _LISTENER_DOMAINS = frozenset(
-        (
-            "binary_sensor",
-            "sensor",
-            "device_tracker",
-            "person",
-            "light",
-            "switch",
-            "climate",
-            "cover",
-            "fan",
-            "media_player",
-        )
-    )
-    _CONTROL_EVENT_DOMAINS = frozenset({"light", "switch", "climate", "cover", "fan", "media_player"})
+    _LISTENER_DOMAINS = DISCOVERY_DOMAINS | frozenset({"person"})
+    _CONTROL_EVENT_DOMAINS = STATEFUL_EXECUTION_DOMAINS
 
     # 按时段调整开灯亮度的参考表
     _BRIGHTNESS_TABLE = (
@@ -580,6 +568,21 @@ class ListenersMixin:
                 return suppressions
         return []
 
+    def _is_inflight_smartagent_state_feedback(
+        self, entity_id: str, state: str
+    ) -> bool:
+        """Return whether this state is feedback from a running SA command."""
+        registry = getattr(self, "_inflight_smartagent_state_feedback", None)
+        if not isinstance(registry, dict):
+            return False
+        request_ids = registry.get(
+            (
+                str(entity_id or "").strip(),
+                str(state or "").strip().lower(),
+            )
+        )
+        return isinstance(request_ids, set) and bool(request_ids)
+
     def _record_implicit_reverse_correction(
         self,
         *,
@@ -917,7 +920,7 @@ class ListenersMixin:
         priority_getter = getattr(self, "_get_priority_summary", None)
         if callable(priority_getter):
             try:
-                priority_guards = priority_getter()
+                priority_guards = priority_getter(include_lineage=True)
             except Exception as exc:
                 _LOGGER.debug("[Listeners] _get_priority_summary failed for add-on snapshot: %s", exc)
                 priority_guards = None
@@ -1016,12 +1019,55 @@ class ListenersMixin:
                 policy_evaluation.get("aggregate_decision") or ""
             ).strip().lower(),
             "decision_event_claim_ids": decision_event_claim_ids,
+            "occupancy_cycle_id": str(
+                result.get("occupancy_cycle_id")
+                or (
+                    decision_trace.get("context_snapshot", {}).get("occupancy_cycle_id")
+                    if isinstance(decision_trace, dict)
+                    and isinstance(decision_trace.get("context_snapshot"), dict)
+                    else ""
+                )
+                or ""
+            ).strip(),
         }
         decision_contract_lineage = {
             key: value
             for key, value in decision_contract_lineage.items()
             if value
         }
+        nested_result = (
+            result.get("result")
+            if isinstance(result.get("result"), dict)
+            else {}
+        )
+        daylight_evidence = (
+            result.get("daylight_evidence")
+            if isinstance(result.get("daylight_evidence"), dict)
+            else nested_result.get("daylight_evidence")
+            if isinstance(nested_result.get("daylight_evidence"), dict)
+            else {}
+        )
+        if daylight_evidence:
+            decision_contract_lineage["daylight_evidence"] = dict(
+                daylight_evidence
+            )
+            decision_contract_lineage["policy_evaluation"] = dict(
+                policy_evaluation
+            )
+            bound_snapshot_id = str(world_snapshot_id or "").strip()
+            if bound_snapshot_id:
+                decision_contract_lineage["world_snapshot_id"] = (
+                    bound_snapshot_id
+                )
+            bound_decision_time = str(
+                result.get("decision_time")
+                or nested_result.get("decision_time")
+                or ""
+            ).strip()
+            if bound_decision_time:
+                decision_contract_lineage["decision_time"] = (
+                    bound_decision_time
+                )
         device_info = getattr(self, "device_info", {})
         if not isinstance(device_info, dict):
             device_info = {}

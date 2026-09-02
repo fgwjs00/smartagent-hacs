@@ -20,12 +20,12 @@ from homeassistant.auth import models as auth_models
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry
 from homeassistant.helpers import config_validation as cv
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    CONF_AI_ENABLED,
     CONF_CLEANUP_LEGACY_PAIR_TOKENS,
     CONF_REFRESH_REGISTRY_SOURCE_ENABLED,
     CONF_OBSERVATION_REFRESH_PROVIDER_RUNTIME_ENABLED,
@@ -38,10 +38,16 @@ from .const import (
 )
 from .dispatch_proof import (
     DispatchProofError,
+    async_build_loaded_identity_evidence as _async_build_host_proof_loaded_identity_evidence,
     async_consume_dispatch_proof,
+    seal_loaded_source_identity as _seal_host_proof_loaded_source_identity,
     verify_dispatch_proof,
 )
 from .host_dispatch_proof import dispatch_proof_secret_for_ha_request
+from .host_dispatch_proof_material import (
+    HostDispatchProofMaterialError,
+    async_prepare_host_dispatch_proof_material_for_entry,
+)
 from .coordinator import SmartAgentCoordinator, _coerce_file_log_level
 from .config_update_service import apply_config_update_service
 from .admin_actor import is_current_human_admin, is_current_human_user
@@ -65,7 +71,6 @@ from .ha_adapter import (
 from .room_merge_view import RoomMergeViewMixin
 from .sensor_event_filter import EnvironmentTelemetryFilter
 from .listener_registry_runtime import is_explicitly_managed_device_row
-from .security_channel_secrets import security_channel_secret_mapping_is_valid
 from .refresh_registry_publisher import (
     RefreshRegistryPublisherError,
     async_publish_refresh_registry_snapshot_once,
@@ -76,9 +81,6 @@ from .websocket_handlers import build_smart_agent_websocket_commands
 from .websocket_registration import register_smart_agent_websocket_commands
 from .view_registration import register_host_views
 from .ld2410_maintenance_bridge import LD2410MaintenanceMQTTBridge
-from .maintenance_delegation_publisher import (
-    MaintenanceDelegationPublisherError,
-)
 from .observation_refresh_provider_request_attestation import (
     ObservationRefreshProviderRequestVerificationError,
 )
@@ -89,6 +91,10 @@ from .observation_refresh_provider_view import (
 
 
 # AI Scene snake_case/legacy 仅作为迁移兼容入口，统一集中管理。
+_LOADED_INTEGRATION_SOURCE_IDENTITY = _seal_host_proof_loaded_source_identity(
+    "custom_components.smart_agent",
+    __file__,
+)
 _SYSTEM_CPU_SNAPSHOT: tuple[int, int] | None = None
 
 
@@ -321,11 +327,11 @@ def _dispatch_proof_secret_for_request(
     *,
     request: web.Request | None = None,
 ) -> str:
-    return dispatch_proof_secret_for_ha_request(
-        hass,
-        proof,
-        request_bearer=_extract_bearer_token(request) if request is not None else "",
-    )
+    # Keep the request argument for the registered view contract only.
+    # Host Proof v3 must never treat its bearer as proof key material.
+    # Verification keys come exclusively from the dedicated HA keyring.
+    del request
+    return dispatch_proof_secret_for_ha_request(hass, proof)
 
 
 def _ha_log_window_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -1091,6 +1097,18 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
             or getattr(coord, "_SA_VERSION", "")
             or "unknown"
         )
+        loaded_identity_evidence: dict[str, Any] = {}
+        identity_builder = globals().get(
+            "_async_build_host_proof_loaded_identity_evidence"
+        )
+        if callable(identity_builder):
+            loaded_identity_evidence = await identity_builder(
+                hass,
+                getattr(coord, "_addon_client", None),
+                integration_version=runtime_version,
+                runtime_version=runtime_version,
+                integration_source=dict(_LOADED_INTEGRATION_SOURCE_IDENTITY),
+            )
         bridge = getattr(coord, "_internal_event_bridge", None)
         bridge_stats_raw: Any = {}
         if bridge is not None:
@@ -1198,6 +1216,7 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 "source": "ha_listener_runtime",
                 "integration_version": runtime_version,
                 "runtime_version": runtime_version,
+                "loaded_identity_evidence": loaded_identity_evidence,
                 "internal_event_bridge": internal_event_bridge,
                 "enabled": enabled,
                 "sensors_muted": bool(getattr(coord, "_sensors_muted", False)),
@@ -2432,49 +2451,24 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartAgent from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    security_channel_values = {
-        **dict(entry.data or {}),
-        **dict(entry.options or {}),
-    }
-    if not security_channel_secret_mapping_is_valid(security_channel_values):
-        _LOGGER.error(
-            "SmartAgent setup blocked: dedicated security channel secret "
-            "domains are invalid; update the integration options"
+    try:
+        host_proof_material, host_proof_setup_error = (
+            await async_prepare_host_dispatch_proof_material_for_entry(hass, entry)
         )
+    except HostDispatchProofMaterialError as exc:
+        raise ConfigEntryNotReady(
+            "SmartAgent shared Host Proof material is not ready"
+        ) from exc
+    if host_proof_setup_error:
+        _LOGGER.error(host_proof_setup_error)
         return False
     await _async_cleanup_legacy_pair_tokens_if_enabled(hass, entry)
     await _async_remove_legacy_entities(hass, entry)
-    coordinator = SmartAgentCoordinator(hass, entry)
-    maintenance_publisher = getattr(
-        coordinator, "_maintenance_delegation_publisher", None
+    coordinator = SmartAgentCoordinator(
+        hass,
+        entry,
+        host_dispatch_proof_material=host_proof_material,
     )
-    if maintenance_publisher is not None and maintenance_publisher.enabled is True:
-        requested_ai_enabled = dict(entry.options or {}).get(CONF_AI_ENABLED)
-        if type(requested_ai_enabled) is not bool:
-            coordinator._enabled = False
-            _LOGGER.warning(
-                "[MaintenanceDelegation] AI management startup blocked: "
-                "ai_enabled is not an explicit boolean"
-            )
-        elif requested_ai_enabled is True:
-            coordinator._enabled = False
-            try:
-                recovery = (
-                    await maintenance_publisher.async_reconcile_ai_management_startup()
-                )
-            except MaintenanceDelegationPublisherError as exc:
-                _LOGGER.warning(
-                    "[MaintenanceDelegation] AI management startup reconciliation "
-                    "blocked error=%s",
-                    str(exc),
-                )
-            else:
-                if (
-                    recovery.get("effect_status") == "verified_success"
-                    and recovery.get("device_effect_authority") == "none"
-                    and dict(entry.options or {}).get(CONF_AI_ENABLED) is True
-                ):
-                    coordinator._enabled = True
     await hass.async_add_executor_job(coordinator._blocking_init)
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator

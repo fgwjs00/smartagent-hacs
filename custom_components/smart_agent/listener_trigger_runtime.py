@@ -18,6 +18,7 @@ from homeassistant.helpers.event import async_call_later
 
 from .const import SOURCE_AUTOMATION, SOURCE_DASHBOARD, SOURCE_PHYSICAL, SOURCE_VOICE
 from .presence_runtime import room_candidates, room_snapshot
+from .service_contracts import STATEFUL_EXECUTION_DOMAINS
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -435,7 +436,7 @@ def schedule_inference(
         self._pending_triggers.append(pending_trigger)
 
     domain = entity_id.split(".")[0]
-    if domain in ("light", "switch", "fan", "cover", "climate", "media_player"):
+    if domain in STATEFUL_EXECUTION_DOMAINS:
         with self._pending_triggers_lock:
             self._pending_trigger_controllable[entity_id] = new_state
     is_urgent = domain in ("binary_sensor", "device_tracker", "person")

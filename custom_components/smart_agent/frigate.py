@@ -43,6 +43,19 @@ _ACTIVITY_LABELS = [
     "看电视", "阅读", "用电脑/手机", "休息/躺下", "用餐", "做饭",
     "健身/运动", "站立活动", "交谈", "儿童玩耍", "无人",
 ]
+_ACTIVITY_SEMANTIC_VALUES = {
+    "看电视": "watching_tv",
+    "阅读": "reading",
+    "用电脑/手机": "using_device",
+    "休息/躺下": "resting",
+    "用餐": "eating",
+    "做饭": "cooking",
+    "健身/运动": "exercising",
+    "站立活动": "moving",
+    "交谈": "conversation",
+    "儿童玩耍": "child_play",
+    "无人": "vacant",
+}
 
 
 @dataclass(frozen=True)
@@ -330,6 +343,33 @@ class FrigateMixin:
             "ts": time.time(),
         }
 
+        # HA remains a thin acquisition host.  Forward the typed, bounded
+        # activity fact to the add-on resident-world ledger; never forward the
+        # image or free-form visual description.
+        room = self._frigate_activity_signal_space(camera, event_id)
+        enqueue = getattr(self, "_enqueue_internal_event", None)
+        if room and callable(enqueue):
+            observed_at = self._ha_local_now().isoformat()
+            forwarded = enqueue(
+                "world_signal",
+                {
+                    "schema_version": "smartagent.world_signal.v1",
+                    "signal_kind": "activity",
+                    "space_id": room,
+                    "source_id": f"frigate:{camera}",
+                    "semantic_value": _ACTIVITY_SEMANTIC_VALUES.get(valid_label, "unknown"),
+                    "observed_at": observed_at,
+                    "freshness_ttl_secs": _ACTIVITY_STALE_TIMEOUT,
+                    "evidence_refs": [event_id] if event_id else [],
+                },
+                ts=observed_at,
+            )
+            if not forwarded:
+                self._sys_log(
+                    "WARN",
+                    f"[行为识别/{trigger_source}] camera={camera} 常驻世界信号入队失败",
+                )
+
         if event_id:
             trigger_text = f"{valid_label} — {desc}" if desc else valid_label
             self._remember_frigate_visual_description(event_id, f"【行为识别】{trigger_text}")
@@ -337,6 +377,27 @@ class FrigateMixin:
         self._sys_log("INFO",
             f"[行为识别/{trigger_source}] camera={camera} 识别结果：{valid_label}（{desc}）"
         )
+
+    def _frigate_activity_signal_space(self, camera: str, event_id: str | None) -> str:
+        """Resolve the acquisition space without interpreting the activity."""
+        event = (
+            self._frigate_events_cache.get(event_id)
+            if event_id and isinstance(self._frigate_events_cache, OrderedDict)
+            else None
+        )
+        if isinstance(event, dict):
+            zones = (
+                event.get("presence_zones")
+                or event.get("current_zones")
+                or event.get("entered_zones")
+                or []
+            )
+            if isinstance(zones, (list, tuple)):
+                for zone_id in zones:
+                    room = self._get_frigate_zone_room(camera, str(zone_id or ""))
+                    if room:
+                        return room
+        return self._get_frigate_camera_room(camera)
 
     async def _async_analyze_visual_event(self, event_id: str, camera: str) -> None:
         """Phase 7G 行为识别：通过 Frigate 事件快照触发视觉大模型行为分析。

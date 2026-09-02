@@ -27,11 +27,6 @@ WEBSOCKET_COMMAND_NAMES: tuple[str, ...] = (
     "ws_save_sensor_type",
     "ws_get_room_topology",
     "ws_list_backups",
-    "ws_attest_field_canary_operator_identity",
-    "ws_publish_field_canary_operator_approval",
-    "ws_issue_field_canary_promotion_grant",
-    "ws_prepare_field_canary_promotion_grant_revocation",
-    "ws_commit_field_canary_promotion_grant_revocation",
 )
 
 

@@ -5,12 +5,13 @@ import asyncio
 import hashlib
 import hmac
 import json
+from pathlib import Path
 import re
 import time
 from typing import Any, Callable, Iterable
 
 
-PROOF_VERSION = 1
+PROOF_VERSION = 3
 PROOF_PURPOSE = "ha_execute_dispatch"
 FIELD_CANARY_PROOF_VERSION = 2
 FIELD_CANARY_PROOF_PURPOSE = "ha_execute_dispatch_field_canary"
@@ -20,7 +21,7 @@ FIELD_DISPATCH_PERMIT_SCHEMA_VERSION = (
 )
 PROOF_MAX_TTL_SECONDS = 30
 PROOF_CLOCK_SKEW_SECONDS = 5
-_KEY_DERIVATION_CONTEXT = b"smartagent/ha-dispatch-proof/v1"
+_KEY_DERIVATION_CONTEXT = b"smartagent/ha-dispatch-proof/v3/dedicated-keyring"
 _FIELD_CANARY_KEY_DERIVATION_CONTEXT = (
     b"smartagent/ha-dispatch-proof/v2/field-canary"
 )
@@ -30,7 +31,7 @@ _STORE_VERSION = 1
 _STORE_PREFIX = "smart_agent.ha_dispatch_proofs"
 _MAX_CONSUMED_PROOFS = 4096
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
-_V1_EXPECTED_KEYS = frozenset(
+_STANDARD_EXPECTED_KEYS = frozenset(
     {
         "v",
         "purpose",
@@ -52,7 +53,7 @@ _V1_EXPECTED_KEYS = frozenset(
 )
 _V2_EXPECTED_KEYS = frozenset(
     {
-        *_V1_EXPECTED_KEYS,
+        *_STANDARD_EXPECTED_KEYS,
         "field_dispatch_permit_schema_version",
         "field_dispatch_permit_id",
         "field_dispatch_permit_digest",
@@ -113,6 +114,170 @@ def key_id(secret: str, *, version: int = PROOF_VERSION) -> str:
     return hashlib.sha256(_derived_key(secret, version=version)).hexdigest()[:16]
 
 
+def seal_loaded_source_identity(module: str, file_value: str) -> dict[str, str]:
+    """Seal one non-sensitive source identity at module/process startup."""
+
+    file_path = str(file_value or "")
+    sha256 = ""
+    try:
+        if file_path:
+            sha256 = hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
+    except OSError:
+        sha256 = ""
+    return {
+        "module": str(module or ""),
+        "file": file_path,
+        "sha256": sha256,
+    }
+
+
+def host_proof_keyring_identity(addon_client: Any) -> dict[str, Any]:
+    """Project the loaded v3 keyring without exposing key material."""
+
+    enabled = getattr(addon_client, "_host_dispatch_proof_enabled", False) is True
+    current_secret = getattr(
+        addon_client,
+        "_host_dispatch_proof_current_secret",
+        "",
+    )
+    staged_secret = getattr(
+        addon_client,
+        "_host_dispatch_proof_staged_secret",
+        "",
+    )
+    current_secret = current_secret if type(current_secret) is str else ""
+    staged_secret = staged_secret if type(staged_secret) is str else ""
+
+    current_kid = ""
+    staged_kids: list[str] = []
+    try:
+        if current_secret:
+            current_kid = key_id(current_secret)
+    except DispatchProofError:
+        current_kid = ""
+    try:
+        if staged_secret:
+            staged_kid = key_id(staged_secret)
+            if staged_kid and staged_kid != current_kid:
+                staged_kids.append(staged_kid)
+    except DispatchProofError:
+        pass
+
+    return {
+        "proof_version": PROOF_VERSION,
+        "enabled": enabled,
+        "configured": bool(current_kid),
+        "current_kid": current_kid,
+        "staged_kids": staged_kids,
+    }
+
+
+async def _async_proof_store_metadata(
+    hass: Any,
+    kid: str,
+    *,
+    now: int,
+    store_factory: Callable[[Any, int, str], Any],
+) -> dict[str, Any]:
+    """Read aggregate consumption metadata; never return proof identifiers."""
+
+    store = store_factory(hass, _STORE_VERSION, f"{_STORE_PREFIX}.{kid}")
+    try:
+        payload = await store.async_load()
+    except Exception:
+        return {"kid": kid, "state": "unavailable"}
+    if payload is None:
+        return {
+            "kid": kid,
+            "state": "absent",
+            "consumed_count": 0,
+            "live_count": 0,
+            "expired_count": 0,
+            "earliest_live_expiry": 0,
+            "latest_live_expiry": 0,
+        }
+    if not isinstance(payload, dict) or not isinstance(payload.get("consumed"), dict):
+        return {"kid": kid, "state": "corrupt"}
+
+    expiries: list[int] = []
+    for raw_digest, raw_expiry in payload["consumed"].items():
+        if (
+            not _HEX_64.fullmatch(str(raw_digest or ""))
+            or type(raw_expiry) is not int
+        ):
+            return {"kid": kid, "state": "corrupt"}
+        expiries.append(int(raw_expiry))
+    live_expiries = [expiry for expiry in expiries if expiry > now]
+    return {
+        "kid": kid,
+        "state": "valid",
+        "consumed_count": len(expiries),
+        "live_count": len(live_expiries),
+        "expired_count": len(expiries) - len(live_expiries),
+        "earliest_live_expiry": min(live_expiries) if live_expiries else 0,
+        "latest_live_expiry": max(live_expiries) if live_expiries else 0,
+    }
+
+
+async def async_build_loaded_identity_evidence(
+    hass: Any,
+    addon_client: Any,
+    *,
+    integration_version: str,
+    runtime_version: str,
+    integration_source: dict[str, Any],
+    now: int | None = None,
+    store_factory: Callable[[Any, int, str], Any] | None = None,
+) -> dict[str, Any]:
+    """Build read-only HA loaded-identity evidence with redacted store totals."""
+
+    evaluated_at = int(time.time() if now is None else now)
+    if store_factory is None:
+        try:
+            from homeassistant.helpers.storage import Store
+        except Exception:
+            Store = None  # type: ignore[assignment]
+        store_factory = Store
+
+    keyring = host_proof_keyring_identity(addon_client)
+    kids = [
+        kid
+        for kid in [keyring["current_kid"], *keyring["staged_kids"]]
+        if kid
+    ]
+    if store_factory is None:
+        store_metadata = [
+            {"kid": kid, "state": "unavailable"}
+            for kid in kids
+        ]
+    else:
+        store_metadata = [
+            await _async_proof_store_metadata(
+                hass,
+                kid,
+                now=evaluated_at,
+                store_factory=store_factory,
+            )
+            for kid in kids
+        ]
+
+    source = {
+        key: str(integration_source.get(key) or "")
+        for key in ("module", "file", "sha256")
+    }
+    return {
+        "schema_version": "smartagent.host_proof_loaded_identity_evidence.v1",
+        "side": "ha",
+        "host_proof": keyring,
+        "loaded_integration": {
+            "integration_version": str(integration_version or "unknown"),
+            "runtime_version": str(runtime_version or "unknown"),
+            "source": source,
+        },
+        "proof_store": store_metadata,
+    }
+
+
 def dispatch_proof_secret_for_clients(
     proof: Any,
     addon_clients: Iterable[Any],
@@ -134,10 +299,26 @@ def dispatch_proof_secret_for_clients(
         return ""
 
     for addon_client in addon_clients:
-        if proof_version == PROOF_VERSION:
-            candidates = (getattr(addon_client, "_auth_token", ""),)
+        if (
+            proof_version == PROOF_VERSION
+            and getattr(addon_client, "_host_dispatch_proof_enabled", False)
+            is True
+        ):
+            candidates = (
+                getattr(
+                    addon_client,
+                    "_host_dispatch_proof_current_secret",
+                    "",
+                ),
+                getattr(
+                    addon_client,
+                    "_host_dispatch_proof_staged_secret",
+                    "",
+                ),
+            )
         elif (
-            getattr(
+            proof_version == FIELD_CANARY_PROOF_VERSION
+            and getattr(
                 addon_client,
                 "_field_canary_host_dispatch_proof_enabled",
                 False,
@@ -203,7 +384,7 @@ def verify_dispatch_proof(
     }:
         raise DispatchProofError("dispatch_proof_version_invalid")
     expected_keys = (
-        _V1_EXPECTED_KEYS
+        _STANDARD_EXPECTED_KEYS
         if version == PROOF_VERSION
         else _V2_EXPECTED_KEYS
     )
@@ -259,14 +440,14 @@ def verify_dispatch_proof(
         raise DispatchProofError("dispatch_proof_target_mismatch")
     transaction_id = str(proof.get("execution_transaction_id") or "").strip()
     authority = str(proof.get("authority") or "").strip().lower()
-    v1_authorities = {
+    standard_authorities = {
         "gateway_decision",
         "controlled_execution",
         "operations_patrol",
     }
     if not transaction_id or (
         version == PROOF_VERSION
-        and authority not in v1_authorities
+        and authority not in standard_authorities
     ) or (
         version == FIELD_CANARY_PROOF_VERSION
         and authority != FIELD_CANARY_PROOF_AUTHORITY
@@ -377,10 +558,13 @@ __all__ = [
     "FIELD_CANARY_PROOF_PURPOSE",
     "FIELD_CANARY_PROOF_VERSION",
     "FIELD_DISPATCH_PERMIT_SCHEMA_VERSION",
+    "async_build_loaded_identity_evidence",
     "async_consume_dispatch_proof",
     "canonical_envelope_projection",
     "dispatch_proof_secret_for_clients",
     "envelope_digest",
+    "host_proof_keyring_identity",
     "key_id",
+    "seal_loaded_source_identity",
     "verify_dispatch_proof",
 ]

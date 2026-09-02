@@ -10,14 +10,20 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from homeassistant.core import HomeAssistant
 
 if __package__:
-    from .service_contracts import ServiceContractResult, validate_service_call
+    from .service_contracts import (
+        SERVICE_CONTRACTS,
+        ServiceContractResult,
+        validate_service_call,
+    )
     from .output_contracts import begin_output_attempt, finalize_output_attempt
 else:
     _contract_module_name = "_smart_agent_service_contracts_runtime"
@@ -31,6 +37,7 @@ else:
         sys.modules[_contract_module_name] = _contract_module
         _contract_spec.loader.exec_module(_contract_module)
     ServiceContractResult = _contract_module.ServiceContractResult
+    SERVICE_CONTRACTS = _contract_module.SERVICE_CONTRACTS
     validate_service_call = _contract_module.validate_service_call
     _output_module_name = "_smart_agent_output_contracts_runtime"
     _output_module = sys.modules.get(_output_module_name)
@@ -187,6 +194,7 @@ def async_get_state(hass: HomeAssistant, entity_id: str) -> Any:
 def _state_snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     """Serialize the pre-execution HA state needed for rollback/audit."""
     state_obj = async_get_state(hass, entity_id)
+    observed_at = time.time()
     if state_obj is None:
         return {
             "entity_id": entity_id,
@@ -195,15 +203,18 @@ def _state_snapshot(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
             "attributes": {},
             "last_changed": "",
             "last_updated": "",
+            "observed_at": observed_at,
         }
     attrs = getattr(state_obj, "attributes", {})
+    state = str(getattr(state_obj, "state", "") or "")
     return {
         "entity_id": entity_id,
-        "available": True,
-        "state": str(getattr(state_obj, "state", "") or ""),
-        "attributes": attrs if isinstance(attrs, dict) else {},
+        "available": state.strip().lower() not in {"", "none", "unknown", "unavailable"},
+        "state": state,
+        "attributes": dict(attrs) if isinstance(attrs, dict) else {},
         "last_changed": str(getattr(state_obj, "last_changed", "") or ""),
         "last_updated": str(getattr(state_obj, "last_updated", "") or ""),
+        "observed_at": observed_at,
     }
 
 
@@ -222,10 +233,40 @@ def _brightness_pct_from_snapshot(snapshot: dict[str, Any]) -> int | None:
 
 
 def _numeric_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _timestamp_value(value: Any) -> float | None:
+    """Normalize an aware HA timestamp or finite epoch without truthy coercion."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return None
+        parsed = value.timestamp()
+        return parsed if math.isfinite(parsed) else None
+    if isinstance(value, (int, float)):
+        return _numeric_value(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    numeric = _numeric_value(text)
+    if numeric is not None:
+        return numeric
+    try:
+        parsed_datetime = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed_datetime.tzinfo is None:
+        return None
+    parsed = parsed_datetime.timestamp()
+    return parsed if math.isfinite(parsed) else None
 
 
 def _normalized_vector(value: Any, length: int) -> tuple[float, ...] | None:
@@ -241,145 +282,134 @@ def _attribute_check(expected: Any, actual: Any, *, verified: bool) -> dict[str,
     return {"expected": expected, "actual": actual, "verified": bool(verified)}
 
 
-def _light_attribute_checks(
-    command: dict[str, Any],
-    snapshot: dict[str, Any],
-) -> dict[str, dict[str, Any]]:
-    data = command.get("data") if isinstance(command.get("data"), dict) else {}
-    attrs = snapshot.get("attributes") if isinstance(snapshot.get("attributes"), dict) else {}
-    checks: dict[str, dict[str, Any]] = {}
+def _readback_contract(command: dict[str, Any]) -> dict[str, Any] | None:
+    service_key = (
+        f"{str(command.get('domain') or '').strip()}."
+        f"{str(command.get('service') or '').strip()}"
+    )
+    service_contract = SERVICE_CONTRACTS.get(service_key)
+    if not isinstance(service_contract, dict):
+        return None
+    readback = service_contract.get("readback")
+    if (
+        not isinstance(readback, dict)
+        or readback.get("schema_version") != "ha_post_state.v1"
+        or not isinstance(readback.get("state"), dict)
+        or not isinstance(readback.get("attribute_checks"), list)
+    ):
+        return None
+    return readback
 
-    if "brightness_pct" in data:
-        requested = _numeric_value(data.get("brightness_pct"))
-        expected = int(round(requested)) if requested is not None else data.get("brightness_pct")
-        actual = _brightness_pct_from_snapshot(snapshot)
-        checks["brightness_pct"] = _attribute_check(
-            expected,
-            actual,
-            verified=requested is not None and actual is not None and abs(actual - requested) <= 1,
+
+def _attribute_contract_check(
+    *,
+    data: dict[str, Any],
+    attrs: dict[str, Any],
+    rule: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    command_field = str(rule.get("command_field") or "")
+    state_attribute = str(rule.get("state_attribute") or "")
+    if not command_field or not state_attribute or command_field not in data:
+        return None
+    receipt_key = str(rule.get("receipt_key") or command_field)
+    comparison = str(rule.get("comparison") or "")
+    tolerance = _numeric_value(rule.get("tolerance")) or 0.0
+    expected_raw = data.get(command_field)
+    actual_raw = attrs.get(state_attribute)
+
+    if comparison in {"numeric", "brightness_pct"}:
+        expected_number = _numeric_value(expected_raw)
+        actual_number = (
+            _brightness_pct_from_snapshot({"attributes": attrs})
+            if comparison == "brightness_pct"
+            else _numeric_value(actual_raw)
         )
-
-    if "color_temp_kelvin" in data:
-        requested = _numeric_value(data.get("color_temp_kelvin"))
-        expected = int(round(requested)) if requested is not None else data.get("color_temp_kelvin")
-        actual_value = _numeric_value(attrs.get("color_temp_kelvin"))
-        if actual_value is None:
-            actual_mired = _numeric_value(attrs.get("color_temp"))
-            if actual_mired and actual_mired > 0:
-                actual_value = 1_000_000 / actual_mired
-        actual = int(round(actual_value)) if actual_value is not None else None
-        checks["color_temp_kelvin"] = _attribute_check(
-            expected,
-            actual,
-            verified=(
-                requested is not None
-                and actual_value is not None
-                and abs(actual_value - requested) <= 100
-            ),
+        expected = (
+            int(round(expected_number))
+            if comparison == "brightness_pct" and expected_number is not None
+            else expected_number
+            if expected_number is not None
+            else expected_raw
         )
-
-    if "color_temp" in data:
-        requested = _numeric_value(data.get("color_temp"))
-        expected = int(round(requested)) if requested is not None else data.get("color_temp")
-        actual_value = _numeric_value(attrs.get("color_temp"))
-        if actual_value is None:
-            actual_kelvin = _numeric_value(attrs.get("color_temp_kelvin"))
-            if actual_kelvin and actual_kelvin > 0:
-                actual_value = 1_000_000 / actual_kelvin
-        actual = int(round(actual_value)) if actual_value is not None else None
-        checks["color_temp"] = _attribute_check(
-            expected,
-            actual,
-            verified=(
-                requested is not None
-                and actual_value is not None
-                and abs(actual_value - requested) <= 2
-            ),
+        actual = (
+            int(round(actual_number))
+            if comparison == "brightness_pct" and actual_number is not None
+            else actual_number
         )
-
-    if "effect" in data:
-        expected = str(data.get("effect") or "")
-        actual = str(attrs.get("effect") or "")
-        checks["effect"] = _attribute_check(expected, actual, verified=actual == expected)
-
-    vector_specs = {
-        "rgb_color": (3, 2.0),
-        "hs_color": (2, 2.0),
-        "xy_color": (2, 0.02),
-    }
-    for key, (length, tolerance) in vector_specs.items():
-        if key not in data:
-            continue
-        expected_vector = _normalized_vector(data.get(key), length)
-        actual_vector = _normalized_vector(attrs.get(key), length)
-        if key == "rgb_color":
-            expected = [int(round(item)) for item in expected_vector] if expected_vector else data.get(key)
-            actual = [int(round(item)) for item in actual_vector] if actual_vector else None
-        else:
-            expected = list(expected_vector) if expected_vector else data.get(key)
-            actual = list(actual_vector) if actual_vector else None
         verified = bool(
-            expected_vector
-            and actual_vector
+            expected_number is not None
+            and actual_number is not None
+            and abs(actual_number - expected_number) <= tolerance
+        )
+    elif comparison in {"color_temp_kelvin", "color_temp_mired"}:
+        expected_number = _numeric_value(expected_raw)
+        actual_number = _numeric_value(actual_raw)
+        fallback = _numeric_value(attrs.get(str(rule.get("fallback_attribute") or "")))
+        if actual_number is None and fallback is not None and fallback > 0:
+            actual_number = 1_000_000 / fallback
+        expected = int(round(expected_number)) if expected_number is not None else expected_raw
+        actual = int(round(actual_number)) if actual_number is not None else None
+        verified = bool(
+            expected_number is not None
+            and actual_number is not None
+            and abs(actual_number - expected_number) <= tolerance
+        )
+    elif comparison in {"integer_vector", "numeric_vector"}:
+        length = rule.get("length")
+        expected_vector = (
+            _normalized_vector(expected_raw, length)
+            if isinstance(length, int)
+            else None
+        )
+        actual_vector = (
+            _normalized_vector(actual_raw, length)
+            if isinstance(length, int)
+            else None
+        )
+        if comparison == "integer_vector":
+            expected = (
+                [int(round(item)) for item in expected_vector]
+                if expected_vector is not None
+                else expected_raw
+            )
+            actual = (
+                [int(round(item)) for item in actual_vector]
+                if actual_vector is not None
+                else None
+            )
+        else:
+            expected = list(expected_vector) if expected_vector is not None else expected_raw
+            actual = list(actual_vector) if actual_vector is not None else None
+        verified = bool(
+            expected_vector is not None
+            and actual_vector is not None
             and all(
                 abs(actual_item - expected_item) <= tolerance
                 for actual_item, expected_item in zip(actual_vector, expected_vector)
             )
         )
-        checks[key] = _attribute_check(expected, actual, verified=verified)
-
-    return checks
-
-
-def _command_already_in_target_state(command: dict[str, Any], snapshot: dict[str, Any]) -> bool:
-    if not snapshot.get("available"):
-        return False
-    state = str(snapshot.get("state") or "").strip().lower()
-    service = str(command.get("service") or "").strip()
-    domain = str(command.get("domain") or "").strip()
-    data = command.get("data") if isinstance(command.get("data"), dict) else {}
-
-    if service == "turn_off":
-        return state == "off"
-    if service != "turn_on":
-        return False
-    if state != "on":
-        return False
-    if domain == "light":
-        attribute_checks = _light_attribute_checks(command, snapshot)
-        return all(item["verified"] for item in attribute_checks.values())
-    return True
+    elif comparison == "boolean":
+        expected = expected_raw
+        actual = actual_raw
+        verified = type(expected_raw) is bool and type(actual_raw) is bool and actual_raw is expected_raw
+    elif comparison == "string":
+        expected = expected_raw.strip() if type(expected_raw) is str else ""
+        actual = actual_raw.strip() if type(actual_raw) is str else ""
+        verified = bool(expected) and actual == expected
+    else:
+        expected = expected_raw
+        actual = actual_raw
+        verified = False
+    return receipt_key, _attribute_check(expected, actual, verified=verified)
 
 
-def _expected_post_state(command: dict[str, Any]) -> str | None:
-    domain = str(command.get("domain") or "")
-    service = str(command.get("service") or "")
-    data = command.get("data") if isinstance(command.get("data"), dict) else {}
-    if domain in {"light", "switch", "fan"} and service == "turn_on":
-        return "on"
-    if (
-        domain in {"light", "switch", "fan", "climate", "media_player"}
-        and service == "turn_off"
-    ):
-        return "off"
-    if domain == "cover":
-        return {"open_cover": "open", "close_cover": "closed"}.get(service)
-    if domain == "climate" and service == "set_hvac_mode":
-        return str(data.get("hvac_mode") or "").strip().lower() or None
-    if domain == "media_player":
-        return {
-            "media_play": "playing",
-            "media_pause": "paused",
-        }.get(service)
-    return None
-
-
-def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any]:
-    expected = _expected_post_state(command)
-    domain = str(command.get("domain") or "")
-    snapshot = _state_snapshot(hass, str(command.get("entity_id") or ""))
+def _contract_evaluation(
+    command: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    contract = _readback_contract(command)
     actual = str(snapshot.get("state") or "").strip().lower()
-    if expected is None:
+    if contract is None:
         return {
             "expected": "",
             "actual": actual,
@@ -387,27 +417,194 @@ def _post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, An
             "verification_supported": False,
             "verification_reason": "verification_contract_missing",
             "attribute_checks": {},
-            "post_state_snapshot": snapshot,
         }
-    attribute_checks = {}
-    if expected == "on" and domain == "light":
-        attribute_checks = _light_attribute_checks(command, snapshot)
-    verified = bool(snapshot.get("available")) and actual == expected
-    if attribute_checks:
-        verified = verified and all(item["verified"] for item in attribute_checks.values())
+    data = command.get("data") if isinstance(command.get("data"), dict) else {}
+    attrs = snapshot.get("attributes") if isinstance(snapshot.get("attributes"), dict) else {}
+    rules = [item for item in contract["attribute_checks"] if isinstance(item, dict)]
+    declared_fields = {
+        str(item.get("command_field") or "") for item in rules
+    } | {
+        str(item) for item in contract.get("non_effect_fields", []) if str(item)
+    }
+    state_field = str(contract["state"].get("field") or "")
+    if state_field:
+        declared_fields.add(state_field)
+    if set(data) - declared_fields:
+        return {
+            "expected": str(contract.get("expected") or ""),
+            "actual": actual,
+            "verified": False,
+            "verification_supported": False,
+            "verification_reason": "verification_contract_parameter_unsupported",
+            "attribute_checks": {},
+        }
+    checks = dict(
+        item
+        for item in (
+            _attribute_contract_check(data=data, attrs=attrs, rule=rule)
+            for rule in rules
+        )
+        if item is not None
+    )
+    expected = str(contract.get("expected") or "")
+    state_contract = contract["state"]
+    operator = str(state_contract.get("operator") or "")
+    if operator == "equals":
+        target = str(state_contract.get("value") or "").strip().lower()
+        state_verified = bool(target) and actual == target
+    elif operator == "one_of":
+        targets = tuple(
+            str(item).strip().lower()
+            for item in state_contract.get("values", [])
+            if str(item).strip()
+        )
+        state_verified = bool(targets) and actual in targets
+    elif operator == "not_in":
+        rejected = {
+            str(item).strip().lower()
+            for item in state_contract.get("values", [])
+            if str(item).strip()
+        }
+        state_verified = bool(rejected) and actual not in rejected
+    elif operator == "command_field":
+        field = str(state_contract.get("field") or "")
+        target = str(data.get(field) or "").strip().lower()
+        expected = target
+        state_verified = bool(target) and actual == target
+    elif operator == "readable":
+        state_verified = True
+    else:
+        state_verified = False
+    available = bool(snapshot.get("available")) and actual not in {
+        "",
+        "none",
+        "unknown",
+        "unavailable",
+    }
+    attributes_verified = all(item["verified"] for item in checks.values())
+    if contract.get("requires_attribute_check") is True and not checks:
+        attributes_verified = False
+    verified = available and state_verified and attributes_verified
     return {
         "expected": expected,
         "actual": actual,
         "verified": verified,
         "verification_supported": True,
-        "verification_reason": "",
-        "attribute_checks": attribute_checks,
+        "verification_reason": (
+            ""
+            if verified
+            else "post_state_unavailable"
+            if not available
+            else "post_state_not_converged"
+        ),
+        "attribute_checks": checks,
+    }
+
+
+def _post_dispatch_freshness_checks(
+    command: dict[str, Any],
+    pre_snapshot: dict[str, Any] | None,
+    post_snapshot: dict[str, Any],
+    dispatch_started_at: Any,
+) -> dict[str, dict[str, Any]]:
+    pre = pre_snapshot if isinstance(pre_snapshot, dict) else {}
+    pre_attrs = pre.get("attributes") if isinstance(pre.get("attributes"), dict) else {}
+    post_attrs = (
+        post_snapshot.get("attributes")
+        if isinstance(post_snapshot.get("attributes"), dict)
+        else {}
+    )
+    pre_last_updated = _timestamp_value(pre.get("last_updated"))
+    pre_observed_at = _timestamp_value(pre.get("observed_at"))
+    dispatch_at = _timestamp_value(dispatch_started_at)
+    post_last_updated = _timestamp_value(post_snapshot.get("last_updated"))
+    post_observed_at = _timestamp_value(post_snapshot.get("observed_at"))
+    pre_readable = bool(pre.get("available"))
+    timeline_verified = bool(
+        pre_last_updated is not None
+        and pre_observed_at is not None
+        and dispatch_at is not None
+        and post_last_updated is not None
+        and post_observed_at is not None
+        and pre_last_updated <= pre_observed_at <= dispatch_at
+        and dispatch_at < post_last_updated <= post_observed_at
+        and post_last_updated > pre_last_updated
+    )
+    state_changed = (
+        str(pre.get("state") or ""),
+        pre_attrs,
+    ) != (
+        str(post_snapshot.get("state") or ""),
+        post_attrs,
+    )
+    pre_not_at_target = not _contract_evaluation(command, pre).get("verified", False)
+    return {
+        "pre_state_readable": _attribute_check(True, pre_readable, verified=pre_readable),
+        "timeline_fresh": _attribute_check(True, timeline_verified, verified=timeline_verified),
+        "state_changed_after_dispatch": _attribute_check(True, state_changed, verified=state_changed),
+        "pre_state_not_at_target": _attribute_check(
+            True,
+            pre_not_at_target,
+            verified=pre_not_at_target,
+        ),
+    }
+
+
+def _command_already_in_target_state(command: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    evaluation = _contract_evaluation(command, snapshot)
+    return bool(
+        evaluation.get("verification_supported") is True
+        and evaluation.get("verified") is True
+    )
+
+
+def _post_state_verification(
+    hass: Any,
+    command: dict[str, Any],
+    *,
+    pre_state_snapshot: dict[str, Any] | None = None,
+    dispatch_started_at: Any = None,
+) -> dict[str, Any]:
+    snapshot = _state_snapshot(hass, str(command.get("entity_id") or ""))
+    evaluation = _contract_evaluation(command, snapshot)
+    freshness_checks: dict[str, dict[str, Any]] = {}
+    if (
+        evaluation.get("verification_supported") is True
+        and pre_state_snapshot is not None
+        and dispatch_started_at is not None
+    ):
+        freshness_checks = _post_dispatch_freshness_checks(
+            command,
+            pre_state_snapshot,
+            snapshot,
+            dispatch_started_at,
+        )
+        if any(item.get("verified") is not True for item in freshness_checks.values()):
+            evaluation["verified"] = False
+            evaluation["verification_reason"] = "post_state_not_fresh"
+    return {
+        **evaluation,
+        # Persist the same Host service boundary used for physical freshness;
+        # the Gateway ledger begins before this process reads the pre-state.
+        "service_dispatch_started_at": dispatch_started_at,
+        "freshness_checks": freshness_checks,
         "post_state_snapshot": snapshot,
     }
 
 
-async def _wait_for_post_state_verification(hass: Any, command: dict[str, Any]) -> dict[str, Any]:
-    verification = _post_state_verification(hass, command)
+async def _wait_for_post_state_verification(
+    hass: Any,
+    command: dict[str, Any],
+    *,
+    pre_state_snapshot: dict[str, Any] | None = None,
+    dispatch_started_at: Any = None,
+) -> dict[str, Any]:
+    verification = _post_state_verification(
+        hass,
+        command,
+        pre_state_snapshot=pre_state_snapshot,
+        dispatch_started_at=dispatch_started_at,
+    )
     if (
         verification.get("verified")
         or verification.get("verification_supported") is False
@@ -417,7 +614,12 @@ async def _wait_for_post_state_verification(hass: Any, command: dict[str, Any]) 
     interval = max(0.0, float(_POST_STATE_VERIFY_INTERVAL_SECONDS))
     while time.monotonic() < deadline:
         await asyncio.sleep(interval)
-        verification = _post_state_verification(hass, command)
+        verification = _post_state_verification(
+            hass,
+            command,
+            pre_state_snapshot=pre_state_snapshot,
+            dispatch_started_at=dispatch_started_at,
+        )
         if verification.get("verified"):
             return verification
     return verification
@@ -1274,6 +1476,8 @@ async def async_execute_command_envelope(
         pre_state_snapshot.append(snapshot)
         if _command_already_in_target_state(command, snapshot):
             verification = _post_state_verification(hass, command)
+            verification["verified"] = False
+            verification["verification_reason"] = "already_in_target_state"
             results.append({
                 **command,
                 "ok": True,
@@ -1293,14 +1497,21 @@ async def async_execute_command_envelope(
                 ),
             })
             continue
+        dispatch_started_at: float | None = None
         try:
+            dispatch_started_at = time.time()
             await hass.services.async_call(
                 command["domain"],
                 command["service"],
                 {"entity_id": command["entity_id"], **command["data"]},
                 blocking=True,
             )
-            verification = await _wait_for_post_state_verification(hass, command)
+            verification = await _wait_for_post_state_verification(
+                hass,
+                command,
+                pre_state_snapshot=snapshot,
+                dispatch_started_at=dispatch_started_at,
+            )
             receipt = _execution_receipt_fields(
                 transport_status="acknowledged",
                 verification=verification,
@@ -1324,7 +1535,12 @@ async def async_execute_command_envelope(
             if not verified and stop_on_first_error:
                 stopped_after_error = True
         except Exception as exc:
-            verification = _post_state_verification(hass, command)
+            verification = _post_state_verification(
+                hass,
+                command,
+                pre_state_snapshot=snapshot,
+                dispatch_started_at=dispatch_started_at,
+            )
             receipt = _execution_receipt_fields(
                 transport_status="transport_error",
                 verification=verification,
@@ -1360,9 +1576,13 @@ async def async_execute_command_envelope(
         effect_status = "effect_unknown"
         workflow_status = "reconciliation_required"
         retry_disposition = "manual_review"
-    elif ok:
+    elif ok and succeeded_count > 0:
         effect_status = "verified_success"
         workflow_status = "completed"
+        retry_disposition = "forbidden"
+    elif skipped_count > 0 and failed_count == 0:
+        effect_status = "verified_failed"
+        workflow_status = "skipped"
         retry_disposition = "forbidden"
     else:
         effect_status = "verified_failed"

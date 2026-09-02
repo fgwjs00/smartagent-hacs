@@ -14,13 +14,17 @@ from typing import Any
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later
 
+from .admin_actor import AuthenticatedOwnerSession
 from .action_normalization import action_domain, action_entity_id
 from .action_receipts import ActionResultCollector
 from .const import ACTION_PARAM_KEYS_LIGHT_SCENE, MODE_SHOWROOM
 from .execution_gate import (
-    STATELESS_DOMAINS as THIN_GATE_STATELESS_DOMAINS,
     evaluate_self_trigger_protection,
     evaluate_thin_execution_gate,
+)
+from .service_contracts import (
+    EXECUTION_DOMAINS as THIN_GATE_EXECUTION_DOMAINS,
+    STATELESS_DOMAINS as THIN_GATE_STATELESS_DOMAINS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,7 +70,8 @@ class ActionExecutionRuntimeMixin:
         _USER_EXPLICIT = "USER_EXPLICIT"
         _is_user_explicit = (cmd_source == _USER_EXPLICIT)
         _has_authenticated_user_intent = bool(
-            _is_user_explicit and user_intent_authority is not None
+            _is_user_explicit
+            and type(user_intent_authority) is AuthenticatedOwnerSession
         )
         _decision_lineage = (
             decision_contract_lineage
@@ -516,6 +521,7 @@ class ActionExecutionRuntimeMixin:
                 "service": service,
                 "entity_id": entity_id,
             }
+            daylight_guard_evaluation: dict[str, Any] | None = None
             if correlation_id:
                 action_result_context["correlation_id"] = correlation_id
             if parent_transaction_id:
@@ -557,6 +563,8 @@ class ActionExecutionRuntimeMixin:
                 raw_entity_id=raw_entity_id,
                 entity_exists=entity_exists,
                 raw_entity_exists=raw_entity_exists,
+                allowed_domains=THIN_GATE_EXECUTION_DOMAINS,
+                stateless_domains=THIN_GATE_STATELESS_DOMAINS,
             )
             if not thin_gate.allowed:
                 blocked_count += 1
@@ -593,8 +601,26 @@ class ActionExecutionRuntimeMixin:
                 )
             )
             if pre_router_auto_presence_lighting:
-                daylight_reason = self._daylight_auto_lighting_suppressed_reason(entity_id)
-                if daylight_reason:
+                daylight_guard_evaluation = (
+                    self._daylight_auto_lighting_execution_evaluation(
+                        entity_id,
+                        domain,
+                        service,
+                        actions=original_actions,
+                        require_world_snapshot_guard=require_world_snapshot_guard,
+                        decision_contract_lineage=decision_contract_lineage,
+                        world_snapshot_id=world_snapshot_id,
+                        active_space_id=active_space_id,
+                        decision_time=decision_time,
+                    )
+                )
+                action_result_context["daylight_guard_evaluation"] = dict(
+                    daylight_guard_evaluation
+                )
+                daylight_reason = str(
+                    daylight_guard_evaluation.get("reason_code") or ""
+                ).strip()
+                if daylight_guard_evaluation.get("allowed") is not True:
                     self._sys_log(
                         "WARN",
                         f"[DaylightGuard] blocked daytime automatic presence lighting {domain}.turn_on({entity_id}): {daylight_reason}",
@@ -604,6 +630,7 @@ class ActionExecutionRuntimeMixin:
                         **action_result_context,
                         "status": "blocked_daylight_auto_lighting",
                         "msg": daylight_reason,
+                        "ha_command_status": "not_dispatched",
                     })
                     continue
             if domain not in ("script", "scene"):
@@ -830,8 +857,27 @@ class ActionExecutionRuntimeMixin:
                 service == "turn_on"
                 and is_automatic_presence_lighting
             ):
-                daylight_reason = self._daylight_auto_lighting_suppressed_reason(entity_id)
-                if daylight_reason:
+                if daylight_guard_evaluation is None:
+                    daylight_guard_evaluation = (
+                        self._daylight_auto_lighting_execution_evaluation(
+                            entity_id,
+                            domain,
+                            service,
+                            actions=original_actions,
+                            require_world_snapshot_guard=require_world_snapshot_guard,
+                            decision_contract_lineage=decision_contract_lineage,
+                            world_snapshot_id=world_snapshot_id,
+                            active_space_id=active_space_id,
+                            decision_time=decision_time,
+                        )
+                    )
+                    action_result_context["daylight_guard_evaluation"] = dict(
+                        daylight_guard_evaluation
+                    )
+                daylight_reason = str(
+                    daylight_guard_evaluation.get("reason_code") or ""
+                ).strip()
+                if daylight_guard_evaluation.get("allowed") is not True:
                     self._sys_log(
                         "WARN",
                         f"[日照守卫] 拒绝白天自动开灯 {domain}.turn_on({entity_id})：{daylight_reason}",
@@ -841,6 +887,7 @@ class ActionExecutionRuntimeMixin:
                         **action_result_context,
                         "status": "blocked_daylight_auto_lighting",
                         "msg": daylight_reason,
+                        "ha_command_status": "not_dispatched",
                     })
                     continue
 
@@ -1334,10 +1381,15 @@ class ActionExecutionRuntimeMixin:
                 }
 
             response_rows = batch_response.get("results")
+            receipt_dispositions = batch_response.get(
+                "_smartagent_receipt_dispositions"
+            )
             response_shape_valid = (
                 isinstance(response_rows, list)
                 and len(response_rows) == len(prepared_batch_calls)
                 and all(isinstance(row, dict) for row in response_rows)
+                and isinstance(receipt_dispositions, list)
+                and len(receipt_dispositions) == len(prepared_batch_calls)
             )
             if not response_shape_valid:
                 response_rows = [None] * len(prepared_batch_calls)
@@ -1346,7 +1398,15 @@ class ActionExecutionRuntimeMixin:
             executed = 0
             failed_count = 0
             blocked_count = 0
-            for prepared, receipt in zip(prepared_batch_calls, response_rows):
+            for index, (prepared, receipt) in enumerate(
+                zip(prepared_batch_calls, response_rows)
+            ):
+                receipt_disposition = (
+                    receipt_dispositions[index]
+                    if isinstance(receipt_dispositions, list)
+                    and index < len(receipt_dispositions)
+                    else ""
+                )
                 result_context = dict(prepared["result_context"])
                 result_context.update({
                     "domain": prepared["domain"],
@@ -1359,6 +1419,7 @@ class ActionExecutionRuntimeMixin:
                     isinstance(receipt, dict)
                     and receipt.get("ok") is True
                     and receipt.get("executed") is True
+                    and receipt_disposition == "verified_success"
                 ):
                     await self._record_prepared_service_success(
                         domain=prepared["domain"],
@@ -1376,6 +1437,9 @@ class ActionExecutionRuntimeMixin:
                         now_ts=float(prepared["now_ts"]),
                         ai_source=prepared["ai_source"],
                         ai_new_state=prepared["ai_new_state"],
+                        occupancy_cycle_id=str(
+                            _decision_lineage.get("occupancy_cycle_id") or ""
+                        ).strip(),
                     )
                     self._clear_service_call_error(
                         txn_id,
@@ -1398,7 +1462,7 @@ class ActionExecutionRuntimeMixin:
                         receipt.get("error_type")
                         or "ha_service_unverified_success"
                     ).strip()
-                    if receipt.get("ok") is True and (
+                    if receipt_disposition == "noop" and receipt.get("ok") is True and (
                         receipt.get("executed") is False
                         or receipt_status.lower() == "skipped"
                     ):

@@ -150,6 +150,20 @@ def _apply_mode_and_learning_settings(
     if "learning_mode" in payload:
         value = bool(payload.get("learning_mode"))
         _changed(owner, "_learning_mode", value, applied, f"learning_mode={value}")
+    # Only a persisted SmartAgent setting owns the product mode.  The add-on
+    # also returns a normalized ``shadow`` value for an empty settings row;
+    # treating that default as authoritative would silently overwrite a
+    # legacy engineering canary during migration.
+    if (
+        "active_ai_mode" in payload
+        and str(payload.get("source") or "").strip() == "addon_local"
+    ):
+        value = str(payload.get("active_ai_mode") or "").strip().lower()
+        if value == "on":
+            value = "active"
+        if value not in {"off", "shadow", "active"}:
+            value = "shadow"
+        _changed(owner, "_active_ai_mode", value, applied, f"active_ai_mode={value}")
     habit_value = payload.get("habit_proactive")
     if habit_value is None:
         habit_value = payload.get("habit_proactive_ask")

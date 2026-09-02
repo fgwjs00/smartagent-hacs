@@ -9,9 +9,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .admin_actor import current_human_admin_for_entity_call
-from .maintenance_delegation_publisher import (
-    MaintenanceDelegationPublisherError,
-)
 from .const import (
     CONF_AI_ENABLED,
     CONF_SENSORS_MUTED,
@@ -31,14 +28,37 @@ from .coordinator import SmartAgentCoordinator
 
 
 async def _require_current_human_admin(entity):
-    """Fail closed unless this entity service call is from a current HA admin."""
+    """Bind the entity service call to the current household-owner HA session."""
 
     user = await current_human_admin_for_entity_call(entity.hass, entity)
     if user is None:
         raise HomeAssistantError(
-            "仅当前有效的 Home Assistant 管理员可修改 SmartAgent 策略"
+            "仅当前有效的 Home Assistant 业主会话可修改 SmartAgent 策略"
         )
     return user
+
+
+async def _push_owner_system_setting(entity, field: str, value: bool) -> bool:
+    """Write one owner setting to the add-on truth source before local state."""
+
+    addon_client = getattr(entity.coordinator, "_addon_client", None)
+    if addon_client is None:
+        return False
+    try:
+        result = await addon_client.post_system_settings({field: value})
+    except Exception as exc:
+        entity.coordinator._sys_log(
+            "WARNING",
+            f"[OwnerSettings] {field} 写入 add-on 失败: {exc}",
+        )
+        return False
+    if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
+        entity.coordinator._sys_log(
+            "WARNING",
+            f"[OwnerSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
+        )
+        return False
+    return True
 
 
 async def async_setup_entry(
@@ -84,43 +104,23 @@ class SmartAgentPausedSwitch(CoordinatorEntity, SwitchEntity):
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
     async def async_turn_on(self, **kwargs) -> None:
-        admin_user = await _require_current_human_admin(self)
-        publisher = getattr(
-            self.coordinator, "_maintenance_delegation_publisher", None
-        )
-        if publisher is None or publisher.enabled is not True:
-            raise HomeAssistantError(
-                "维护授权入口未启用，AI 智能托管仍保持暂停"
-            )
-        try:
-            result = await publisher.async_enable_ai_management(
-                user=admin_user,
-                admin_context=self._context,
-            )
-        except MaintenanceDelegationPublisherError as exc:
-            self.coordinator._sys_log(
-                "WARNING",
-                f"[MaintenanceDelegation] AI 智能托管恢复失败: {exc}",
-            )
-            raise HomeAssistantError(
-                "维护授权或状态回读失败，AI 智能托管仍保持暂停"
-            ) from exc
-        if (
-            result.get("effect_status") != "verified_success"
-            or result.get("device_effect_authority") != "none"
-        ):
-            raise HomeAssistantError(
-                "AI 智能托管恢复未获得可验证回执，当前保持暂停"
-            )
+        await _require_current_human_admin(self)
+        if not await _push_owner_system_setting(self, "service_paused", False):
+            raise HomeAssistantError("写入 add-on 失败，AI 智能托管仍保持暂停")
         self.coordinator._enabled = True
         self._attr_is_on = True
+        self._persist(True)
+        self.coordinator._sys_log("INFO", "AI 智能托管已由当前业主开启")
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         await _require_current_human_admin(self)
+        if not await _push_owner_system_setting(self, "service_paused", True):
+            raise HomeAssistantError("写入 add-on 失败，AI 智能托管未暂停")
         self.coordinator._enabled = False
         self._attr_is_on = False
         self._persist(False)
+        self.coordinator._sys_log("INFO", "AI 智能托管已由当前业主暂停")
         self.async_write_ha_state()
 
     @property
@@ -203,28 +203,10 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         opts[CONF_LEARNING_MODE] = value
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
-    async def _push_to_addon(self, field: str, value: bool) -> bool:
-        """把单个布尔字段反写到 add-on /settings/system；失败时返回 False。"""
-        addon_client = getattr(self.coordinator, "_addon_client", None)
-        if addon_client is None:
-            return False
-        try:
-            result = await addon_client.post_system_settings({field: value})
-        except Exception as exc:
-            self.coordinator._sys_log("WARNING", f"[AddonSettings] {field} 写入 add-on 失败: {exc}")
-            return False
-        if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
-            self.coordinator._sys_log(
-                "WARNING",
-                f"[AddonSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
-            )
-            return False
-        return True
-
     async def async_turn_on(self, **kwargs) -> None:
         await _require_current_human_admin(self)
         # add-on first：先反写 add-on（真源）；写失败则 fail-closed，不翻转内存态/不持久化/不记成功。
-        if not await self._push_to_addon("learning_mode", True):
+        if not await _push_owner_system_setting(self, "learning_mode", True):
             raise HomeAssistantError("写入 add-on 失败，静默学习模式未开启")
         self.coordinator._learning_mode = True
         self._attr_is_on = True
@@ -233,31 +215,9 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
-        admin_user = await _require_current_human_admin(self)
-        publisher = getattr(
-            self.coordinator, "_maintenance_delegation_publisher", None
-        )
-        if publisher is None or publisher.enabled is not True:
-            raise HomeAssistantError(
-                "维护授权入口未启用，静默学习模式未关闭"
-            )
-        try:
-            result = await publisher.async_disable_learning_mode(
-                user=admin_user,
-                admin_context=self._context,
-            )
-        except MaintenanceDelegationPublisherError as exc:
-            self.coordinator._sys_log(
-                "WARNING",
-                f"[MaintenanceDelegation] learning_mode 关闭失败: {exc}",
-            )
-            raise HomeAssistantError(
-                "维护授权失败，静默学习模式未关闭"
-            ) from exc
-        if result.get("status") not in {"applied", "already_applied", "already_disabled"}:
-            raise HomeAssistantError(
-                "维护授权回执无效，静默学习模式未关闭"
-            )
+        await _require_current_human_admin(self)
+        if not await _push_owner_system_setting(self, "learning_mode", False):
+            raise HomeAssistantError("写入 add-on 失败，静默学习模式未关闭")
         self.coordinator._learning_mode = False
         self._attr_is_on = False
         self._persist(False)

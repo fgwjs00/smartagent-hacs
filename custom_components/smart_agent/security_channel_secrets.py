@@ -15,14 +15,15 @@ DEDICATED_SECURITY_CHANNEL_SECRET_KEYS = (
     "observation_refresh_provider_replay_integrity_secret",
     "output_ledger_ingress_secret",
     "output_ledger_attestation_secret",
+    "host_dispatch_proof_current_secret",
+    "host_dispatch_proof_staged_secret",
+    "field_canary_host_dispatch_proof_secret",
+    "field_canary_previous_host_dispatch_proof_secret",
     "maintenance_change_ingress_secret",
     "maintenance_delegation_attestation_secret",
     "field_canary_operator_identity_ingress_secret",
     "field_canary_operator_identity_attestation_secret",
     "field_canary_operator_identity_previous_attestation_secret",
-    "field_canary_host_dispatch_proof_secret",
-    "field_canary_previous_host_dispatch_proof_secret",
-    "user_intent_delegation_secret",
 )
 
 

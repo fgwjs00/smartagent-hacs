@@ -8,8 +8,12 @@ from __future__ import annotations
 import logging
 import threading
 import json as _json
+import hashlib
+import math
+from datetime import datetime, timezone
 
 from .action_mapping import entities_to_actions, normalize_raw_actions
+from .service_contracts import REGISTERED_CAPABILITY_IDS, SERVICE_CONTRACTS, capability_for_domain
 from typing import Any
 from .const import (
     DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF,
@@ -42,6 +46,141 @@ DOMAIN_LABELS = {
 }
 
 _ROLLBACK_OFF_STATES = {"", "off", "unavailable", "unknown", "none"}
+_RUNTIME_CAPABILITY_SCHEMA_VERSION = "smartagent.device_runtime_capability.v1"
+_RUNTIME_CAPABILITY_MAX_AGE_SECONDS = 24 * 60 * 60
+_FEATURE_SERVICE_MASKS: dict[str, dict[str, int]] = {
+    "cover": {"cover.open_cover": 1, "cover.close_cover": 2, "cover.set_cover_position": 4, "cover.stop_cover": 8},
+    "climate": {"climate.set_temperature": 1 | 2, "climate.set_preset_mode": 16, "climate.turn_off": 128, "climate.turn_on": 256},
+    "fan": {"fan.set_percentage": 1, "fan.oscillate": 2, "fan.set_preset_mode": 8, "fan.turn_off": 16, "fan.turn_on": 32},
+    "vacuum": {"vacuum.pause": 4, "vacuum.stop": 8, "vacuum.return_to_base": 16, "vacuum.start": 8192},
+}
+
+
+def _runtime_json(value: Any) -> str:
+    return _json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _runtime_digest(value: Any) -> str:
+    return hashlib.sha256(_runtime_json(value).encode("utf-8")).hexdigest()
+
+
+def _runtime_string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+
+def _runtime_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _runtime_observed_at(state_obj: Any) -> str:
+    observed = getattr(state_obj, "last_updated", None) or getattr(state_obj, "last_changed", None)
+    if not isinstance(observed, datetime):
+        return ""
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return observed.astimezone(timezone.utc).isoformat()
+
+
+def _runtime_supported_services(domain: str, attrs: dict[str, Any]) -> list[str]:
+    if "supported_services" in attrs:
+        result: list[str] = []
+        for raw in _runtime_string_list(attrs.get("supported_services")):
+            service_key = raw if "." in raw else f"{domain}.{raw}"
+            if service_key in SERVICE_CONTRACTS and service_key.split(".", 1)[0] == domain:
+                result.append(service_key)
+        return sorted(dict.fromkeys(result))
+    services: set[str] = set()
+    features = attrs.get("supported_features")
+    if type(features) is int and features >= 0:
+        services.update(
+            service
+            for service, mask in _FEATURE_SERVICE_MASKS.get(domain, {}).items()
+            if features & mask
+        )
+    if domain in {"light", "switch"}:
+        services.update({f"{domain}.turn_on", f"{domain}.turn_off"})
+    if domain == "fan":
+        services.update({"fan.turn_on", "fan.turn_off"})
+    if domain == "climate":
+        if _runtime_string_list(attrs.get("hvac_modes")):
+            services.add("climate.set_hvac_mode")
+        if _runtime_string_list(attrs.get("preset_modes")):
+            services.add("climate.set_preset_mode")
+        minimum = _runtime_number(attrs.get("min_temp"))
+        maximum = _runtime_number(attrs.get("max_temp"))
+        if minimum is not None and maximum is not None and minimum <= maximum:
+            services.add("climate.set_temperature")
+    return sorted(service for service in services if service in SERVICE_CONTRACTS)
+
+
+def _build_runtime_capability_facts(entity_id: str, state_obj: Any) -> dict[str, Any]:
+    clean_entity_id = str(entity_id or "").strip()
+    observed_at = _runtime_observed_at(state_obj)
+    if "." not in clean_entity_id or state_obj is None or not observed_at:
+        return {}
+    domain = clean_entity_id.split(".", 1)[0]
+    attrs = dict(getattr(state_obj, "attributes", {}) or {})
+    snapshot: dict[str, Any] = {}
+    dimensions: list[dict[str, Any]] = []
+    features = attrs.get("supported_features")
+    if type(features) is int and features >= 0:
+        snapshot["supported_features"] = features
+    if domain == "climate":
+        hvac_modes = _runtime_string_list(attrs.get("hvac_modes"))
+        preset_modes = _runtime_string_list(attrs.get("preset_modes"))
+        fan_modes = _runtime_string_list(attrs.get("fan_modes"))
+        swing_modes = _runtime_string_list(attrs.get("swing_modes"))
+        if hvac_modes:
+            snapshot["hvac_modes"] = hvac_modes
+            dimensions.append({"key": "hvac_mode", "kind": "enum", "states": hvac_modes})
+        minimum = _runtime_number(attrs.get("min_temp"))
+        maximum = _runtime_number(attrs.get("max_temp"))
+        if minimum is not None and maximum is not None and minimum <= maximum:
+            snapshot["min_temp"] = minimum
+            snapshot["max_temp"] = maximum
+            step = _runtime_number(attrs.get("target_temp_step"))
+            if step is not None and step > 0:
+                snapshot["target_temp_step"] = step
+            dimensions.append({"key": "target_temp", "kind": "continuous", "range": [minimum, maximum], "unit": str(attrs.get("temperature_unit") or "").strip().lower() or "c"})
+        for key, values in (("preset_modes", preset_modes), ("fan_modes", fan_modes), ("swing_modes", swing_modes)):
+            if values:
+                snapshot[key] = values
+        if preset_modes:
+            dimensions.append({"key": "preset_mode", "kind": "enum", "states": preset_modes})
+    elif domain == "fan":
+        preset_modes = _runtime_string_list(attrs.get("preset_modes"))
+        if preset_modes:
+            snapshot["preset_modes"] = preset_modes
+            dimensions.append({"key": "preset_mode", "kind": "enum", "states": preset_modes})
+    elif domain == "vacuum":
+        speeds = _runtime_string_list(attrs.get("fan_speed_list"))
+        if speeds:
+            snapshot["fan_speed_list"] = speeds
+    state = str(getattr(state_obj, "state", "unknown"))
+    base = {
+        "schema_version": _RUNTIME_CAPABILITY_SCHEMA_VERSION,
+        "entity_id": clean_entity_id,
+        "domain": domain,
+        "state": state,
+        "observed_at": observed_at,
+        "freshness": {
+            "source": "ha_state",
+            "max_age_seconds": _RUNTIME_CAPABILITY_MAX_AGE_SECONDS,
+            "state_generation": _runtime_digest({"entity_id": clean_entity_id, "domain": domain, "state": state, "observed_at": observed_at}),
+        },
+        "supported_services": _runtime_supported_services(domain, attrs),
+        "behavior_dims": dimensions,
+        "capability_snapshot": snapshot,
+    }
+    return {**base, "facts_digest": _runtime_digest(base)}
 
 
 def _find_ha_area_by_id_or_name(area_reg: Any, target: str) -> Any | None:
@@ -127,6 +266,7 @@ class DevicesMixin:
         *,
         action: str = "upsert",
         created: str | None = None,
+        state_obj: Any = None,
     ) -> bool:
         payload: dict[str, Any] = {
             "action": action,
@@ -134,6 +274,10 @@ class DevicesMixin:
         }
         if action != "delete":
             row = dict(info or {})
+            if state_obj is None:
+                states = getattr(getattr(self, "hass", None), "states", None)
+                getter = getattr(states, "get", None)
+                state_obj = getter(entity_id) if callable(getter) else None
             payload.update(
                 {
                     "name": str(row.get("name") or entity_id),
@@ -143,6 +287,7 @@ class DevicesMixin:
                     "control_mode": str(row.get("control_mode") or "shared"),
                     "sensor_type": str(row.get("sensor_type") or ""),
                     "created": str(created or self._ha_db_now_text()),
+                    "capability_facts": _build_runtime_capability_facts(entity_id, state_obj),
                 }
             )
         return (
@@ -419,27 +564,7 @@ class DevicesMixin:
         else:
             can_localize_zone = sensor_type in {"frigate", "mmwave"}
 
-        domain_capabilities = {
-            "light": "lighting",
-            "switch": "switch",
-            "button": "scene",
-            "input_button": "scene",
-            "scene": "scene",
-            "script": "scene",
-            "binary_sensor": "sensor",
-            "sensor": "sensor",
-            "climate": "climate",
-            "cover": "cover",
-            "fan": "fan",
-            "media_player": "media",
-            "alarm_control_panel": "security",
-            "lock": "security",
-            "camera": "security",
-            "vacuum": "vacuum",
-            "humidifier": "appliance",
-            "water_heater": "appliance",
-        }
-        supported_capabilities = set(domain_capabilities.values()) | {"unknown"}
+        supported_capabilities = set(REGISTERED_CAPABILITY_IDS) | {"unknown"}
         type_capability = str(info.get("type") or "").strip().lower()
         if type_capability not in supported_capabilities:
             type_capability = ""
@@ -451,7 +576,11 @@ class DevicesMixin:
             roles = [str(item).strip() for item in raw_roles if str(item).strip()]
         if shared_fixture and "shared" not in roles:
             roles.append("shared")
-        raw_services = info.get("supported_services") or info.get("ops")
+        raw_services = (
+            info.get("supported_services")
+            if "supported_services" in info
+            else info.get("ops")
+        )
         if isinstance(raw_services, str):
             supported_services = [raw_services] if raw_services else []
         elif isinstance(raw_services, (list, tuple, set)):
@@ -462,9 +591,7 @@ class DevicesMixin:
             info.get("capability")
             or info.get("device_class")
             or type_capability
-            or domain_capabilities.get(domain)
-            or domain
-            or "unknown"
+            or capability_for_domain(domain)
         ).strip().lower()
 
         vacant_action = str(info.get("vacant_action") or "preserve").strip().lower()
@@ -548,11 +675,22 @@ class DevicesMixin:
                 domain_label, ops = DOMAIN_LABELS.get(domain, (domain, ""))
                 area_name = self._get_entity_area(eid) or "未知区域"
                 registry_meta = self._get_entity_registry_metadata(eid)
-                candidates.append({
+                runtime_facts = _build_runtime_capability_facts(eid, state)
+                candidate = {
                     "entity_id": eid, "name": name, "domain": domain,
                     "domain_label": domain_label, "area": area_name, "ops": ops,
                     **registry_meta,
-                })
+                }
+                if runtime_facts:
+                    candidate.update(
+                        {
+                            "runtime_capability_facts": runtime_facts,
+                            "supported_services": list(runtime_facts.get("supported_services") or []),
+                            "behavior_dims": list(runtime_facts.get("behavior_dims") or []),
+                            "capability_snapshot": dict(runtime_facts.get("capability_snapshot") or {}),
+                        }
+                    )
+                candidates.append(candidate)
         self._sys_log("INFO", f"[发现] 扫描到 {len(candidates)} 个候选设备（未录入）")
         self.async_set_updated_data({})
         return candidates
@@ -590,6 +728,7 @@ class DevicesMixin:
                         s_type = "mmwave"
 
                 registry_meta = self._get_entity_registry_metadata(eid)
+                runtime_facts = _build_runtime_capability_facts(eid, state)
                 info = {
                     "name": name,
                     "room": area_name,
@@ -599,6 +738,15 @@ class DevicesMixin:
                     "sensor_type": s_type,
                     **registry_meta,
                 }
+                if runtime_facts:
+                    info.update(
+                        {
+                            "runtime_capability_facts": runtime_facts,
+                            "supported_services": list(runtime_facts.get("supported_services") or []),
+                            "behavior_dims": list(runtime_facts.get("behavior_dims") or []),
+                            "capability_snapshot": dict(runtime_facts.get("capability_snapshot") or {}),
+                        }
+                    )
                 _ok = await self._persist_device_record(eid, info, created=now)
                 if not _ok:
                     self._sys_log("WARN", f"[批量添加] 写入失败，跳过设备: {eid}")
@@ -693,6 +841,13 @@ class DevicesMixin:
             "control_mode": existing_mode,
             **registry_meta,
         }
+        state_obj = self.hass.states.get(entity_id)
+        runtime_facts = _build_runtime_capability_facts(entity_id, state_obj)
+        if runtime_facts:
+            info["runtime_capability_facts"] = runtime_facts
+            info["supported_services"] = list(runtime_facts.get("supported_services") or [])
+            info["behavior_dims"] = list(runtime_facts.get("behavior_dims") or [])
+            info["capability_snapshot"] = dict(runtime_facts.get("capability_snapshot") or {})
         _ok = await self._persist_device_record(entity_id, info)
         if not _ok:
             self._sys_log("WARN", f"[设备新增] 写入失败，未更新内存态: {entity_id}")

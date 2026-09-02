@@ -9,9 +9,9 @@ from typing import Any, NamedTuple
 from .action_normalization import action_domain
 
 
-# M7 v0.1 deliberately has no unscoped all-home execution mode.  Production
-# expansion must happen through an exact canary scope and an independent grant.
-ACTIVE_AI_MODES = frozenset({"off", "shadow", "canary"})
+# Owner-facing modes are off/shadow/active.  Canary remains an internal rollout
+# mode for engineering diagnosis and backward-compatible field trials.
+ACTIVE_AI_MODES = frozenset({"off", "shadow", "active", "canary"})
 DEFAULT_ACTIVE_AI_MODE = "shadow"
 
 
@@ -46,6 +46,8 @@ def _string_set(value: Any, *, lowercase: bool = False) -> frozenset[str]:
 
 def normalize_active_ai_mode(value: Any) -> str:
     mode = str(value or "").strip().lower()
+    if mode == "on":
+        mode = "active"
     return mode if mode in ACTIVE_AI_MODES else DEFAULT_ACTIVE_AI_MODE
 
 
@@ -386,6 +388,17 @@ def evaluate_active_ai_execution_gate(
             action_space_ids=action_space_ids,
             action_entity_ids=action_entity_ids,
         )
+    if config.mode == "active" and action_entity_missing:
+        return _decision(
+            config,
+            allow_model=True,
+            allow_execution=False,
+            reason="active_ai_action_entity_missing",
+            trigger_space_id=space_id,
+            action_domains=domains,
+            action_space_ids=action_space_ids,
+            action_entity_ids=action_entity_ids,
+        )
     if config.mode == "canary":
         if not space_id or space_id not in config.canary_space_ids:
             return _decision(
@@ -504,7 +517,11 @@ def evaluate_active_ai_execution_gate(
         config,
         allow_model=True,
         allow_execution=True,
-        reason="active_ai_canary_allowed",
+        reason=(
+            "active_ai_managed_home_allowed"
+            if config.mode == "active"
+            else "active_ai_canary_allowed"
+        ),
         trigger_space_id=space_id,
         action_domains=domains,
         action_space_ids=action_space_ids,

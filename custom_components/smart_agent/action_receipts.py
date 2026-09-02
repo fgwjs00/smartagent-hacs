@@ -80,10 +80,83 @@ def active_ai_authorization_ref(
         "policy_evaluation_digest": policy_digest,
         "commands_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     }
+    occupancy_cycle_id = str(lineage.get("occupancy_cycle_id") or "").strip()
+    if occupancy_cycle_id:
+        authorization_ref["occupancy_cycle_id"] = occupancy_cycle_id
     aggregate = str(lineage.get("policy_aggregate_decision") or "").strip().lower()
     if aggregate:
         authorization_ref["policy_aggregate_decision"] = aggregate
     return authorization_ref
+
+
+def canonical_active_ai_receipt_dispositions(
+    result: Any,
+    *,
+    request_id: str,
+    commands: list[dict[str, Any]],
+    authorization_ref: dict[str, Any],
+) -> list[str] | None:
+    """Verify the canonical physical receipt before HA-host lineage writes."""
+
+    if not isinstance(result, dict):
+        return None
+    if (
+        str(result.get("request_id") or "") != str(request_id or "")
+        or result.get("ok") is not True
+        or str(result.get("effect_status") or "") != "verified_success"
+        or str(result.get("workflow_status") or "") != "completed"
+        or result.get("reconciliation_required") is not False
+    ):
+        return None
+    returned_ref = result.get("authorization_ref")
+    if not isinstance(returned_ref, dict) or any(
+        returned_ref.get(key) != value for key, value in authorization_ref.items()
+    ):
+        return None
+    rows = result.get("results")
+    if (
+        not isinstance(rows, list)
+        or len(rows) != len(commands)
+        or any(not isinstance(row, dict) for row in rows)
+    ):
+        return None
+    dispositions: list[str] = []
+    for command, row in zip(commands, rows):
+        expected = {
+            "entity_id": str(command.get("entity_id") or ""),
+            "domain": str(command.get("domain") or ""),
+            "service": str(command.get("service") or ""),
+            "data": dict(command.get("data") or {}),
+        }
+        if any(row.get(key) != value for key, value in expected.items()):
+            return None
+        if row.get("executed") is False and str(row.get("status") or "") == "skipped":
+            if (
+                row.get("ok") is not True
+                or str(row.get("workflow_status") or "") != "skipped"
+                or str(row.get("transport_status") or "") != "not_sent"
+            ):
+                return None
+            dispositions.append("noop")
+            continue
+        snapshot = row.get("post_state_snapshot")
+        if (
+            row.get("ok") is not True
+            or row.get("executed") is not True
+            or str(row.get("receipt_version") or "") == ""
+            or str(row.get("verification_contract_version") or "") != "ha_post_state.v1"
+            or str(row.get("effect_status") or "") != "verified_success"
+            or str(row.get("workflow_status") or "") != "completed"
+            or row.get("reconciliation_required") is not False
+            or not isinstance(snapshot, dict)
+            or str(snapshot.get("entity_id") or "") != expected["entity_id"]
+            or snapshot.get("available") is not True
+            or str(snapshot.get("state") or "").strip().lower()
+            in {"", "unknown", "unavailable"}
+        ):
+            return None
+        dispositions.append("verified_success")
+    return dispositions
 
 
 def decision_action_result_from_ha_result(item: dict[str, Any]) -> dict[str, Any]:
@@ -117,6 +190,12 @@ def decision_action_result_from_ha_result(item: dict[str, Any]) -> dict[str, Any
     }
     if isinstance(item.get("params"), dict) and item.get("params"):
         result["params"] = dict(item.get("params") or {})
+    daylight_guard_evaluation = item.get("daylight_guard_evaluation")
+    if isinstance(daylight_guard_evaluation, dict) and daylight_guard_evaluation:
+        ha_command_status = str(item.get("ha_command_status") or "").strip()
+        if ha_command_status:
+            result["ha_command_status"] = ha_command_status
+        result["daylight_guard_evaluation"] = dict(daylight_guard_evaluation)
     for source_key, target_key in (
         ("error", "error"),
         ("error_type", "error_type"),
@@ -219,5 +298,6 @@ __all__ = [
     "ActionResultCollector",
     "action_execution_result",
     "active_ai_authorization_ref",
+    "canonical_active_ai_receipt_dispositions",
     "decision_action_result_from_ha_result",
 ]

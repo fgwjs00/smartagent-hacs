@@ -9,6 +9,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
+from .service_contracts import STATEFUL_EXECUTION_DOMAINS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -551,8 +552,6 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
     elif tool_name == "smart_room_status":
         room_filter: str = tool_args.get("room", "")
         occ_map = coordinator._get_room_occupancy_map() if hasattr(coordinator, "_get_room_occupancy_map") else {}
-        _CTRL_DOMAINS = {"light", "switch", "climate", "cover", "fan", "media_player"}
-
         # 按房间组织设备
         room_devices: dict[str, list[str]] = {}
         for eid, info in coordinator.device_info.items():
@@ -560,7 +559,7 @@ async def execute_mcp_tool(hass: HomeAssistant, params: dict, hass_user=None) ->
             if room_filter and r != room_filter:
                 continue
             domain = eid.split(".")[0] if "." in eid else ""
-            if domain not in _CTRL_DOMAINS:
+            if domain not in STATEFUL_EXECUTION_DOMAINS:
                 continue
             st = hass.states.get(eid)
             state_val = st.state if st else "unknown"

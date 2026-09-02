@@ -6,17 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-
-ALLOWED_DOMAINS = frozenset({
-    "light", "switch", "climate", "cover", "fan",
-    "media_player", "script", "scene",
-    "input_boolean", "input_number", "input_select",
-})
 BLOCKED_SERVICES = frozenset({
     "reload", "restart", "stop", "delete", "remove",
     "enable", "disable",
 })
-STATELESS_DOMAINS = frozenset({"script", "scene"})
 
 
 @dataclass(frozen=True)
@@ -84,6 +77,8 @@ def evaluate_thin_execution_gate(
     raw_entity_id: Any = None,
     entity_exists: bool = True,
     raw_entity_exists: bool = True,
+    allowed_domains: set[str] | frozenset[str],
+    stateless_domains: set[str] | frozenset[str],
 ) -> ThinExecutionGateResult:
     """Check only transport-portable hard gates before HA service dispatch."""
 
@@ -102,7 +97,7 @@ def evaluate_thin_execution_gate(
             log_code="missing_required_action_fields",
         )
 
-    if domain_s not in ALLOWED_DOMAINS:
+    if domain_s not in allowed_domains:
         return ThinExecutionGateResult(
             allowed=False,
             entity_id=entity_s,
@@ -122,7 +117,7 @@ def evaluate_thin_execution_gate(
             log_code="service_blocked",
         )
 
-    if raw_entity_s and "." in raw_entity_s and domain_s not in STATELESS_DOMAINS and not raw_entity_exists:
+    if raw_entity_s and "." in raw_entity_s and domain_s not in stateless_domains and not raw_entity_exists:
         return ThinExecutionGateResult(
             allowed=False,
             entity_id=raw_entity_s,
@@ -132,7 +127,7 @@ def evaluate_thin_execution_gate(
             log_code="raw_entity_not_found",
         )
 
-    if domain_s not in STATELESS_DOMAINS and not entity_exists:
+    if domain_s not in stateless_domains and not entity_exists:
         return ThinExecutionGateResult(
             allowed=False,
             entity_id=entity_s,
@@ -434,7 +429,7 @@ def evaluate_priority_arbitration(
     )
 
 
-def evaluate_confirmed_presence_reentry_override(
+def evaluate_proactive_priority_handoff(
     *,
     entity_id: Any,
     service: Any,
@@ -444,22 +439,38 @@ def evaluate_confirmed_presence_reentry_override(
     target_space_id: Any,
     world_snapshot_id: Any,
     decision_time: Any,
+    occupancy_cycle_id: Any,
     now_ts: float,
     is_lighting: bool,
     max_age_seconds: float,
 ) -> ThinExecutionGateResult:
-    """Validate the narrow Core-issued exception for reversing an AI P4 light-off."""
+    """Validate one server-issued AI-to-AI reverse-action cycle handoff."""
+
+    del is_lighting
 
     entity_s = _clean(entity_id)
     service_s = _clean(service).lower().split(".", 1)[-1]
     active_space = _clean(active_space_id)
     target_space = _clean(target_space_id)
     snapshot_id = _clean(world_snapshot_id)
+    is_arrival = service_s in {"turn_on", "open_cover"}
+    trigger_transition_valid = (
+        _clean(claim.get("trigger_old_state")).lower()
+        in {"off", "clear", "vacant", "none", "idle", "empty"}
+        and _clean(claim.get("trigger_new_state")).lower()
+        in {"on", "occupied", "present", "motion", "person"}
+        if isinstance(claim, dict) and is_arrival
+        else isinstance(claim, dict)
+        and _clean(claim.get("trigger_old_state")).lower()
+        in {"on", "occupied", "present", "motion", "person"}
+        and _clean(claim.get("trigger_new_state")).lower()
+        in {"off", "clear", "vacant", "none", "idle", "empty"}
+    )
     invalid = ThinExecutionGateResult(
         allowed=False,
         entity_id=entity_s,
         service=service_s,
-        log_code="confirmed_presence_reentry_override_invalid",
+        log_code="proactive_priority_handoff_invalid",
     )
     if not isinstance(claim, dict) or not isinstance(existing, dict):
         return invalid
@@ -467,12 +478,11 @@ def evaluate_confirmed_presence_reentry_override(
         version = int(claim.get("version"))
         previous_priority = int(claim.get("previous_priority"))
         existing_priority = int(existing.get("priority"))
-        guard_until = float(existing.get("guard_until"))
         now = float(now_ts)
         max_age = max(0.0, float(max_age_seconds))
     except (TypeError, ValueError, OverflowError):
         return invalid
-    if not all(math.isfinite(value) for value in (guard_until, now, max_age)):
+    if not all(math.isfinite(value) for value in (now, max_age)):
         return invalid
 
     raw_decision_time = _clean(decision_time)
@@ -508,10 +518,10 @@ def evaluate_confirmed_presence_reentry_override(
         return invalid
 
     if (
-        version != 1
-        or _clean(claim.get("type")) != "confirmed_presence_reentry"
-        or service_s != "turn_on"
-        or not is_lighting
+        version != 2
+        or _clean(claim.get("type")) != "proactive_priority_handoff"
+        or service_s not in {"turn_on", "turn_off", "open_cover", "close_cover"}
+        or _clean(claim.get("service")).lower() != service_s
         or not entity_s
         or _clean(claim.get("entity_id")) != entity_s
         or not active_space
@@ -520,17 +530,23 @@ def evaluate_confirmed_presence_reentry_override(
         or not snapshot_id
         or _clean(claim.get("world_snapshot_id")) != snapshot_id
         or not _clean(claim.get("trigger_entity_id"))
-        or _clean(claim.get("trigger_old_state")).lower()
-        not in {"off", "clear", "vacant", "none", "idle", "empty"}
-        or _clean(claim.get("trigger_new_state")).lower()
-        not in {"on", "occupied", "present", "motion", "person"}
-        or previous_priority != 4
-        or _clean(claim.get("previous_source")).lower() != "ai_infer"
-        or _clean(claim.get("previous_state")).lower() != "off"
-        or existing_priority != 4
-        or _clean(existing.get("source")).lower() != "ai_infer"
-        or _clean(existing.get("state")).lower() != "off"
-        or guard_until <= now
+        or not trigger_transition_valid
+        or previous_priority not in {3, 4}
+        or _clean(claim.get("previous_source")).lower() not in {"ai_rule", "ai_infer"}
+        or _clean(claim.get("previous_state")).lower()
+        != ("off" if service_s in {"turn_on", "open_cover"} else "on")
+        or existing_priority != previous_priority
+        or _clean(existing.get("source")).lower()
+        != _clean(claim.get("previous_source")).lower()
+        or _clean(existing.get("state")).lower()
+        != _clean(claim.get("previous_state")).lower()
+        or not _clean(occupancy_cycle_id)
+        or _clean(claim.get("occupancy_cycle_id")) != _clean(occupancy_cycle_id)
+        or not _clean(existing.get("occupancy_cycle_id"))
+        or _clean(claim.get("previous_occupancy_cycle_id"))
+        != _clean(existing.get("occupancy_cycle_id"))
+        or _clean(claim.get("occupancy_cycle_id"))
+        == _clean(claim.get("previous_occupancy_cycle_id"))
     ):
         return invalid
 
@@ -538,5 +554,5 @@ def evaluate_confirmed_presence_reentry_override(
         allowed=True,
         entity_id=entity_s,
         service=service_s,
-        log_code="confirmed_presence_reentry_override",
+        log_code="proactive_priority_handoff",
     )

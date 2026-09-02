@@ -97,6 +97,15 @@ def build_decision_trace_lineage(
         if isinstance(nested_result.get("policy_evaluation"), dict)
         else {}
     )
+    daylight_evidence = (
+        result.get("daylight_evidence")
+        if isinstance(result.get("daylight_evidence"), dict)
+        else nested_result.get("daylight_evidence")
+        if isinstance(nested_result.get("daylight_evidence"), dict)
+        else details.get("daylight_evidence")
+        if isinstance(details.get("daylight_evidence"), dict)
+        else {}
+    )
     decision_event_claim_ids: list[str] = []
     causal_event_rows = decision_request.get("causal_events")
     if isinstance(causal_event_rows, list):
@@ -161,8 +170,36 @@ def build_decision_trace_lineage(
         "policy_aggregate_decision": str(
             policy_evaluation.get("aggregate_decision") or ""
         ).strip().lower(),
+        "occupancy_cycle_id": str(
+            result.get("occupancy_cycle_id")
+            or nested_result.get("occupancy_cycle_id")
+            or context_snapshot.get("occupancy_cycle_id")
+            or bundle.get("occupancy_cycle_id")
+            or source_context.get("occupancy_cycle_id")
+            or ""
+        ).strip(),
     }
     lineage.update({key: value for key, value in contract_lineage.items() if value})
+    if daylight_evidence:
+        lineage["daylight_evidence"] = dict(daylight_evidence)
+        lineage["policy_evaluation"] = dict(policy_evaluation)
+        decision_time = str(
+            result.get("decision_time")
+            or nested_result.get("decision_time")
+            or details.get("decision_time")
+            or ""
+        ).strip()
+        if decision_time:
+            lineage["decision_time"] = decision_time
+        world_snapshot_id = str(
+            result.get("world_snapshot_id")
+            or nested_result.get("world_snapshot_id")
+            or details.get("world_snapshot_id")
+            or bundle.get("world_snapshot_id")
+            or ""
+        ).strip()
+        if world_snapshot_id:
+            lineage["world_snapshot_id"] = world_snapshot_id
     return lineage
 
 

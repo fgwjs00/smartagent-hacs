@@ -6,9 +6,12 @@ ActionsMixin — 动作执行层。
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from datetime import datetime
+from math import isfinite
 from typing import Any
 
 from homeassistant.core import callback
@@ -22,6 +25,7 @@ from .action_receipts import (
     ActionResultCollector,
     action_execution_result,
     active_ai_authorization_ref,
+    canonical_active_ai_receipt_dispositions,
     decision_action_result_from_ha_result,
 )
 from .action_normalization import (
@@ -39,12 +43,9 @@ from .const import (
     MODE_SHOWROOM,
 )
 from .execution_gate import (
-    ALLOWED_DOMAINS as THIN_GATE_ALLOWED_DOMAINS,
-    BLOCKED_SERVICES as THIN_GATE_BLOCKED_SERVICES,
-    STATELESS_DOMAINS as THIN_GATE_STATELESS_DOMAINS,
     evaluate_automation_conflict_window,
     evaluate_color_temp_mireds_param,
-    evaluate_confirmed_presence_reentry_override,
+    evaluate_proactive_priority_handoff,
     evaluate_global_suppress_window,
     evaluate_manual_override_window,
     evaluate_self_trigger_protection,
@@ -69,49 +70,46 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
     # 设备管辖域标签（用于日志）
     _CONTROL_MODE_LABELS = {"ai": "AI全权", "ha": "HA优先", "shared": "共享"}
 
-    # 安全白名单：AI 允许操作的 HA 域和禁止调用的危险服务
-    _ALLOWED_DOMAINS = THIN_GATE_ALLOWED_DOMAINS
-    _BLOCKED_SERVICES = THIN_GATE_BLOCKED_SERVICES
-
     # 动作验证参数
     _ACTION_VERIFY_DELAY = 5    # 执行后 N 秒回查状态
     _ACTION_RETRY_MAX = 1       # 最大自动重试次数
     _VERIFY_QUEUE_MAX = 50      # 待验证队列上限
     _VERIFY_EXPIRE_SEC = 120    # 超过 N 秒未验证完成的条目强制丢弃
 
-    def _issue_user_intent_delegation(
-        self,
-        envelope: dict[str, Any],
-        authority: Any | None,
-    ) -> dict[str, Any] | None:
-        """Mint one bound delegation only from the trusted HA authority fact."""
-        if authority is None:
-            raise RuntimeError("user_intent_authority_missing")
-        from .user_intent_delegation import (
-            AuthenticatedUserIntentAuthority,
-            issue_user_intent_delegation,
-        )
-
-        if type(authority) is not AuthenticatedUserIntentAuthority:
-            raise RuntimeError("user_intent_authority_invalid")
-        secret = str(getattr(self, "_user_intent_delegation_secret", "") or "").strip()
-        if not secret:
-            raise RuntimeError("user_intent_delegation_secret_missing")
-        try:
-            return issue_user_intent_delegation(
-                envelope,
-                secret=secret,
-                user_id=authority.user_id,
-                session_id=authority.session_id,
-            )
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(str(exc)) from exc
-
     # 场景/脚本重复执行冷却
     _SCENE_COOLDOWN = 60        # 同一场景/脚本 N 秒内不重复执行
     _DIM_TO_OFF_BRIGHTNESS_PCT = 5
     _DAYLIGHT_AUTO_LIGHTING_SUPPRESSED = "daylight_auto_lighting_suppressed"
     _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
+    _DAYLIGHT_EVIDENCE_SCHEMA_VERSION = "smartagent.daylight_evidence.v2"
+    _DAYLIGHT_EVIDENCE_REF_PREFIX = "daylight_evidence:"
+    _DAYLIGHT_EVIDENCE_MAX_AGE_SECONDS = 30
+    _DAYLIGHT_EVIDENCE_FIELDS = frozenset(
+        {
+            "schema_version",
+            "guard",
+            "provenance",
+            "world_snapshot_id",
+            "decision_time",
+            "observed_at",
+            "active_space_id",
+            "environment_bucket",
+            "illuminance_lux",
+            "threshold_lux",
+            "source_entity_id",
+            "source_space_id",
+            "source_event_id",
+            "source_signal_kind",
+            "source_unit",
+            "source",
+            "freshness_max_age_seconds",
+            "plan_fingerprint",
+            "commands_digest",
+            "target_bindings",
+            "reason_code",
+            "evidence_digest",
+        }
+    )
     _DAYLIGHT_FALLBACK_START_HOUR = 8
     _DAYLIGHT_FALLBACK_END_HOUR = 20
     _PROTECTED_NIGHT_START_HOUR = 22
@@ -426,6 +424,381 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if sun_state in self._DARK_SUN_STATES:
             return ""
         return ""
+
+    def _daylight_auto_lighting_execution_evaluation(
+        self,
+        entity_id: str,
+        domain: str,
+        service: str,
+        *,
+        actions: list[dict[str, Any]],
+        require_world_snapshot_guard: bool,
+        decision_contract_lineage: dict[str, Any] | None,
+        world_snapshot_id: str,
+        active_space_id: str,
+        decision_time: str,
+    ) -> dict[str, Any]:
+        """Validate the planning daylight fact without rebuilding HA state."""
+
+        if not require_world_snapshot_guard:
+            reason = self._daylight_auto_lighting_suppressed_reason(entity_id)
+            return {
+                "guard": "daylight_auto_lighting",
+                "allowed": not bool(reason),
+                "reason_code": reason or "legacy_runtime_not_daylight",
+                "evidence_source": "legacy_ha_runtime",
+            }
+
+        lineage = (
+            decision_contract_lineage
+            if isinstance(decision_contract_lineage, dict)
+            else {}
+        )
+        evidence = (
+            lineage.get("daylight_evidence")
+            if isinstance(lineage.get("daylight_evidence"), dict)
+            else {}
+        )
+        policy = (
+            lineage.get("policy_evaluation")
+            if isinstance(lineage.get("policy_evaluation"), dict)
+            else {}
+        )
+        freshness: dict[str, Any] = {
+            "observed_at": str(evidence.get("observed_at") or "").strip(),
+            "decision_time": str(evidence.get("decision_time") or "").strip(),
+            "max_age_seconds": evidence.get("freshness_max_age_seconds"),
+            "age_seconds": None,
+        }
+        evaluation: dict[str, Any] = {
+            "guard": "daylight_auto_lighting",
+            "allowed": False,
+            "reason_code": "daylight_evidence_missing",
+            "evidence_source": "sealed_planning_evidence",
+            "provenance": str(evidence.get("provenance") or "").strip(),
+            "illuminance_lux": evidence.get("illuminance_lux"),
+            "threshold_lux": evidence.get("threshold_lux"),
+            "source_entity_id": str(evidence.get("source_entity_id") or "").strip(),
+            "source_space_id": str(evidence.get("source_space_id") or "").strip(),
+            "target_entity_id": str(entity_id or "").strip(),
+            "target_space_id": "",
+            "freshness": freshness,
+            "world_snapshot_id": str(
+                evidence.get("world_snapshot_id") or world_snapshot_id or ""
+            ).strip(),
+            "evidence_digest": str(evidence.get("evidence_digest") or "").strip().lower(),
+            "policy_evaluation_id": str(policy.get("evaluation_id") or "").strip(),
+        }
+
+        def _reject(reason_code: str) -> dict[str, Any]:
+            evaluation["reason_code"] = reason_code
+            return evaluation
+
+        def _canonical(value: Any, *, depth: int = 0) -> Any:
+            if depth > 6:
+                raise ValueError("canonical depth exceeded")
+            if value is None or isinstance(value, (bool, int)):
+                return value
+            if isinstance(value, float):
+                if not isfinite(value):
+                    raise ValueError("non-finite value")
+                return int(value) if value.is_integer() else value
+            if isinstance(value, str):
+                text = value.strip()
+                if len(text) > 512 or any(
+                    ord(char) < 32 or ord(char) == 127 for char in text
+                ):
+                    raise ValueError("invalid text")
+                return text
+            if isinstance(value, dict):
+                if len(value) > 128:
+                    raise ValueError("object too large")
+                return {
+                    str(key): _canonical(item, depth=depth + 1)
+                    for key, item in sorted(
+                        value.items(), key=lambda item: str(item[0])
+                    )
+                }
+            if isinstance(value, (list, tuple)):
+                if len(value) > 128:
+                    raise ValueError("array too large")
+                return [_canonical(item, depth=depth + 1) for item in value]
+            raise ValueError("unsupported canonical type")
+
+        def _digest(value: Any, *, ensure_ascii: bool) -> str:
+            encoded = json.dumps(
+                _canonical(value),
+                ensure_ascii=ensure_ascii,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+        def _action_command(action: dict[str, Any]) -> dict[str, Any] | None:
+            target = action.get("target") if isinstance(action.get("target"), dict) else {}
+            action_entity = str(
+                action.get("entity_id")
+                or action.get("entity")
+                or target.get("entity_id")
+                or ""
+            ).strip()
+            service_raw = str(
+                action.get("service")
+                or action.get("action")
+                or action.get("command")
+                or ""
+            ).strip()
+            action_domain = str(action.get("domain") or "").strip().lower()
+            action_service = service_raw
+            if "." in service_raw:
+                service_domain, action_service = service_raw.split(".", 1)
+                if not action_domain:
+                    action_domain = service_domain.strip().lower()
+            if not action_domain and "." in action_entity:
+                action_domain = action_entity.split(".", 1)[0].lower()
+            params = action.get("params")
+            if not isinstance(params, dict):
+                params = action.get("data")
+            if not isinstance(params, dict):
+                params = action.get("service_data")
+            if not isinstance(params, dict):
+                params = {}
+            if not action_entity or not action_domain or not action_service:
+                return None
+            return {
+                "entity_id": action_entity,
+                "domain": action_domain,
+                "service": action_service.strip(),
+                "data": _canonical(params),
+            }
+
+        def _entity_space(bound_entity_id: str) -> str:
+            info = self.device_info.get(bound_entity_id)
+            if not isinstance(info, dict):
+                info = {}
+            for key in ("space_id", "room", "area", "control_zone"):
+                value = str(info.get(key) or "").strip()
+                if value:
+                    return value
+            if hasattr(self, "_get_entity_area"):
+                return str(self._get_entity_area(bound_entity_id) or "").strip()
+            return ""
+
+        if not evidence:
+            return evaluation
+        if (
+            frozenset(evidence) != self._DAYLIGHT_EVIDENCE_FIELDS
+            or evidence.get("schema_version") != self._DAYLIGHT_EVIDENCE_SCHEMA_VERSION
+        ):
+            return _reject("daylight_evidence_schema_invalid")
+        if (
+            evidence.get("guard") != "daylight_auto_lighting"
+            or evidence.get("provenance") != "server_planning_state_observation"
+            or evidence.get("source") != "ha_state"
+            or evidence.get("environment_bucket") != "dark"
+            or evidence.get("reason_code") != "sealed_dark_lux_evidence"
+        ):
+            return _reject("daylight_evidence_provenance_invalid")
+        supplied_digest = str(evidence.get("evidence_digest") or "").strip().lower()
+        if len(supplied_digest) != 64 or any(
+            char not in "0123456789abcdef" for char in supplied_digest
+        ):
+            return _reject("daylight_evidence_digest_invalid")
+        try:
+            expected_digest = _digest(
+                {key: value for key, value in evidence.items() if key != "evidence_digest"},
+                ensure_ascii=True,
+            )
+        except (TypeError, ValueError):
+            return _reject("daylight_evidence_digest_invalid")
+        if expected_digest != supplied_digest:
+            return _reject("daylight_evidence_digest_mismatch")
+
+        policy_digest = str(policy.get("evaluation_digest") or "").strip().lower()
+        policy_id = str(policy.get("evaluation_id") or "").strip()
+        if not policy or len(policy_digest) != 64:
+            return _reject("daylight_policy_evaluation_missing")
+        try:
+            expected_policy_digest = _digest(
+                {
+                    key: value
+                    for key, value in policy.items()
+                    if key not in {"evaluation_id", "evaluation_digest"}
+                },
+                ensure_ascii=True,
+            )
+        except (TypeError, ValueError):
+            return _reject("daylight_policy_evaluation_invalid")
+        if (
+            expected_policy_digest != policy_digest
+            or policy_id != f"policy-eval-{policy_digest[:24]}"
+            or str(lineage.get("policy_evaluation_id") or "").strip() != policy_id
+            or str(lineage.get("policy_evaluation_digest") or "").strip().lower()
+            != policy_digest
+        ):
+            return _reject("daylight_policy_evaluation_digest_mismatch")
+        if (
+            str(policy.get("request_id") or "").strip()
+            != str(lineage.get("decision_request_id") or "").strip()
+            or str(policy.get("aggregate_decision") or "").strip().lower()
+            != str(lineage.get("policy_aggregate_decision") or "").strip().lower()
+        ):
+            return _reject("daylight_policy_evaluation_lineage_mismatch")
+        policy_refs = policy.get("evidence_refs")
+        evidence_ref = f"{self._DAYLIGHT_EVIDENCE_REF_PREFIX}{supplied_digest}"
+        if not isinstance(policy_refs, list) or evidence_ref not in policy_refs:
+            return _reject("daylight_evidence_policy_binding_missing")
+
+        snapshot_id = str(world_snapshot_id or "").strip()
+        fingerprint = str(lineage.get("plan_fingerprint") or "").strip().lower()
+        normalized_decision_time = str(decision_time or "").strip()
+        normalized_active_space = str(active_space_id or "").strip()
+        if (
+            not snapshot_id
+            or snapshot_id == "unknown"
+            or str(evidence.get("world_snapshot_id") or "").strip() != snapshot_id
+            or str(lineage.get("world_snapshot_id") or "").strip() != snapshot_id
+            or str(policy.get("world_snapshot_id") or "").strip() != snapshot_id
+        ):
+            return _reject("daylight_evidence_snapshot_mismatch")
+        if (
+            not normalized_decision_time
+            or str(evidence.get("decision_time") or "").strip()
+            != normalized_decision_time
+            or str(lineage.get("decision_time") or "").strip()
+            != normalized_decision_time
+        ):
+            return _reject("daylight_evidence_decision_time_mismatch")
+        if (
+            len(fingerprint) != 64
+            or str(evidence.get("plan_fingerprint") or "").strip().lower()
+            != fingerprint
+            or str(policy.get("plan_fingerprint") or "").strip().lower()
+            != fingerprint
+        ):
+            return _reject("daylight_evidence_plan_mismatch")
+        if (
+            not normalized_active_space
+            or str(evidence.get("active_space_id") or "").strip()
+            != normalized_active_space
+        ):
+            return _reject("daylight_evidence_active_space_mismatch")
+
+        source_entity_id = str(evidence.get("source_entity_id") or "").strip()
+        source_space_id = str(evidence.get("source_space_id") or "").strip()
+        source_event_id = str(evidence.get("source_event_id") or "").strip()
+        source_info = self.device_info.get(source_entity_id)
+        if not isinstance(source_info, dict):
+            source_info = {}
+        source_kind = str(
+            source_info.get("device_class")
+            or source_info.get("signal_kind")
+            or source_info.get("capability")
+            or ""
+        ).strip().lower()
+        source_unit = str(
+            source_info.get("unit_of_measurement")
+            or source_info.get("canonical_unit")
+            or ""
+        ).strip().lower()
+        if (
+            not source_entity_id.startswith("sensor.")
+            or evidence.get("source_signal_kind") != "illuminance"
+            or evidence.get("source_unit") not in {"lx", "lux"}
+            or (source_kind and source_kind not in {"illuminance", "lux"})
+            or (source_unit and source_unit not in {"lx", "lux"})
+            or source_space_id != normalized_active_space
+            or _entity_space(source_entity_id) != source_space_id
+            or source_event_id
+            != f"ha_state:{source_entity_id}:{str(evidence.get('observed_at') or '').strip()}"
+        ):
+            return _reject("daylight_evidence_source_binding_mismatch")
+
+        target_bindings = evidence.get("target_bindings")
+        if not isinstance(target_bindings, list):
+            return _reject("daylight_evidence_target_binding_missing")
+        matching_targets = [
+            row
+            for row in target_bindings
+            if isinstance(row, dict)
+            and str(row.get("entity_id") or "").strip() == entity_id
+            and str(row.get("domain") or "").strip() == domain
+            and str(row.get("service") or "").strip() == service
+        ]
+        actual_target_space = _entity_space(entity_id)
+        evaluation["target_space_id"] = actual_target_space
+        if (
+            len(matching_targets) != 1
+            or not actual_target_space
+            or actual_target_space != normalized_active_space
+            or str(matching_targets[0].get("space_id") or "").strip()
+            != actual_target_space
+        ):
+            return _reject("daylight_evidence_target_binding_mismatch")
+
+        commands: list[dict[str, Any]] = []
+        try:
+            for action in actions:
+                command = _action_command(action)
+                if command is None:
+                    return _reject("daylight_evidence_commands_invalid")
+                commands.append(command)
+            expected_commands_digest = _digest(commands, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return _reject("daylight_evidence_commands_invalid")
+        if (
+            not commands
+            or str(evidence.get("commands_digest") or "").strip().lower()
+            != expected_commands_digest
+        ):
+            return _reject("daylight_evidence_commands_mismatch")
+
+        raw_lux = evidence.get("illuminance_lux")
+        raw_threshold = evidence.get("threshold_lux")
+        if (
+            isinstance(raw_lux, bool)
+            or isinstance(raw_threshold, bool)
+            or not isinstance(raw_lux, (int, float))
+            or not isinstance(raw_threshold, (int, float))
+        ):
+            return _reject("daylight_evidence_lux_invalid")
+        lux = float(raw_lux)
+        threshold = float(raw_threshold)
+        if not isfinite(lux) or threshold != self._DAYLIGHT_GUARD_LUX_THRESHOLD:
+            return _reject("daylight_evidence_lux_invalid")
+        max_age = evidence.get("freshness_max_age_seconds")
+        if type(max_age) is not int or max_age != self._DAYLIGHT_EVIDENCE_MAX_AGE_SECONDS:
+            return _reject("daylight_evidence_freshness_invalid")
+        try:
+            observed = datetime.fromisoformat(
+                str(evidence.get("observed_at") or "").strip().replace("Z", "+00:00")
+            )
+            planned = datetime.fromisoformat(
+                normalized_decision_time.replace("Z", "+00:00")
+            )
+            if observed.tzinfo is None or planned.tzinfo is None:
+                raise ValueError("timezone required")
+            age_seconds = planned.timestamp() - observed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return _reject("daylight_evidence_freshness_invalid")
+        freshness["age_seconds"] = round(age_seconds, 3)
+        if age_seconds < 0 or age_seconds > max_age:
+            return _reject("daylight_evidence_expired")
+        if lux > threshold:
+            return _reject(self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED)
+        if (
+            policy.get("schema_version") != "0.1"
+            or policy.get("stage") != "planning"
+            or policy.get("aggregate_decision") != "allow"
+            or policy.get("actor_class") != "autonomous_agent"
+            or policy.get("execution_intent") != "autonomous"
+        ):
+            return _reject("daylight_policy_evaluation_not_authorizing")
+
+        evaluation["allowed"] = True
+        evaluation["reason_code"] = "sealed_dark_lux_evidence"
+        return evaluation
 
     @staticmethod
     def _looks_like_automatic_presence_lighting(
@@ -1396,6 +1769,62 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
     # ── 动作执行主入口 ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _smartagent_state_feedback_key(
+        command: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """Return the state-feedback identity for one SmartAgent light command."""
+        entity_id = str(command.get("entity_id") or "").strip()
+        domain = str(command.get("domain") or "").strip().lower()
+        service = str(command.get("service") or "").strip().lower()
+        if not entity_id or domain not in {"light", "switch"}:
+            return None
+        target_state = {"turn_on": "on", "turn_off": "off"}.get(service)
+        return (entity_id, target_state) if target_state else None
+
+    def _begin_smartagent_state_feedback(
+        self,
+        commands: list[dict[str, Any]],
+        *,
+        request_id: str,
+    ) -> list[tuple[str, str]]:
+        """Mark transitions attributable to this in-flight SmartAgent dispatch."""
+        registry = getattr(self, "_inflight_smartagent_state_feedback", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self._inflight_smartagent_state_feedback = registry
+        keys: list[tuple[str, str]] = []
+        for command in commands:
+            key = self._smartagent_state_feedback_key(command)
+            if key is None:
+                continue
+            request_ids = registry.setdefault(key, set())
+            if not isinstance(request_ids, set):
+                request_ids = set()
+                registry[key] = request_ids
+            request_ids.add(request_id)
+            keys.append(key)
+        return keys
+
+    def _end_smartagent_state_feedback(
+        self,
+        keys: list[tuple[str, str]],
+        *,
+        request_id: str,
+    ) -> None:
+        """Release only markers owned by the completed dispatch."""
+        registry = getattr(self, "_inflight_smartagent_state_feedback", None)
+        if not isinstance(registry, dict):
+            return
+        for key in keys:
+            request_ids = registry.get(key)
+            if not isinstance(request_ids, set):
+                registry.pop(key, None)
+                continue
+            request_ids.discard(request_id)
+            if not request_ids:
+                registry.pop(key, None)
+
     async def _execute_enveloped_service(
         self,
         domain: str,
@@ -1542,6 +1971,24 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         }
         if authorization_ref is not None:
             envelope["authorization_ref"] = authorization_ref
+
+        async def _dispatch_with_state_feedback(dispatch: Any) -> Any:
+            feedback_keys = (
+                []
+                if is_user_explicit
+                else self._begin_smartagent_state_feedback(
+                    commands,
+                    request_id=request_id,
+                )
+            )
+            try:
+                return await dispatch()
+            finally:
+                self._end_smartagent_state_feedback(
+                    feedback_keys,
+                    request_id=request_id,
+                )
+
         result: dict[str, Any] | None
         if require_world_snapshot_guard:
             is_enabled = getattr(self, "_is_enabled", None)
@@ -1603,27 +2050,20 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                         "status": "failed",
                     }
                 else:
-                    try:
-                        delegation = (
-                            self._issue_user_intent_delegation(
-                                envelope,
-                                user_intent_authority,
-                            )
-                            if is_user_explicit
-                            else None
-                        )
-                    except RuntimeError as exc:
+                    if is_user_explicit:
+                        from .admin_actor import AuthenticatedOwnerSession
+
+                    if is_user_explicit and type(user_intent_authority) is not AuthenticatedOwnerSession:
                         result = {
                             "ok": False,
-                            "error": str(exc),
+                            "error": "household_owner_session_invalid",
                             "error_type": "policy_rejected",
                             "status": "blocked",
                         }
                     else:
-                        execute_kwargs: dict[str, Any] = {}
-                        if delegation is not None:
-                            execute_kwargs["user_intent_delegation"] = delegation
-                        result = await execute(envelope, **execute_kwargs)
+                        result = await _dispatch_with_state_feedback(
+                            lambda: execute(envelope)
+                        )
                     if not isinstance(result, dict):
                         result = {
                             "ok": False,
@@ -1632,7 +2072,39 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                             "status": "failed",
                         }
         else:
-            result = await async_execute_command_envelope(self.hass, envelope)
+            result = await _dispatch_with_state_feedback(
+                lambda: async_execute_command_envelope(self.hass, envelope)
+            )
+        if (
+            require_world_snapshot_guard
+            and not is_user_explicit
+            and isinstance(result, dict)
+            and authorization_ref is not None
+        ):
+            dispositions = canonical_active_ai_receipt_dispositions(
+                result,
+                request_id=request_id,
+                commands=commands,
+                authorization_ref=authorization_ref,
+            )
+            if dispositions is None:
+                result = {
+                    "ok": False,
+                    "executed": False,
+                    "error": "ha_execution_receipt_unverified",
+                    "error_type": "ha_service_unverified_success",
+                    "status": "failed",
+                    "effect_status": "effect_unknown",
+                    "workflow_status": "reconciliation_required",
+                    "reconciliation_required": True,
+                    "results": (
+                        list(result.get("results") or [])
+                        if isinstance(result.get("results"), list)
+                        else []
+                    ),
+                }
+            else:
+                result["_smartagent_receipt_dispositions"] = dispositions
         if isinstance(result, dict) and result.get("ok"):
             self._clear_service_call_error(transaction_id, action_seq, entity_id)
             return result
@@ -1682,6 +2154,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         now_ts: float,
         ai_source: str,
         ai_new_state: str,
+        occupancy_cycle_id: str = "",
     ) -> None:
         """Apply post-dispatch bookkeeping for one verified batch receipt."""
         self._last_inference[entity_id] = now_ts
@@ -1703,7 +2176,16 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         }
         with self._user_overrides_lock:
             self._user_overrides.pop(entity_id, None)
-        self._record_device_operation(entity_id, ai_source, ai_new_state, params)
+        if occupancy_cycle_id:
+            self._record_device_operation(
+                entity_id,
+                ai_source,
+                ai_new_state,
+                params,
+                occupancy_cycle_id=occupancy_cycle_id,
+            )
+        else:
+            self._record_device_operation(entity_id, ai_source, ai_new_state, params)
         normalized_parent_transaction_id = str(parent_transaction_id or "").strip()
         event_detail = f"{entity_id} -> {service}"
         event_metadata: dict[str, Any] = {
@@ -1813,10 +2295,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         # canonical user path.  A raw command-source string is not authority.
         authenticated_user_explicit = False
         if is_user_explicit and require_world_snapshot_guard:
-            from .user_intent_delegation import AuthenticatedUserIntentAuthority
+            from .admin_actor import AuthenticatedOwnerSession
 
             authenticated_user_explicit = (
-                type(user_intent_authority) is AuthenticatedUserIntentAuthority
+                type(user_intent_authority) is AuthenticatedOwnerSession
             )
         state = self.hass.states.get(entity_id)
         is_presence_departure_turnoff = (
@@ -1997,19 +2479,26 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             target_info = self.device_info.get(entity_id, {}) if isinstance(self.device_info, dict) else {}
             if not isinstance(target_info, dict):
                 target_info = {}
-            reentry_override = evaluate_confirmed_presence_reentry_override(
+            current_cycle_id = str(
+                (decision_contract_lineage or {}).get("occupancy_cycle_id")
+                if isinstance(decision_contract_lineage, dict)
+                else ""
+            ).strip()
+            existing_priority_record = (
+                self._device_priority_map.get(entity_id)
+                if isinstance(getattr(self, "_device_priority_map", None), dict)
+                else None
+            )
+            reentry_override = evaluate_proactive_priority_handoff(
                 entity_id=entity_id,
                 service=service,
                 claim=priority_override_claim,
-                existing=(
-                    self._device_priority_map.get(entity_id)
-                    if isinstance(getattr(self, "_device_priority_map", None), dict)
-                    else None
-                ),
+                existing=existing_priority_record,
                 active_space_id=active_space_id,
                 target_space_id=target_space_id,
                 world_snapshot_id=world_snapshot_id,
                 decision_time=decision_time,
+                occupancy_cycle_id=current_cycle_id,
                 now_ts=now_ts,
                 is_lighting=(
                     domain == "light"
@@ -2022,7 +2511,35 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                     "INFO",
                     f"[priority] explicit user command bypassed AI anti-flap guard: {entity_id}.{service}",
                 )
-            elif not (require_world_snapshot_guard and reentry_override.allowed):
+            elif require_world_snapshot_guard and reentry_override.allowed:
+                self._sys_log(
+                    "INFO",
+                    f"[主动优先级交接] {entity_id} 使用 Core cycle claim 反向动作",
+                )
+            elif (
+                isinstance(existing_priority_record, dict)
+                and existing_priority_record.get("priority") in {3, 4}
+                and str(existing_priority_record.get("source") or "").strip().lower()
+                in {"ai_rule", "ai_infer"}
+                and str(existing_priority_record.get("occupancy_cycle_id") or "").strip()
+                and (
+                    (
+                        str(existing_priority_record.get("state") or "").strip().lower()
+                        in self._OFF_STATES
+                        and ("turn_on" in service or "open" in service)
+                    )
+                    or (
+                        str(existing_priority_record.get("state") or "").strip().lower()
+                        not in self._OFF_STATES
+                        and ("turn_off" in service or "close" in service)
+                    )
+                )
+            ):
+                return _fail_before_service(
+                    "priority_guard_active",
+                    error_type="priority_guard",
+                )
+            else:
                 allowed, arb_reason = self._arbitrate(entity_id, ai_source, service, params)
                 if not allowed:
                     self._sys_log("WARN", arb_reason)
@@ -2030,13 +2547,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                         str(arb_reason or "priority_guard_rejected"),
                         error_type="priority_guard",
                     )
-            else:
-                self._sys_log(
-                    "INFO",
-                    f"[P4快速重返] {entity_id} 使用 Core 确认存在 claim 覆盖 AI P4 关灯保护",
-                )
-
-            # 兼容旧的用户覆盖保护（对未接入优先级系统的边界情况兜底）
+            # 人工 override 是唯一可配置的时间保护；未配置即禁用。
             with self._user_overrides_lock:
                 override = self._user_overrides.get(entity_id)
             manual_guard = evaluate_manual_override_window(
@@ -2045,7 +2556,9 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 now_ts=now_ts,
                 override=override,
                 off_states=self._OFF_STATES,
-                window_seconds=self._USER_OVERRIDE_PROTECTION,
+                window_seconds=getattr(
+                    self, "_manual_override_protection_seconds", 0
+                ),
             )
             if not manual_guard.allowed and not authenticated_user_explicit:
                 self._sys_log("WARN", f"[manual override protection] {manual_guard.msg}")
@@ -2059,7 +2572,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                     current_override = self._user_overrides.get(entity_id)
                     if current_override is override or current_override == override:
                         self._user_overrides.pop(entity_id, None)
-        ai_new_state = "on" if "turn_on" in service else "off"
+        canonical_service = str(service or "").strip().lower().split(".", 1)[-1]
+        ai_new_state = (
+            "on" if canonical_service in {"turn_on", "open_cover"} else "off"
+        )
         safe_params = {k: v for k, v in params.items() if k != "entity_id"}
         # HA 2024+ 已废弃 color_temp(mireds)，统一改为 color_temp_kelvin(Kelvin)
         # 若 AI 仍输出旧格式，自动转换以避免 schema 报错
@@ -2221,9 +2737,25 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             and isinstance(envelope_rows[0], dict)
             else None
         )
+        receipt_dispositions = envelope_result.get(
+            "_smartagent_receipt_dispositions"
+        )
+        receipt_disposition = (
+            str(receipt_dispositions[0])
+            if isinstance(receipt_dispositions, list)
+            and len(receipt_dispositions) == 1
+            else ""
+        )
         if isinstance(receipt, dict) and receipt.get("ok") is True:
             receipt_status = str(receipt.get("status") or "").strip().lower()
-            if receipt.get("executed") is False or receipt_status == "skipped":
+            strict_active_ai_receipt = (
+                require_world_snapshot_guard and not is_user_explicit
+            )
+            if (
+                receipt.get("executed") is False or receipt_status == "skipped"
+            ) and (
+                receipt_disposition == "noop" or not strict_active_ai_receipt
+            ):
                 noop_reason = str(
                     receipt.get("reason") or receipt.get("status") or "already_in_target_state"
                 ).strip()
@@ -2235,7 +2767,14 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                     status="skipped",
                 )
                 return False
-            if receipt.get("executed") is not True:
+            if (
+                receipt.get("executed") is not True
+                or (
+                    require_world_snapshot_guard
+                    and not is_user_explicit
+                    and receipt_disposition != "verified_success"
+                )
+            ):
                 return _fail_after_service(
                     "ha_execution_receipt_unverified",
                     error_type="ha_service_unverified_success",
@@ -2268,7 +2807,21 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         # AI 成功执行时清除该设备的用户覆盖记录，并记录后续仲裁状态。
         with self._user_overrides_lock:
             self._user_overrides.pop(entity_id, None)
-        self._record_device_operation(entity_id, ai_source, ai_new_state, params)
+        occupancy_cycle_id = str(
+            (decision_contract_lineage or {}).get("occupancy_cycle_id")
+            if isinstance(decision_contract_lineage, dict)
+            else ""
+        ).strip()
+        if occupancy_cycle_id and not is_user_explicit:
+            self._record_device_operation(
+                entity_id,
+                ai_source,
+                ai_new_state,
+                params,
+                occupancy_cycle_id=occupancy_cycle_id,
+            )
+        else:
+            self._record_device_operation(entity_id, ai_source, ai_new_state, params)
         parent_transaction_id = str(parent_transaction_id or "").strip()
         event_detail = f"{entity_id} -> {service}"
         event_metadata: dict[str, Any] = {

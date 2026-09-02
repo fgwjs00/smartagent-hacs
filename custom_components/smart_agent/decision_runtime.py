@@ -23,7 +23,7 @@ from .confidence_arbitration_contract import (
     validate_auto_execution_arbitration,
 )
 from .execution_gate import evaluate_slow_brain_confidence_gate
-from .user_intent_delegation import AuthenticatedUserIntentAuthority
+from .admin_actor import AuthenticatedOwnerSession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -348,9 +348,10 @@ async def run_addon_decision(
     )
     # Only the typed authority created by the HA conversation boundary can
     # establish a user-explicit voice execution.  Keep the legacy boolean for
-    # compatibility with non-conversation callers, but it never mints a token.
+    # compatibility with non-conversation callers, but it never selects the
+    # owner execution class.
     explicit_voice_control = bool(
-        type(user_intent_authority) is AuthenticatedUserIntentAuthority
+        type(user_intent_authority) is AuthenticatedOwnerSession
         and bundle.get("is_voice")
     )
     addon_client = getattr(self, "_addon_client", None)
@@ -934,10 +935,30 @@ async def run_addon_decision(
                     rollout_reason = "active_ai_canary_entity_not_allowed"
                     rollout_trace["reason"] = rollout_reason
                     rollout_trace["blocked_entity_ids"] = sorted(blocked_entity_ids)
+            if source == "patrol_reconciliation":
+                proactive_shadow = (
+                    result.get("proactive_shadow")
+                    if isinstance(result.get("proactive_shadow"), dict)
+                    else {}
+                )
+                proactive_runtime = (
+                    proactive_shadow.get("runtime_materialization")
+                    if isinstance(proactive_shadow.get("runtime_materialization"), dict)
+                    else proactive_shadow
+                )
+                if proactive_runtime.get("execution_permitted") is not True:
+                    rollout_reason = "proactive_execution_not_permitted"
+                    rollout_allow_execution = False
+                    rollout_trace["allow_execution"] = False
+                    rollout_trace["reason"] = rollout_reason
+                    rollout_trace["proactive_execution_permitted"] = False
             result["rollout"] = rollout_trace
             result["rollout_reason"] = rollout_reason
             if not rollout_allow_execution:
-                is_shadow = rollout_reason == "active_ai_shadow"
+                is_shadow = rollout_reason in {
+                    "active_ai_shadow",
+                    "proactive_execution_not_permitted",
+                }
                 final_outcome = "observe_only" if is_shadow else "blocked"
                 action_status = "not_executed" if is_shadow else "blocked"
                 public_reason = _rollout_public_reason(rollout_reason)

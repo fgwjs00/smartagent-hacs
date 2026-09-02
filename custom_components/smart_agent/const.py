@@ -1,5 +1,7 @@
 """Constants for the SmartAgent integration."""
 
+from .service_contracts import DISCOVERY_DOMAINS
+
 DOMAIN = "smart_agent"
 
 CONF_REFRESH_REGISTRY_SOURCE_ENABLED = "refresh_registry_source_enabled"
@@ -78,9 +80,15 @@ CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET = (
     "field_canary_previous_host_dispatch_proof_secret"
 )
 
-# Dedicated HA-only signer for authenticated voice intent.  Empty keeps the
-# ordinary voice/decision path available but does not mint user authority.
-CONF_USER_INTENT_DELEGATION_SECRET = "user_intent_delegation_secret"
+# Dedicated add-on -> HA Host Proof v3 keyring.  The current key signs and
+# verifies; the staged key is verification-only during a bounded rotation.
+CONF_HOST_DISPATCH_PROOF_ENABLED = "host_dispatch_proof_enabled"
+CONF_HOST_DISPATCH_PROOF_CURRENT_SECRET = (
+    "host_dispatch_proof_current_secret"
+)
+CONF_HOST_DISPATCH_PROOF_STAGED_SECRET = (
+    "host_dispatch_proof_staged_secret"
+)
 
 DEVICE_CONTROL_MODES = frozenset({"ai", "ha", "shared"})
 
@@ -94,6 +102,7 @@ CONF_ONLINE_MODEL = "online_model"
 CONF_CONFIDENCE_AUTO = "confidence_auto"
 CONF_CONFIDENCE_NOTIFY = "confidence_notify"
 CONF_COOLDOWN = "cooldown_seconds"
+CONF_MANUAL_OVERRIDE_PROTECTION_SECONDS = "manual_override_protection_seconds"
 CONF_VOICE_INPUT_ENTITY = "voice_input_entity"
 CONF_TTS_SERVICE = "tts_service"
 CONF_TTS_TARGET = "tts_target"
@@ -505,7 +514,6 @@ STARTUP_GRACE_SECONDS = 30
 MERGE_WINDOW_SECONDS = 3
 MEMORY_RETENTION_DAYS = 365
 NOTIFY_DEDUP_SECONDS = 300
-OVERRIDE_WINDOW_SECONDS = 120
 # 纠错学习窗口（允许延迟手动纠错进入 corrections）
 CORRECTION_WINDOW_SECONDS = 600
 TERMINAL_LOGS_MAX = 15
@@ -600,7 +608,7 @@ ACTION_PARAM_KEYS_COLOR = frozenset({
 })
 
 # Target domains for device discovery
-TARGET_DOMAINS = {"light", "switch", "binary_sensor", "sensor", "climate", "cover", "media_player", "device_tracker", "fan"}
+TARGET_DOMAINS = set(DISCOVERY_DOMAINS)
 
 # entity_id 包含以下关键词时跳过
 SKIP_KEYWORDS = [
@@ -684,14 +692,14 @@ SOURCE_AI_RULE    = "ai_rule"        # AI 锁定规则执行
 SOURCE_AI_INFER   = "ai_infer"       # AI 推理执行
 SOURCE_EMERGENCY  = "emergency"      # 安全传感器触发
 
-# 保护时间窗口（秒）
-# 用户操作后，AI 在此窗口内完全退让（不做反向操作）
+# 保护时间窗口（秒）。只有人工操作可由 entry data/options 配置保护时长；
+# 自动化与 AI 操作不以固定秒数阻断新的 world fact。
 PRIORITY_GUARD_WINDOWS = {
     PRIORITY_EMERGENCY:   300,   # 紧急事件设备级保护 5 分钟（与全局抑制同步）
-    PRIORITY_USER_DIRECT: 60,    # 5A-2 柔性保护：用户操作后 60 s（配合 presence-off 事件驱动解锁）
-    PRIORITY_AUTOMATION:  60,    # 自动化执行后 60 秒 AI 退让
-    PRIORITY_AI_LOCKED:   30,    # 锁定规则执行后 30 秒内不重复
-    PRIORITY_AI_LEARNED:  120,   # AI 推理后 120 秒去重
+    PRIORITY_USER_DIRECT: 0,
+    PRIORITY_AUTOMATION:  0,
+    PRIORITY_AI_LOCKED:   0,
+    PRIORITY_AI_LEARNED:  0,
 }
 
 # 连续操作升级阈值：用户在 N 分钟内对同一设备操作 M 次 → 延长保护到 X 秒
