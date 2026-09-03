@@ -1,14 +1,13 @@
 product: SmartAgent
-release_version: 0.0.219
-display_version: Beta 0.0.219
+release_version: 0.0.220
+display_version: Beta 0.0.220
 channel: beta
-release_date: '2026-09-02'
+release_date: '2026-09-03'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: Beta 0.0.219 将主动 AI 产品开关收口到 SmartAgent V4 设置页：业主可选关闭、观察学习或主动执行。主动执行默认覆盖全屋所有已纳管且能力合同完整的设备，不再要求业主维护
-    canary 房间、domain 和实体清单；能力、风险、幂等、preflight、一次性执行证明、Receipt 与物理读回仍强制生效。全新安装仍以 shadow
-    起步，canary 仅作为不可见的工程迁移兼容。0.0.219 同时补齐正式镜像对 Supervisor/Host Proof 启动合同的冒烟验证。公开发布不等于部署或现场验收，家庭设备仍需部署后按空间自然进出验证。
-  customer_visible_version: Beta 0.0.219
+  summary: Beta 0.0.220 更新 SmartAgent V4 管理端：将首页、空间、设备、视觉感知和运维页按家庭任务重组，收口客户可读文案与状态表达，增加管理员待处理工作台和设备长列表分页。简明视图与工程视图继续使用同一路由、数据源、筛选与事务回执；候选、请求受理、执行与物理复核仍分层呈现。能力、风险、幂等、preflight、Host
+    Proof、Receipt 与物理读回合同不变。公开发布不等于现场验收，部署后仍需按全屋空间自然进出验证人来灯亮、人走灯灭和目标灯选择。
+  customer_visible_version: Beta 0.0.220
