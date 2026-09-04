@@ -394,7 +394,16 @@ async def run_addon_decision(
             or result_payload.get("id")
             or ""
         ).strip()
-        path_taken = str(result_payload.get("path_taken") or "llm")
+        result_details = (
+            result_payload.get("details")
+            if isinstance(result_payload.get("details"), dict)
+            else {}
+        )
+        path_taken = str(
+            result_details.get("path_taken")
+            or result_payload.get("path_taken")
+            or "llm"
+        )
         reason_value = str(reason or result_payload.get("reason") or ("matched" if matched else "no_actions"))
         scene_value = str(scene_desc or result_payload.get("scene") or "")
         event_payload = {
@@ -607,6 +616,20 @@ async def run_addon_decision(
         status = int(result.get("__status", 200) or 200)
         if status >= 400 or result.get("ok") is False:
             error = result.get("error") or result.get("error_type") or f"http_{status}"
+            result_details = (
+                result.get("details") if isinstance(result.get("details"), dict) else {}
+            )
+            planner_invoked = result_details.get("planner_invoked")
+            if str(result.get("scene") or "").strip():
+                failure_scene = str(result["scene"])
+            elif planner_invoked is False:
+                failure_scene = (
+                    "前置事件合同冲突"
+                    if str(error) == "decision_event_payload_mismatch"
+                    else "决策在规划前被拒绝"
+                )
+            else:
+                failure_scene = "线上大模型返回失败"
             policy_rejected = bool(
                 str(result.get("error_type") or "").strip().lower()
                 == "policy_rejected"
@@ -618,7 +641,7 @@ async def run_addon_decision(
                 status_code=status,
                 matched=False,
                 reason=str(error),
-                scene_desc=str(result.get("scene") or "线上大模型返回失败"),
+                scene_desc=failure_scene,
                 confidence_value=0,
                 actions_payload=[],
                 transaction_id_value=str(result.get("transaction_id") or ""),
