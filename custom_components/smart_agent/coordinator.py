@@ -1331,6 +1331,7 @@ class SmartAgentCoordinator(
             source_priority_map=SOURCE_PRIORITY_MAP,
             default_priority=PRIORITY_AI_LEARNED,
             off_states=self._OFF_STATES,
+            ai_params=ai_params,
         )
         return arbitration.allowed, arbitration.msg
 
@@ -1397,6 +1398,8 @@ class SmartAgentCoordinator(
                 "remaining_sec": max(0, int(rec["guard_until"] - now)),
                 "guard_until": rec.get("guard_until", 0),
             }
+            if rec.get("params"):
+                row["params"] = comparable_action_params(eid.split(".", 1)[0], rec["params"])
             occupancy_cycle_id = str(rec.get("occupancy_cycle_id") or "").strip()
             if occupancy_cycle_id:
                 row["occupancy_cycle_id"] = occupancy_cycle_id

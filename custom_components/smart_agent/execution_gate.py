@@ -383,6 +383,7 @@ def evaluate_priority_arbitration(
     source_priority_map: dict[str, int],
     default_priority: int,
     off_states: set[str] | frozenset[str],
+    ai_params: dict[str, Any] | None = None,
 ) -> ThinExecutionGateResult:
     """Evaluate source-priority guard arbitration without HA runtime access."""
 
@@ -407,6 +408,17 @@ def evaluate_priority_arbitration(
     if incoming_priority < existing_priority:
         return ThinExecutionGateResult(allowed=True, entity_id=entity_s, service=service_s)
 
+    existing_source = _clean(existing.get("source"))
+    if (existing_source in {"physical", "dashboard", "voice"}
+            and existing_priority == source_priority_map.get(existing_source)
+            and incoming_priority > existing_priority
+            and int(guard_until - float(now_ts)) > 0
+            and entity_s.startswith("climate.") and service_s.split(".")[-1] == "set_temperature"
+            and temperature_params_conflict(existing.get("params"), ai_params)):
+        return ThinExecutionGateResult(allowed=False, entity_id=entity_s, service=service_s,
+            status="blocked_priority_guard", msg="priority_param_conflict",
+            log_code="priority_guard_rejected", error_type="priority_guard")
+
     current_state = _clean(existing.get("state"))
     is_off = current_state in off_states
     ai_turning_on = "turn_on" in service_s or "open" in service_s
@@ -427,6 +439,17 @@ def evaluate_priority_arbitration(
         log_code="priority_guard_rejected",
         error_type="priority_guard",
     )
+
+
+def temperature_params_conflict(existing, incoming) -> bool:
+    """Only shared, finite temperature values establish a manual conflict."""
+    if not isinstance(existing, dict) or not isinstance(incoming, dict):
+        return False
+    for key in ("temperature", "target_temp_low", "target_temp_high"):
+        values = (existing.get(key), incoming.get(key))
+        if all(type(value) in (int, float) and math.isfinite(value) for value in values) and values[0] != values[1]:
+            return True
+    return False
 
 
 def evaluate_proactive_priority_handoff(
@@ -524,6 +547,8 @@ def evaluate_proactive_priority_handoff(
         or _clean(claim.get("service")).lower() != service_s
         or not entity_s
         or _clean(claim.get("entity_id")) != entity_s
+        or (claim.get("transition_kind") == "confirmed_departure" and not is_confirmed_departure_handoff(
+            claim, entity_id=entity_s, space_id=active_space))
         or not active_space
         or target_space != active_space
         or _clean(claim.get("space_id")) != active_space
@@ -545,8 +570,9 @@ def evaluate_proactive_priority_handoff(
         or not _clean(existing.get("occupancy_cycle_id"))
         or _clean(claim.get("previous_occupancy_cycle_id"))
         != _clean(existing.get("occupancy_cycle_id"))
-        or _clean(claim.get("occupancy_cycle_id"))
-        == _clean(claim.get("previous_occupancy_cycle_id"))
+        or (_clean(claim.get("occupancy_cycle_id"))
+        == _clean(claim.get("previous_occupancy_cycle_id")) and not is_confirmed_departure_handoff(
+            claim, entity_id=entity_s, space_id=active_space))
     ):
         return invalid
 
@@ -555,4 +581,33 @@ def evaluate_proactive_priority_handoff(
         entity_id=entity_s,
         service=service_s,
         log_code="proactive_priority_handoff",
+    )
+
+
+def is_confirmed_departure_handoff(claim, *, entity_id: str, space_id: str) -> bool:
+    """The existing v2 handoff may finish the same real occupancy cycle."""
+    if not isinstance(claim, dict) or claim.get("transition_kind") != "confirmed_departure":
+        return False
+    reference = claim.get("presence_hold_ref")
+    occurrence = reference.get("task_occurrence") if isinstance(reference, dict) else None
+    return bool(
+        entity_id.startswith("light.") and claim.get("service") == "turn_off"
+        and claim.get("occupancy_cycle_id")
+        and claim.get("previous_occupancy_cycle_id")
+        and (_is_finalized_patrol_task(claim.get("patrol_task_claim")) or (
+        isinstance(reference, dict) and reference.get("schema_version") == "0.1" and reference.get("parent_transaction_id")
+        and isinstance(occurrence, dict) and occurrence.get("schema_version") == "0.1"
+        and occurrence.get("scope_id") == space_id
+        and str(occurrence.get("job_id") or "").startswith("presence_hold_recheck:")
+        and occurrence.get("scheduled_for_utc") and occurrence.get("policy_revision")))
+    )
+
+
+def _is_finalized_patrol_task(task) -> bool:
+    return bool(
+        isinstance(task, dict) and task.get("state") == "finalized"
+        and task.get("provider_id") == "home_assistant"
+        and task.get("job_id") == "ha_low_frequency_patrol_safety_net"
+        and task.get("scope_id") == "patrol_safety_net"
+        and all(task.get(key) for key in ("claim_id", "fingerprint", "scheduled_for_utc", "policy_revision"))
     )

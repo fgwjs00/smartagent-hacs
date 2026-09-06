@@ -35,6 +35,7 @@ async def run_addon_fast_path_fail_closed(
     old_state: str,
     *,
     occupancy_cycle_id: str = "",
+    causal_event: dict[str, Any] | None = None,
     trigger_context: dict[str, Any] | None = None,
     suppress_slow_fallback: bool = False,
 ) -> None:
@@ -77,7 +78,9 @@ async def run_addon_fast_path_fail_closed(
         await self._refresh_correction_suppressions_cache(addon_client)
     snapshot = self._build_addon_fast_path_snapshot(entity_id)
     observations = snapshot.get("state_observations")
-    if isinstance(observations, dict):
+    if isinstance(causal_event, dict) and causal_event:
+        snapshot["causal_events"] = [dict(causal_event)]
+    elif isinstance(observations, dict):
         trigger_observation = observations.get(entity_id)
         if isinstance(trigger_observation, dict):
             # Bind the transition to the same HA state observation used by
@@ -86,7 +89,7 @@ async def run_addon_fast_path_fail_closed(
             trigger_observation["previous_state"] = str(old_state or "")
             trigger_observation["event_current_state"] = str(new_state or "")
     enrich_fast_path_presence_timing(self, snapshot, trigger_context)
-    snapshot["occupancy_cycle_id"] = str(occupancy_cycle_id).strip()
+    snapshot["occupancy_cycle_id"] = str(occupancy_cycle_id or "").strip()
     request_id = self._new_addon_fast_path_request_id(entity_id, old_state, new_state)
     snapshot["request_id"] = request_id
     snapshot_diag = self._addon_fast_path_snapshot_diagnostics(snapshot, entity_id)
@@ -154,6 +157,7 @@ async def run_addon_fast_path_fail_closed(
                     old_state=old_state,
                     new_state=new_state,
                     presence=presence_details,
+                    presence_hold_ref=response.get("presence_hold_ref"),
                 )
                 path_taken = str(response.get("path_taken") or details.get("path_taken") or "none")
                 result_payload = result if isinstance(result, dict) else {}
@@ -546,6 +550,9 @@ async def run_addon_fast_path_fail_closed(
                                 execution_suppressed_reason=execution_suppressed_reason,
                                 rollout=rollout_trace,
                             )
+                        from .room_remainder_runtime import schedule_room_remainder
+                        schedule_room_remainder(self, response, entity_id=entity_id,
+                                                trigger=f"{entity_id}: {old_state} -> {new_state}", new_state=new_state)
                         return
                     if not audit_pending and not await _finalize_fast_path_claim(
                         "fast_path_completed",
@@ -591,6 +598,7 @@ async def run_addon_fast_path_fail_closed(
                             new_state,
                             one_off_prompt=self._fast_path_slow_audit_prompt(),
                             _allow_learning_mode_inference=True,
+                            causal_event=causal_event,
                             source_trace_context=execution_audit_context,
                         )
                     elif audit_pending:
@@ -598,6 +606,9 @@ async def run_addon_fast_path_fail_closed(
                             "fast_path_execution_failed",
                             required_for_action=False,
                         )
+                    from .room_remainder_runtime import schedule_room_remainder
+                    schedule_room_remainder(self, response, entity_id=entity_id,
+                                            trigger=f"{entity_id}: {old_state} -> {new_state}", new_state=new_state)
                     return
                 if 200 <= status < 300:
                     should_fail_closed = False
@@ -610,6 +621,7 @@ async def run_addon_fast_path_fail_closed(
                             entity_id,
                             f"{entity_id}: {old_state} -> {new_state}",
                             new_state,
+                            causal_event=causal_event,
                             source_trace_context=_fast_path_handoff_context("addon_fast_path_disabled"),
                         )
                         return
@@ -621,9 +633,11 @@ async def run_addon_fast_path_fail_closed(
                                 f"active_space={snapshot_diag.get('active_space') or '-'}",
                             )
                             self._schedule_inference(
-                                entity_id,
+                            entity_id,
                                 f"{entity_id}: {old_state} -> {new_state}",
                                 new_state,
+
+                                causal_event=causal_event,
                                 source_trace_context=_fast_path_handoff_context("addon_fast_path_no_match"),
                             )
                             return
@@ -645,6 +659,9 @@ async def run_addon_fast_path_fail_closed(
                             "fast_path_no_fallback",
                             required_for_action=False,
                         )
+                        from .room_remainder_runtime import schedule_room_remainder
+                        schedule_room_remainder(self, response, entity_id=entity_id,
+                                                trigger=f"{entity_id}: {old_state} -> {new_state}", new_state=new_state)
                     if reason == "confidence_below_auto_threshold" and not confirm_required:
                         if slow_fallback_allowed(suppress_slow_fallback, (
                             action_count > 0
@@ -661,10 +678,12 @@ async def run_addon_fast_path_fail_closed(
                                 f"active_space={snapshot_diag.get('active_space') or '-'}",
                             )
                             self._schedule_inference(
-                                entity_id,
+                            entity_id,
                                 f"{entity_id}: {old_state} -> {new_state}",
                                 new_state,
                                 _allow_learning_mode_inference=(confirm_suppressed_reason == "learning_mode"),
+
+                                causal_event=causal_event,
                                 source_trace_context=_fast_path_handoff_context("addon_fast_path_low_confidence"),
                             )
                             return
@@ -686,6 +705,10 @@ async def run_addon_fast_path_fail_closed(
                             "fast_path_filtered",
                             required_for_action=False,
                         )
+                        if isinstance(response.get("room_remainder_ref"), dict):
+                            from .room_remainder_runtime import schedule_room_remainder
+                            schedule_room_remainder(self, response, entity_id=entity_id,
+                                                    trigger=f"{entity_id}: {old_state} -> {new_state}", new_state=new_state)
                     self._sys_log(
                         "INFO",
                         f"[Add-on FastPath] not matched; HA local decision skipped | status={status} matched={response.get('matched')}",
@@ -707,6 +730,7 @@ async def run_addon_fast_path_fail_closed(
                             entity_id,
                             f"{entity_id}: {old_state} -> {new_state}",
                             new_state,
+                            causal_event=causal_event,
                             source_trace_context=_fast_path_handoff_context(
                                 "addon_fast_path_409"
                             ),

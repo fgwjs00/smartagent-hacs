@@ -191,6 +191,26 @@ def local_device_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dic
             for key in ("last_changed", "last_updated"):
                 raw = getattr(state_obj, key, "")
                 row[key] = raw.isoformat() if hasattr(raw, "isoformat") else str(raw or "")
+            # The HA-owned producer emits one canonical generation for both
+            # sides of the digest binding.  Existing persisted facts are kept
+            # so a changed/tampered generation still fails closed downstream;
+            # rows predating capability facts are bootstrapped only from the
+            # current HA State object and its own timestamp.
+            from .devices import _build_runtime_capability_facts
+
+            live_facts = _build_runtime_capability_facts(entity_id, state_obj)
+            if live_facts:
+                row["runtime_capability_live"] = dict(live_facts)
+                persisted_facts = row.get("runtime_capability_facts")
+                if (
+                    "runtime_capability_facts" not in row
+                    or persisted_facts is None
+                    or (
+                        isinstance(persisted_facts, dict)
+                        and not persisted_facts
+                    )
+                ):
+                    row["runtime_capability_facts"] = dict(live_facts)
         else:
             if row.get("state") is not None:
                 row["state"] = str(row.get("state") or "unknown")

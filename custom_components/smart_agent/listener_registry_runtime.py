@@ -520,6 +520,29 @@ def managed_device_info_row_from_addon_device(
         "ha_unique_id": str(row.get("ha_unique_id") or row.get("unique_id") or ""),
         "ha_device_id": str(row.get("ha_device_id") or row.get("device_id") or ""),
     }
+    raw_metadata = row.get("metadata")
+    if isinstance(raw_metadata, dict):
+        policy_source = str(
+            raw_metadata.get("policy_source")
+            or raw_metadata.get("management_source")
+            or ""
+        ).strip()
+        if (
+            raw_metadata.get("managed_policy_explicit") is True
+            and policy_source
+            in {
+                "device_management_sync",
+                "config_migration",
+                "legacy_explicit_management",
+            }
+        ):
+            # Only the canonical governance proof crosses into the decision
+            # snapshot.  Runtime facts and bridge payloads cannot synthesize
+            # management authority or carry arbitrary nested metadata.
+            info["metadata"] = {
+                "managed_policy_explicit": True,
+                "policy_source": policy_source,
+            }
     sampling_contract = row.get("signal_sampling_contract")
     if isinstance(sampling_contract, dict):
         info["signal_sampling_contract"] = copy.deepcopy(sampling_contract)
@@ -530,10 +553,18 @@ def managed_device_info_row_from_addon_device(
             if isinstance(supported_services, (list, tuple))
             else []
         )
-    for key in ("behavior_dims", "capability_snapshot", "runtime_capability_binding"):
+    for key in (
+        "behavior_dims",
+        "capability_snapshot",
+        "runtime_capability_binding",
+        "runtime_capability_facts",
+        "runtime_capability_live",
+    ):
         value = row.get(key)
         if isinstance(value, (dict, list, tuple)):
             info[key] = copy.deepcopy(value)
+    if "risk_level" in row:
+        info["risk_level"] = row["risk_level"]
     return entity_id, info
 
 def device_info_row_from_addon_device(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:

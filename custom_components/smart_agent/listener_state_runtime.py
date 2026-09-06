@@ -30,6 +30,8 @@ def handle_listener_state_changed(
     old = data.get("old_state")
     new_s = new.state if new else ""
     old_s = old.state if old else ""
+    from .listener_causal_event import callback_cause
+    causal_event = callback_cause(entity_id, old, new)
 
     source_type = "物理/自动"
     if new and new.context:
@@ -373,7 +375,12 @@ def handle_listener_state_changed(
     if new and new.context and new.context.user_id:
         record_operation = getattr(self, "_record_device_operation", None)
         if callable(record_operation):
-            record_operation(entity_id, SOURCE_DASHBOARD, new_s)
+            from math import isfinite
+            old_attributes, new_attributes = getattr(old, "attributes", {}) or {}, getattr(new, "attributes", {}) or {}
+            temperatures = {key: new_attributes[key] for key in ("temperature", "target_temp_low", "target_temp_high")
+                if domain == "climate" and key in new_attributes and old_attributes.get(key) != new_attributes[key]
+                and type(new_attributes[key]) in (int, float) and isfinite(new_attributes[key])}
+            record_operation(entity_id, SOURCE_DASHBOARD, new_s, temperatures)
 
         user_overrides = getattr(self, "_user_overrides", None)
         user_overrides_lock = getattr(self, "_user_overrides_lock", None)
@@ -427,28 +434,6 @@ def handle_listener_state_changed(
     is_presence_sensor = self._is_presence_listener_entity(entity_id, info)
     if domain == "binary_sensor" and not is_presence_sensor:
         if self._is_actionable_contact_arrival_for_slow_inference(entity_id, new_s):
-            causal_observed_at = ""
-            for timestamp_key in ("last_updated", "last_changed"):
-                timestamp = getattr(new, timestamp_key, None)
-                isoformat = getattr(timestamp, "isoformat", None)
-                if callable(isoformat):
-                    causal_observed_at = str(isoformat() or "").strip()
-                elif timestamp not in (None, ""):
-                    causal_observed_at = str(timestamp).strip()
-                if causal_observed_at:
-                    break
-            causal_event = {
-                "entity_id": entity_id,
-                "old_state": old_s,
-                "new_state": new_s,
-                "observed_at": causal_observed_at,
-                "source_event_id": (
-                    f"ha_state:{entity_id}:{causal_observed_at}"
-                    if causal_observed_at
-                    else ""
-                ),
-                "quality": "good",
-            }
             self._last_listener_filter_reason = "contact_slow_path_only"
             self._emit_listener_event(
                 listener_action="slow_path_scheduled",
@@ -509,6 +494,14 @@ def handle_listener_state_changed(
 
     if is_presence_sensor and duplicate_arrival:
         self._cancel_presence_temporal_recheck(entity_id)
+        # Arrival deduplication suppresses actions, not the current Presence
+        # update needed to cancel an in-flight vacancy candidate.
+        self._spawn_addon_fast_path_task(self._run_addon_fast_path_fail_closed(
+            entity_id, new_s, old_s, occupancy_cycle_id=occupancy_cycle_id,
+            causal_event=causal_event,
+            trigger_context={"presence_update_only": True},
+            suppress_slow_fallback=True,
+        ), entity_id=entity_id, new_state=new_s, old_state=old_s)
         self._emit_listener_event(
             listener_action="filtered",
             entity_id=entity_id,
@@ -542,9 +535,10 @@ def handle_listener_state_changed(
             new_s,
             old_s,
             occupancy_cycle_id=occupancy_cycle_id,
+            causal_event=causal_event,
         )
     except TypeError as exc:
-        if "occupancy_cycle_id" not in str(exc):
+        if "occupancy_cycle_id" not in str(exc) and "causal_event" not in str(exc):
             raise
         fast_path_coro = self._run_addon_fast_path_fail_closed(
             entity_id,

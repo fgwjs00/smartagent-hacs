@@ -18,6 +18,7 @@ _FAST_PATH_HANDOFF_SOURCES = frozenset(
         "addon_fast_path_disabled",
         "addon_fast_path_low_confidence",
         "addon_fast_path_no_match",
+        "addon_room_remainder",
     }
 )
 
@@ -32,7 +33,7 @@ def _source_trace_projection(
     if fast_path_execution_audit:
         return dict(fast_path_execution_audit), fast_path_execution_audit
     source = str(raw_source_trace_context.get("source") or "").strip()
-    if source not in _FAST_PATH_HANDOFF_SOURCES:
+    if source not in _FAST_PATH_HANDOFF_SOURCES and source != "presence_hold_recheck":
         return {}, {}
     projected = {
         key: json.loads(json.dumps(value, ensure_ascii=False, default=str))
@@ -47,6 +48,8 @@ def _source_trace_projection(
             "reason",
             "decision_trace",
             "event_claim",
+            "room_remainder_ref",
+            "presence_hold_ref",
         )
         if (value := raw_source_trace_context.get(key)) not in (None, "")
     }
@@ -466,6 +469,12 @@ def build_addon_slow_decision_bundle(
         normalized_source == "manual"
     )
     decision_objective = (
+        "presence_hold_recheck"
+        if source_trace_context.get("source") == "presence_hold_recheck"
+        else
+        "causal_room_remainder"
+        if source_trace_context.get("source") == "addon_room_remainder"
+        else
         "patrol_reconciliation"
         if normalized_source.startswith("patrol")
         else "fast_path_execution_audit"
@@ -497,6 +506,9 @@ def build_addon_slow_decision_bundle(
         "states": states,
         "state_observations": state_observations,
         "observed_at": str(snapshot.get("observed_at") or ""),
+        "manual_action_summary": snapshot.get("manual_action_summary")
+        if isinstance(snapshot.get("manual_action_summary"), dict)
+        else {},
         "created_at": str(snapshot.get("created_at") or ""),
         "environment_context": environment_context,
         "presence_snapshot": presence_snapshot,

@@ -220,6 +220,7 @@ class ListenersMixin:
         old_state: str,
         new_state: str,
         presence: dict[str, Any] | None,
+        presence_hold_ref: dict[str, Any] | None = None,
     ) -> None:
         schedule_presence_temporal_recheck(
             self,
@@ -227,6 +228,7 @@ class ListenersMixin:
             old_state=old_state,
             new_state=new_state,
             presence=presence,
+            presence_hold_ref=presence_hold_ref,
             schedule=async_call_later,
         )
 
@@ -433,18 +435,10 @@ class ListenersMixin:
                     if value not in (None, ""):
                         context[f"sun_{key}"] = value
 
-        def _entity_room(entity_id: str, info: dict[str, Any]) -> str:
-            for key in ("space_id", "room", "area"):
-                value = str((info or {}).get(key) or "").strip()
-                if value:
-                    return value
-            area_getter = getattr(self, "_get_entity_area", None)
-            if callable(area_getter):
-                try:
-                    return str(area_getter(entity_id) or "").strip()
-                except Exception as exc:
-                    _LOGGER.debug("[Listeners] area lookup failed for daylight context %s: %s", entity_id, exc)
-            return ""
+        def _entity_room(_entity_id: str, info: dict[str, Any]) -> str:
+            # Lux joins use only the canonical Core inventory identity.  Room
+            # and area are display labels and cannot recover a missing space.
+            return str((info or {}).get("space_id") or "").strip()
 
         trigger_info = device_info.get(trigger_entity_id, {}) if trigger_entity_id else {}
         if not isinstance(trigger_info, dict):
@@ -752,7 +746,7 @@ class ListenersMixin:
         self,
         entity_id: str,
         *,
-        include_environment_devices: bool = False,
+        include_environment_devices: bool = True,
     ) -> dict[str, Any]:
         """Build the plain snapshot consumed by add-on Core fast-path decisions."""
         raw_device_info = getattr(self, "device_info", {}) or {}
@@ -784,7 +778,7 @@ class ListenersMixin:
         now_ts = time.time()
         observed_at = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
         states: dict[str, str] = {}
-        state_observations: dict[str, dict[str, str]] = {}
+        state_observations: dict[str, dict[str, Any]] = {}
         for eid in device_info.keys():
             if not eid:
                 continue
@@ -819,6 +813,20 @@ class ListenersMixin:
                 state_observations[eid] = observation
                 attributes = getattr(state, "attributes", None)
                 if isinstance(attributes, dict):
+                    if eid.startswith("climate."):
+                        # HA exposes these values in its configured display
+                        # unit. Do not assume Celsius or use the setpoint as
+                        # the observed room temperature.
+                        climate_attributes = {
+                            key: attributes[key]
+                            for key in ("temperature", "target_temperature", "current_temperature", "hvac_action")
+                            if key in attributes
+                        }
+                        units = getattr(getattr(self.hass, "config", None), "units", None)
+                        unit = str(getattr(units, "temperature_unit", "") or "")
+                        if unit:
+                            climate_attributes["temperature_unit"] = unit
+                        observation["attributes"] = climate_attributes
                     device_class = str(attributes.get("device_class") or "").strip().lower()
                     if device_class and not device_info[eid].get("device_class"):
                         device_info[eid]["device_class"] = device_class
@@ -2863,6 +2871,7 @@ class ListenersMixin:
         old_state: str,
         *,
         occupancy_cycle_id: str = "",
+        causal_event: dict[str, Any] | None = None,
         trigger_context: dict[str, Any] | None = None,
         suppress_slow_fallback: bool = False,
     ) -> None:
@@ -2872,6 +2881,7 @@ class ListenersMixin:
             new_state,
             old_state,
             occupancy_cycle_id=occupancy_cycle_id,
+            causal_event=causal_event,
             trigger_context=trigger_context,
             suppress_slow_fallback=suppress_slow_fallback,
         )

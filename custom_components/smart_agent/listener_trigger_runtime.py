@@ -176,57 +176,13 @@ def presence_temporal_recheck_delay(presence: dict[str, Any]) -> float | None:
     return max(1.0, hold_secs - elapsed)
 
 def schedule_presence_temporal_recheck(
-    self,
-    entity_id: str,
-    *,
-    old_state: str,
-    new_state: str,
-    presence: dict[str, Any] | None,
+    self, entity_id: str, *, old_state: str, new_state: str,
+    presence: dict[str, Any] | None, presence_hold_ref: dict[str, Any] | None = None,
     schedule: Any = async_call_later,
 ) -> None:
-    vacant_states = {"off", "closed", "not_home", "away", "idle", "clear", "empty", "vacant"}
-    normalized_state = str(new_state or "").strip().lower()
-    temporal = presence if isinstance(presence, dict) else {}
-    delay = self._presence_temporal_recheck_delay(temporal)
-
-    if normalized_state not in vacant_states:
-        self._cancel_presence_temporal_recheck(entity_id)
-        return
-    if delay is None:
-        if str(temporal.get("temporal_status") or "") in {
-            "vacant_hold_satisfied",
-            "vacant_confirmed",
-        }:
-            self._cancel_presence_temporal_recheck(entity_id)
-        return
-
-    self._cancel_presence_temporal_recheck(entity_id)
-    timers = getattr(self, "_presence_off_timers", None)
-    if not isinstance(timers, dict):
-        timers = {}
-        self._presence_off_timers = timers
-
-    @callback
-    def _recheck(_: datetime) -> None:
-        timers.pop(entity_id, None)
-        states = getattr(getattr(self, "hass", None), "states", None)
-        get_state = getattr(states, "get", None)
-        state_obj = get_state(entity_id) if callable(get_state) else None
-        current_state = str(getattr(state_obj, "state", "") or "").strip().lower()
-        if current_state not in vacant_states:
-            return
-        self._spawn_addon_fast_path_task(
-            self._run_addon_fast_path_fail_closed(entity_id, current_state, old_state),
-            entity_id=entity_id,
-            old_state=old_state,
-            new_state=current_state,
-        )
-
-    try:
-        timers[entity_id] = schedule(self.hass, delay, _recheck)
-    except Exception as exc:
-        timers.pop(entity_id, None)
-        _LOGGER.debug("[PresenceTemporal] schedule recheck failed for %s: %s", entity_id, exc)
+    from .presence_hold_runtime import schedule_hold
+    schedule_hold(self, entity_id, new_state=new_state, presence=presence,
+                  reference=presence_hold_ref, schedule=schedule)
 
 def build_presence_snapshot_for_entity(
     self,
@@ -407,6 +363,11 @@ def schedule_inference(
     now = time.time()
     cooldown = self._effective_cooldown()
     cooldown_key = self._slow_inference_cooldown_key(entity_id, new_state)
+    if isinstance(source_trace_context, dict) and source_trace_context.get("source") == "addon_room_remainder":
+        reference = source_trace_context.get("room_remainder_ref") or {}
+        cooldown_key = f"{cooldown_key}:remainder:{reference.get('scope_digest', '')}"
+    if isinstance(source_trace_context, dict) and source_trace_context.get("source") == "presence_hold_recheck":
+        cooldown_key = str(source_trace_context["presence_hold_ref"]["task_occurrence"]["job_id"])
     elapsed = now - self._last_inference.get(cooldown_key, 0)
     if elapsed < cooldown:
         _remaining = int(cooldown - elapsed)
@@ -767,6 +728,10 @@ def flush_triggers(self, _: datetime) -> None:
                 "one_off_prompt": str(batch["one_off_prompt"]),
                 "source_trace_context": batch["source_trace_context"],
             }
+            hold_ref = (batch["source_trace_context"] or {}).get("presence_hold_ref")
+            if isinstance(hold_ref, dict):
+                decision_kwargs["task_occurrence"] = hold_ref["task_occurrence"]
+                decision_kwargs["trigger_space_id"] = hold_ref["task_occurrence"]["scope_id"]
             if batch.get("causal_events"):
                 decision_kwargs["causal_events"] = list(batch["causal_events"])
             self._spawn_slow_inference_task(

@@ -573,8 +573,9 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 "data": _canonical(params),
             }
 
-        def _entity_space(bound_entity_id: str) -> str:
-            info = self.device_info.get(bound_entity_id)
+        def _entity_space(bound_entity_id: str, info: Any = None) -> str:
+            if info is None:
+                info = self.device_info.get(bound_entity_id)
             if not isinstance(info, dict):
                 info = {}
             for key in ("space_id", "room", "area", "control_zone"):
@@ -690,6 +691,8 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         source_event_id = str(evidence.get("source_event_id") or "").strip()
         source_info = self.device_info.get(source_entity_id)
         if not isinstance(source_info, dict):
+            source_info = (getattr(self, "_environment_context_device_info", {}) or {}).get(source_entity_id)
+        if not isinstance(source_info, dict):
             source_info = {}
         source_kind = str(
             source_info.get("device_class")
@@ -709,7 +712,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             or (source_kind and source_kind not in {"illuminance", "lux"})
             or (source_unit and source_unit not in {"lx", "lux"})
             or source_space_id != normalized_active_space
-            or _entity_space(source_entity_id) != source_space_id
+            or _entity_space(source_entity_id, source_info) != source_space_id
             or source_event_id
             != f"ha_state:{source_entity_id}:{str(evidence.get('observed_at') or '').strip()}"
         ):
@@ -2480,7 +2483,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             if not isinstance(target_info, dict):
                 target_info = {}
             current_cycle_id = str(
-                (decision_contract_lineage or {}).get("occupancy_cycle_id")
+                ((decision_contract_lineage or {}).get("occupancy_cycle_id") or "")
                 if isinstance(decision_contract_lineage, dict)
                 else ""
             ).strip()
@@ -2808,7 +2811,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         with self._user_overrides_lock:
             self._user_overrides.pop(entity_id, None)
         occupancy_cycle_id = str(
-            (decision_contract_lineage or {}).get("occupancy_cycle_id")
+            ((decision_contract_lineage or {}).get("occupancy_cycle_id") or "")
             if isinstance(decision_contract_lineage, dict)
             else ""
         ).strip()

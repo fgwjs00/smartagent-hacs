@@ -593,6 +593,19 @@ def _attach_safety_net_occurrence(
         policy=dict(patrol_policy),
         job_id="ha_low_frequency_patrol_safety_net",
     )
+    cycles = getattr(owner, "_arrival_occupancy_cycles", {}) or {}
+    payload["occupancy_cycle_ids"] = {
+        space: row["cycle_id"]
+        for space, row in cycles.items()
+        if isinstance(row, dict) and row.get("cycle_id")
+    }
+    priority_getter = getattr(owner, "_get_priority_summary", None)
+    scoped_entities = payload.get("device_capability_snapshot") or {}
+    if callable(priority_getter):
+        payload["priority_records"] = [
+            dict(row) for row in priority_getter(include_lineage=True)
+            if row.get("entity_id") in scoped_entities
+        ]
 
 
 def _update_safety_net_fingerprint(owner: Any, payload: dict[str, Any]) -> None:

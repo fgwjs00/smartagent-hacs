@@ -958,23 +958,6 @@ async def run_addon_decision(
                     rollout_reason = "active_ai_canary_entity_not_allowed"
                     rollout_trace["reason"] = rollout_reason
                     rollout_trace["blocked_entity_ids"] = sorted(blocked_entity_ids)
-            if source == "patrol_reconciliation":
-                proactive_shadow = (
-                    result.get("proactive_shadow")
-                    if isinstance(result.get("proactive_shadow"), dict)
-                    else {}
-                )
-                proactive_runtime = (
-                    proactive_shadow.get("runtime_materialization")
-                    if isinstance(proactive_shadow.get("runtime_materialization"), dict)
-                    else proactive_shadow
-                )
-                if proactive_runtime.get("execution_permitted") is not True:
-                    rollout_reason = "proactive_execution_not_permitted"
-                    rollout_allow_execution = False
-                    rollout_trace["allow_execution"] = False
-                    rollout_trace["reason"] = rollout_reason
-                    rollout_trace["proactive_execution_permitted"] = False
             result["rollout"] = rollout_trace
             result["rollout_reason"] = rollout_reason
             if not rollout_allow_execution:
@@ -1262,6 +1245,10 @@ async def run_addon_decision(
                         or ("等待用户确认" if confirm_required else "置信度不足，仅记录未执行"),
                     )
                 result.setdefault("status", "ok")
+                if isinstance(result.get("room_remainder_ref"), dict):
+                    from .room_remainder_runtime import schedule_room_remainder
+                    schedule_room_remainder(self, result, entity_id=str(bundle.get("trigger_entity_id") or ""),
+                                            trigger=trigger, new_state=str(bundle.get("trigger_new_state") or ""))
                 return result
             if learning_observe_only:
                 result["matched"] = True
@@ -1572,6 +1559,10 @@ async def run_addon_decision(
         elif bundle.get("is_voice") and not str(result.get("speak") or "").strip():
             result["speak"] = reply_text
         result.setdefault("status", "ok")
+        if isinstance(result.get("room_remainder_ref"), dict):
+            from .room_remainder_runtime import schedule_room_remainder
+            schedule_room_remainder(self, result, entity_id=str(bundle.get("trigger_entity_id") or ""),
+                                    trigger=str(trigger or ""), new_state=str(bundle.get("new_state") or ""))
         return result
 
 __all__ = [
