@@ -99,7 +99,7 @@ def _runtime_supported_services(domain: str, attrs: dict[str, Any]) -> list[str]
         return sorted(dict.fromkeys(result))
     services: set[str] = set()
     features = attrs.get("supported_features")
-    if type(features) is int and features >= 0:
+    if isinstance(features, int) and not isinstance(features, bool) and features >= 0:
         services.update(
             service
             for service, mask in _FEATURE_SERVICE_MASKS.get(domain, {}).items()
@@ -131,8 +131,8 @@ def _build_runtime_capability_facts(entity_id: str, state_obj: Any) -> dict[str,
     snapshot: dict[str, Any] = {}
     dimensions: list[dict[str, Any]] = []
     features = attrs.get("supported_features")
-    if type(features) is int and features >= 0:
-        snapshot["supported_features"] = features
+    if isinstance(features, int) and not isinstance(features, bool) and features >= 0:
+        snapshot["supported_features"] = int(features)
     if domain == "climate":
         hvac_modes = _runtime_string_list(attrs.get("hvac_modes"))
         preset_modes = _runtime_string_list(attrs.get("preset_modes"))
@@ -297,6 +297,28 @@ class DevicesMixin:
                 ts=self._ha_db_now_text(),
             )
         ) is not None
+
+    async def _reconcile_device_runtime_capabilities(self, rows: list[Any]) -> bool:
+        """Refresh existing projections after missed startup or reconnect events."""
+        synchronized = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            mapped = self._managed_device_info_row_from_addon_device(row)
+            if mapped is None:
+                continue
+            persisted = row.get("runtime_capability_facts")
+            if not isinstance(persisted, dict):
+                # Registration and deletion own projection membership.
+                continue
+            entity_id, info = mapped
+            state_obj = self.hass.states.get(entity_id)
+            facts = _build_runtime_capability_facts(entity_id, state_obj)
+            if not facts or facts["facts_digest"] == persisted.get("facts_digest"):
+                continue
+            if await self._persist_device_record(entity_id, info, state_obj=state_obj):
+                synchronized = True
+        return synchronized
 
     async def _persist_memory_action(
         self,

@@ -328,6 +328,10 @@ async def async_refresh_device_info_from_addon_devices(self, *, reason: str = ""
 
     try:
         rows = await get_devices()
+        reconcile = getattr(self, "_reconcile_device_runtime_capabilities", None)
+        if isinstance(rows, list) and callable(reconcile) and await reconcile(rows):
+            # Read the confirmed projection back through Gateway capability binding.
+            rows = await get_devices()
     except Exception as exc:
         status["reason"] = "addon_exception"
         status["error"] = str(exc)
