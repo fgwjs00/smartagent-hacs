@@ -297,7 +297,19 @@ def handle_listener_state_changed(
         )
         return
 
-    if self._is_inflight_smartagent_state_feedback(entity_id, new_s):
+    native = getattr(self, "_native_execution_attribution", None)
+    native_attribution = native.attribution(new, entity_id) if native is not None else None
+    native_manual = bool(native_attribution and native_attribution.get("origin") == "user_action")
+    if native_attribution and not native_manual:
+        if native_attribution.get("origin") == "system_action":
+            native.defer(ev)
+        self._emit_listener_event(
+            listener_action="filtered", entity_id=entity_id, old_state=old_s, new_state=new_s,
+            filter_reason="native_execution_observation", source_type=source_type,
+        )
+        return
+
+    if not native_manual and self._is_inflight_smartagent_state_feedback(entity_id, new_s):
         self._record_presence_interaction_trace(
             entity_id,
             domain,
@@ -335,7 +347,7 @@ def handle_listener_state_changed(
             last_ai["reverse_user_action"] = True
             last_ai["reverse_user_action_state"] = new_s
             last_ai["reverse_user_action_source"] = source_type
-    if isinstance(last_ai, dict) and str(last_ai.get("state") or "") == new_s:
+    if not native_manual and isinstance(last_ai, dict) and str(last_ai.get("state") or "") == new_s:
         try:
             ai_action_age = time.time() - float(last_ai.get("time") or 0)
         except (TypeError, ValueError):

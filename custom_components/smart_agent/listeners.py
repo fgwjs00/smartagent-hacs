@@ -794,19 +794,36 @@ class ListenersMixin:
                         else "good"
                     ),
                 }
-                for timestamp_key in ("last_changed", "last_updated"):
+                observation["snapshot_collected_at"] = observed_at
+                observation["ha_state_observed_at"] = observed_at
+                observation["timestamp_missing_reasons"] = {
+                    "source_observed_at": "ha_state_does_not_provide_hardware_sample_time",
+                    "received_at": "snapshot_read_is_not_event_receipt",
+                }
+                for timestamp_key in ("last_changed", "last_updated", "last_reported"):
                     timestamp = getattr(state, timestamp_key, None)
                     if timestamp in (None, ""):
+                        observation["timestamp_missing_reasons"][timestamp_key] = "not_provided_by_ha_state"
                         continue
                     isoformat = getattr(timestamp, "isoformat", None)
                     observation[timestamp_key] = (
                         str(isoformat()) if callable(isoformat) else str(timestamp)
                     )
-                observed_at_value = str(
-                    observation.get("last_updated")
-                    or observation.get("last_changed")
-                    or ""
-                ).strip()
+                state_attrs = getattr(state, "attributes", {}) or {}
+                time_keys = (
+                    ("last_changed", "last_updated")
+                    if str(state_attrs.get("device_class") or device_info[eid].get("device_class") or "").lower() == "illuminance"
+                    else ("last_updated", "last_changed")
+                )
+                time_key = next((key for key in time_keys if observation.get(key)), "")
+                observed_at_value = str(observation.get(time_key) or "").strip()
+                observation["observed_at_source"] = f"ha_{time_key}" if time_key else "missing"
+                if str(state_attrs.get("device_class") or device_info[eid].get("device_class") or "").lower() == "illuminance":
+                    # We just read HA's current state. Its last change is not
+                    # a sampling clock: integrations may only write on change.
+                    observed_at_value = observed_at
+                    observation["observed_at_source"] = "ha_state_read"
+                observation["report_time_semantics"] = "ha_state_write_not_signal_sample"
                 if observed_at_value:
                     observation["observed_at"] = observed_at_value
                     observation["source_event_id"] = f"ha_state:{eid}:{observed_at_value}"
@@ -847,6 +864,7 @@ class ListenersMixin:
             "room_topology": topology,
             "mode": str(getattr(self, "_mode", "") or ""),
             "presence_contract_source": "addon_presence_engine",
+            "snapshot_collected_at": observed_at,
             "observed_at": observed_at,
             "created_at": observed_at,
         }
@@ -1810,7 +1828,14 @@ class ListenersMixin:
             parent_id = str(getattr(context, "parent_id", None) or "").strip()
             attribution: dict[str, Any] | None = None
 
-            if user_id and self._is_user_scene_script_service(domain, service):
+            native = getattr(self, "_native_execution_attribution", None)
+            if native is not None and user_id in native.users:
+                attribution = {
+                    "origin": "system_action", "actor": "homeassistant:system_service",
+                    "context_id": context_id, "root_context_id": context_id,
+                    "native_execution": True, "time": now,
+                }
+            elif user_id and self._is_user_scene_script_service(domain, service):
                 attribution = {
                     "origin": "user_scene_script_action",
                     "actor": f"ha_user:{user_id}",
@@ -1855,6 +1880,11 @@ class ListenersMixin:
         *,
         entity_id: str = "",
     ) -> dict[str, Any]:
+        native = getattr(self, "_native_execution_attribution", None)
+        if native is not None:
+            attribution = native.attribution(state_obj, entity_id)
+            if attribution is not None:
+                return attribution
         context = getattr(state_obj, "context", None)
         context_id = str(getattr(context, "id", None) or "").strip()
         user_id = str(getattr(context, "user_id", None) or "").strip()
@@ -1939,6 +1969,7 @@ class ListenersMixin:
         new_state_obj: Any,
         source_type: str,
         device_info: dict[str, Any],
+        occurred_at: float | None = None,
     ) -> bool:
         """暂存到达照明学习所需的业主直接操作证据。"""
         domain = str(entity_id or "").split(".", 1)[0]
@@ -1985,7 +2016,7 @@ class ListenersMixin:
         if not room:
             return False
 
-        occurred_at = time.time()
+        occurred_at = time.time() if occurred_at is None else occurred_at
         retention = max(
             float(self._ARRIVAL_MANUAL_EVIDENCE_RETENTION_SECONDS),
             float(self._ARRIVAL_LEARNING_LOOKBACK_SECONDS)
@@ -2444,6 +2475,8 @@ class ListenersMixin:
         source_type: str,
         old_state_obj: Any = None,
         new_state_obj: Any = None,
+        *,
+        observed_at: float | None = None,
     ) -> None:
         device_info = getattr(self, "device_info", {}) if isinstance(getattr(self, "device_info", None), dict) else {}
         info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
@@ -2454,6 +2487,8 @@ class ListenersMixin:
             area_getter=getattr(self, "_get_entity_area", None),
         )
         now = self._ha_local_now()
+        if observed_at is not None:
+            now = datetime.fromtimestamp(observed_at, tz=now.tzinfo)
         enqueue = getattr(self, "_enqueue_internal_event", None)
         if not callable(enqueue):
             return

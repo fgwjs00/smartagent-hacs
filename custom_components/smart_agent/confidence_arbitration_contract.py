@@ -124,6 +124,12 @@ def _arrival_lighting_turn_on_candidate(
 ) -> bool:
     if not isinstance(context_snapshot, dict):
         return False
+    handoff = context_snapshot.get("source_trace_context") or {}
+    if handoff.get("source") in {"addon_fast_path_arrival_lighting", "addon_fast_path_illuminance"}:
+        # Cold learning already handed the decision to the normal AI planner.
+        # Keep its confidence/policy arbitration, without requiring a learned
+        # lamp preference again in either host confirmation or validation.
+        return False
     trigger_context = (
         context_snapshot.get("trigger_context")
         if isinstance(context_snapshot.get("trigger_context"), dict)

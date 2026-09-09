@@ -469,8 +469,6 @@ def evaluate_proactive_priority_handoff(
 ) -> ThinExecutionGateResult:
     """Validate one server-issued AI-to-AI reverse-action cycle handoff."""
 
-    del is_lighting
-
     entity_s = _clean(entity_id)
     service_s = _clean(service).lower().split(".", 1)[-1]
     active_space = _clean(active_space_id)
@@ -547,8 +545,8 @@ def evaluate_proactive_priority_handoff(
         or _clean(claim.get("service")).lower() != service_s
         or not entity_s
         or _clean(claim.get("entity_id")) != entity_s
-        or (claim.get("transition_kind") == "confirmed_departure" and not is_confirmed_departure_handoff(
-            claim, entity_id=entity_s, space_id=active_space))
+        or (claim.get("transition_kind") == "confirmed_departure" and not (
+            is_lighting and is_confirmed_departure_handoff(claim, entity_id=entity_s, space_id=active_space)))
         or not active_space
         or target_space != active_space
         or _clean(claim.get("space_id")) != active_space
@@ -591,10 +589,10 @@ def is_confirmed_departure_handoff(claim, *, entity_id: str, space_id: str) -> b
     reference = claim.get("presence_hold_ref")
     occurrence = reference.get("task_occurrence") if isinstance(reference, dict) else None
     return bool(
-        entity_id.startswith("light.") and claim.get("service") == "turn_off"
+        claim.get("entity_id") == entity_id and claim.get("service") == "turn_off"
         and claim.get("occupancy_cycle_id")
         and claim.get("previous_occupancy_cycle_id")
-        and (_is_finalized_patrol_task(claim.get("patrol_task_claim")) or (
+        and ((entity_id.startswith("light.") and _is_finalized_patrol_task(claim.get("patrol_task_claim"))) or (
         isinstance(reference, dict) and reference.get("schema_version") == "0.1" and reference.get("parent_transaction_id")
         and isinstance(occurrence, dict) and occurrence.get("schema_version") == "0.1"
         and occurrence.get("scope_id") == space_id

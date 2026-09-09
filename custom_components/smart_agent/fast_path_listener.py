@@ -625,20 +625,31 @@ async def run_addon_fast_path_fail_closed(
                             source_trace_context=_fast_path_handoff_context("addon_fast_path_disabled"),
                         )
                         return
-                    if reason == "no_match":
-                        if slow_fallback_allowed(suppress_slow_fallback, self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)):
+                    if reason in {"no_match", "arrival_lighting_requires_planning", "illuminance_lighting_requires_planning"}:
+                        # The gateway has already resolved current room lux.
+                        # Do not let the host's older sun-only summary veto it.
+                        eligible = (
+                            True if reason == "illuminance_lighting_requires_planning" else
+                            self._is_presence_arrival_for_slow_inference(entity_id, new_state)
+                            if reason == "arrival_lighting_requires_planning"
+                            else self._should_slow_infer_after_fast_path_no_match(entity_id, new_state, snapshot)
+                        )
+                        if slow_fallback_allowed(suppress_slow_fallback, eligible):
                             self._sys_log(
                                 "INFO",
-                                f"[Add-on FastPath] no_match; scheduling slow inference | entity={entity_id} "
+                                f"[Add-on FastPath] {reason}; scheduling slow inference | entity={entity_id} "
                                 f"active_space={snapshot_diag.get('active_space') or '-'}",
                             )
                             self._schedule_inference(
-                            entity_id,
+                                entity_id,
                                 f"{entity_id}: {old_state} -> {new_state}",
                                 new_state,
-
                                 causal_event=causal_event,
-                                source_trace_context=_fast_path_handoff_context("addon_fast_path_no_match"),
+                                source_trace_context=_fast_path_handoff_context(
+                                    "addon_fast_path_illuminance" if reason == "illuminance_lighting_requires_planning" else
+                                    "addon_fast_path_arrival_lighting" if reason == "arrival_lighting_requires_planning"
+                                    else "addon_fast_path_no_match"
+                                ),
                             )
                             return
                         info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", None), dict) else {}
@@ -700,7 +711,7 @@ async def run_addon_fast_path_fail_closed(
                             "fast_path_no_fallback",
                             required_for_action=False,
                         )
-                    if reason not in {"no_match", "confidence_below_auto_threshold"}:
+                    if reason not in {"no_match", "arrival_lighting_requires_planning", "illuminance_lighting_requires_planning", "confidence_below_auto_threshold"}:
                         await _finalize_fast_path_claim(
                             "fast_path_filtered",
                             required_for_action=False,

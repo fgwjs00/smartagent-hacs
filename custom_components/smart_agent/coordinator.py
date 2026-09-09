@@ -271,8 +271,6 @@ class SmartAgentCoordinator(
         self,
         hass: HomeAssistant,
         entry: ConfigEntry,
-        *,
-        host_dispatch_proof_material: Mapping[str, object],
     ) -> None:
         """Initialize and load config from entry (data + options)."""
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=5))
@@ -412,15 +410,6 @@ class SmartAgentCoordinator(
             base_url=_addon_base_url,
             port=_addon_port,
             auth_token=_addon_token,
-            host_dispatch_proof_enabled=(
-                host_dispatch_proof_material.get("enabled") is True
-            ),
-            host_dispatch_proof_current_secret=str(
-                host_dispatch_proof_material.get("current_secret") or ""
-            ),
-            host_dispatch_proof_staged_secret=str(
-                host_dispatch_proof_material.get("staged_secret") or ""
-            ),
             field_canary_host_dispatch_proof_enabled=(
                 data.get(CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED, False)
                 is True
@@ -1277,8 +1266,9 @@ class SmartAgentCoordinator(
         params: dict | None = None,
         *,
         occupancy_cycle_id: str = "",
+        occurred_at: float | None = None,
     ) -> dict:
-        now = time.time()
+        now = time.time() if occurred_at is None else occurred_at
         priority = SOURCE_PRIORITY_MAP.get(source, PRIORITY_AI_LEARNED)
         guard_seconds = (
             self._manual_override_protection_seconds
@@ -1605,6 +1595,7 @@ class SmartAgentCoordinator(
             async def _listener_entity_set_periodic_refresh(_now: Any) -> None:
                 try:
                     await self._async_refresh_device_info_from_addon_devices(reason="periodic_listener")
+                    await self.async_refresh_device_areas()
                     await self._async_refresh_memory_assets_from_addon()
                     if self._refresh_listeners_if_entity_set_changed():
                         _LOGGER.debug("[Listeners] refreshed subscriptions after managed entity set changed")
@@ -1699,6 +1690,15 @@ class SmartAgentCoordinator(
         self._listener_removers.append(
             self.hass.bus.async_listen("call_service", self._make_call_service_handler())
         )
+        from .native_execution_attribution import EVENT_NATIVE_EXECUTION, NativeExecutionAttribution
+        self._native_execution_attribution = NativeExecutionAttribution(self)
+        self._listener_removers.append(
+            self.hass.bus.async_listen(EVENT_NATIVE_EXECUTION, self._native_execution_attribution.observe)
+        )
+        for registry_event in ("area_registry_updated", "device_registry_updated", "entity_registry_updated"):
+            self._listener_removers.append(
+                self.hass.bus.async_listen(registry_event, self._async_ha_registry_area_changed)
+            )
         self._refresh_listeners()
         # Phase 11.9: 启动时立即刷新行为戒律（强制使用最新措辞，无需等待凌晨3点）
         # Frigate MQTT 深度集成（Phase 7A）
@@ -1718,7 +1718,7 @@ class SmartAgentCoordinator(
             )
             area_updated = await self.async_refresh_device_areas()
             if area_updated:
-                self._sys_log("INFO", f"[启动] 自动补全 {area_updated} 个设备的区域信息")
+                self._sys_log("INFO", f"[启动] 已同步 {area_updated} 个设备的 HA 区域信息")
             self._refresh_ha_resources()
             await self._async_update_status("正在监控", "系统初始化完成")
 

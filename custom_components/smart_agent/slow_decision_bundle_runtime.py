@@ -18,6 +18,8 @@ _FAST_PATH_HANDOFF_SOURCES = frozenset(
         "addon_fast_path_disabled",
         "addon_fast_path_low_confidence",
         "addon_fast_path_no_match",
+        "addon_fast_path_arrival_lighting",
+        "addon_fast_path_illuminance",
         "addon_room_remainder",
     }
 )
@@ -309,6 +311,7 @@ def _context_text(
         "addon_fast_path_disabled",
         "addon_fast_path_low_confidence",
         "addon_fast_path_no_match",
+        "addon_fast_path_arrival_lighting",
     }:
         context_parts.append(
             "[fast_path_handoff] "
@@ -469,6 +472,9 @@ def build_addon_slow_decision_bundle(
         normalized_source == "manual"
     )
     decision_objective = (
+        "environment_reconciliation"
+        if source_trace_context.get("source") == "addon_fast_path_illuminance"
+        else
         "presence_hold_recheck"
         if source_trace_context.get("source") == "presence_hold_recheck"
         else

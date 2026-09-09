@@ -96,16 +96,12 @@ def canonical_active_ai_receipt_dispositions(
     commands: list[dict[str, Any]],
     authorization_ref: dict[str, Any],
 ) -> list[str] | None:
-    """Verify the canonical physical receipt before HA-host lineage writes."""
+    """Verify a correlated reported-state receipt before HA-host lineage writes."""
 
     if not isinstance(result, dict):
         return None
     if (
         str(result.get("request_id") or "") != str(request_id or "")
-        or result.get("ok") is not True
-        or str(result.get("effect_status") or "") != "verified_success"
-        or str(result.get("workflow_status") or "") != "completed"
-        or result.get("reconciliation_required") is not False
     ):
         return None
     returned_ref = result.get("authorization_ref")
@@ -120,6 +116,23 @@ def canonical_active_ai_receipt_dispositions(
         or any(not isinstance(row, dict) for row in rows)
     ):
         return None
+    native_batch = result.get("execution_path") == "ha_native_websocket"
+    expected_effect = "verified_success"
+    if native_batch:
+        effects = [row.get("effect_status") for row in rows]
+        if "effect_unknown" in effects:
+            expected_effect = "effect_unknown"
+        elif not effects or any(effect != "verified_success" for effect in effects):
+            expected_effect = "verified_failed"
+    expected_workflow = {
+        "verified_success": "completed", "verified_failed": "failed",
+        "effect_unknown": "reconciliation_required",
+    }[expected_effect]
+    if (result.get("ok") is not (expected_effect == "verified_success")
+            or result.get("effect_status") != expected_effect
+            or result.get("workflow_status") != expected_workflow
+            or result.get("reconciliation_required") is not (expected_effect == "effect_unknown")):
+        return None
     dispositions: list[str] = []
     for command, row in zip(commands, rows):
         expected = {
@@ -130,6 +143,12 @@ def canonical_active_ai_receipt_dispositions(
         }
         if any(row.get(key) != value for key, value in expected.items()):
             return None
+        if (native_batch and row.get("ok") is False
+                and row.get("effect_status") in {"verified_failed", "effect_unknown"}):
+            # Keep independent verified rows without promoting a failed or
+            # uncertain command, or authorizing a batch retry.
+            dispositions.append(row["effect_status"])
+            continue
         if row.get("executed") is False and str(row.get("status") or "") == "skipped":
             if (
                 row.get("ok") is not True
@@ -139,18 +158,25 @@ def canonical_active_ai_receipt_dispositions(
                 return None
             dispositions.append("noop")
             continue
-        snapshot = row.get("post_state_snapshot")
+        native = row.get("verification_contract_version") == "ha_reported_state.v1"
+        snapshot = row.get("reported_state") if native else row.get("post_state_snapshot")
+        if native and (row.get("reported_state_matches") is not True
+                       or row.get("verified") is not True
+                       or row.get("assumed_state") is not False
+                       or row.get("transport_status") != "acknowledged"
+                       or row.get("state_attribution") != "smartagent_context"):
+            return None
         if (
             row.get("ok") is not True
             or row.get("executed") is not True
             or str(row.get("receipt_version") or "") == ""
-            or str(row.get("verification_contract_version") or "") != "ha_post_state.v1"
+            or str(row.get("verification_contract_version") or "") not in {"ha_post_state.v1", "ha_reported_state.v1"}
             or str(row.get("effect_status") or "") != "verified_success"
             or str(row.get("workflow_status") or "") != "completed"
             or row.get("reconciliation_required") is not False
             or not isinstance(snapshot, dict)
             or str(snapshot.get("entity_id") or "") != expected["entity_id"]
-            or snapshot.get("available") is not True
+            or (not native and snapshot.get("available") is not True)
             or str(snapshot.get("state") or "").strip().lower()
             in {"", "unknown", "unavailable"}
         ):

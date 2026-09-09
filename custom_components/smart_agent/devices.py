@@ -6,10 +6,12 @@ DevicesMixin — 设备管理层。
 from __future__ import annotations
 
 import logging
+import asyncio
 import threading
 import json as _json
 import hashlib
 import math
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from .action_mapping import entities_to_actions, normalize_raw_actions
@@ -27,6 +29,8 @@ from .const import (
     DEVICE_CAP_KEY_SLEEP_SAFE,
     DEVICE_CONTROL_MODES,
 )
+
+from .device_registry_identity import REGISTRY_IDENTITY_FIELDS, registry_metadata, registry_entry_matches
 
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
 
@@ -278,6 +282,9 @@ class DevicesMixin:
                 states = getattr(getattr(self, "hass", None), "states", None)
                 getter = getattr(states, "get", None)
                 state_obj = getter(entity_id) if callable(getter) else None
+            for key in REGISTRY_IDENTITY_FIELDS:
+                if key in row:
+                    payload[key] = row[key]
             payload.update(
                 {
                     "name": str(row.get("name") or entity_id),
@@ -307,15 +314,19 @@ class DevicesMixin:
             mapped = self._managed_device_info_row_from_addon_device(row)
             if mapped is None:
                 continue
-            persisted = row.get("runtime_capability_facts")
-            if not isinstance(persisted, dict):
-                # Registration and deletion own projection membership.
-                continue
             entity_id, info = mapped
+            identity = self._get_entity_registry_metadata(entity_id)
+            known_registry_id = row.get("ha_entity_registry_id")
+            if known_registry_id and identity.get("ha_entity_registry_id") != known_registry_id:
+                # A replacement is not a metadata refresh of the former entity.
+                continue
+            identity_changed = any(value and row.get(key) != value for key, value in identity.items())
+            persisted = row.get("runtime_capability_facts")
             state_obj = self.hass.states.get(entity_id)
             facts = _build_runtime_capability_facts(entity_id, state_obj)
-            if not facts or facts["facts_digest"] == persisted.get("facts_digest"):
+            if not identity_changed and (not isinstance(persisted, dict) or not facts or facts["facts_digest"] == persisted.get("facts_digest")):
                 continue
+            info.update(identity)
             if await self._persist_device_record(entity_id, info, state_obj=state_obj):
                 synchronized = True
         return synchronized
@@ -485,32 +496,36 @@ class DevicesMixin:
             return {}
         if not entry:
             return {}
+        return registry_metadata(entry)
+
+    def _get_entity_area_assignment(self, entity_id: str) -> dict[str, Any] | None:
+        """Read HA's entity override and device default separately."""
+        entry = er.async_get(self.hass).async_get(entity_id)
+        if entry is None:
+            return None
+        device_id = str(getattr(entry, "device_id", "") or "")
+        device = dr.async_get(self.hass).async_get(device_id) if device_id else None
+        entity_area_id = getattr(entry, "area_id", None)
+        device_area_id = getattr(device, "area_id", None) if device else None
+        effective_area_id = entity_area_id or device_area_id
+        area = ar.async_get(self.hass).async_get_area(effective_area_id) if effective_area_id else None
         return {
-            "ha_unique_id": str(getattr(entry, "unique_id", "") or ""),
-            "ha_device_id": str(getattr(entry, "device_id", "") or ""),
+            "ha_area_id": str(getattr(area, "id", "") or "") if area else "",
+            "ha_entity_area_id": entity_area_id,
+            "ha_device_area_id": device_area_id,
+            "ha_device_id": device_id,
+            "area_source": "ha_registry",
+            "room": str(getattr(area, "name", "") or "") if area else "",
         }
 
     def _get_entity_area(self, entity_id: str) -> str:
-        """Look up the area name for an entity via HA's entity/device/area registries."""
+        """Return the effective area name, including the device default."""
         try:
-            ent_reg = er.async_get(self.hass)
-            entry = ent_reg.async_get(entity_id)
-            if not entry:
-                return ""
-            area_id = entry.area_id
-            if not area_id and entry.device_id:
-                dev_reg = dr.async_get(self.hass)
-                device = dev_reg.async_get(entry.device_id)
-                if device:
-                    area_id = device.area_id
-            if area_id:
-                area_reg = ar.async_get(self.hass)
-                area = area_reg.async_get_area(area_id)
-                if area:
-                    return area.name
-        except Exception:
-            pass
-        return ""
+            assignment = self._get_entity_area_assignment(entity_id)
+            return assignment["room"] if assignment else ""
+        except Exception as exc:
+            _LOGGER.debug("[Devices] area registry unavailable for %s: %s", entity_id, exc)
+            return ""
 
     def get_device_capability(self, entity_id: str) -> dict[str, Any]:
         """返回单设备能力快照（Wave 6 只读语义，默认值保持保守）。"""
@@ -518,7 +533,7 @@ class DevicesMixin:
         room = (info.get("room") or "").strip()
         space_id = (info.get("space_id") or room).strip()
 
-        raw_spaces = info.get(DEVICE_CAP_KEY_COVERAGE_SPACES)
+        raw_spaces = info.get("coverage_space_ids", info.get(DEVICE_CAP_KEY_COVERAGE_SPACES))
         coverage_spaces: list[str] = []
         if isinstance(raw_spaces, (list, tuple, set)):
             for item in raw_spaces:
@@ -590,7 +605,7 @@ class DevicesMixin:
         type_capability = str(info.get("type") or "").strip().lower()
         if type_capability not in supported_capabilities:
             type_capability = ""
-        raw_roles = info.get("roles") or info.get("role") or info.get("fixture_roles")
+        raw_roles = info.get("roles", info.get("role", info.get("fixture_roles")))
         roles: list[str] = []
         if isinstance(raw_roles, str):
             roles = [raw_roles] if raw_roles else []
@@ -636,7 +651,8 @@ class DevicesMixin:
             DEVICE_CAP_KEY_COVERAGE_SPACES: coverage_spaces,
             "coverage_space_ids": list(coverage_spaces),
             DEVICE_CAP_KEY_SHARED_FIXTURE: bool(shared_fixture),
-            "shared_space_ids": list(coverage_spaces) if shared_fixture else [],
+            "shared_space_ids": deepcopy(info["shared_space_ids"]) if "shared_space_ids" in info
+                else list(coverage_spaces) if shared_fixture else [],
             DEVICE_CAP_KEY_ENERGY_LEVEL: energy_level,
             DEVICE_CAP_KEY_CAN_TRIGGER_ENTER: bool(can_trigger_enter),
             DEVICE_CAP_KEY_CAN_CONFIRM_LEAVE: bool(can_confirm_leave),
@@ -648,6 +664,13 @@ class DevicesMixin:
             capability[DEVICE_CAP_KEY_RISK_LEVEL] = risk_level
         if can_block_turn_off is not None:
             capability[DEVICE_CAP_KEY_CAN_BLOCK_TURN_OFF] = bool(can_block_turn_off)
+        for key in (
+            "disturbance", "capability_snapshot", "metadata",
+            "service_selection", "ha_control_policy",
+            "behavior_dims", "learnable", "season_sensitive", "learning_policy",
+        ):
+            if key in info:
+                capability[key] = deepcopy(info[key])
         return capability
 
     def get_device_capability_snapshot(self) -> dict[str, dict[str, Any]]:
@@ -892,120 +915,165 @@ class DevicesMixin:
             await self._async_update_status("设备管理", f"删除设备: {name}")
         self.async_set_updated_data({})
 
-    async def async_refresh_device_areas(self) -> int:
-        """仅刷新仍处于「待填写区域」的设备区域信息（通过 HA 注册表查找）。"""
-        updated = 0
-        for eid, info in self.device_info.items():
-            if info.get("room") and info["room"] != "待填写区域":
+    async def _async_reconcile_ha_registry_entity_ids(
+        self, rows: list[dict[str, Any]], *, registry_event: dict[str, Any] | None = None,
+    ) -> bool:
+        """Commit real HA renames before replacing the runtime listener projection."""
+        registry = er.async_get(self.hass)
+        if registry is None:
+            return False
+        changed = False
+        for row in rows:
+            if not isinstance(row, dict) or row.get("managed") is not True:
                 continue
-            area = self._get_entity_area(eid)
-            if area:
-                next_info = dict(info)
-                next_info["room"] = area
-                _ok = await self._persist_device_record(eid, next_info)
-                if not _ok:
-                    self._sys_log("WARN", f"[设备] 区域刷新写入失败: {eid}")
-                    continue
-                info["room"] = area
-                updated += 1
-        if updated > 0:
-            self.async_set_updated_data({})
-            self._sys_log("INFO", f"[设备] 区域信息刷新完成: 更新了 {updated} 个设备的区域")
-        return updated
+            old = str(row.get("entity_id") or "")
+            if registry_entry_matches(old, row, registry.async_get(old)):
+                continue
+            native_event = registry_event or {}
+            entry = None
+            if native_event.get("old_entity_id") == old:
+                entry = registry.async_get(native_event.get("entity_id"))
+            if entry is None:
+                matches = [item for item in registry.entities.values() if registry_entry_matches(old, row, item)]
+                entry = matches[0] if len(matches) == 1 else None
+            if entry is None:
+                continue
+            new = entry.entity_id
+            result = await self._persist_business_event("device", {
+                "action": "registry_entity_rename", "old_entity_id": old, "entity_id": new,
+                "native_rename_event": native_event.get("old_entity_id") == old,
+                **registry_metadata(entry),
+            }, ts=self._ha_db_now_text())
+            if result is None:
+                continue
+            # This SQL helper maintains the old HA cache only after Core commits.
+            cache_writer = getattr(self, "_persist_device_entity_id_migration", None)
+            if callable(cache_writer):
+                cache_writer(old, new, {**row, **registry_metadata(entry)})
+            changed = True
+        return changed
+
+    async def async_refresh_device_areas(self, *, changed_entity_ids: set[str] | None = None) -> int:
+        """Re-read confirmed HA registry assignments; never write stale SA rooms back."""
+        if not hasattr(self, "_ha_area_sync_lock"):
+            self._ha_area_sync_lock = asyncio.Lock()
+        async with self._ha_area_sync_lock:
+            try:
+                entity_ids = set(self.device_info) | set(getattr(self, "_managed_registry_entity_ids", ()))
+                assignments = [
+                    {"entity_id": eid, **assignment}
+                    for eid in sorted(entity_ids)
+                    if (assignment := self._get_entity_area_assignment(eid)) is not None
+                ]
+                registry = ar.async_get(self.hass)
+                areas = [{"id": area.id, "name": area.name} for area in registry.areas.values()]
+            except Exception as exc:
+                self._last_ha_area_sync = {"ok": False, "error": "ha_registry_unavailable"}
+                self._sys_log("WARN", f"[设备] 读取 HA 区域失败: {exc}")
+                return 0
+            result = await self._persist_business_event("device", {
+                "action": "registry_area_sync", "assignments": assignments, "areas": areas,
+                "changed_entity_ids": sorted(changed_entity_ids or ()),
+            }, ts=self._ha_db_now_text())
+            self._last_ha_area_sync = result or {"ok": False, "error": "area_projection_not_saved"}
+            if result is None:
+                return 0
+            updated = 0
+            for assignment in result.get("assignments", []):
+                info = self.device_info.get(assignment["entity_id"])
+                if isinstance(info, dict):
+                    updated += int(any(info.get(key) != value for key, value in assignment.items() if key != "entity_id"))
+                    info.update(assignment)
+            if updated:
+                self.async_set_updated_data({})
+            return updated
+
+    async def _async_ha_registry_area_changed(self, event: Any) -> None:
+        data = event.data
+        if event.event_type == "entity_registry_updated" and data.get("old_entity_id"):
+            await self._async_refresh_device_info_from_addon_devices(reason="ha_entity_rename", registry_event=data)
+            self._refresh_listeners_if_entity_set_changed()
+        changed = set()
+        changed_fields = data.get("changes") or {}
+        for eid in set(self.device_info) | set(getattr(self, "_managed_registry_entity_ids", ())):
+            entry = er.async_get(self.hass).async_get(eid)
+            if (event.event_type == "entity_registry_updated" and eid == data.get("entity_id")
+                    and ("area_id" in changed_fields or "device_id" in changed_fields)):
+                changed.add(eid)
+            elif (event.event_type == "device_registry_updated" and "area_id" in changed_fields
+                    and getattr(entry, "device_id", None) == data.get("device_id")):
+                changed.add(eid)
+            elif event.event_type == "area_registry_updated":
+                assignment = self._get_entity_area_assignment(eid) or {}
+                previous = self.device_info.get(eid, {})
+                if data.get("area_id") in {assignment.get("ha_area_id"), previous.get("ha_area_id")}:
+                    changed.add(eid)
+        await self.async_refresh_device_areas(changed_entity_ids=changed)
 
     async def async_sync_rooms_to_ha(self) -> dict:
-        """将 SmartAgent 的房间信息同步回 Home Assistant 的 Area Registry。"""
-        from homeassistant.helpers import area_registry as ar, entity_registry as er
-        area_reg = ar.async_get(self.hass)
-        entity_reg = er.async_get(self.hass)
+        """Compatibility refresh entrypoint; edits use the common HA registry writer."""
+        updated = await self.async_refresh_device_areas()
+        status = getattr(self, "_last_ha_area_sync", {}) or {}
+        return {
+            "ok": status.get("ok", False), "created_areas": 0, "updated_entities": 0,
+            "updated_projections": updated, "errors": int(status.get("ok") is not True),
+            "conflicts": status.get("conflicts", []), "source": "ha_registry_reconciliation",
+        }
 
-        results = {"created_areas": 0, "updated_entities": 0, "errors": 0}
-        area_cache = {} # name -> area_id
-
-        # 1. 预加载现有区域
-        for entry in area_reg.areas.values():
-            area_cache[entry.name] = entry.id
-
-        # 2. 遍历设备进行同步
-        for eid, info in self.device_info.items():
-            room = info.get("room")
-            if not room or room in ("待填写区域", "未知区域"):
-                continue
-
-            # 获取或创建区域
-            area_id = area_cache.get(room)
-            if not area_id:
-                try:
-                    area = area_reg.async_get_or_create(room)
-                    area_id = area.id
-                    area_cache[room] = area_id
-                    results["created_areas"] += 1
-                except Exception as e:
-                    self._sys_log("ERROR", f"[同步] 创建区域 {room} 失败: {e}")
-                    results["errors"] += 1
-                    continue
-
-            # 更新实体区域
-            try:
-                entry = entity_reg.async_get(eid)
-                if entry and entry.area_id != area_id:
-                    entity_reg.async_update_entity(eid, area_id=area_id)
-                    results["updated_entities"] += 1
-            except Exception as e:
-                self._sys_log("ERROR", f"[同步] 更新实体 {eid} 区域失败: {e}")
-                results["errors"] += 1
-
-        self._sys_log("INFO", f"[同步] 房间同步到 HA 完成: 新建区域 {results['created_areas']}，更新实体 {results['updated_entities']}，错误 {results['errors']}")
-        self.async_set_updated_data({})
-        return results
-
-    async def async_sync_device_room_to_ha(self, entity_id: str, room: str) -> dict:
-        """Mirror one SmartAgent room assignment into HA's Area Registry."""
+    async def async_sync_device_room_to_ha(
+        self, entity_id: str, room: str | None, *, scope: str = "entity",
+    ) -> dict:
+        """Write HA's device default or entity override and read its confirmed value."""
         eid = str(entity_id or "").strip()
         target_room = str(room or "").strip()
         result = {
-            "ok": True,
-            "entity_id": eid,
-            "room": target_room,
-            "created_areas": 0,
-            "updated_entities": 0,
-            "errors": 0,
+            "ok": True, "entity_id": eid, "room": target_room, "area_scope": scope,
+            "created_areas": 0, "updated_entities": 0, "updated_devices": 0, "errors": 0,
             "source": "ha_area_registry_mirror",
         }
-        if not eid:
-            result.update({"ok": False, "error": "entity_id_required", "errors": 1})
-            return result
-        if not target_room or target_room in ("待填写区域", "未知区域", "未分配"):
-            result.update({"skipped": True, "reason": "room_not_provided"})
-            return result
-
+        if not eid or scope not in {"device", "entity"}:
+            return {**result, "ok": False, "error": "invalid_area_target", "errors": 1}
         area_reg = ar.async_get(self.hass)
         entity_reg = er.async_get(self.hass)
-        area = _find_ha_area_by_id_or_name(area_reg, target_room)
-        if area is None:
-            result.update({"ok": False, "error": "area_not_found", "error_type": "not_found", "errors": 1})
-            return result
-
-        area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()
-        area_name = str(getattr(area, "name", "") or target_room).strip()
-        result["area_id"] = area_id
-        result["area_name"] = area_name
+        area = None
+        if target_room not in {"", "未分配", "待填写区域", "未知区域", "跟随设备"}:
+            area = _find_ha_area_by_id_or_name(area_reg, target_room)
+            if area is None:
+                return {**result, "ok": False, "error": "area_not_found", "error_type": "not_found", "errors": 1}
+        area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "")) if area else None
         try:
             entry = entity_reg.async_get(eid)
             if entry is None:
-                result.update({"ok": False, "error": "entity_not_found", "errors": 1})
-                return result
-            if entry.area_id != area_id:
+                return {**result, "ok": False, "error": "entity_not_found", "errors": 1}
+            if scope == "device":
+                device_id = str(getattr(entry, "device_id", "") or "")
+                registry = dr.async_get(self.hass)
+                device = registry.async_get(device_id) if device_id else None
+                if device is None:
+                    return {**result, "ok": False, "error": "device_not_found", "errors": 1}
+                if device.area_id != area_id:
+                    registry.async_update_device(device_id, area_id=area_id)
+                    result["updated_devices"] = 1
+            elif getattr(entry, "area_id", None) != area_id:
                 entity_reg.async_update_entity(eid, area_id=area_id)
                 result["updated_entities"] = 1
+            assignment = self._get_entity_area_assignment(eid)
+            result.update(assignment or {})
+            result["area_id"] = (assignment or {}).get("ha_area_id", "")
+            result["area_name"] = (assignment or {}).get("room", "")
+            if scope == "device":
+                result["affected_assignments"] = [
+                    {"entity_id": current_id, **current}
+                    for current_id in sorted(set(self.device_info) | set(getattr(self, "_managed_registry_entity_ids", ())) | {eid})
+                    if (current := self._get_entity_area_assignment(current_id)) is not None
+                    and current["ha_device_id"] == device_id
+                ]
         except Exception as exc:
             self._sys_log("ERROR", f"[同步] 更新设备 {eid} 区域失败: {exc}")
-            result.update({"ok": False, "error": "entity_area_update_failed", "errors": 1})
-            return result
-
+            return {**result, "ok": False, "error": "entity_area_update_failed", "errors": 1}
         info = self.device_info.get(eid)
-        if isinstance(info, dict):
-            info["room"] = target_room
+        if isinstance(info, dict) and assignment:
+            info.update(assignment)
             self.async_set_updated_data({})
         return result
 
@@ -1108,7 +1176,9 @@ class DevicesMixin:
         body = dict(patch) if isinstance(patch, dict) else {}
         name = str(body.get("name") or body.get("friendly_name") or "").strip()
         requested_entity_id = str(body.get("new_entity_id") or body.get("target_entity_id") or "").strip()
-        room = str(body.get("room") or body.get("area") or body.get("space") or "").strip()
+        room_provided = any(key in body for key in ("room", "area", "space"))
+        room = str(next((body[key] for key in ("room", "area", "space") if key in body), "") or "").strip()
+        area_scope = str(body.get("area_scope") or "entity")
         capability_name = str(body.get("capability") or body.get("device_class") or "").strip().lower()
         sensor_type_provided = "sensor_type" in body or "presence_sensor_type" in body
         sensor_type = str(body.get("sensor_type") or body.get("presence_sensor_type") or "").strip().lower()
@@ -1153,7 +1223,9 @@ class DevicesMixin:
             if sensor_type_provided:
                 result["sensor_type"] = sensor_type
             return previous_sensor_type != str(next_info.get("sensor_type") or "").strip().lower()
-        if not name and not requested_entity_id and not room:
+        if area_scope not in {"entity", "device"}:
+            return {**result, "ok": False, "error": "invalid_area_target", "status": 400}
+        if not name and not requested_entity_id and not room_provided:
             semantics_changed = await _apply_local_semantics(eid)
             if semantics_changed:
                 self._refresh_listeners()
@@ -1193,7 +1265,7 @@ class DevicesMixin:
         area = None
         area_id = ""
         area_name = ""
-        if room:
+        if room_provided and room not in {"", "未分配", "待填写区域", "未知区域", "跟随设备"}:
             area = _find_ha_area_by_id_or_name(ar.async_get(self.hass), room)
             if area is None:
                 result.update(
@@ -1214,10 +1286,9 @@ class DevicesMixin:
             update_kwargs["name"] = name
         if active_entity_id != eid:
             update_kwargs["new_entity_id"] = active_entity_id
-        if area is not None:
-            update_kwargs["area_id"] = area_id
-
-        old_area_id = str(getattr(entry, "area_id", "") or "").strip()
+        old_area_id = getattr(entry, "area_id", None)
+        if room_provided and area_scope == "entity":
+            update_kwargs["area_id"] = area_id or None
         try:
             if update_kwargs:
                 entity_reg.async_update_entity(eid, **update_kwargs)
@@ -1247,13 +1318,24 @@ class DevicesMixin:
             )
             return result
 
+        area_sync = None
+        if room_provided:
+            area_sync = await self.async_sync_device_room_to_ha(active_entity_id, room, scope=area_scope)
+            if not area_sync.get("ok"):
+                return {**result, "ok": False, "ha_area_sync": area_sync,
+                        "error": area_sync.get("error", "ha_area_sync_failed")}
+            if area_scope == "entity":
+                area_sync["updated_entities"] = int(old_area_id != (area_id or None))
+
         renamed = active_entity_id != eid
         info = self.device_info.pop(eid, None) if renamed else self.device_info.get(eid)
         if isinstance(info, dict):
             if name:
                 info["name"] = name
-            if room:
-                info["room"] = room
+            if area_sync:
+                info.update({key: area_sync[key] for key in (
+                    "room", "ha_area_id", "ha_entity_area_id", "ha_device_area_id", "area_source",
+                ) if key in area_sync})
             info["entity_id"] = active_entity_id
             info.update(self._get_entity_registry_metadata(active_entity_id))
             self.device_info[active_entity_id] = info
@@ -1269,19 +1351,9 @@ class DevicesMixin:
                 "errors": 0,
                 "source": "ha_entity_registry_mirror",
             }
-        if room:
-            result["ha_area_sync"] = {
-                "ok": True,
-                "entity_id": active_entity_id,
-                "room": room,
-                "area_id": area_id,
-                "area_name": area_name,
-                "created_areas": 0,
-                "updated_entities": int(old_area_id != area_id),
-                "errors": 0,
-                "source": "ha_area_registry_mirror",
-            }
-            result["room"] = room
+        if area_sync:
+            result["ha_area_sync"] = area_sync
+            result["room"] = area_sync["room"]
 
         result["entity_id"] = active_entity_id
         result["new_entity_id"] = active_entity_id

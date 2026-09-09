@@ -20,7 +20,6 @@ from homeassistant.auth import models as auth_models
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry
 from homeassistant.helpers import config_validation as cv
 from homeassistant.util import dt as dt_util
@@ -39,15 +38,9 @@ from .const import (
 from .dispatch_proof import (
     DispatchProofError,
     async_build_loaded_identity_evidence as _async_build_host_proof_loaded_identity_evidence,
-    async_consume_dispatch_proof,
     seal_loaded_source_identity as _seal_host_proof_loaded_source_identity,
-    verify_dispatch_proof,
 )
 from .host_dispatch_proof import dispatch_proof_secret_for_ha_request
-from .host_dispatch_proof_material import (
-    HostDispatchProofMaterialError,
-    async_prepare_host_dispatch_proof_material_for_entry,
-)
 from .coordinator import SmartAgentCoordinator, _coerce_file_log_level
 from .config_update_service import apply_config_update_service
 from .admin_actor import is_current_human_admin, is_current_human_user
@@ -57,12 +50,10 @@ from .host_read_models import (
     local_room_rows as _local_room_rows,
 )
 from .ha_adapter import (
-    _bind_verified_dispatch_authority,
     _bind_user_explicit_output_authority,
     async_call_service,
     async_delete_ha_area,
     async_ensure_ha_area,
-    async_execute_command_envelope,
     async_rename_ha_area,
     get_ai_scenes_cache_snapshot,
     get_room_topology_cache_snapshot,
@@ -270,6 +261,10 @@ _LEGACY_PAIR_TOKEN_CLIENT_NAMES = {
 
 
 def _is_trusted_addon_proxy_peer(request: web.Request) -> bool:
+    # HA's HTTP middleware sets this from its dedicated Supervisor socket.
+    # Unix socket requests have no TCP peername; this is not a client header.
+    if request.get("ha_supervisor_unix_socket") is True:
+        return True
     transport = getattr(request, "transport", None)
     try:
         peer = transport.get_extra_info("peername") if transport is not None else None
@@ -1239,139 +1234,6 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
         )
 
 
-class SmartAgentHaExecuteView(HomeAssistantView):
-    """HA 宿主执行边界：统一承接 CommandEnvelope。"""
-
-    url = "/api/v1/ha/execute"
-    extra_urls: list[str] = []
-    name = "api:smart_agent:v1:ha:execute"
-    requires_auth = True
-
-    async def post(self, request: web.Request) -> web.Response:
-        if (err := _view_admin_check(request)):
-            return err
-        try:
-            body = await request.json()
-        except Exception:
-            return self.json(
-                _json_error_payload("invalid_json", "bad_request", False),
-                status_code=400,
-            )
-
-        if not isinstance(body, dict):
-            return self.json(
-                _json_error_payload("invalid_body", "bad_request", False),
-                status_code=400,
-            )
-
-        if not _is_addon_internal_execute_request(request, body):
-            return self.json(
-                _json_error_payload(
-                    "ha_execute_requires_addon_internal",
-                    "forbidden",
-                    False,
-                    execution_path="ha_execute_adapter",
-                ),
-                status_code=403,
-            )
-
-        dispatch_proof = body.get("_smartagent_dispatch_proof")
-        proof_secret = _dispatch_proof_secret_for_request(
-            request.app["hass"],
-            dispatch_proof,
-            request=request,
-        )
-        try:
-            verified_proof = verify_dispatch_proof(
-                body,
-                dispatch_proof,
-                secret=proof_secret,
-            )
-        except DispatchProofError as exc:
-            return self.json(
-                _json_error_payload(
-                    str(exc) or "ha_execute_dispatch_proof_invalid",
-                    "forbidden",
-                    False,
-                    execution_path="ha_execute_adapter",
-                ),
-                status_code=403,
-            )
-
-        execution_body = dict(body)
-        execution_body.pop("_smartagent_transport", None)
-        execution_body.pop("_smartagent_dispatch_proof", None)
-        # A valid one-time proof is a presented bearer.  Burn it durably before
-        # any mutable runtime policy check so a rejected request cannot wait for
-        # the policy state to change and replay the same authorization later.
-        try:
-            await async_consume_dispatch_proof(
-                request.app["hass"],
-                verified_proof,
-            )
-        except DispatchProofError as exc:
-            return self.json(
-                _json_error_payload(
-                    str(exc) or "ha_execute_dispatch_proof_consume_failed",
-                    "forbidden",
-                    False,
-                    execution_path="ha_execute_adapter",
-                ),
-                status_code=409 if str(exc) == "dispatch_proof_replayed" else 503,
-            )
-
-        safety = (
-            execution_body.get("safety")
-            if isinstance(execution_body.get("safety"), dict)
-            else {}
-        )
-        context = safety.get("context") if isinstance(safety.get("context"), dict) else {}
-        if context.get("active_ai_managed") is True:
-            coord = _get_first_coordinator(request.app["hass"])
-            is_enabled = getattr(coord, "_is_enabled", None) if coord is not None else None
-            ai_enabled = (
-                bool(is_enabled())
-                if callable(is_enabled)
-                else bool(getattr(coord, "_enabled", False))
-            )
-            if not ai_enabled:
-                return self.json(
-                    _json_error_payload(
-                        "active_ai_global_disabled",
-                        "policy_rejected",
-                        False,
-                        execution_path="ha_execute_adapter",
-                    ),
-                    status_code=409,
-                )
-
-        try:
-            dispatch_authority = _bind_verified_dispatch_authority(
-                execution_body,
-                verified_proof,
-            )
-        except ValueError:
-            return self.json(
-                _json_error_payload(
-                    "verified_dispatch_authority_binding_invalid",
-                    "forbidden",
-                    False,
-                    execution_path="ha_execute_adapter",
-                ),
-                status_code=403,
-            )
-        result = await async_execute_command_envelope(
-            request.app["hass"],
-            execution_body,
-            authority=dispatch_authority,
-        )
-        status_code = 200 if bool(result.get("ok")) else 409
-        error_type = str(result.get("error_type") or "")
-        if error_type in {"bad_request", "safety_blocked"}:
-            status_code = 400
-        payload = dict(result)
-        payload["execution_path"] = "ha_execute_adapter"
-        return self.json(payload, status_code=status_code)
 
 
 class SmartAgentRoomsView(HomeAssistantView):
@@ -2451,23 +2313,11 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SmartAgent from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    try:
-        host_proof_material, host_proof_setup_error = (
-            await async_prepare_host_dispatch_proof_material_for_entry(hass, entry)
-        )
-    except HostDispatchProofMaterialError as exc:
-        raise ConfigEntryNotReady(
-            "SmartAgent shared Host Proof material is not ready"
-        ) from exc
-    if host_proof_setup_error:
-        _LOGGER.error(host_proof_setup_error)
-        return False
     await _async_cleanup_legacy_pair_tokens_if_enabled(hass, entry)
     await _async_remove_legacy_entities(hass, entry)
     coordinator = SmartAgentCoordinator(
         hass,
         entry,
-        host_dispatch_proof_material=host_proof_material,
     )
     await hass.async_add_executor_job(coordinator._blocking_init)
     await coordinator.async_config_entry_first_refresh()

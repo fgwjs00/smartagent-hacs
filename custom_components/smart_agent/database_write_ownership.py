@@ -22,7 +22,7 @@ BUSINESS_TABLE_OWNERSHIP = {
     for table in ("devices", "habits", "rules", "ai_scenes")
 }
 HA_COMPATIBILITY_WRITE_COLUMNS = {
-    "devices": frozenset({"ha_unique_id", "ha_device_id", "entity_id", "updated"}),
+    "devices": frozenset({"ha_unique_id", "ha_device_id", "ha_entity_registry_id", "ha_platform", "entity_id", "updated"}),
     "ai_scenes": frozenset({"ha_entity_id", "updated"}),
 }
 
@@ -145,7 +145,7 @@ def ha_local_write_allowed(sql: str) -> bool:
         return False
     allowed_columns = HA_COMPATIBILITY_WRITE_COLUMNS.get(table, frozenset())
     required_mapping = {
-        "devices": frozenset({"ha_unique_id", "ha_device_id", "entity_id"}),
+        "devices": frozenset({"ha_unique_id", "ha_device_id", "ha_entity_registry_id", "ha_platform", "entity_id"}),
         "ai_scenes": frozenset({"ha_entity_id"}),
     }.get(table, frozenset())
     return bool(

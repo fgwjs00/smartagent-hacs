@@ -83,7 +83,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
     _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
     _DAYLIGHT_EVIDENCE_SCHEMA_VERSION = "smartagent.daylight_evidence.v2"
     _DAYLIGHT_EVIDENCE_REF_PREFIX = "daylight_evidence:"
-    _DAYLIGHT_EVIDENCE_MAX_AGE_SECONDS = 30
+    _DAYLIGHT_EVIDENCE_MAX_AGE_SECONDS = 180
     _DAYLIGHT_EVIDENCE_FIELDS = frozenset(
         {
             "schema_version",
@@ -771,7 +771,8 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if not isfinite(lux) or threshold != self._DAYLIGHT_GUARD_LUX_THRESHOLD:
             return _reject("daylight_evidence_lux_invalid")
         max_age = evidence.get("freshness_max_age_seconds")
-        if type(max_age) is not int or max_age != self._DAYLIGHT_EVIDENCE_MAX_AGE_SECONDS:
+        # Keep already issued 30-second evidence readable during an update.
+        if type(max_age) is not int or max_age not in {30, self._DAYLIGHT_EVIDENCE_MAX_AGE_SECONDS}:
             return _reject("daylight_evidence_freshness_invalid")
         try:
             observed = datetime.fromisoformat(
@@ -786,7 +787,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         except (TypeError, ValueError, OverflowError):
             return _reject("daylight_evidence_freshness_invalid")
         freshness["age_seconds"] = round(age_seconds, 3)
-        if age_seconds < 0 or age_seconds > max_age:
+        if age_seconds < 0 or age_seconds >= max_age:
             return _reject("daylight_evidence_expired")
         if lux > threshold:
             return _reject(self._DAYLIGHT_AUTO_LIGHTING_SUPPRESSED)
@@ -1964,6 +1965,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                             "active_space_id": str(active_space_id or "").strip(),
                             "cmd_source": str(cmd_source or "").strip(),
                             "decision_time": str(decision_time or "").strip(),
+                            "occupancy_cycle_id": str((decision_contract_lineage or {}).get("occupancy_cycle_id") or ""),
                             "target_space_ids": target_space_ids,
                         }
                         if require_world_snapshot_guard

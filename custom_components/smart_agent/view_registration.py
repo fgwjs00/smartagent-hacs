@@ -14,7 +14,6 @@ V1_HOST_BRIDGE_VIEW_CLASS_NAMES: tuple[str, ...] = (
     "SmartAgentAuthLogoutView",
     "SmartAgentEventsWSView",
     "SmartAgentListenerDiagnosticsView",
-    "SmartAgentHaExecuteView",
     "SmartAgentRoomsView",
     "SmartAgentRoomsSyncView",
     "SmartAgentRoomDetailView",
