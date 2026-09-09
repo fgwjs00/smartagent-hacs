@@ -17,7 +17,6 @@ from .device_registry_identity import registry_metadata, registry_entry_matches
 from homeassistant.helpers.event import async_call_later
 
 from .const import DEVICE_CONTROL_MODES
-from .presence_runtime import schedule_startup_presence_reconciliation
 from .sensor_event_filter import environment_sensor_kind
 
 
@@ -236,82 +235,18 @@ def reconcile_active_listener_states(
     *,
     schedule: Any = async_call_later,
 ) -> None:
-    """Catch up active managed presence sensors that were already on before listener binding."""
-    if not entity_ids:
+    """Wake the shared room loop on inventory/startup, including vacant rooms."""
+    if not entity_ids or not self._is_enabled() or getattr(self, "_sensors_muted", False):
         return
-    states = getattr(getattr(self, "hass", None), "states", None)
-    get_state = getattr(states, "get", None)
-    if not callable(get_state):
-        return
-    reconciled = getattr(self, "_listener_active_state_reconciled", None)
-    if not isinstance(reconciled, dict):
-        reconciled = {}
-        self._listener_active_state_reconciled = reconciled
-    device_info = getattr(self, "device_info", {}) or {}
-    if not isinstance(device_info, dict):
-        device_info = {}
+    previous = getattr(self, "_room_lighting_startup_cancel", None)
+    if callable(previous):
+        previous()
+    def wake(now: Any) -> None:
+        from .room_lighting_runtime import reconcile_rooms
+        self._room_lighting_startup_cancel = None
+        self.hass.async_create_task(reconcile_rooms(self, now))
+    self._room_lighting_startup_cancel = schedule(self.hass, 0.2, wake)
 
-    for entity_id in entity_ids:
-        raw_info = device_info.get(entity_id)
-        info = raw_info if isinstance(raw_info, dict) else {}
-        if not self._is_presence_listener_entity(entity_id, info):
-            continue
-        try:
-            state_obj = get_state(entity_id)
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] active state reconcile read failed for %s: %s", entity_id, exc)
-            continue
-        state = str(getattr(state_obj, "state", "") or "").strip().lower()
-        if state != "on":
-            reconciled.pop(entity_id, None)
-            continue
-        state_marker = str(
-            getattr(state_obj, "last_changed", "")
-            or getattr(state_obj, "last_updated", "")
-            or state
-        )
-        reconcile_marker = f"{state}:{state_marker}"
-        if reconciled.get(entity_id) == reconcile_marker:
-            continue
-
-        if not self._is_enabled():
-            reconciled.pop(entity_id, None)
-            self._emit_listener_event(
-                listener_action="filtered",
-                entity_id=entity_id,
-                old_state="unknown",
-                new_state=state,
-                filter_reason="ai_disabled",
-                source_type="state_reconcile",
-                reconcile_reason="listener_refresh_active_state",
-            )
-            continue
-        if getattr(self, "_sensors_muted", False):
-            reconciled.pop(entity_id, None)
-            self._emit_listener_event(
-                listener_action="filtered",
-                entity_id=entity_id,
-                old_state="unknown",
-                new_state=state,
-                filter_reason="sensors_muted",
-                source_type="state_reconcile",
-                reconcile_reason="listener_refresh_active_state",
-            )
-            continue
-
-        reconciled[entity_id] = reconcile_marker
-        self._emit_listener_event(
-            listener_action="filtered",
-            entity_id=entity_id,
-            old_state="unknown",
-            new_state=state,
-            filter_reason="state_recovery_unknown_unavailable",
-            source_type="state_reconcile",
-            reconcile_reason="listener_refresh_active_state",
-        )
-        schedule_startup_presence_reconciliation(
-            self, entity_id, reconcile_marker=reconcile_marker, schedule=schedule,
-        )
 
 async def async_refresh_device_info_from_addon_devices(
     self, *, reason: str = "", registry_event: dict[str, Any] | None = None,

@@ -139,6 +139,8 @@ async def run_addon_fast_path_fail_closed(
             return
         else:
             if isinstance(response, dict):
+                from .room_lighting_runtime import schedule_room_check
+                schedule_room_check(self, response)
                 status = int(response.get("__status") or 0)
                 result = response.get("result")
                 matched = response.get("matched") is True
@@ -414,6 +416,7 @@ async def run_addon_fast_path_fail_closed(
                     )
                 audit_pending = bool(
                     matched
+                    and result_payload.get("source") != "room_lighting"
                     and arbitration_validation.allowed
                     and not execution_suppressed_reason
                     and self._fast_path_result_allows_slow_audit(

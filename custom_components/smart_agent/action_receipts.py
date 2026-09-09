@@ -89,6 +89,24 @@ def active_ai_authorization_ref(
     return authorization_ref
 
 
+def is_pre_dispatch_policy_rejection(result: Any, *, request_id: str) -> bool:
+    """Recognize the gateway's 403 response issued before command dispatch."""
+    return (
+        isinstance(result, dict)
+        and result.get("__status") == 403
+        and result.get("ok") is False
+        and result.get("executed") is False
+        and result.get("error_type") == "policy_rejected"
+        and bool(result.get("error"))
+        and result.get("execution_path") == "command_envelope"
+        and result.get("results", []) == []
+        and result.get("effect_status", "not_sent") == "not_sent"
+        and result.get("transport_status", "not_sent") == "not_sent"
+        and result.get("reconciliation_required", False) is False
+        and result.get("request_id", request_id) == request_id
+    )
+
+
 def canonical_active_ai_receipt_dispositions(
     result: Any,
     *,
@@ -218,13 +236,15 @@ def decision_action_result_from_ha_result(item: dict[str, Any]) -> dict[str, Any
         result["params"] = dict(item.get("params") or {})
     daylight_guard_evaluation = item.get("daylight_guard_evaluation")
     if isinstance(daylight_guard_evaluation, dict) and daylight_guard_evaluation:
+        result["daylight_guard_evaluation"] = dict(daylight_guard_evaluation)
+    if "daylight_guard_evaluation" in result or item.get("http_status") is not None:
         ha_command_status = str(item.get("ha_command_status") or "").strip()
         if ha_command_status:
             result["ha_command_status"] = ha_command_status
-        result["daylight_guard_evaluation"] = dict(daylight_guard_evaluation)
     for source_key, target_key in (
         ("error", "error"),
         ("error_type", "error_type"),
+        ("request_id", "request_id"),
         ("reason", "action_reason"),
         ("scene_desc", "scene_desc"),
         ("trigger_summary", "trigger_summary"),
@@ -232,6 +252,8 @@ def decision_action_result_from_ha_result(item: dict[str, Any]) -> dict[str, Any
         value = str(item.get(source_key) or "").strip()
         if value:
             result[target_key] = value
+    if item.get("http_status") is not None:
+        result["http_status"] = item["http_status"]
     execution_transaction_id = item.get("execution_transaction_id")
     if execution_transaction_id not in (None, ""):
         result["execution_transaction_id"] = execution_transaction_id
@@ -325,5 +347,6 @@ __all__ = [
     "action_execution_result",
     "active_ai_authorization_ref",
     "canonical_active_ai_receipt_dispositions",
+    "is_pre_dispatch_policy_rejection",
     "decision_action_result_from_ha_result",
 ]

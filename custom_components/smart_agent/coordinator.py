@@ -1567,6 +1567,14 @@ class SmartAgentCoordinator(
         except Exception as exc:
             _LOGGER.debug("[AddonSettings] 周期同步注册失败: %s", exc)
 
+        from .room_lighting_runtime import reconcile_rooms
+        async def room_lighting_periodic(now):
+            await reconcile_rooms(self, now)
+
+        self._listener_removers.append(async_track_time_interval(
+            self.hass, room_lighting_periodic, timedelta(seconds=20)))
+        self._spawn_background_task(reconcile_rooms(self), "room_lighting_reconciliation")
+
         # Phase 10.0: 初始化虚拟在场推断引擎（device_info 此时已加载完成）
         try:
             async def _patrol_safety_net_periodic(_now: Any) -> None:
@@ -1772,6 +1780,13 @@ class SmartAgentCoordinator(
             except Exception:
                 pass
         self._listener_removers.clear()
+        for cancel in getattr(self, "_room_lighting_timers", {}).values():
+            cancel()
+        self._room_lighting_timers = {}
+        cancel = getattr(self, "_room_lighting_startup_cancel", None)
+        if callable(cancel):
+            cancel()
+        self._room_lighting_startup_cancel = None
         for cancel in self._active_timers.values():
             try:
                 cancel()

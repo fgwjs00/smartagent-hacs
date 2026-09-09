@@ -408,6 +408,14 @@ def validate_auto_execution_arbitration(
             )
 
     arrival_candidate = _arrival_lighting_turn_on_candidate(actions, context_snapshot)
+    if result.get("source") == "room_lighting":
+        # Deterministic room control is authorized by the existing Plan/Policy
+        # contract. Learning certificates belong to optional learned choices.
+        has_canonical_qualification = bool(
+            isinstance(result.get("room_lighting"), dict)
+            and all(isinstance(payload.get(key), dict) and payload[key] == result.get(key)
+                    for key in ("decision_request", "plan_sketch", "policy_evaluation"))
+            and payload["policy_evaluation"].get("aggregate_decision") == "allow")
     confirmation_gate = str(payload.get("confirmation_gate") or "").strip()
     has_confirmation_gate = bool(
         confirmation_gate == _ARRIVAL_LIGHTING_CONFIRMATION_GATE

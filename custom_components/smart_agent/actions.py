@@ -27,6 +27,7 @@ from .action_receipts import (
     active_ai_authorization_ref,
     canonical_active_ai_receipt_dispositions,
     decision_action_result_from_ha_result,
+    is_pre_dispatch_policy_rejection,
 )
 from .action_normalization import (
     action_domain,
@@ -144,6 +145,8 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         error: str = "",
         error_type: str = "",
         status: str = "",
+        http_status: int | None = None,
+        request_id: str = "",
     ) -> None:
         key = self._service_call_error_key(transaction_id, action_seq, entity_id)
         store = getattr(self, "_service_call_errors", None)
@@ -157,6 +160,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             detail["error_type"] = str(error_type)
         if status:
             detail["ha_command_status"] = str(status)
+        if http_status is not None:
+            detail["http_status"] = http_status
+        if request_id:
+            detail["request_id"] = request_id
         store[key] = detail
 
     def _clear_service_call_error(self, transaction_id: int, action_seq: int, entity_id: str) -> None:
@@ -2080,7 +2087,18 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             result = await _dispatch_with_state_feedback(
                 lambda: async_execute_command_envelope(self.hass, envelope)
             )
-        if (
+        if require_world_snapshot_guard and is_pre_dispatch_policy_rejection(
+            result, request_id=request_id,
+        ):
+            # A pre-dispatch refusal has no execution receipt to verify. Keep
+            # the gateway error and correlate it with the request we sent.
+            result = {
+                **result,
+                "status": "not_dispatched",
+                "http_status": result["__status"],
+                "request_id": request_id,
+            }
+        elif (
             require_world_snapshot_guard
             and not is_user_explicit
             and isinstance(result, dict)
@@ -2136,6 +2154,8 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             error=error,
             error_type=error_type,
             status=status,
+            http_status=result.get("http_status") if isinstance(result, dict) else None,
+            request_id=str(result.get("request_id") or "") if isinstance(result, dict) else "",
         )
         if return_failed_result and isinstance(result, dict):
             return result

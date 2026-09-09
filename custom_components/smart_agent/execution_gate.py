@@ -547,13 +547,17 @@ def evaluate_proactive_priority_handoff(
         or _clean(claim.get("entity_id")) != entity_s
         or (claim.get("transition_kind") == "confirmed_departure" and not (
             is_lighting and is_confirmed_departure_handoff(claim, entity_id=entity_s, space_id=active_space)))
+        or (claim.get("transition_kind") == "room_arrival" and not (
+            is_lighting and is_room_arrival_handoff(claim, entity_id=entity_s, space_id=active_space)))
         or not active_space
         or target_space != active_space
         or _clean(claim.get("space_id")) != active_space
         or not snapshot_id
         or _clean(claim.get("world_snapshot_id")) != snapshot_id
-        or not _clean(claim.get("trigger_entity_id"))
-        or not trigger_transition_valid
+        or ((not _clean(claim.get("trigger_entity_id")) or not trigger_transition_valid)
+            and not (is_lighting and (is_confirmed_departure_handoff(
+                claim, entity_id=entity_s, space_id=active_space) or is_room_arrival_handoff(
+                claim, entity_id=entity_s, space_id=active_space))))
         or previous_priority not in {3, 4}
         or _clean(claim.get("previous_source")).lower() not in {"ai_rule", "ai_infer"}
         or _clean(claim.get("previous_state")).lower()
@@ -582,11 +586,31 @@ def evaluate_proactive_priority_handoff(
     )
 
 
+def is_room_arrival_handoff(claim, *, entity_id: str, space_id: str) -> bool:
+    if not isinstance(claim, dict) or claim.get("transition_kind") != "room_arrival":
+        return False
+    room = claim.get("room_lighting_ref")
+    return bool(isinstance(room, dict) and claim.get("entity_id") == entity_id
+        and claim.get("service") == "turn_on" and room.get("space_id") == space_id
+        and room.get("presence_state") == "occupied"
+        and room.get("world_snapshot_id") == claim.get("world_snapshot_id")
+        and room.get("occupancy_cycle_id") == claim.get("occupancy_cycle_id")
+        and claim.get("occupancy_cycle_id") and claim.get("previous_occupancy_cycle_id")
+        and claim["occupancy_cycle_id"] != claim["previous_occupancy_cycle_id"])
+
+
 def is_confirmed_departure_handoff(claim, *, entity_id: str, space_id: str) -> bool:
     """The existing v2 handoff may finish the same real occupancy cycle."""
     if not isinstance(claim, dict) or claim.get("transition_kind") != "confirmed_departure":
         return False
     reference = claim.get("presence_hold_ref")
+    room = claim.get("room_lighting_ref")
+    if isinstance(room, dict):
+        return bool(claim.get("entity_id") == entity_id and claim.get("service") == "turn_off"
+            and room.get("space_id") == space_id and room.get("presence_state") == "vacant"
+            and room.get("occupancy_cycle_id") == claim.get("occupancy_cycle_id")
+            and room.get("world_snapshot_id") == claim.get("world_snapshot_id")
+            and claim.get("occupancy_cycle_id") and claim.get("previous_occupancy_cycle_id"))
     occurrence = reference.get("task_occurrence") if isinstance(reference, dict) else None
     return bool(
         claim.get("entity_id") == entity_id and claim.get("service") == "turn_off"

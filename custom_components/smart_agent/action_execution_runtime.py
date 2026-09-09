@@ -1408,6 +1408,9 @@ class ActionExecutionRuntimeMixin:
                     else ""
                 )
                 result_context = dict(prepared["result_context"])
+                if batch_response.get("http_status") is not None:
+                    result_context["http_status"] = batch_response["http_status"]
+                    result_context["request_id"] = batch_response["request_id"]
                 result_context.update({
                     "domain": prepared["domain"],
                     "service": prepared["service"],
@@ -1505,6 +1508,8 @@ class ActionExecutionRuntimeMixin:
                     error=receipt_error,
                     error_type=receipt_error_type,
                     status=command_status,
+                    http_status=batch_response.get("http_status"),
+                    request_id=str(batch_response.get("request_id") or ""),
                 )
                 failed_count += 1
                 results.append({
