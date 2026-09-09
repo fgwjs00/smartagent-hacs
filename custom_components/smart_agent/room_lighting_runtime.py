@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 from typing import Any
+from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later
 
 
@@ -79,6 +80,7 @@ def schedule_room_check(owner: Any, response: dict, *, schedule: Any = None) -> 
         return
     seconds = (datetime.fromisoformat(due) - owner._ha_local_now()).total_seconds()
     handle = None
+    @callback
     def wake(now: Any) -> None:
         if timers.get(space) is not handle:
             return

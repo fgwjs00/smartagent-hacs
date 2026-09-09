@@ -15,6 +15,7 @@ from typing import Any
 from .device_registry_identity import registry_metadata, registry_entry_matches
 
 from homeassistant.helpers.event import async_call_later
+from homeassistant.core import callback
 
 from .const import DEVICE_CONTROL_MODES
 from .sensor_event_filter import environment_sensor_kind
@@ -241,6 +242,7 @@ def reconcile_active_listener_states(
     previous = getattr(self, "_room_lighting_startup_cancel", None)
     if callable(previous):
         previous()
+    @callback
     def wake(now: Any) -> None:
         from .room_lighting_runtime import reconcile_rooms
         self._room_lighting_startup_cancel = None

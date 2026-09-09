@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.227
-display_version: Beta 0.0.227
+release_version: 0.0.228
+display_version: Beta 0.0.228
 channel: beta
 release_date: '2026-09-10'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 统一基础房间灯控循环，恢复到场、离场、环境变化与重启补偿；执行证据独立保存，保留原始执行拒绝原因。
-  customer_visible_version: Beta 0.0.227
+  summary: 补齐房间灯控定时回调的 HA 事件循环标记，修复保持到期和启动恢复任务的线程错误。
+  customer_visible_version: Beta 0.0.228
