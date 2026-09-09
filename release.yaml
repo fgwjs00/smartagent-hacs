@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.225
-display_version: Beta 0.0.225
+release_version: 0.0.226
+display_version: Beta 0.0.226
 channel: beta
 release_date: '2026-09-09'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 设备按物理设备选用功能，手动与主动控制统一调用 HA；保留空间、传感器用途、灯具语义及学习记忆，接通 AI 管家设备委托与回执。
-  customer_visible_version: Beta 0.0.225
+  summary: 修复 HA 设备清单在原生编译后读取服务字典时的类型冲突，并补充实际原生模块的设备读取与重连发布检查。
+  customer_visible_version: Beta 0.0.226
