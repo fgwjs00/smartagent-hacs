@@ -44,8 +44,6 @@ def action_domain(action: Any) -> str:
 
 def action_requires_presence_refresh(
     action: Any,
-    *,
-    dim_to_off_brightness_pct: int = 5,
 ) -> bool:
     """Return whether execution will apply the light/switch turn-off guard."""
     if not isinstance(action, dict):
@@ -76,13 +74,10 @@ def action_requires_presence_refresh(
         and "brightness_pct" in params
     ):
         try:
-            brightness_pct = int(float(params.get("brightness_pct")))
+            brightness_pct = float(params.get("brightness_pct"))
         except (TypeError, ValueError):
             brightness_pct = None
-        if (
-            brightness_pct is not None
-            and 0 <= brightness_pct <= dim_to_off_brightness_pct
-        ):
+        if brightness_pct == 0:
             service = "turn_off"
 
     return domain in {"light", "switch"} and service == "turn_off"

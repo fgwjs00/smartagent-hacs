@@ -815,6 +815,8 @@ class ListenersMixin:
                     if str(state_attrs.get("device_class") or device_info[eid].get("device_class") or "").lower() == "illuminance"
                     else ("last_updated", "last_changed")
                 )
+                if self._is_presence_listener_entity(eid, device_info[eid]):
+                    time_keys = ("last_reported", "last_updated", "last_changed")
                 time_key = next((key for key in time_keys if observation.get(key)), "")
                 observed_at_value = str(observation.get(time_key) or "").strip()
                 observation["observed_at_source"] = f"ha_{time_key}" if time_key else "missing"
@@ -2161,7 +2163,8 @@ class ListenersMixin:
             return True
 
         observed_value = (
-            raw_info.get("last_observed_at")
+            getattr(state_obj, "last_reported", None)
+            or raw_info.get("last_observed_at")
             or raw_info.get("observed_at")
             or getattr(state_obj, "last_updated", None)
             or getattr(state_obj, "last_changed", None)

@@ -79,7 +79,6 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
     # 场景/脚本重复执行冷却
     _SCENE_COOLDOWN = 60        # 同一场景/脚本 N 秒内不重复执行
-    _DIM_TO_OFF_BRIGHTNESS_PCT = 5
     _DAYLIGHT_AUTO_LIGHTING_SUPPRESSED = "daylight_auto_lighting_suppressed"
     _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
     _DAYLIGHT_EVIDENCE_SCHEMA_VERSION = "smartagent.daylight_evidence.v2"
@@ -123,10 +122,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
     @classmethod
     def _action_requires_presence_refresh(cls, action: Any) -> bool:
         """Match the action shapes that will use the Presence turn-off guard."""
-        return action_requires_presence_refresh(
-            action,
-            dim_to_off_brightness_pct=cls._DIM_TO_OFF_BRIGHTNESS_PCT,
-        )
+        return action_requires_presence_refresh(action)
 
     _action_execution_result = staticmethod(action_execution_result)
     _decision_action_result_from_ha_result = staticmethod(decision_action_result_from_ha_result)
@@ -1631,23 +1627,21 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                     # 以便 AI 决策页能呈现“为什么没动”，而不是在此静默置空丢弃。
                     self._sys_log("ERROR", f"[动作修正] AI 返回无效 entity_id「{entity_id}」且无法匹配到已知设备，交由执行层硬闸拒绝")
 
-        # 极低亮度的 turn_on 等同于关灯，规范化为 turn_off 以统一走守卫逻辑。
-        # AI 有时用此手段绕过 Product Rule P1 "禁止 turn_off 展厅灯" 的限制，必须在此拦截。
+        # 只有 0% 按关灯处理；正亮度仍是开灯，不能改变规划目标。
         brightness_pct = None
         if service == "turn_on" and domain == "light" and isinstance(params, dict) and "brightness_pct" in params:
             try:
-                brightness_pct = int(float(params.get("brightness_pct")))
+                brightness_pct = float(params.get("brightness_pct"))
             except (TypeError, ValueError):
                 brightness_pct = None
         if (
             service == "turn_on"
             and domain == "light"
-            and brightness_pct is not None
-            and 0 <= brightness_pct <= self._DIM_TO_OFF_BRIGHTNESS_PCT
+            and brightness_pct == 0
         ):
             self._sys_log("WARN",
                 f"[动作规范化] {entity_id} turn_on(brightness_pct={brightness_pct}) 等效关灯，转换为 turn_off"
-                "（防止绕过 Product Rule P1 保护）")
+                "（保留关灯守卫）")
             service = "turn_off"
             params = {}
 
