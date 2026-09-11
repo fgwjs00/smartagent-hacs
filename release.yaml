@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.229
-display_version: Beta 0.0.229
+release_version: 0.0.230
+display_version: Beta 0.0.230
 channel: beta
-release_date: '2026-09-10'
+release_date: '2026-09-11'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 修复到场选灯、短时两轮手动撤销、Presence 有效期与失败恢复，保留默认灯和规划亮度，恢复低亮度开灯。
-  customer_visible_version: Beta 0.0.229
+  summary: 修复灯控确认边界编译异常、下发前错误退避和异常漏报，保留过期证据下的回执核对入口，恢复普通低打扰场景的主灯候选。
+  customer_visible_version: Beta 0.0.230
