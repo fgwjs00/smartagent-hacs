@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.232
-display_version: Beta 0.0.232
+release_version: 0.0.233
+display_version: Beta 0.0.233
 channel: beta
-release_date: '2026-09-13'
+release_date: '2026-09-14'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 统一设备正式配置读取，修复场景与执行检查的纳管判断不一致；改善登录会话失效处理和雷达维护入口。保持既有人来开灯、人走关灯算法及现场配置。
-  customer_visible_version: Beta 0.0.232
+  summary: 修复场景手动全关误走自动决策入口而被占用和优先级保护拒绝的问题；复用已认证主人控制、正式设备权限、事务去重及灯态回读。保持既有人来开灯、人走关灯及自动保护规则。
+  customer_visible_version: Beta 0.0.233
