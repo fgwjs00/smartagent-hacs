@@ -1,10 +1,9 @@
 """Runtime loader and pure validator for the generated HA service contract."""
 from __future__ import annotations
 
-import copy
+
 import hashlib
 import json
-import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -164,6 +163,14 @@ SERVICES_TO_DOMAINS: dict[str, frozenset[str]] = {
 }
 if set(_services_by_domain) != set(EXECUTION_DOMAINS):
     raise RuntimeError("HA executable domain and service contract sets diverged")
+
+
+# BEGIN GENERATED SERVICE VALIDATION
+# Generated from contracts/python/service_validation.py; do not edit.
+import copy
+import math
+from dataclasses import asdict, dataclass
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,15 +355,17 @@ def _capability_range(capability: Any, capability_key: str) -> tuple[float, floa
     return minimum, maximum
 
 
-def validate_service_call(
+def _validate_service_call(
     domain: str,
     service: str,
     data: Any,
     capability: Any = None,
+    *,
+    service_contracts: dict[str, dict[str, Any]],
 ) -> ServiceContractResult:
     """Validate one HA service call without mutating or silently filtering data."""
     service_key = f"{str(domain or '').strip()}.{str(service or '').strip()}"
-    schema = SERVICE_CONTRACTS.get(service_key)
+    schema = service_contracts.get(service_key)
     if schema is None:
         return _rejected(service_key, "service_not_supported")
     if not isinstance(data, dict):
@@ -430,6 +439,19 @@ def validate_service_call(
         allowed=True,
         service_key=service_key,
         normalized_data=copy.deepcopy(data),
+    )
+# END GENERATED SERVICE VALIDATION
+
+
+def validate_service_call(
+    domain: str,
+    service: str,
+    data: Any,
+    capability: Any = None,
+) -> ServiceContractResult:
+    """Validate using this runtime's loaded contract, without filtering data."""
+    return _validate_service_call(
+        domain, service, data, capability, service_contracts=SERVICE_CONTRACTS,
     )
 
 

@@ -108,7 +108,12 @@ class BackupManager:
             manifest_path = os.path.join(os.path.dirname(__file__), "manifest.json")
             with open(manifest_path, encoding="utf-8") as f:
                 return json.load(f).get("version", "unknown")
-        except Exception:
+        except Exception as exc:
+            _LOGGER.warning(
+                "Backup manifest version unavailable: operation=read_manifest_version "
+                "exception_type=%s; using unknown version",
+                type(exc).__name__,
+            )
             return "unknown"
 
     def _ha_backup_now(self) -> datetime:
@@ -118,8 +123,11 @@ class BackupManager:
                 value = local_now()
                 if isinstance(value, datetime):
                     return value
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Backup clock fallback: operation=backup_now.local_clock exception_type=%s",
+                    type(exc).__name__,
+                )
 
         configured_timezone = str(
             getattr(getattr(getattr(self, "_hass", None), "config", None), "time_zone", "") or ""
@@ -129,7 +137,11 @@ class BackupManager:
                 from zoneinfo import ZoneInfo
 
                 return datetime.now(ZoneInfo(configured_timezone))
-            except Exception:
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Backup clock fallback: operation=backup_now.timezone_lookup exception_type=%s",
+                    type(exc).__name__,
+                )
                 offset = _FIXED_TIMEZONE_OFFSETS.get(configured_timezone)
                 if offset is not None:
                     return datetime.now(timezone(timedelta(hours=offset), configured_timezone))
@@ -150,11 +162,13 @@ class BackupManager:
     def _ha_backup_timestamp_iso(self, timestamp: float) -> str:
         try:
             tzinfo = self._ha_backup_now().tzinfo
-            if tzinfo is not None:
-                return datetime.fromtimestamp(float(timestamp), timezone.utc).astimezone(tzinfo).isoformat()
-        except Exception:
-            pass
-        return datetime.fromtimestamp(timestamp).isoformat()
+            if tzinfo is None:
+                raise ValueError("HA backup timezone unavailable")
+            return datetime.fromtimestamp(float(timestamp), timezone.utc).astimezone(tzinfo).isoformat()
+        except Exception as exc:
+            raise RuntimeError(
+                "backup_timestamp_conversion_failed: BackupManager._ha_backup_timestamp_iso"
+            ) from exc
 
     @staticmethod
     def _sanitize_backup_id(backup_id: str) -> str:

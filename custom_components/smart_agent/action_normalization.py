@@ -5,6 +5,21 @@ from __future__ import annotations
 from typing import Any
 
 
+class InvalidActionDelay(ValueError):
+    """A present delay cannot be interpreted using the supported delay contract."""
+
+    def __init__(self, action_seq: int | None) -> None:
+        super().__init__("action_delay_seconds_invalid")
+        self.action_seq = action_seq
+
+
+def action_delay_seconds(action: dict[str, Any], *, action_seq: int | None = None) -> int:
+    try:
+        return max(0, int(action.get("delay_seconds", 0)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InvalidActionDelay(action_seq) from exc
+
+
 def action_entity_id(action: Any) -> str:
     """Return the effective entity id for supported planner action shapes."""
     if not isinstance(action, dict):

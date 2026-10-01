@@ -14,16 +14,24 @@ import logging
 import re
 import time
 import base64
+import hashlib
+import math
+import uuid
 import aiohttp
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from homeassistant.core import callback
+from .task_completion import (
+    TaskCompletion, create_ha_task, observe_ha_task, read_task_completion, report_task_completion,
+)
 
 try:
     from core.vision import FrigateProvider as CoreFrigateProvider
-except Exception:  # pragma: no cover - add-on Core is optional inside HA runtime
+except ModuleNotFoundError as exc:  # add-on Core is optional inside HA runtime
+    if exc.name not in {"core", "core.vision"}:
+        raise
     CoreFrigateProvider = None  # type: ignore[assignment]
 
 _LOGGER = logging.getLogger(__name__)
@@ -193,49 +201,24 @@ class FrigateMixin:
             self._frigate_visual_descriptions.pop(event_id, None)
 
     def _observe_frigate_task_failure(self, task: Any, *, context: str) -> None:
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            self._sys_log("WARN", f"[Frigate] {context} task cancelled: task_cancelled")
+        completion = read_task_completion(task)
+        if completion.error is None and not completion.cancelled:
             return
-        except Exception as err:
-            self._sys_log("WARN", f"[Frigate] {context} task failed: {err}")
-            return
-        if exc is None:
-            if hasattr(task, "cancelled") and task.cancelled():
-                self._sys_log("WARN", f"[Frigate] {context} task cancelled: task_cancelled")
-            return
-        self._sys_log("WARN", f"[Frigate] {context} task failed: {exc}")
+        report_task_completion(task, completion, logger=_LOGGER, operation=context,
+                               system_log=self._sys_log)
 
     def _spawn_frigate_task(self, coro: Any, *, context: str) -> Any | None:
         try:
-            task = self.hass.async_create_task(coro)
+            task = create_ha_task(self.hass.async_create_task, coro, logger=_LOGGER,
+                                  operation=context, system_log=self._sys_log)
         except Exception as exc:
-            close = getattr(coro, "close", None)
-            if callable(close):
-                close()
-            _LOGGER.warning(
-                "[Frigate] %s task create failed | exception_type=%s: %s",
-                context,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
-            self._sys_log(
-                "WARN",
-                f"[Frigate] {context} task create failed: task_create_failed "
-                f"exception_type={type(exc).__name__}: {exc}",
-            )
+            report_task_completion(coro, TaskCompletion(error=exc, phase="create"),
+                                   logger=_LOGGER, operation=context, system_log=self._sys_log)
             return None
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if callable(add_done_callback):
-            add_done_callback(
-                lambda done_task: self._observe_frigate_task_failure(
-                    done_task,
-                    context=context,
-                )
-            )
-        return task
+        return observe_ha_task(
+            task, lambda done: self._observe_frigate_task_failure(done, context=context),
+            logger=_LOGGER, operation=context, system_log=self._sys_log,
+        )
 
     def _expire_critical_frigate_event(self, now: float | None = None, *, notify: bool = True) -> bool:
         event = getattr(self, "_critical_frigate_event", None)
@@ -244,8 +227,14 @@ class FrigateMixin:
         if now is None:
             now = time.time()
         try:
-            event_time = float(event.get("time") or 0)
-        except Exception:
+            raw_time = event.get("time")
+            event_time = float(0 if raw_time is None else raw_time)
+            if not math.isfinite(event_time):
+                raise ValueError("frigate_critical_time_nonfinite")
+        except (TypeError, ValueError, OverflowError) as exc:
+            report_task_completion(event, TaskCompletion(error=exc, phase="time_parse"),
+                                   logger=_LOGGER, operation="frigate_critical_time",
+                                   system_log=self._sys_log)
             event_time = 0
         if event_time and now - event_time <= _CRITICAL_FRIGATE_EVENT_TTL:
             return False
@@ -253,8 +242,10 @@ class FrigateMixin:
         if notify:
             try:
                 self.async_set_updated_data({})
-            except Exception:
-                pass
+            except Exception as exc:
+                report_task_completion(event, TaskCompletion(error=exc, phase="notify"),
+                                       logger=_LOGGER, operation="frigate_critical_notify",
+                                       system_log=self._sys_log)
         return True
 
     def get_critical_frigate_event(self) -> dict | None:
@@ -267,34 +258,38 @@ class FrigateMixin:
         # 注意：这里假设 Frigate 在本地，可以通过 HA 的内部代理或直接访问
         # 推荐使用 HA 内部 URL，如果 HA 安装了 Frigate 集成，通常有内部 API
         url = f"http://127.0.0.1:5000/api/events/{event_id}/snapshot.jpg"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        return base64.b64encode(data).decode("utf-8")
-                    else:
-                        self._sys_log("WARN", f"[Frigate] 无法获取快照 {event_id}: HTTP {resp.status}")
-        except Exception as e:
-            _LOGGER.debug("Fetch snapshot failed: %s", e)
-        return None
+        return await self._async_read_frigate_image(url, event_id, operation="frigate_image_snapshot", timeout=10)
 
     async def _async_get_frigate_latest_frame_base64(self, camera_id: str) -> str | None:
         """从 Frigate 获取指定摄像头的当前最新帧（不需要事件 ID）。
 
         使用 Frigate REST API: GET /api/{camera_name}/latest.jpg
-        若 camera_id 不是合法摄像头名（如 zone 名），接口返回 404，静默跳过。
+        camera_id 不存在时，404 保持可选图像缺失；其他失败明确定位。
         """
         url = f"http://127.0.0.1:5000/api/{camera_id}/latest.jpg"
+        return await self._async_read_frigate_image(
+            url, camera_id, operation="frigate_image_latest",
+            timeout=aiohttp.ClientTimeout(total=10), missing_ok=True,
+        )
+
+    async def _async_read_frigate_image(
+        self, url: str, reference: str, *, operation: str,
+        timeout: int | aiohttp.ClientTimeout, missing_ok: bool = False,
+    ) -> str | None:
+        """Optional network image failure is observable; program errors propagate."""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(url, timeout=timeout) as resp:
                     if resp.status == 200:
                         data = await resp.read()
                         return base64.b64encode(data).decode("utf-8")
-                    _LOGGER.debug("[Frigate] latest.jpg HTTP %s for camera=%s", resp.status, camera_id)
-        except Exception as exc:
-            _LOGGER.debug("[Frigate] 获取最新帧失败 camera=%s: %s", camera_id, exc)
+                    reference_hash = hashlib.sha256(reference.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+                    level = logging.DEBUG if missing_ok and resp.status == 404 else logging.WARNING
+                    _LOGGER.log(level, "frigate_image_unavailable operation=%s http_status=%s reference_hash=%s",
+                                operation, resp.status, reference_hash)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            report_task_completion(reference, TaskCompletion(error=exc, phase="fetch"),
+                                   logger=_LOGGER, operation=operation, system_log=self._sys_log)
         return None
 
     async def _async_do_activity_analysis(
@@ -474,7 +469,9 @@ class FrigateMixin:
 
         try:
             from homeassistant.components.mqtt import async_subscribe
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            if exc.name != "homeassistant.components.mqtt":
+                raise
             self._sys_log("WARN", "[Frigate] MQTT 集成未安装，Frigate MQTT 深度集成不可用，将使用 HA Entity 通道")
             return
 
@@ -487,10 +484,13 @@ class FrigateMixin:
             self._frigate_mqtt_unsub = await async_subscribe(
                 self.hass, "frigate/events", self._on_frigate_mqtt_event
             )
-            self._sys_log("INFO", "[Frigate] MQTT 事件订阅成功 → frigate/events")
         except Exception as exc:
-            self._sys_log("WARN", f"[Frigate] MQTT 订阅失败: {exc}，将使用 HA Entity 通道")
+            report_task_completion(self, TaskCompletion(error=exc, phase="subscribe"),
+                                   logger=_LOGGER, operation="frigate_mqtt_subscribe",
+                                   system_log=self._sys_log)
             return
+
+        self._sys_log("INFO", "[Frigate] MQTT 事件订阅成功 → frigate/events")
 
         # v4.11.1：启动时扫描 HA 实体注册表，检测 Frigate 僵尸 person_occupancy 实体
         # v4.11.2：同时从 Frigate HTTP API 恢复当前活跃事件的 zone 人数，
@@ -503,15 +503,33 @@ class FrigateMixin:
         if self._frigate_mqtt_unsub:
             try:
                 self._frigate_mqtt_unsub()
-            except Exception:
-                pass
-            self._frigate_mqtt_unsub = None
-        for cancel in self._frigate_mqtt_debounce_timers.values():
+            except Exception as exc:
+                report_task_completion(self._frigate_mqtt_unsub, TaskCompletion(error=exc, phase="unsubscribe"),
+                                       logger=_LOGGER, operation="frigate_mqtt_unsubscribe",
+                                       system_log=self._sys_log)
+            else:
+                self._frigate_mqtt_unsub = None
+        for key, cancel in list(self._frigate_mqtt_debounce_timers.items()):
             try:
                 cancel()
-            except Exception:
-                pass
-        self._frigate_mqtt_debounce_timers.clear()
+            except Exception as exc:
+                report_task_completion(cancel, TaskCompletion(error=exc, phase="cancel_timer"),
+                                       logger=_LOGGER, operation="frigate_timer_cancel",
+                                       system_log=self._sys_log)
+            else:
+                self._frigate_mqtt_debounce_timers.pop(key, None)
+
+    def _decode_frigate_payload(self, msg: Any) -> dict | None:
+        try:
+            payload = json.loads(msg.payload)
+            if not isinstance(payload, dict):
+                raise TypeError("frigate_mqtt_payload_not_object")
+        except (json.JSONDecodeError, AttributeError, TypeError, UnicodeDecodeError) as exc:
+            report_task_completion(msg, TaskCompletion(error=exc, phase="decode"),
+                                   logger=_LOGGER, operation="frigate_mqtt_payload",
+                                   system_log=self._sys_log)
+            return None
+        return payload
 
     @callback
     def _on_frigate_mqtt_event(self, msg) -> None:
@@ -537,9 +555,8 @@ class FrigateMixin:
             }
         }
         """
-        try:
-            payload = json.loads(msg.payload)
-        except (json.JSONDecodeError, AttributeError):
+        payload = self._decode_frigate_payload(msg)
+        if payload is None:
             return
 
         snap = self._vision_provider.parse_event_payload(payload)
@@ -703,11 +720,9 @@ class FrigateMixin:
                 metadata=metadata,
             )
         except Exception as exc:
-            _LOGGER.warning(
-                "[Frigate] structured observation enqueue failed: %s",
-                exc.__class__.__name__,
-                exc_info=True,
-            )
+            report_task_completion(snapshot, TaskCompletion(error=exc, phase="enqueue_unknown"),
+                                   logger=_LOGGER, operation="frigate_observation_enqueue",
+                                   system_log=self._sys_log)
 
     def _frigate_presence_context(
         self,
@@ -850,6 +865,20 @@ class FrigateMixin:
             )
         return sorted(event_zones)
 
+    def _cancel_frigate_timer_for_replacement(self, event_id: str) -> None:
+        """A failed cancel cannot safely admit another timer for the same event."""
+        old_cancel = self._frigate_mqtt_debounce_timers.get(event_id)
+        if not old_cancel:
+            return
+        try:
+            old_cancel()
+        except Exception as exc:
+            message = report_task_completion(old_cancel, TaskCompletion(error=exc, phase="cancel_unknown"),
+                                             logger=_LOGGER, operation="frigate_timer_replace",
+                                             system_log=self._sys_log)
+            raise RuntimeError(f"frigate_timer_replacement_failed: {message}") from exc
+        self._frigate_mqtt_debounce_timers.pop(event_id, None)
+
     def _schedule_frigate_inference(
         self, event_id: str, camera: str,
         entered_zones: list[str], current_zones: list[str],
@@ -861,12 +890,7 @@ class FrigateMixin:
         from homeassistant.core import callback as _ha_callback
 
         # 同一 event_id 的重复触发取消旧计时器
-        old_cancel = self._frigate_mqtt_debounce_timers.pop(event_id, None)
-        if old_cancel:
-            try:
-                old_cancel()
-            except Exception:
-                pass
+        self._cancel_frigate_timer_for_replacement(event_id)
 
         # zone 冷却检查
         now = time.time()
@@ -927,7 +951,9 @@ class FrigateMixin:
                     },
                 )
             except Exception as exc:
-                self._sys_log("ERROR", f"[Frigate/MQTT] 调度推理失败: {exc}")
+                report_task_completion(cached, TaskCompletion(error=exc, phase="admission_unknown"),
+                                       logger=_LOGGER, operation="frigate_inference_admission",
+                                       system_log=self._sys_log, system_level="ERROR")
 
         handle = async_call_later(self.hass, delay, _fire_inference)
         self._frigate_mqtt_debounce_timers[event_id] = handle
@@ -994,6 +1020,22 @@ class FrigateMixin:
             f"（camera.{camera}）置信度={score:.0%}{zone_text}{occupancy_text}\n{visual_desc}"
         )
 
+    def _frigate_binding_value(self, table: str, field: str, where: str, params: tuple) -> Any:
+        """Read only static binding queries; missing rows may use the documented fallback."""
+        if not hasattr(self, "_db"):
+            return None
+        try:
+            rows = self._db.query_required(f"SELECT {field} FROM {table} WHERE {where}", params)
+            return rows[0][field] if rows and rows[0][field] else None
+        except Exception as exc:
+            error_id = uuid.uuid4().hex
+            reference = "\0".join(str(value) for value in params)
+            reference_hash = hashlib.sha256(reference.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+            message = (f"frigate_binding_read_failed: operation={table}.{field} "
+                       f"reference_hash={reference_hash} error_id={error_id}")
+            _LOGGER.warning("%s exception_type=%s", message, type(exc).__name__)
+            raise RuntimeError(message) from exc
+
     def _get_frigate_camera_name(self, camera_id: str) -> str:
         """
         获取 Frigate 摄像头的友好名称。
@@ -1004,16 +1046,10 @@ class FrigateMixin:
         3. 原始 camera_id 作为兜底
         """
         # 优先查 DB（适配摄像头未接入 HA 的场景）
-        if hasattr(self, "_db"):
-            try:
-                rows = self._db.query(
-                    "SELECT friendly_name FROM frigate_cameras WHERE camera_id=? AND enabled=1",
-                    (camera_id,),
-                )
-                if rows and rows[0]["friendly_name"]:
-                    return rows[0]["friendly_name"]
-            except Exception:
-                pass
+        name = self._frigate_binding_value("frigate_cameras", "friendly_name",
+                                           "camera_id=? AND enabled=1", (camera_id,))
+        if name:
+            return name
         # 回退：HA 实体
         state = self.hass.states.get(f"camera.{camera_id}")
         if state:
@@ -1033,17 +1069,8 @@ class FrigateMixin:
         Returns:
             房间名字符串，未配置时返回空字符串。
         """
-        if hasattr(self, "_db"):
-            try:
-                rows = self._db.query(
-                    "SELECT room FROM frigate_cameras WHERE camera_id=? AND enabled=1",
-                    (camera_id,),
-                )
-                if rows and rows[0]["room"]:
-                    return rows[0]["room"]
-            except Exception:
-                pass
-        return ""
+        return self._frigate_binding_value("frigate_cameras", "room",
+                                           "camera_id=? AND enabled=1", (camera_id,)) or ""
 
     def _get_frigate_zone_name(self, camera_id: str, zone_id: str) -> str:
         """
@@ -1059,17 +1086,8 @@ class FrigateMixin:
         Returns:
             友好名称字符串。
         """
-        if hasattr(self, "_db"):
-            try:
-                rows = self._db.query(
-                    "SELECT friendly_name FROM frigate_zones WHERE camera_id=? AND zone_id=?",
-                    (camera_id, zone_id),
-                )
-                if rows and rows[0]["friendly_name"]:
-                    return rows[0]["friendly_name"]
-            except Exception:
-                pass
-        return zone_id.replace("_", " ").title()
+        return self._frigate_binding_value("frigate_zones", "friendly_name",
+                                           "camera_id=? AND zone_id=?", (camera_id, zone_id)) or zone_id.replace("_", " ").title()
 
     def _get_frigate_zone_room(self, camera_id: str, zone_id: str) -> str:
         """
@@ -1089,25 +1107,12 @@ class FrigateMixin:
         Returns:
             房间名字符串，未配置时返回空字符串。
         """
-        if hasattr(self, "_db"):
-            try:
-                # 1. 优先查 zone 级绑定
-                rows = self._db.query(
-                    "SELECT room FROM frigate_zones WHERE camera_id=? AND zone_id=? AND room!=''",
-                    (camera_id, zone_id),
-                )
-                if rows and rows[0]["room"]:
-                    return rows[0]["room"]
-                # 2. 降级到摄像头级绑定
-                rows = self._db.query(
-                    "SELECT room FROM frigate_cameras WHERE camera_id=? AND enabled=1 AND room!=''",
-                    (camera_id,),
-                )
-                if rows and rows[0]["room"]:
-                    return rows[0]["room"]
-            except Exception:
-                pass
-        return ""
+        room = self._frigate_binding_value("frigate_zones", "room",
+                                           "camera_id=? AND zone_id=? AND room!=''", (camera_id, zone_id))
+        if room:
+            return room
+        return self._frigate_binding_value("frigate_cameras", "room",
+                                           "camera_id=? AND enabled=1 AND room!=''", (camera_id,)) or ""
 
     def get_frigate_zone_summary(self) -> str:
         """
@@ -1134,6 +1139,30 @@ class FrigateMixin:
 
         return "【Frigate 视觉区域占用】\n" + "\n".join(parts)
 
+    @staticmethod
+    def _frigate_text(value: Any, *, field: str, missing_ok: bool = False) -> str:
+        if value is None and missing_ok:
+            return ""
+        if not isinstance(value, str):
+            raise TypeError(f"frigate_read_invalid_text: field={field}")
+        return value.strip()
+
+    @staticmethod
+    def _frigate_record_list(value: Any, *, field: str) -> list[dict]:
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            raise TypeError(f"frigate_read_invalid_records: field={field}")
+        return value
+
+    def _frigate_recovery_person(self, event: dict) -> tuple[str, str, set[str]]:
+        camera = self._frigate_text(event.get("camera"), field="events.camera", missing_ok=True)
+        event_id = self._frigate_text(event.get("id"), field="events.id", missing_ok=True)
+        raw_zones = event.get("zones")
+        raw_zones = [] if raw_zones is None else raw_zones
+        if not isinstance(raw_zones, list):
+            raise TypeError("frigate_read_invalid_zones: field=events.zones")
+        zones = {self._frigate_text(zone, field="events.zones.member").lower() for zone in raw_zones}
+        return camera, event_id, zones - {""}
+
     def _restore_frigate_occupancy_snapshot(
         self, active_events: list[dict[str, Any]]
     ) -> dict[str, dict[str, int]]:
@@ -1143,13 +1172,7 @@ class FrigateMixin:
         for event in active_events:
             if not isinstance(event, dict) or event.get("label") != "person":
                 continue
-            camera = str(event.get("camera") or "").strip()
-            event_id = str(event.get("id") or "").strip()
-            current_zones = {
-                str(zone).strip().lower()
-                for zone in (event.get("zones") or [])
-                if str(zone or "").strip()
-            }
+            camera, event_id, current_zones = self._frigate_recovery_person(event)
             if not camera:
                 continue
             camera_counts = recovered.setdefault(camera, {})
@@ -1192,16 +1215,18 @@ class FrigateMixin:
         """
         import aiohttp
 
+        phase = "discovery"
         try:
             from .frigate_config import get_cameras_from_frigate_api
 
             # 先获取 Frigate base URL（复用已有的 API 发现逻辑）
             _, base_url = await get_cameras_from_frigate_api()
             if not base_url:
-                _LOGGER.debug("[Frigate] 占用恢复跳过：Frigate API 不可达")
+                _LOGGER.warning("frigate_occupancy_unavailable operation=frigate_occupancy_recovery phase=discovery")
                 return
 
             active_events: list[dict] = []
+            phase = "fetch"
             async with aiohttp.ClientSession() as _sess:
                 async with _sess.get(
                     f"{base_url}/api/events",
@@ -1209,21 +1234,26 @@ class FrigateMixin:
                     timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     if resp.status == 200:
+                        phase = "decode"
                         active_events = await resp.json(content_type=None)
+                        self._frigate_record_list(active_events, field="events")
                     else:
-                        _LOGGER.debug("[Frigate] 占用恢复: API 返回 %d", resp.status)
+                        _LOGGER.warning("frigate_occupancy_unavailable operation=frigate_occupancy_recovery http_status=%s",
+                                        resp.status)
                         return
 
             if not active_events:
                 _LOGGER.debug("[Frigate] 占用恢复: 无活跃事件，zone 人数维持 0")
                 return
 
+            phase = "restore"
             recovered = self._restore_frigate_occupancy_snapshot(active_events)
 
             if not recovered:
                 return
 
             # 日志汇报
+            phase = "summary"
             summary_parts = []
             for camera, zones in recovered.items():
                 cam_name = self._get_frigate_camera_name(camera)
@@ -1242,13 +1272,39 @@ class FrigateMixin:
             )
 
         except Exception as exc:
-            _LOGGER.debug("[Frigate] 占用恢复跳过: %s", exc)
+            report_task_completion(self, TaskCompletion(error=exc, phase=phase),
+                                   logger=_LOGGER, operation="frigate_occupancy_recovery",
+                                   system_log=self._sys_log)
 
     def get_recent_frigate_events(self, limit: int = 5) -> list[dict]:
         """获取最近 N 个 Frigate 事件（供前端面板使用）。"""
         events = list(self._frigate_events_cache.values())
         events.sort(key=lambda e: e.get("time", 0), reverse=True)
         return events[:limit]
+
+    async def _async_frigate_known_api_zones(self) -> set[str] | None:
+        """Unknown authority cannot establish that a zone has been deleted."""
+        try:
+            from .frigate_config import get_cameras_from_frigate_api
+            from .frigate_authority import frigate_api_zone_ids
+            cameras, base_url = await get_cameras_from_frigate_api()
+            if not base_url:
+                return None
+            return frigate_api_zone_ids(cameras)
+        except Exception as exc:
+            report_task_completion(self, TaskCompletion(error=exc, phase="discovery"),
+                                   logger=_LOGGER, operation="frigate_zombie_discovery",
+                                   system_log=self._sys_log)
+            return None
+
+    def _frigate_known_db_zones(self) -> set[str]:
+        if not hasattr(self, "_db"):
+            return set()
+        from .frigate_authority import FRIGATE_ZONE_QUERIES, frigate_db_zone_ids
+        known: set[str] = set()
+        for sql, field in FRIGATE_ZONE_QUERIES:
+            known.update(frigate_db_zone_ids(self._db.query_required(sql), field))
+        return known
 
     async def _async_check_frigate_zombie_entities(self) -> None:
         """
@@ -1268,39 +1324,24 @@ class FrigateMixin:
 
         v4.11.2: 修复 v4.11.1 假阳性 bug——DB 为空时（用户未绑定 zone）会误报所有 person_occupancy 实体
         """
+        phase = "discovery"
         try:
-            from .frigate_config import get_cameras_from_frigate_api
+            frigate_zones_from_api = await self._async_frigate_known_api_zones()
+            if frigate_zones_from_api is None:
+                _LOGGER.warning("frigate_zombie_check_unavailable operation=frigate_zombie_check phase=discovery")
+                return
+            phase = "database"
+            known_zones = frigate_zones_from_api | self._frigate_known_db_zones()
 
-            # ── 1. 从 Frigate HTTP API 获取实际 zones（最权威来源）──────────────
-            frigate_zones_from_api: set[str] = set()
-            try:
-                yml_cameras, _ = await get_cameras_from_frigate_api()
-                for cam in yml_cameras:
-                    for zone in cam.get("zones", []):
-                        frigate_zones_from_api.add(str(zone.get("zone_id", "")).lower())
-                        frigate_zones_from_api.add(str(cam.get("camera_id", "")).lower())
-            except Exception as _api_exc:
-                _LOGGER.debug("[Frigate] 僵尸检测: API 查询失败，仅使用 DB: %s", _api_exc)
-
-            # ── 2. 从 SmartAgent DB 收集已绑定的 zone/camera 名称 ──────────────
-            db_zones: set[str] = set()
-            if hasattr(self, "_db"):
-                for _r in (self._db.query("SELECT zone_id FROM frigate_zones") or []):
-                    db_zones.add(str(_r.get("zone_id", "")).lower())
-                for _r in (self._db.query("SELECT camera_id FROM frigate_cameras") or []):
-                    db_zones.add(str(_r.get("camera_id", "")).lower())
-
-            known_zones = frigate_zones_from_api | db_zones
-
-            # ── 3. 若两个来源均为空，说明 Frigate 不可达且 DB 未配置，跳过检测 ──
+            # ── 3. 两个有效来源均无记录时，保留未配置场景的跳过行为 ──
             if not known_zones:
                 _LOGGER.debug(
-                    "[Frigate] 僵尸实体检测跳过：Frigate API 不可达且 DB 无 zone 记录"
-                    "（可能 Frigate 尚未配置或刚重启）"
+                    "[Frigate] 僵尸实体检测跳过：Frigate API 和 DB 尚无 camera/zone 记录"
                 )
                 return
 
             # ── 4. 扫描 HA 状态机 ─────────────────────────────────────────────
+            phase = "scan"
             zombie: list[str] = []
             _suffix = "_person_occupancy"
             for _state in self.hass.states.async_all():
@@ -1325,4 +1366,6 @@ class FrigateMixin:
             else:
                 _LOGGER.debug("[Frigate] 未发现僵尸 person_occupancy 实体")
         except Exception as exc:
-            _LOGGER.debug("[Frigate] 僵尸实体检测跳过: %s", exc)
+            report_task_completion(self, TaskCompletion(error=exc, phase=phase),
+                                   logger=_LOGGER, operation="frigate_zombie_check",
+                                   system_log=self._sys_log)

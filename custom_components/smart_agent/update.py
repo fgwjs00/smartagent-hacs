@@ -34,6 +34,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN
+from .task_completion import (
+    TaskCompletion, create_ha_task, observe_ha_task, read_task_completion, report_task_completion,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,56 +50,23 @@ _CHECK_INTERVAL = timedelta(hours=24)
 
 
 def _handle_update_task_done(task: Any, *, label: str) -> None:
-    try:
-        if hasattr(task, "cancelled") and task.cancelled():
-            return
-        exc = task.exception()
-    except asyncio.CancelledError:
+    completion = read_task_completion(task)
+    if completion.cancelled or completion.error is None:
         return
-    except Exception as err:
-        _LOGGER.warning(
-            "[Update] background task exception retrieval failed | task=%s exception_type=%s: %s",
-            label,
-            type(err).__name__,
-            err,
-            exc_info=True,
-        )
-        return
-    if exc is None:
-        return
-    _LOGGER.warning(
-        "[Update] background task failed | task=%s exception_type=%s: %s",
-        label,
-        type(exc).__name__,
-        exc,
-        exc_info=(type(exc), exc, exc.__traceback__),
-    )
+    report_task_completion(task, completion, logger=_LOGGER, operation=f"update.{label}")
 
 
 def _observe_update_task(task: Any, label: str) -> Any:
-    try:
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if callable(add_done_callback):
-            add_done_callback(lambda done: _handle_update_task_done(done, label=label))
-    except Exception as exc:
-        _LOGGER.debug("[Update] failed to attach task observer | task=%s: %s", label, exc)
-    return task
+    return observe_ha_task(task, lambda done: _handle_update_task_done(done, label=label),
+                           logger=_LOGGER, operation=f"update.{label}")
 
 
 def _spawn_update_task(hass: HomeAssistant, coro: Any, label: str) -> Any | None:
     try:
-        task = hass.async_create_task(coro)
+        task = create_ha_task(hass.async_create_task, coro, logger=_LOGGER, operation=f"update.{label}")
     except Exception as exc:
-        close = getattr(coro, "close", None)
-        if callable(close):
-            close()
-        _LOGGER.warning(
-            "[Update] background task create failed | task=%s exception_type=%s: %s",
-            label,
-            type(exc).__name__,
-            exc,
-            exc_info=True,
-        )
+        report_task_completion(coro, TaskCompletion(error=exc, phase="create"),
+                               logger=_LOGGER, operation=f"update.{label}")
         return None
     return _observe_update_task(task, label)
 

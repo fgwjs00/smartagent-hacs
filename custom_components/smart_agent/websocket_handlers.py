@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import date, timedelta
 import logging
 from typing import Any
+import uuid
 
 import voluptuous as vol
 from homeassistant.components import websocket_api
@@ -23,6 +24,40 @@ from .ha_adapter import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _send_ws_failure(connection: Any, request_id: int, operation: str, code: str, cause: Exception) -> None:
+    """Keep request failure visible without rendering upstream exception bodies."""
+    error_id = uuid.uuid4().hex
+    _LOGGER.warning("[WebSocket] operation=%s request_id=%s error_id=%s cause_type=%s",
+                    operation, request_id, error_id, type(cause).__name__)
+    connection.send_error(request_id, code, f"暂时无法确认请求结果；error_id={error_id}")
+
+
+def _read_decision_stats(db: Any, today_str: str, cutoff_30: str) -> tuple[int, int, list[dict]]:
+    """Required local reads must complete before a statistics snapshot is published."""
+    inf_rows = db.query_required(
+        "SELECT COUNT(*) AS cnt FROM events WHERE type='AI_Inference' AND time >= ?", (today_str,))
+    today_inferences = inf_rows[0]["cnt"] if inf_rows else 0
+    cor_rows = db.query_required("SELECT COUNT(*) AS cnt FROM corrections WHERE time >= ?", (today_str,))
+    today_corrections = cor_rows[0]["cnt"] if cor_rows else 0
+    room_inf = db.query_required(
+        "SELECT area AS room, COUNT(*) AS cnt FROM events "
+        "WHERE type='AI_Inference' AND area != '' AND time >= ? "
+        "GROUP BY area ORDER BY cnt DESC LIMIT 10", (cutoff_30,))
+    room_cor = db.query_required(
+        "SELECT d.area AS room, SUM(c.correction_count) AS corrections "
+        "FROM corrections c LEFT JOIN devices d ON c.entity_id = d.entity_id "
+        "WHERE c.time >= ? AND d.area != '' GROUP BY d.area", (cutoff_30,))
+    cor_map = {r["room"]: int(r.get("corrections") or 0) for r in room_cor if r.get("room")}
+    room_overturn_rates = []
+    for row in room_inf:
+        room = row.get("room", "")
+        infs = int(row.get("cnt") or 0)
+        cors = cor_map.get(room, 0)
+        rate = round(cors / infs * 100, 1) if infs > 0 else 0.0
+        room_overturn_rates.append({"room": room, "inferences": infs, "corrections": cors, "rate": rate})
+    return today_inferences, today_corrections, room_overturn_rates
 
 
 def build_smart_agent_websocket_commands(
@@ -177,7 +212,13 @@ def build_smart_agent_websocket_commands(
         if coord is None:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
-        scenes = get_ai_scenes_cache_snapshot(coord)
+        from .ai_scene_projection import SceneProjectionUnavailable
+        try:
+            scenes = get_ai_scenes_cache_snapshot(coord)
+        except SceneProjectionUnavailable as exc:
+            connection.send_error(msg["id"], "ai_scenes_unavailable",
+                                  f"场景目录暂时无法读取；error_id={exc.error_id}")
+            return
         connection.send_result(msg["id"], {"scenes": scenes})
 
     @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_energy_stats"})
@@ -190,7 +231,14 @@ def build_smart_agent_websocket_commands(
         if coord is None:
             connection.send_error(msg["id"], "not_found", "SmartAgent coordinator not loaded")
             return
-        stats = coord._energy_stats if isinstance(coord._energy_stats, list) else []
+        stats = getattr(coord, "_energy_stats", None)
+        if not isinstance(stats, list):
+            error = getattr(coord, "_energy_stats_error", None) or {}
+            connection.send_error(
+                msg["id"], "energy_stats_unavailable",
+                f"能耗统计暂时无法读取；error_id={error.get('error_id', 'startup_energy_stats')}",
+            )
+            return
         connection.send_result(msg["id"], {"stats": stats})
 
     @websocket_api.websocket_command({vol.Required("type"): "smart_agent/get_transactions"})
@@ -225,12 +273,7 @@ def build_smart_agent_websocket_commands(
                     if isinstance(rows, list):
                         txns = [row for row in rows if isinstance(row, dict)]
             except Exception as exc:
-                _LOGGER.debug("[WebSocket] add-on transactions fetch failed: %s", exc)
-                connection.send_error(
-                    msg["id"],
-                    "addon_unreachable",
-                    "SmartAgent add-on transactions unavailable",
-                )
+                _send_ws_failure(connection, msg["id"], "ws_get_transactions", "addon_unreachable", exc)
                 return
         if txns is None:
             txns = get_transactions_cache_snapshot(coord)
@@ -267,55 +310,11 @@ def build_smart_agent_websocket_commands(
         # P2 fix: 近30天截止日期（原代码误用了今天）
         cutoff_30 = (today - timedelta(days=30)).strftime("%Y-%m-%d")
 
-        def _fetch():
-            # P1 fix: 整体 try/except，避免任何 SQL 异常导致 WS 处理函数崩溃
-            try:
-                db = coord._db
-                # 今日 AI 推理次数（events 表 type=AI_Inference）
-                inf_rows = db.query(
-                    "SELECT COUNT(*) AS cnt FROM events WHERE type='AI_Inference' AND time >= ?",
-                    (today_str,),
-                )
-                today_inferences = inf_rows[0]["cnt"] if inf_rows else 0
-
-                # 今日用户修正次数（corrections 表 time 今日）
-                cor_rows = db.query(
-                    "SELECT COUNT(*) AS cnt FROM corrections WHERE time >= ?",
-                    (today_str,),
-                )
-                today_corrections = cor_rows[0]["cnt"] if cor_rows else 0
-
-                # 按房间统计推翻率（近 30 天）
-                room_inf = db.query(
-                    "SELECT area AS room, COUNT(*) AS cnt FROM events "
-                    "WHERE type='AI_Inference' AND area != '' AND time >= ? "
-                    "GROUP BY area ORDER BY cnt DESC LIMIT 10",
-                    (cutoff_30,),
-                )
-                # P3 fix: 移除 SELECT 中未使用的 c.entity_id（GROUP BY d.area 时返回值不确定）
-                room_cor = db.query(
-                    "SELECT d.area AS room, SUM(c.correction_count) AS corrections "
-                    "FROM corrections c "
-                    "LEFT JOIN devices d ON c.entity_id = d.entity_id "
-                    "WHERE c.time >= ? AND d.area != '' "
-                    "GROUP BY d.area",
-                    (cutoff_30,),
-                )
-                cor_map = {r["room"]: int(r.get("corrections") or 0) for r in room_cor if r.get("room")}
-                room_overturn_rates = []
-                for r in room_inf:
-                    room = r.get("room", "")
-                    infs = int(r.get("cnt") or 0)
-                    cors = cor_map.get(room, 0)
-                    rate = round(cors / infs * 100, 1) if infs > 0 else 0.0
-                    room_overturn_rates.append({"room": room, "inferences": infs, "corrections": cors, "rate": rate})
-
-                return today_inferences, today_corrections, room_overturn_rates
-            except Exception as _exc:
-                _LOGGER.warning("[DecisionStats] DB 查询失败: %s", _exc)
-                return 0, 0, []
-
-        ti, tc, rates = await hass.async_add_executor_job(_fetch)
+        try:
+            ti, tc, rates = await hass.async_add_executor_job(_read_decision_stats, coord._db, today_str, cutoff_30)
+        except Exception as exc:
+            _send_ws_failure(connection, msg["id"], "ws_get_decision_stats", "decision_stats_unavailable", exc)
+            return
 
         addon_diagnostics: dict[str, Any] = {}
         transaction_rows: list[dict[str, Any]] | None = None
@@ -375,8 +374,7 @@ def build_smart_agent_websocket_commands(
         try:
             result = await addon_client.get_behavior_patterns()
         except Exception as exc:
-            _LOGGER.warning("[WS] get_behavior_patterns add-on query failed: %s", exc)
-            connection.send_error(msg["id"], "addon_unreachable", str(exc))
+            _send_ws_failure(connection, msg["id"], "ws_get_behavior_patterns", "addon_unreachable", exc)
             return
         if not isinstance(result, dict):
             connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
@@ -457,8 +455,7 @@ def build_smart_agent_websocket_commands(
         try:
             stats = await addon_client.get_learning_stats()
         except Exception as _exc:
-            _LOGGER.warning("[WS] get_learning_stats add-on query failed: %s", _exc)
-            connection.send_error(msg["id"], "addon_unreachable", str(_exc))
+            _send_ws_failure(connection, msg["id"], "ws_get_learning_stats", "addon_unreachable", _exc)
             return
         if not isinstance(stats, dict):
             connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
@@ -501,7 +498,7 @@ def build_smart_agent_websocket_commands(
         try:
             # 查 DB 中的摄像头绑定记录
             def _db_query():
-                rows = coord._db.query("SELECT * FROM frigate_cameras ORDER BY created_at DESC")
+                rows = coord._db.query_required("SELECT * FROM frigate_cameras ORDER BY created_at DESC")
                 return [dict(r) for r in rows] if rows else []
 
             db_cameras = await hass.async_add_executor_job(_db_query)
@@ -529,8 +526,7 @@ def build_smart_agent_websocket_commands(
                 "config_path": config_path or "",
             })
         except Exception as _exc:
-            _LOGGER.warning("[WS] get_frigate_cameras 异常: %s", _exc)
-            connection.send_error(msg["id"], "query_error", str(_exc))
+            _send_ws_failure(connection, msg["id"], "ws_get_frigate_cameras", "query_error", _exc)
 
     # ── Frigate Zone 房间绑定 WS 接口 ──────────────────────────────────
     @websocket_api.websocket_command({
@@ -564,7 +560,7 @@ def build_smart_agent_websocket_commands(
 
             # 查 DB 中已绑定的 zone
             def _db_query():
-                rows = coord._db.query(
+                rows = coord._db.query_required(
                     "SELECT * FROM frigate_zones WHERE camera_id=?", (camera_id,)
                 )
                 return {r["zone_id"]: r for r in rows} if rows else {}
@@ -596,8 +592,7 @@ def build_smart_agent_websocket_commands(
 
             connection.send_result(msg["id"], {"zones": result, "camera_id": camera_id})
         except Exception as _exc:
-            _LOGGER.warning("[WS] get_frigate_zones 异常: %s", _exc)
-            connection.send_error(msg["id"], "query_error", str(_exc))
+            _send_ws_failure(connection, msg["id"], "ws_get_frigate_zones", "query_error", _exc)
 
     @websocket_api.websocket_command({
         vol.Required("type"): "smart_agent/save_frigate_zone",
@@ -690,8 +685,7 @@ def build_smart_agent_websocket_commands(
                 body={"entity_id": msg["entity_id"], "sensor_type": msg["sensor_type"]},
             )
         except Exception as exc:
-            _LOGGER.debug("[WebSocket] add-on sensor_type save failed: %s", exc)
-            connection.send_error(msg["id"], "addon_unreachable", "SmartAgent add-on is unavailable")
+            _send_ws_failure(connection, msg["id"], "ws_save_sensor_type", "addon_unreachable", exc)
             return
 
         if not isinstance(addon_response, dict):
@@ -746,8 +740,7 @@ def build_smart_agent_websocket_commands(
             connection.send_result(msg["id"], {"topology": rows})
         except Exception as exc:
             # add-on 读取失败不得伪造空成功，前端会误判为"无拓扑"。返回结构化错误供前端区分。
-            _LOGGER.debug("[Topology] add-on topology ws read failed: %s", exc)
-            connection.send_error(msg["id"], "addon_unreachable", "读取 add-on 房间拓扑失败")
+            _send_ws_failure(connection, msg["id"], "ws_get_room_topology", "addon_unreachable", exc)
 
     # ── 备份列表 WS ───────────────────────────────────────────────────────────
 
@@ -770,7 +763,7 @@ def build_smart_agent_websocket_commands(
                 backups = []
             connection.send_result(msg["id"], {"backups": backups})
         except Exception as e:
-            connection.send_error(msg["id"], "error", str(e))
+            _send_ws_failure(connection, msg["id"], "ws_list_backups", "error", e)
 
     @websocket_api.websocket_command({
         vol.Required("type"): "smart_agent/field_canary/operator_identity/attest",

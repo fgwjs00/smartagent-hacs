@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timezone
 from math import isfinite
 from typing import Any
+from collections.abc import Callable
 
 from .device_registry_identity import registry_metadata, registry_entry_matches
 
@@ -56,6 +57,16 @@ def is_presence_listener_entity(self, entity_id: str, info: dict[str, Any] | Non
     sensor_type = str(row.get("sensor_type") or row.get("presence_sensor_type") or "").strip().lower()
     return sensor_type in self._ACTIONABLE_SENSOR_TYPES
 
+def _read_live_presence_value(
+    host: Any, reader: Callable[..., Any], *args: Any, failure_code: str,
+) -> Any:
+    try:
+        return reader(*args)
+    except Exception as exc:
+        host._last_live_presence_guard_status["reason"] = failure_code
+        raise RuntimeError(failure_code) from exc
+
+
 def get_live_presence_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
     """Read current HA states for Core-authorized, fresh guard evidence."""
     self._last_live_presence_guard_status = {
@@ -65,10 +76,9 @@ def get_live_presence_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
     snapshot_getter = getattr(self, "get_presence_snapshot", None)
     if not callable(snapshot_getter):
         return {}
-    try:
-        snapshot = snapshot_getter()
-    except Exception:
-        return {}
+    snapshot = _read_live_presence_value(
+        self, snapshot_getter, failure_code="presence_live_snapshot_read_failed"
+    )
     rooms = snapshot.get("rooms") if isinstance(snapshot, dict) else None
     if not isinstance(rooms, dict):
         self._last_live_presence_guard_status["reason"] = "presence_rooms_unavailable"
@@ -185,10 +195,9 @@ def get_live_presence_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
                     continue
                 if age_secs > freshness_ttl_secs:
                     continue
-            try:
-                state_obj = get_state(entity_id)
-            except Exception:
-                state_obj = None
+            state_obj = _read_live_presence_value(
+                self, get_state, entity_id, failure_code="presence_live_state_read_failed"
+            )
             raw_state = str(
                 getattr(state_obj, "state", "") or ""
             ).strip().lower()

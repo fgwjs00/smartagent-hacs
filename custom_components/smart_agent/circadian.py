@@ -13,6 +13,8 @@ CircadianEngine — 昼夜节律引擎 (Phase 13.2)。
 """
 from __future__ import annotations
 
+from .timezone_support import configured_timezone as _circadian_timezone
+
 import logging
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -24,23 +26,6 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
-def _circadian_timezone(configured_timezone: str):
-    normalized_tz = configured_timezone.lower()
-    fixed_offset_hours = {
-        "asia/shanghai": 8,
-        "asia/chongqing": 8,
-        "asia/harbin": 8,
-        "asia/hong_kong": 8,
-        "hongkong": 8,
-        "prc": 8,
-        "utc": 0,
-    }.get(normalized_tz)
-    try:
-        return ZoneInfo(configured_timezone)
-    except ZoneInfoNotFoundError:
-        if fixed_offset_hours is not None:
-            return timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
-        raise
 
 # 房间修正系数：(亮度倍率, 色温偏移K)
 _ROOM_MODIFIERS: dict[str, tuple[float, int]] = {

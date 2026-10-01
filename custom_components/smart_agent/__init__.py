@@ -5,8 +5,10 @@ Proactive smart home AI: device triggers -> LLM inference -> actions.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import secrets
 import time
 from typing import Any
 from datetime import timedelta
@@ -41,6 +43,7 @@ from .dispatch_proof import (
     seal_loaded_source_identity as _seal_host_proof_loaded_source_identity,
 )
 from .host_dispatch_proof import dispatch_proof_secret_for_ha_request
+from .http_payloads import read_json_payload
 from .coordinator import SmartAgentCoordinator, _coerce_file_log_level
 from .config_update_service import apply_config_update_service
 from .admin_actor import is_current_human_admin, is_current_human_user
@@ -86,96 +89,33 @@ _LOADED_INTEGRATION_SOURCE_IDENTITY = _seal_host_proof_loaded_source_identity(
     "custom_components.smart_agent",
     __file__,
 )
-_SYSTEM_CPU_SNAPSHOT: tuple[int, int] | None = None
 
 
-def _clamp_percent(value: Any) -> float:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    if numeric != numeric or numeric < 0:
-        return 0.0
-    if numeric > 100:
-        return 100.0
-    return round(numeric, 1)
+from .host_resources import (
+    ProcResourceReader, clamp_percent as _clamp_percent,
+    cpu_percent_between as _cpu_percent_between,
+)
+
+
+_PROC_RESOURCE_READER = ProcResourceReader(
+    open_text=lambda *args, **kwargs: open(*args, **kwargs),
+    sleep=lambda seconds: time.sleep(seconds),
+    report=lambda location, error: _LOGGER.warning(
+        "resource metric unavailable location=%s error=%s", location, error
+    ),
+)
 
 
 def _read_proc_cpu_snapshot() -> tuple[int, int] | None:
-    try:
-        with open("/proc/stat", "r", encoding="utf-8") as fp:
-            line = fp.readline()
-    except OSError:
-        return None
-
-    parts = line.split()
-    if not parts or parts[0] != "cpu":
-        return None
-    try:
-        values = [int(item) for item in parts[1:]]
-    except ValueError:
-        return None
-    if len(values) < 4:
-        return None
-
-    idle = values[3] + (values[4] if len(values) > 4 else 0)
-    return sum(values), idle
-
-
-def _cpu_percent_between(before: tuple[int, int], after: tuple[int, int]) -> float | None:
-    total_delta = after[0] - before[0]
-    idle_delta = after[1] - before[1]
-    if total_delta <= 0 or idle_delta < 0:
-        return None
-    busy_delta = max(0, total_delta - idle_delta)
-    return _clamp_percent((busy_delta * 100.0) / total_delta)
+    return _PROC_RESOURCE_READER.read_cpu_snapshot()
 
 
 def _read_proc_cpu_percent() -> float | None:
-    global _SYSTEM_CPU_SNAPSHOT
-
-    current = _read_proc_cpu_snapshot()
-    if current is None:
-        return None
-
-    previous = _SYSTEM_CPU_SNAPSHOT
-    if previous is None:
-        time.sleep(0.05)
-        sampled = _read_proc_cpu_snapshot()
-        _SYSTEM_CPU_SNAPSHOT = sampled or current
-        if sampled is None:
-            return None
-        return _cpu_percent_between(current, sampled)
-
-    _SYSTEM_CPU_SNAPSHOT = current
-    return _cpu_percent_between(previous, current)
+    return _PROC_RESOURCE_READER.read_cpu_percent()
 
 
 def _read_proc_memory_percent() -> float | None:
-    fields: dict[str, float] = {}
-    try:
-        with open("/proc/meminfo", "r", encoding="utf-8") as fp:
-            for line in fp:
-                if ":" not in line:
-                    continue
-                key, raw_value = line.split(":", 1)
-                parts = raw_value.strip().split()
-                if not parts:
-                    continue
-                try:
-                    fields[key] = float(parts[0])
-                except ValueError:
-                    continue
-    except OSError:
-        return None
-
-    total = fields.get("MemTotal", 0.0)
-    available = fields.get("MemAvailable")
-    if available is None:
-        available = fields.get("MemFree", 0.0) + fields.get("Buffers", 0.0) + fields.get("Cached", 0.0)
-    if total <= 0 or available is None:
-        return None
-    return _clamp_percent(((total - available) * 100.0) / total)
+    return _PROC_RESOURCE_READER.read_memory_percent()
 
 
 def _ha_host_now_iso() -> str:
@@ -608,6 +548,14 @@ async def _refresh_coord_room_topology_cache(coord: Any) -> None:
             await result
 
 
+def _auth_backend_unavailable(operation: str, error: Exception) -> web.HTTPServiceUnavailable:
+    error_id = secrets.token_hex(12)
+    _LOGGER.error("operation=%s error_id=%s cause_type=%s", operation, error_id, type(error).__name__)
+    payload = _json_error_payload("authentication_unavailable", "unavailable", False,
+                                  operation=operation, error_id=error_id)
+    return web.HTTPServiceUnavailable(text=json.dumps(payload), content_type="application/json")
+
+
 async def _resolve_user_from_token(hass: HomeAssistant, token: str):
     token = str(token or "").strip()
     if not token:
@@ -616,8 +564,8 @@ async def _resolve_user_from_token(hass: HomeAssistant, token: str):
         return None
     try:
         refresh_token = await hass.auth.async_validate_access_token(token)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise _auth_backend_unavailable("auth.validate_access_token", exc) from exc
     if refresh_token is None:
         return None
 
@@ -627,8 +575,8 @@ async def _resolve_user_from_token(hass: HomeAssistant, token: str):
 
     try:
         return await hass.auth.async_get_user(uid)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise _auth_backend_unavailable("auth.resolve_token_user", exc) from exc
 
 
 async def _resolve_request_user(request: web.Request, *, allow_query_token: bool = False):
@@ -728,11 +676,22 @@ class SmartAgentAuthLoginView(HomeAssistantView):
         coord = _get_first_coordinator(hass)
 
         try:
-            body = await request.json()
-            if not isinstance(body, dict):
-                body = {}
-        except Exception:
-            body = {}
+            raw_body = await request.read()
+            body = json.loads(raw_body) if raw_body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False, operation="auth.login_body"),
+                status_code=400,
+            )
+        except web.HTTPException:
+            raise
+        except Exception as exc:
+            raise _auth_backend_unavailable("auth.login_body", exc) from exc
+        if not isinstance(body, dict):
+            return self.json(
+                _json_error_payload("invalid_json", "bad_request", False, operation="auth.login_body"),
+                status_code=400,
+            )
 
         user = request.get("hass_user")
         source_token = ""
@@ -818,8 +777,9 @@ class SmartAgentAuthLogoutView(HomeAssistantView):
         if session_token:
             sessions = _get_auth_sessions(hass)
             if session_token in sessions:
-                session_info = sessions.pop(session_token, None)
+                session_info = sessions[session_token]
                 await _async_revoke_auth_session_token(hass, session_token, session_info)
+                sessions.pop(session_token, None)
                 return self.json({"ok": True})
 
         user = await _resolve_request_user(request, allow_query_token=True)
@@ -1256,8 +1216,8 @@ class SmartAgentRoomsView(HomeAssistantView):
             return err
 
         try:
-            body = await request.json()
-        except Exception:
+            body = await read_json_payload(request, operation="rooms_create")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return self.json(
                 _json_error_payload("invalid_json", "bad_request", False, scope="rooms_create"),
                 status_code=400,
@@ -1354,8 +1314,8 @@ class SmartAgentRoomDetailView(HomeAssistantView):
         if (err := _view_admin_check(request)):
             return err
         try:
-            body = await request.json()
-        except Exception:
+            body = await read_json_payload(request, operation="rooms_rename")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return self.json(_json_error_payload("invalid_json", "bad_request", False, scope="rooms_rename"), status_code=400)
         if not isinstance(body, dict) or not str(body.get("name") or "").strip():
             return self.json(_json_error_payload("area_name_required", "bad_request", False, scope="rooms_rename"), status_code=400)
@@ -1452,8 +1412,8 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
             return err
 
         try:
-            body = await request.json()
-        except Exception:
+            body = await read_json_payload(request, operation="device_registry_sync")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return self.json(
                 _json_error_payload("invalid_json", "bad_request", False, scope="device_registry_sync"),
                 status_code=400,
@@ -1652,13 +1612,14 @@ class SmartAgentBackupsView(HomeAssistantView):
         coord = _get_first_coordinator(request.app["hass"])
         backup_mgr = getattr(coord, "_backup_manager", None) if coord is not None else None
         list_backups = getattr(backup_mgr, "list_backups", None)
-        if not callable(list_backups):
-            return self.json({"backups": [], "source": "ha_host_local"}, status_code=200)
-
         try:
+            if not callable(list_backups):
+                raise RuntimeError("backup_manager_unavailable")
             result = list_backups()
             if hasattr(result, "__await__"):
                 result = await result
+            if not isinstance(result, list):
+                raise TypeError("invalid_backup_inventory")
         except Exception as exc:
             _LOGGER.exception("[BackupsBridge] list backups failed: %s", exc)
             return self.json(
@@ -1704,8 +1665,8 @@ class SmartAgentBackupsActionView(HomeAssistantView):
             )
 
         try:
-            body = await request.json()
-        except Exception:
+            body = await read_json_payload(request, operation="backups_action")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return self.json(
                 _json_error_payload(
                     "invalid_json",
@@ -1998,8 +1959,7 @@ async def _async_revoke_auth_session_token(
     try:
         user = await hass.auth.async_get_user(user_id)
     except Exception as exc:
-        _LOGGER.debug("[Auth] logout refresh token lookup failed: %s", exc)
-        return
+        raise _auth_backend_unavailable("auth.logout_user_lookup", exc) from exc
     refresh_tokens = getattr(user, "refresh_tokens", {}) or {}
     refresh_token = refresh_tokens.get(refresh_token_id)
     if refresh_token is None:
@@ -2012,7 +1972,7 @@ async def _async_revoke_auth_session_token(
     try:
         await hass.auth.async_remove_refresh_token(refresh_token)
     except Exception as exc:
-        _LOGGER.debug("[Auth] logout refresh token revoke failed: %s", exc)
+        raise _auth_backend_unavailable("auth.logout_refresh_token_revoke", exc) from exc
 
 
 async def _async_cleanup_legacy_pair_tokens(hass: HomeAssistant) -> int:
@@ -2058,17 +2018,21 @@ async def _issue_auth_session(hass: HomeAssistant, user, source_token: str) -> s
             (t for t in getattr(user, "refresh_tokens", {}).values() if t.client_name == "SmartAgent 管理端会话"),
             None,
         )
-    except Exception:
-        refresh_token = None
+    except Exception as exc:
+        raise _auth_backend_unavailable("auth.session_refresh_token_lookup", exc) from exc
 
-    if refresh_token is None:
-        refresh_token = await hass.auth.async_create_refresh_token(
-            user,
-            client_name="SmartAgent 管理端会话",
-            access_token_expiration=timedelta(seconds=_AUTH_SESSION_TTL),
-        )
-
-    session_token = hass.auth.async_create_access_token(refresh_token)
+    operation = "auth.create_refresh_token"
+    try:
+        if refresh_token is None:
+            refresh_token = await hass.auth.async_create_refresh_token(
+                user,
+                client_name="SmartAgent 管理端会话",
+                access_token_expiration=timedelta(seconds=_AUTH_SESSION_TTL),
+            )
+        operation = "auth.create_access_token"
+        session_token = hass.auth.async_create_access_token(refresh_token)
+    except Exception as exc:
+        raise _auth_backend_unavailable(operation, exc) from exc
     sessions = _get_auth_sessions(hass)
     sessions[session_token] = {
         "user_id": getattr(user, "id", "") or "",
@@ -2096,8 +2060,8 @@ async def _resolve_user_by_auth_session(hass: HomeAssistant, session_token: str)
         return None
     try:
         return await hass.auth.async_get_user(uid)
-    except Exception:
-        return None
+    except Exception as exc:
+        raise _auth_backend_unavailable("auth.resolve_session_user", exc) from exc
 
 
 class SmartAgentDevicePairConfirmView(HomeAssistantView):
@@ -2116,10 +2080,10 @@ class SmartAgentDevicePairConfirmView(HomeAssistantView):
         coord = _get_first_coordinator(hass)
 
         try:
-            body = await request.json()
+            body = await read_json_payload(request, operation="pair_confirm")
             if not isinstance(body, dict):
                 body = {}
-        except Exception:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return self.json(
                 _json_error_payload("invalid_json", "bad_request", False),
                 status_code=400,

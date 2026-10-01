@@ -19,7 +19,11 @@ def _now_iso() -> str:
         from homeassistant.util import dt as dt_util
 
         return dt_util.now().isoformat()
-    except Exception:
+    except Exception as exc:
+        _LOGGER.warning(
+            "operation=InternalEventBridge._now_iso exception_type=%s fallback=utc",
+            type(exc).__name__,
+        )
         return datetime.now(UTC).isoformat()
 
 
@@ -69,8 +73,11 @@ class InternalEventBridge:
                     return value.strip()
                 if hasattr(value, "isoformat"):
                     return value.isoformat()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn(
+                    "operation=InternalEventBridge._default_ts "
+                    f"exception_type={type(exc).__name__} fallback=ha_clock",
+                )
         return _now_iso()
 
     def _next_seq(self) -> int:
@@ -81,7 +88,11 @@ class InternalEventBridge:
         method = getattr(self._addon_client, "post_internal_event", None)
         try:
             signature = inspect.signature(method)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            self._warn(
+                "operation=InternalEventBridge._client_accepts_envelope_headers "
+                f"exception_type={type(exc).__name__} fallback=envelope_headers",
+            )
             return True
         parameters = signature.parameters
         if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
@@ -91,8 +102,34 @@ class InternalEventBridge:
     def start(self) -> None:
         if self._worker_task and not self._worker_task.done():
             return
-        self._worker_task = asyncio.ensure_future(self._worker_loop())
-        self._monitor_task = asyncio.ensure_future(self._monitor_loop())
+        self._worker_task = self._create_task(self._worker_loop(), "worker")
+        try:
+            self._monitor_task = self._create_task(self._monitor_loop(), "monitor")
+        except BaseException:
+            self._worker_task.cancel()
+            self._worker_task = None
+            raise
+
+    def _create_task(self, coroutine: Any, kind: str, *, seq: int | None = None) -> asyncio.Task:
+        """A rejected task cannot leave its coroutine open or hide later failure."""
+        try:
+            task = asyncio.ensure_future(coroutine)
+        except BaseException:
+            coroutine.close()
+            raise
+        task.add_done_callback(lambda done: self._observe_task_result(done, kind, seq=seq))
+        return task
+
+    def _observe_task_result(self, task: asyncio.Task, kind: str, *, seq: int | None = None) -> None:
+        """Retrieve background failures without exposing their exception body."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._warn(
+                f"[P1] operation=InternalEventBridge._observe_task_result task={kind} "
+                f"seq={seq} exception_type={type(error).__name__} outcome=unknown",
+            )
 
     async def stop(self) -> None:
         tasks = [
@@ -139,13 +176,17 @@ class InternalEventBridge:
             try:
                 self._queue.put_nowait(item)
                 self._warn(
-                    f"[P1] internal event queue full; dropped oldest event "
+                    f"[P1] operation=InternalEventBridge.enqueue seq={item['seq']} "
+                    f"internal event queue full; dropped oldest event "
                     f"(dropped={self._dropped}, queued={self._queue.qsize()})"
                 )
                 return True
             except asyncio.QueueFull:
                 self._dropped += 1
-                self._warn("[P1] internal event queue full; failed to enqueue latest event")
+                self._warn(
+                    f"[P1] operation=InternalEventBridge.enqueue seq={item['seq']} "
+                    "internal event queue full; failed to enqueue latest event",
+                )
                 return False
 
     async def _worker_loop(self) -> None:
@@ -157,15 +198,34 @@ class InternalEventBridge:
                     self._posted += 1
                 else:
                     self._failed += 1
+                    self._warn(
+                        f"[P1] operation=InternalEventBridge._worker_loop seq={item['seq']} "
+                        f"attempts={item['attempts']} error=unconfirmed_persistence",
+                    )
                     self._schedule_retry(item)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self._failed += 1
-                self._warn(f"[P1] internal event post failed: {exc}")
+                self._warn(
+                    f"[P1] operation=InternalEventBridge._worker_loop seq={item['seq']} "
+                    f"attempts={item['attempts']} exception_type={type(exc).__name__}",
+                )
                 self._schedule_retry(item)
             finally:
                 self._queue.task_done()
+
+    @staticmethod
+    def _persistence_http_status(result: dict[str, Any]) -> int:
+        """Reject malformed transport status; missing legacy status still means 200."""
+        raw = result.get("__status", result.get("status", 200))
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            return 502
+        try:
+            status = int(raw)
+        except ValueError:
+            return 502
+        return status if 200 <= status < 300 or 400 <= status < 600 else 502
 
     @staticmethod
     def _normalize_persistence_receipt(
@@ -179,12 +239,15 @@ class InternalEventBridge:
             if isinstance(nested_receipt, dict)
             else dict(result)
         )
-        if result.get("ok") is False:
+        if any(
+            layer.get(flag, True) is not True
+            for layer in (result, nested_receipt) if isinstance(layer, dict)
+            for flag in ("ok", "committed", "persistence_confirmed")
+        ):
             receipt["ok"] = False
-        try:
-            status = int(result.get("__status") or result.get("status") or 200)
-        except (TypeError, ValueError):
-            status = 502
+        status = InternalEventBridge._persistence_http_status(result)
+        if status >= 400 or receipt.get("ok") is not True:
+            receipt.pop("persistence_confirmed", None)
         return receipt, status
 
 
@@ -235,7 +298,15 @@ class InternalEventBridge:
             await asyncio.sleep(min(30.0, float(attempts)))
             self._enqueue_retry_item(item)
 
-        task = asyncio.ensure_future(_requeue_after_delay())
+        try:
+            task = self._create_task(_requeue_after_delay(), "retry", seq=item["seq"])
+        except Exception as exc:
+            self._dropped += 1
+            self._warn(
+                f"[P1] operation=InternalEventBridge._schedule_retry seq={item['seq']} "
+                f"exception_type={type(exc).__name__} outcome=not_scheduled",
+            )
+            return
         self._retry_tasks.add(task)
         task.add_done_callback(self._retry_tasks.discard)
 
@@ -252,12 +323,16 @@ class InternalEventBridge:
             try:
                 self._queue.put_nowait(item)
                 self._warn(
-                    f"[P1] internal event queue full; dropped oldest event "
+                    f"[P1] operation=InternalEventBridge._enqueue_retry_item seq={item['seq']} "
+                    f"internal event queue full; dropped oldest event "
                     f"(dropped={self._dropped}, queued={self._queue.qsize()})"
                 )
             except asyncio.QueueFull:
                 self._dropped += 1
-                self._warn("[P1] internal event queue full; failed to enqueue retry event")
+                self._warn(
+                    f"[P1] operation=InternalEventBridge._enqueue_retry_item seq={item['seq']} "
+                    "internal event queue full; failed to enqueue retry event",
+                )
 
     async def _monitor_loop(self) -> None:
         while True:
@@ -271,6 +346,9 @@ class InternalEventBridge:
             try:
                 self._log_callback("WARN", message)
                 return
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.warning(
+                    "operation=InternalEventBridge._warn exception_type=%s fallback=logger",
+                    type(exc).__name__,
+                )
         _LOGGER.warning(message)

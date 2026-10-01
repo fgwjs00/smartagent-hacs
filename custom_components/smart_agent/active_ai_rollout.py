@@ -6,7 +6,7 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
-from .action_normalization import action_domain
+from .action_normalization import action_domain, action_entity_id
 
 
 # Owner-facing modes are off/shadow/active.  Canary remains an internal rollout
@@ -527,3 +527,12 @@ def evaluate_active_ai_execution_gate(
         action_space_ids=action_space_ids,
         action_entity_ids=action_entity_ids,
     )
+
+
+def blocked_rollout_actions(actions: Iterable[Any], blocked_entity_ids: set[str]) -> list[dict[str, Any]]:
+    """Project rejected candidates without changing their original action fields."""
+    return [
+        {**action, "status": "blocked_by_rollout", "reason": "active_ai_canary_entity_not_allowed"}
+        for action in actions
+        if isinstance(action, dict) and action_entity_id(action).lower() in blocked_entity_ids
+    ]

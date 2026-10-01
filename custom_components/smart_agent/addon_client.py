@@ -62,7 +62,11 @@ def derive_addon_gateway_base_url(ha_url: str, gateway_port: int = _DEFAULT_ADDO
         return ""
     try:
         parsed = urlsplit(raw)
-    except ValueError:
+    except ValueError as exc:
+        _LOGGER.warning(
+            "[AddOnClient] URL suggestion failed operation=derive_addon_gateway_base_url "
+            "field=ha_url exception_type=%s", type(exc).__name__,
+        )
         return ""
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return ""
@@ -78,6 +82,34 @@ _INFER_TIMEOUT = aiohttp.ClientTimeout(total=140)
 # 可用性检查缓存有效期（秒）：成功=60s，失败=10s（快速重试）
 _AVAIL_CACHE_OK = 60.0
 _AVAIL_CACHE_FAIL = 10.0
+
+
+class AddOnResponseError(ValueError):
+    """A received response is unusable; its body must never become diagnostics."""
+
+    def __init__(self, operation: str, reason: str, status: int, request_id: str) -> None:
+        self.result = {
+            "ok": False, "error": "addon_response_invalid", "error_type": "invalid_response",
+            "retryable": False, "__status": status if status >= 400 else 502,
+            "details": {"operation": operation, "stage": "response_decode", "reason": reason,
+                        "upstream_status": status, "request_id": request_id},
+        }
+        super().__init__(f"addon_response_invalid operation={operation} reason={reason} "
+                         f"upstream_status={status} request_id={request_id}")
+
+
+def build_status_read_failure(exc: Exception, *, operation: str) -> dict[str, Any]:
+    """Describe a health read failure without exposing exception bodies."""
+    if isinstance(exc, AddOnResponseError):
+        return dict(exc.result)
+    unreachable = AddOnClient._is_fallback_exception(exc)
+    return {
+        "ok": False,
+        "error": "addon_unreachable" if unreachable else "status_read_failed",
+        "error_type": "dependency_unreachable" if unreachable else "client_exception",
+        "retryable": unreachable, "__status": 502 if unreachable else 500,
+        "details": {"operation": operation, "exception_type": type(exc).__name__},
+    }
 
 
 class AddOnClient:
@@ -239,7 +271,10 @@ class AddOnClient:
         out = str(text or "")
         try:
             structured = json.loads(out)
-
+        except json.JSONDecodeError:
+            # Ordinary text is expected here; the redaction rules below still run.
+            pass
+        else:
             def redact(value: Any) -> Any:
                 if isinstance(value, dict):
                     result: dict[str, Any] = {}
@@ -256,8 +291,6 @@ class AddOnClient:
                 return value
 
             out = json.dumps(redact(structured), ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
         if self._auth_token and self._auth_token in out:
             token_mask = "***" if len(self._auth_token) <= 16 else self._auth_token[:4] + "***" + self._auth_token[-4:]
             out = out.replace(self._auth_token, token_mask)
@@ -299,25 +332,81 @@ class AddOnClient:
         result["__status"] = status
         return result
 
-    def _build_client_exception_result(self, exc: Exception) -> dict[str, Any]:
+    def _build_client_exception_result(
+        self, exc: Exception, *, operation: str, request_id: str = "",
+    ) -> dict[str, Any]:
         """构造客户端内部异常的结构化结果。"""
         return {
             "ok": False,
-            "error": self._redact_sensitive(str(exc) or exc.__class__.__name__),
+            "error": "addon_client_failed",
             "error_type": "client_exception",
             "retryable": False,
             "__status": 500,
+            "details": {"operation": operation, "exception_type": type(exc).__name__, "request_id": request_id},
         }
 
-    def _is_fallback_exception(self, exc: Exception) -> bool:
+    @staticmethod
+    def _is_fallback_exception(exc: Exception) -> bool:
         """仅网络不可达/超时异常允许走回退。"""
         return isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError))
 
-    def _handle_request_exception(self, exc: Exception) -> dict[str, Any] | None:
+    def _handle_request_failure(
+        self, exc: Exception, *, operation: str, request_id: str = "",
+    ) -> dict[str, Any] | None:
         """统一异常处理：网络异常回退，其他异常结构化上报。"""
+        if isinstance(exc, AddOnResponseError):
+            _LOGGER.warning("[AddOnClient] %s", exc)
+            return dict(exc.result)
+        request_id = self._redact_sensitive(request_id).replace("\r", "").replace("\n", "")
+        _LOGGER.warning(
+            "[AddOnClient] request failed operation=%s request_id=%s exception_type=%s",
+            operation, request_id, type(exc).__name__,
+        )
         if self._is_fallback_exception(exc):
             return None
-        return self._build_client_exception_result(exc)
+        return self._build_client_exception_result(exc, operation=operation, request_id=request_id)
+
+    def _response_error(
+        self, response: aiohttp.ClientResponse, operation: str, reason: str,
+    ) -> AddOnResponseError:
+        """Locate invalid responses without including credentials or body contents."""
+        info = getattr(response, "request_info", None)
+        headers = getattr(info, "headers", {})
+        request_id = self._redact_sensitive(str(headers.get("X-Request-ID") or self._new_request_id()))
+        return AddOnResponseError(operation, reason, int(response.status), request_id)
+
+    async def _read_response_json(
+        self, response: aiohttp.ClientResponse, *, operation: str,
+        expected: tuple[type, ...] = (dict,), **json_options: Any,
+    ) -> Any:
+        """Decode once; preserve transport cancellation and reject corrupt receipts."""
+        try:
+            data = await response.json(**json_options)
+        except (json.JSONDecodeError, UnicodeDecodeError, aiohttp.ContentTypeError,
+                aiohttp.ClientPayloadError) as exc:
+            raise self._response_error(response, operation, "invalid_json") from exc
+        if not isinstance(data, expected):
+            raise self._response_error(response, operation, "unexpected_body_type")
+        return data
+
+    async def _read_response_collection(
+        self, response: aiohttp.ClientResponse, *, operation: str, wrapped: bool = False,
+        item_type: type = dict, expected: tuple[type, ...] = (dict, list), **json_options: Any,
+    ) -> list[Any] | dict[str, Any]:
+        """Validate the complete collection before any consumer replaces its snapshot."""
+        data = await self._read_response_json(response, operation=operation, expected=expected, **json_options)
+        if response.status != 200:
+            return self._build_status_result(response.status, data)
+        if isinstance(data, dict):
+            if not wrapped or "data" not in data or data.get("ok") is False or data.get("error"):
+                return self._build_status_result(response.status, data)
+            data = data["data"]
+        if not isinstance(data, list):
+            raise self._response_error(response, operation, "collection_required")
+        for index, item in enumerate(data):
+            if not isinstance(item, item_type):
+                raise self._response_error(response, operation, f"invalid_collection_item[{index}]")
+        return list(data)
 
     async def _get_session(self, timeout: aiohttp.ClientTimeout | None = None) -> aiohttp.ClientSession:
         """获取（或创建）共享 HTTP Session。
@@ -341,6 +430,7 @@ class AddOnClient:
         timeout: aiohttp.ClientTimeout | None = None,
         extra_headers: dict[str, str] | None = None,
         request_id: str | None = None,
+        expected_body_types: tuple[type, ...] = (dict, list),
     ) -> dict[str, Any] | None:
         """统一 JSON 请求能力，返回 status_code + body 供上层状态码感知透传。"""
         m = str(method or "GET").upper()
@@ -357,17 +447,13 @@ class AddOnClient:
         try:
             session = await self._get_session()
             async with session.request(m, f"{self._base}{p}", **kwargs) as resp:
-                try:
-                    payload = await resp.json(content_type=None)
-                except Exception:
-                    payload = {}
+                payload = await self._read_response_json(resp, operation="AddOnClient.request_json", expected=expected_body_types, content_type=None)
                 return {
                     "status_code": int(resp.status),
                     "body": payload if isinstance(payload, (dict, list)) else {},
                 }
         except Exception as exc:
-            _LOGGER.debug("[AddOnClient] request_json failed: %s", self._redact_sensitive(str(exc)))
-            handled = self._handle_request_exception(exc)
+            handled = self._handle_request_failure(exc, operation="AddOnClient.request_json", request_id=normalized_request_id)
             if isinstance(handled, dict):
                 return {
                     "status_code": int(handled.get("__status", 500) or 500),
@@ -400,7 +486,7 @@ class AddOnClient:
             "POST",
             "/decision/fast-path",
             body=payload,
-            request_id=normalized_request_id,
+            request_id=normalized_request_id, expected_body_types=(dict,)
         )
         if not isinstance(result, dict):
             return None
@@ -431,7 +517,7 @@ class AddOnClient:
                 "attempt_id": normalized_attempt_id,
                 "outcome": str(outcome or "").strip(),
             },
-            request_id=normalized_attempt_id or None,
+            request_id=normalized_attempt_id or None, expected_body_types=(dict,)
         )
         if not isinstance(result, dict):
             return None
@@ -473,7 +559,7 @@ class AddOnClient:
             body=payload,
             timeout=_INFER_TIMEOUT,
             extra_headers=operator_headers,
-            request_id=normalized_request_id,
+            request_id=normalized_request_id, expected_body_types=(dict,)
         )
         if not isinstance(result, dict):
             return None
@@ -503,7 +589,7 @@ class AddOnClient:
             "/ha/execute",
             body=body,
             timeout=aiohttp.ClientTimeout(total=25),
-            request_id=request_id,
+            request_id=request_id, expected_body_types=(dict,)
         )
         if not isinstance(result, dict):
             return None
@@ -543,13 +629,10 @@ class AddOnClient:
                 headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_internal_event", expected=(dict,), content_type=None)
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_internal_event", request_id=headers["X-Request-ID"])
 
     async def is_available(self) -> bool:
         """检查 Add-on 是否在线（带缓存，避免每次推理都发 HTTP 请求）。
@@ -571,7 +654,11 @@ class AddOnClient:
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 result = resp.status == 200
-        except Exception:
+        except Exception as exc:
+            _LOGGER.warning(
+                "[AddOnClient] health check failed operation=AddOnClient.is_available "
+                "check_at=%s exception_type=%s", now, type(exc).__name__,
+            )
             result = False
 
         self._avail_cache = result
@@ -580,100 +667,80 @@ class AddOnClient:
 
     async def get_capabilities(self) -> dict[str, Any] | None:
         """Fetch Add-on Gateway capabilities, returning None on network failure only."""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/capabilities",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_capabilities", expected=(dict,))
                     return data if isinstance(data, dict) else None
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_capabilities", expected=(dict,))
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_capabilities", request_id=headers["X-Request-ID"])
 
     async def get_core_status(self) -> dict[str, Any] | None:
         """Fetch Add-on Core migration status, returning None on network/endpoint-missing failure."""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/core/status",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_core_status", expected=(dict,))
                     return data if isinstance(data, dict) else None
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_core_status", expected=(dict,))
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_core_status", request_id=headers["X-Request-ID"])
 
     async def get_addon_system_status(self) -> dict[str, Any] | None:
         """Fetch Add-on system status, returning None on network/endpoint-missing failure."""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/addon/system-status",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_addon_system_status", expected=(dict,))
                     return data if isinstance(data, dict) else None
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_addon_system_status", expected=(dict,))
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_addon_system_status", request_id=headers["X-Request-ID"])
 
     async def get_log_dates(self) -> list[str] | dict[str, Any] | None:
         """获取日志日期列表（优先 add-on canonical 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/logs/dates",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    data = []
-                if resp.status == 200:
-                    if isinstance(data, list):
-                        return [str(x) for x in data]
-                    return {
-                        "ok": False,
-                        "error": "invalid_response_body",
-                        "error_type": "invalid_response",
-                        "retryable": False,
-                        "__status": 502,
-                    }
-                if resp.status in (404, 405):
-                    return self._build_status_result(resp.status, data)
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_log_dates", item_type=str,
+                    expected=((list,) if resp.status == 200 else (dict,)), content_type=None,
+                )
         except Exception as exc:
-            if self._is_fallback_exception(exc):
-                return None
-            return self._build_client_exception_result(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_log_dates", request_id=headers["X-Request-ID"])
 
     async def get_log_content(
         self,
@@ -710,247 +777,214 @@ class AddOnClient:
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_log_content", expected=(dict,))
                     return self._build_status_result(resp.status, data)
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_log_content", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_log_content", request_id=headers["X-Request-ID"])
         return None
 
     async def get_log_info(self) -> dict[str, Any] | None:
         """读取日志元信息（优先 add-on canonical 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/logs/info",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_log_info", expected=(dict,))
                     return self._build_status_result(resp.status, data)
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_log_info", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_log_info", request_id=headers["X-Request-ID"])
         return None
 
     async def get_scene_yaml_export(self, scene_id: int) -> dict[str, Any] | None:
         """读取场景 YAML 导出（优先 add-on canonical 服务面）。"""
         sid = int(scene_id)
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/scenes/export-yaml",
                 params={"scene_id": sid},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_scene_yaml_export", expected=(dict,))
                     return self._build_status_result(resp.status, data)
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_scene_yaml_export", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_scene_yaml_export", request_id=headers["X-Request-ID"])
         return None
 
     async def post_scene_yaml_export(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """写入场景 YAML 导出（优先 add-on root-base 服务面）。"""
         payload = body if isinstance(body, dict) else {}
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/scenes/export-yaml",
                 json=payload,
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_scene_yaml_export", expected=(dict,))
                     return self._build_status_result(resp.status, data)
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_scene_yaml_export", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_scene_yaml_export", request_id=headers["X-Request-ID"])
         return None
 
     async def post_auth_login(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """登录（优先 add-on 服务面）。"""
         payload = body if isinstance(body, dict) else {}
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/auth/login",
                 json=payload,
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_auth_login", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_auth_login", request_id=headers["X-Request-ID"])
         return None
 
     async def get_auth_me(self, token: str = "") -> dict[str, Any] | None:
         """读取当前会话用户信息（优先 add-on 服务面）。"""
         _ = token
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/auth/me",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_auth_me", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_auth_me", request_id=headers["X-Request-ID"])
         return None
 
     async def post_auth_logout(self, token: str = "") -> dict[str, Any] | None:
         """退出登录（优先 add-on 服务面）。"""
         _ = token
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/auth/logout",
                 json={},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_auth_logout", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_auth_logout", request_id=headers["X-Request-ID"])
         return None
 
     async def post_pair_start(self) -> dict[str, Any] | None:
         """触发配对开始（优先 add-on 服务面）。"""
         for path in ("/device/pair/start",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json={},
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_pair_start", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_pair_start", request_id=headers["X-Request-ID"])
         return None
 
     async def post_pair_confirm(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """提交配对确认（优先 add-on 服务面）。"""
         payload = body if isinstance(body, dict) else {}
         for path in ("/device/pair/confirm",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_pair_confirm", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_pair_confirm", request_id=headers["X-Request-ID"])
         return None
 
     async def post_voice_interrupt(self) -> dict[str, Any] | None:
         """触发语音中断（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/voice/interrupt",
                 json={},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_voice_interrupt", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 if 200 <= resp.status < 300 and "status" not in result:
                     result["status"] = "interrupted"
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_voice_interrupt", request_id=headers["X-Request-ID"])
         return None
 
     async def get_status(self) -> dict[str, Any]:
@@ -963,31 +997,21 @@ class AddOnClient:
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
-                    return await resp.json()
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                    return await self._read_response_json(resp, operation="AddOnClient.get_status", expected=(dict,))
+                data = await self._read_response_json(resp, operation="AddOnClient.get_status", expected=(dict,))
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            _LOGGER.warning("[AddOnClient] get_status failed: %s", self._redact_sensitive(str(exc)))
-            handled = self._handle_request_exception(exc)
-            if isinstance(handled, dict):
-                return handled
-            return self._build_status_result(
-                502,
-                {
-                    "ok": False,
-                    "error": "addon_unreachable",
-                    "error_type": "dependency_unreachable",
-                    "retryable": True,
-                },
+            failure = build_status_read_failure(exc, operation="AddOnClient.get_status")
+            _LOGGER.warning(
+                "[AddOnClient] get_status failed operation=AddOnClient.get_status exception_type=%s request_id=%s",
+                type(exc).__name__, failure.get("details", {}).get("request_id", ""),
             )
+            return failure
         return {}
 
     async def get_system_status(self) -> dict[str, Any]:
         """获取系统状态，禁止用旧 /status 伪造健康态。"""
-        result = await self.request_json("GET", "/system/status")
+        result = await self.request_json("GET", "/system/status", expected_body_types=(dict,))
         if isinstance(result, dict):
             status = int(result.get("status_code", 0) or 0)
             body = result.get("body")
@@ -1007,31 +1031,24 @@ class AddOnClient:
 
     async def get_dashboard_summary(self) -> dict[str, Any]:
         """获取仪表盘摘要（优先 /dashboard/summary）。"""
-        result = await self.request_json("GET", "/dashboard/summary")
-        if isinstance(result, dict):
+        for path in ("/dashboard/summary", "/addon/dashboard-summary"):
+            result = await self.request_json("GET", path, expected_body_types=(dict,))
+            if not isinstance(result, dict):
+                return self._build_status_result(502, {
+                    "ok": False, "error": "addon_unreachable",
+                    "error_type": "dependency_unreachable", "retryable": True,
+                })
             status = int(result.get("status_code", 0) or 0)
             body = result.get("body")
             if status == 200 and isinstance(body, dict):
                 return body
-            if status in (404, 405):
-                pass
-            else:
+            if status not in (404, 405):
                 return self._build_status_result(status, body)
-
-        legacy_result = await self.request_json("GET", "/addon/dashboard-summary")
-        if isinstance(legacy_result, dict):
-            status = int(legacy_result.get("status_code", 0) or 0)
-            body = legacy_result.get("body")
-            if status == 200 and isinstance(body, dict):
-                return body
-            if status in (404, 405):
-                pass
-            else:
-                return self._build_status_result(status, body)
-
         legacy = await self.get_status()
         if not isinstance(legacy, dict) or not legacy:
             return {}
+        if legacy.get("ok") is False or legacy.get("error") or legacy.get("error_type"):
+            return legacy
         return {
             "decisions_today": int(legacy.get("inference_count_today", 0) or 0),
             "addon_mode": legacy.get("mode", "unknown"),
@@ -1040,104 +1057,83 @@ class AddOnClient:
 
     async def get_devices(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取设备列表（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/devices",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
-                    if isinstance(data, dict) and isinstance(data.get("data"), list):
-                        return [x for x in data.get("data", []) if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_devices", wrapped=True,
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_devices", request_id=headers["X-Request-ID"])
         return None
 
     async def get_rooms(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取房间列表（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/rooms",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
-                    if isinstance(data, dict) and isinstance(data.get("data"), list):
-                        return [x for x in data.get("data", []) if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_rooms", wrapped=True,
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_rooms", request_id=headers["X-Request-ID"])
         return None
 
     async def discover_devices(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """发现设备（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/devices/discover",
                 json={},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.discover_devices",
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.discover_devices", request_id=headers["X-Request-ID"])
         return None
 
     async def batch_add_devices(self, entities: list[str]) -> dict[str, Any] | None:
         """批量纳管设备（优先 add-on 服务面）。"""
         payload = {"entities": [str(e).strip() for e in (entities or []) if str(e).strip()]}
         for path in ("/devices/batch-add",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.batch_add_devices", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.batch_add_devices", request_id=headers["X-Request-ID"])
         return None
 
     async def update_device(self, entity_id: str, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -1145,25 +1141,23 @@ class AddOnClient:
         eid = str(entity_id or "").strip()
         if not eid:
             return None
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.patch(
                 f"{self._base}/devices/{eid}",
                 json=body if isinstance(body, dict) else {},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.update_device", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.update_device", request_id=headers["X-Request-ID"])
         return None
 
     async def delete_device(self, entity_id: str) -> dict[str, Any] | None:
@@ -1171,158 +1165,139 @@ class AddOnClient:
         eid = str(entity_id or "").strip()
         if not eid:
             return None
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.delete(
                 f"{self._base}/devices/{eid}",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.delete_device", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.delete_device", request_id=headers["X-Request-ID"])
         return None
 
     async def sync_rooms(self) -> dict[str, Any] | None:
         """同步房间到 HA Area（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/rooms/sync",
                 json={},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.sync_rooms", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.sync_rooms", request_id=headers["X-Request-ID"])
         return None
 
     async def get_rooms_topology(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取房间拓扑（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/rooms/topology",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
-                    if isinstance(data, dict) and isinstance(data.get("data"), list):
-                        return [x for x in data.get("data", []) if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_rooms_topology", wrapped=True,
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_rooms_topology", request_id=headers["X-Request-ID"])
         return None
 
     async def save_rooms_topology(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Save room topology into the add-on canonical projection."""
         body = body if isinstance(body, dict) else {}
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/rooms/topology",
                 json=body,
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.save_rooms_topology", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.save_rooms_topology", request_id=headers["X-Request-ID"])
         return None
 
     async def get_learning_stats(self) -> dict[str, Any] | None:
         """获取学习统计（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/learning/stats",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_learning_stats", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_learning_stats", request_id=headers["X-Request-ID"])
         return None
 
     async def get_behavior_patterns(self) -> dict[str, Any] | None:
         """Read canonical behavior patterns from the add-on."""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/behavior-patterns",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_behavior_patterns", expected=(dict,))
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_behavior_patterns", request_id=headers["X-Request-ID"])
         return None
 
     async def get_backup_events(self) -> dict[str, Any] | None:
         """Read the canonical 30-day event slice used by full backups."""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/events/recent",
                 params={"view": "backup", "limit": 5000, "hours": 720},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_backup_events", expected=(dict,))
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_backup_events", request_id=headers["X-Request-ID"])
         return None
 
     async def post_behavior_pattern_action(self, pattern_id: int, action: str) -> dict[str, Any] | None:
@@ -1330,48 +1305,41 @@ class AddOnClient:
         normalized = str(action or "").strip().lower()
         if normalized not in {"delete", "archive", "promote-habit", "promote-rule"}:
             normalized = "archive"
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/behavior-patterns/{int(pattern_id)}/{normalized}",
                 json={},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_behavior_pattern_action", expected=(dict,))
                 return self._build_status_result(resp.status, data)
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_behavior_pattern_action", request_id=headers["X-Request-ID"])
         return None
 
     async def get_ai_scenes(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取 AI 场景列表（优先 add-on 服务面）。"""
         for path in ("/ai-scenes",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list):
-                            return [x for x in data if isinstance(x, dict)]
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
-                    return self._build_status_result(resp.status, data)
+                    return await self._read_response_collection(
+                        resp, operation="AddOnClient.get_ai_scenes",
+                    )
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.get_ai_scenes", request_id=headers["X-Request-ID"])
         return None
 
     async def post_ai_scene_action(self, action: str, scene_id: int) -> dict[str, Any] | None:
@@ -1382,25 +1350,23 @@ class AddOnClient:
         ]
         payload = {"id": int(scene_id)}
         for path in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_ai_scene_action", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_ai_scene_action", request_id=headers["X-Request-ID"])
         return None
 
     async def trigger_ai_scene(self, scene_id: int) -> dict[str, Any] | None:
@@ -1410,20 +1376,18 @@ class AddOnClient:
             (f"/ai-scenes/{sid}/trigger", None),
         ]
         for path, payload in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.trigger_ai_scene", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "id": sid}
                     result.setdefault("id", sid)
                     if resp.status >= 400:
@@ -1433,32 +1397,26 @@ class AddOnClient:
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                _LOGGER.debug("[AddOnClient] trigger_ai_scene exception: %s", self._redact_sensitive(str(exc)))
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.trigger_ai_scene", request_id=headers["X-Request-ID"])
         return None
 
     async def get_transactions(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取事务列表（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/transactions",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_transactions",
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_transactions", request_id=headers["X-Request-ID"])
         return None
 
     async def get_decision_trace_detail(self, txn_id: int | str) -> dict[str, Any] | None:
@@ -1467,19 +1425,17 @@ class AddOnClient:
         if not tid:
             return None
         encoded_tid = quote(tid, safe="")
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/decision-trace/{encoded_tid}",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_decision_trace_detail", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 if resp.status >= 400:
                     result.setdefault("error", f"http_{resp.status}")
@@ -1488,8 +1444,7 @@ class AddOnClient:
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            _LOGGER.debug("[AddOnClient] get_decision_trace_detail exception: %s", self._redact_sensitive(str(exc)))
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_decision_trace_detail", request_id=headers["X-Request-ID"])
 
     async def rollback_transaction(self, txn_id: int) -> dict[str, Any] | None:
         """回滚事务（优先 add-on 服务面）。"""
@@ -1498,20 +1453,18 @@ class AddOnClient:
             (f"/transactions/{tid}/rollback", None),
         ]
         for path, payload in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.rollback_transaction", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "id": tid}
                     result.setdefault("id", tid)
                     if resp.status >= 400:
@@ -1521,81 +1474,65 @@ class AddOnClient:
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                _LOGGER.debug("[AddOnClient] rollback_transaction exception: %s", self._redact_sensitive(str(exc)))
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.rollback_transaction", request_id=headers["X-Request-ID"])
         return None
 
     async def get_memory_profiles(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取画像列表（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/memory/profiles",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_memory_profiles",
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_memory_profiles", request_id=headers["X-Request-ID"])
         return None
 
     async def get_memory_habits(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取习惯列表（优先 add-on 服务面）。"""
         for path in ("/memory/habits",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list):
-                            return [x for x in data if isinstance(x, dict)]
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
-                    return self._build_status_result(resp.status, data)
+                    return await self._read_response_collection(
+                        resp, operation="AddOnClient.get_memory_habits",
+                    )
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.get_memory_habits", request_id=headers["X-Request-ID"])
         return None
 
     async def get_corrections(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取纠错列表（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/corrections",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_corrections",
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_corrections", request_id=headers["X-Request-ID"])
         return None
 
     async def post_profile_action(self, action: str, content: str) -> dict[str, Any] | None:
@@ -1611,26 +1548,24 @@ class AddOnClient:
         ]
         payload = {"content": str(content or "").strip()}
         for path in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_profile_action", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "action": act}
                     result.setdefault("action", act)
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_profile_action", request_id=headers["X-Request-ID"])
         return None
 
     async def post_habit_action(self, action: str, content: str) -> dict[str, Any] | None:
@@ -1646,26 +1581,24 @@ class AddOnClient:
         ]
         payload = {"content": str(content or "").strip()}
         for path in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_habit_action", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "action": act}
                     result.setdefault("action", act)
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_habit_action", request_id=headers["X-Request-ID"])
         return None
 
     async def post_correction_action(self, action: str, entity_id: str | None) -> dict[str, Any] | None:
@@ -1681,96 +1614,85 @@ class AddOnClient:
         if eid:
             payload["entity_id"] = eid
         for path in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_correction_action", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "action": act}
                     result.setdefault("action", act)
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_correction_action", request_id=headers["X-Request-ID"])
         return None
 
     async def get_license_status(self) -> dict[str, Any] | None:
         """获取 License 状态（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/license/status",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_license_status", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_license_status", request_id=headers["X-Request-ID"])
         return None
 
     async def post_license_verify(self, license_key: str | None) -> dict[str, Any] | None:
         """验证 License（优先 add-on 服务面）。"""
         payload = {"license_key": str(license_key or "").strip()}
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/license/verify",
                 json=payload,
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_license_verify", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_license_verify", request_id=headers["X-Request-ID"])
         return None
 
     async def get_backups(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取备份列表（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/backups",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_backups",
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_backups", request_id=headers["X-Request-ID"])
         return None
 
     async def post_backup_action(self, action: str, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -1778,48 +1700,44 @@ class AddOnClient:
         act = str(action or "").strip().lower()
         if act not in ("create", "restore", "delete"):
             return None
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/backups/{act}",
                 json=body,
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_backup_action", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_backup_action", request_id=headers["X-Request-ID"])
         return None
 
     async def post_patrol_trigger(self, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """触发巡检（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/patrol/trigger",
                 json=payload if isinstance(payload, dict) else {},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_patrol_trigger", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_patrol_trigger", request_id=headers["X-Request-ID"])
         return None
 
     async def _post_operations_action(
@@ -1827,7 +1745,7 @@ class AddOnClient:
         path: str,
         body: dict[str, Any],
     ) -> dict[str, Any] | None:
-        result = await self.request_json("POST", path, body=body, timeout=_HEALTH_TIMEOUT)
+        result = await self.request_json("POST", path, body=body, timeout=_HEALTH_TIMEOUT, expected_body_types=(dict,))
         if not isinstance(result, dict):
             return None
         status = int(result.get("status_code") or 0)
@@ -1850,7 +1768,7 @@ class AddOnClient:
         path: str,
         body: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        result = await self.request_json(method, path, body=body, timeout=_HEALTH_TIMEOUT)
+        result = await self.request_json(method, path, body=body, timeout=_HEALTH_TIMEOUT, expected_body_types=(dict,))
         if not isinstance(result, dict):
             return None
         status = int(result.get("status_code") or 0)
@@ -1936,7 +1854,7 @@ class AddOnClient:
             path,
             body=body,
             timeout=_HEALTH_TIMEOUT,
-            extra_headers=actor_headers,
+            extra_headers=actor_headers, expected_body_types=(dict,)
         )
         if not isinstance(result, dict):
             return None
@@ -2060,7 +1978,7 @@ class AddOnClient:
             path,
             body=body,
             timeout=_HEALTH_TIMEOUT,
-            extra_headers=actor_headers,
+            extra_headers=actor_headers, expected_body_types=(dict,)
         )
         if not isinstance(result, dict):
             return None
@@ -2089,7 +2007,11 @@ class AddOnClient:
             manifest_header = base64.urlsafe_b64encode(
                 json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).decode("ascii").rstrip("=")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            _LOGGER.warning(
+                "[AddOnClient] invalid firmware manifest operation=AddOnClient.upload_firmware_image "
+                "stage=manifest_encode exception_type=%s", type(exc).__name__,
+            )
             return {"ok": False, "error": "firmware_manifest_invalid", "__status": 400}
         headers = self._request_headers(self._signed_actor_headers("POST", path, actor))
         headers.update({"Content-Type": "application/octet-stream", "X-SA-Firmware-Manifest": manifest_header})
@@ -2098,16 +2020,12 @@ class AddOnClient:
             async with session.post(
                 f"{self._base}{path}", data=bytes(image), headers=headers, timeout=_HEALTH_TIMEOUT
             ) as resp:
-                try:
-                    payload = await resp.json(content_type=None)
-                except Exception:
-                    payload = {}
+                payload = await self._read_response_json(resp, operation="AddOnClient.upload_firmware_image", expected=(dict,), content_type=None)
                 response = dict(payload) if isinstance(payload, dict) else {"ok": 200 <= resp.status < 300}
                 response["__status"] = int(resp.status)
                 return response
         except Exception as exc:
-            _LOGGER.debug("[AddOnClient] firmware upload failed: %s", self._redact_sensitive(str(exc)))
-            handled = self._handle_request_exception(exc)
+            handled = self._handle_request_failure(exc, operation="AddOnClient.upload_firmware_image", request_id=headers["X-Request-ID"])
             return handled if isinstance(handled, dict) else None
 
     async def get_device_firmware(self, entity_id: str) -> dict[str, Any] | None:
@@ -2150,26 +2068,21 @@ class AddOnClient:
 
     async def get_energy(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取能耗统计（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/energy",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        return [x for x in data if isinstance(x, dict)]
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                return self._build_status_result(resp.status, data)
+                return await self._read_response_collection(
+                    resp, operation="AddOnClient.get_energy",
+                )
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_energy", request_id=headers["X-Request-ID"])
         return None
 
     async def post_ai_scene_ops(self, path_suffix: str, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -2181,25 +2094,23 @@ class AddOnClient:
         }
         if suffix not in allowed:
             return None
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}/{suffix}",
                 json=body if isinstance(body, dict) else {},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_ai_scene_ops", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_ai_scene_ops", request_id=headers["X-Request-ID"])
         return None
 
     async def post_ai_scene_delete_fallback(self, scene_id: int) -> dict[str, Any] | None:
@@ -2209,74 +2120,65 @@ class AddOnClient:
             (f"/ai-scenes/{sid}", {}),
         ]
         for path, payload in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_ai_scene_delete_fallback", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "id": sid}
                     result.setdefault("id", sid)
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_ai_scene_delete_fallback", request_id=headers["X-Request-ID"])
         return None
 
     async def post_ai_scene_archive(self, scene_id: int) -> dict[str, Any] | None:
         """归档场景（canonical /ai-scenes/{id}/archive）。"""
         sid = int(scene_id)
         path = f"/ai-scenes/{sid}/archive"
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.post(
                 f"{self._base}{path}",
                 json={"id": sid},
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.post_ai_scene_archive", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "id": sid}
                 result.setdefault("id", sid)
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.post_ai_scene_archive", request_id=headers["X-Request-ID"])
 
     async def get_vision_cameras(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取视觉摄像头列表（优先 add-on 服务面）。"""
         for path in ("/vision/cameras",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list):
-                            return [x for x in data if isinstance(x, dict)]
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
-                    return self._build_status_result(resp.status, data)
+                    return await self._read_response_collection(
+                        resp, operation="AddOnClient.get_vision_cameras",
+                    )
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.get_vision_cameras", request_id=headers["X-Request-ID"])
         return None
 
     async def post_vision_camera_action(self, action: str, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -2289,20 +2191,18 @@ class AddOnClient:
         ]
         payload = body if isinstance(body, dict) else {}
         for path in endpoints:
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_vision_camera_action", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300, "action": act}
                     result.setdefault("action", act)
                     if resp.status >= 400:
@@ -2312,154 +2212,138 @@ class AddOnClient:
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                _LOGGER.debug("[AddOnClient] post_vision_camera_action exception: %s", self._redact_sensitive(str(exc)))
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_vision_camera_action", request_id=headers["X-Request-ID"])
         return None
 
     async def get_vision_zones(self, camera_id: str) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取视觉 zones（优先 add-on 服务面）。"""
         payload = {"camera_id": str(camera_id or "").strip()}
         for path in ("/vision/zones",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list):
-                            return [x for x in data if isinstance(x, dict)]
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
-                    return self._build_status_result(resp.status, data)
+                    return await self._read_response_collection(
+                        resp, operation="AddOnClient.get_vision_zones",
+                    )
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.get_vision_zones", request_id=headers["X-Request-ID"])
         return None
 
     async def save_vision_zone(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """保存视觉 zone（优先 add-on 服务面）。"""
         payload = body if isinstance(body, dict) else {}
         for path in ("/vision/zones/save",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.save_vision_zone", expected=(dict,))
                     if resp.status == 200 and isinstance(data, dict):
                         return data
                     return self._build_status_result(resp.status, data)
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.save_vision_zone", request_id=headers["X-Request-ID"])
         return None
 
     async def get_system_brand(self) -> dict[str, Any] | None:
         """获取系统品牌信息（优先 add-on 服务面）。"""
+        headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
                 f"{self._base}/system/brand",
-                headers=self._request_headers(),
+                headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
+                data = await self._read_response_json(resp, operation="AddOnClient.get_system_brand", expected=(dict,))
                 result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                 result["__status"] = resp.status
                 return result
         except Exception as exc:
-            return self._handle_request_exception(exc)
+            return self._handle_request_failure(exc, operation="AddOnClient.get_system_brand", request_id=headers["X-Request-ID"])
         return None
 
     async def get_system_settings(self) -> dict[str, Any] | None:
         """读取系统设置（优先 add-on 服务面）。"""
         for path in ("/settings/system",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        data = await self._read_response_json(resp, operation="AddOnClient.get_system_settings", expected=(dict,))
                         if isinstance(data, dict):
                             return data
                         return self._build_status_result(resp.status, data)
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_system_settings", expected=(dict,))
                     return self._build_status_result(resp.status, data)
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.get_system_settings", request_id=headers["X-Request-ID"])
         return None
 
     async def post_system_settings(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """写入系统设置（优先 add-on 服务面）。"""
         payload = body if isinstance(body, dict) else {}
         for path in ("/settings/system",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        data = await self._read_response_json(resp, operation="AddOnClient.post_system_settings", expected=(dict,))
                         if isinstance(data, dict):
                             return data
                         return self._build_status_result(resp.status, data)
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_system_settings", expected=(dict,))
                     return self._build_status_result(resp.status, data)
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_system_settings", request_id=headers["X-Request-ID"])
         return None
 
     async def get_mcp_status(self) -> dict[str, Any] | None:
         """获取 MCP 状态（优先 add-on 服务面）。"""
         for path in ("/mcp/status",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_mcp_status", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                     if resp.status >= 400:
                         result.setdefault("error", f"http_{resp.status}")
@@ -2468,56 +2352,51 @@ class AddOnClient:
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                _LOGGER.debug("[AddOnClient] get_mcp_status exception: %s", self._redact_sensitive(str(exc)))
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.get_mcp_status", request_id=headers["X-Request-ID"])
         return None
 
     async def post_mcp_settings(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """写入 MCP 设置（优先 add-on 服务面）。"""
         payload = body if isinstance(body, dict) else {}
         for path in ("/mcp/settings",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        data = await self._read_response_json(resp, operation="AddOnClient.post_mcp_settings", expected=(dict,))
                         if isinstance(data, dict):
                             return data
                         return self._build_status_result(resp.status, data)
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_mcp_settings", expected=(dict,))
                     return self._build_status_result(resp.status, data)
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_mcp_settings", request_id=headers["X-Request-ID"])
         return None
 
     async def post_capability_dry_run(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """请求 capability dry-run 规划结果（仅建议，不执行）。"""
         payload = body if isinstance(body, dict) else {}
         for path in ("/capability/dry-run",):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.post(
                     f"{self._base}{path}",
                     json=payload,
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.post_capability_dry_run", expected=(dict,))
                     result = data if isinstance(data, dict) else {"ok": 200 <= resp.status < 300}
                     result.setdefault("ok", 200 <= resp.status < 300)
                     if resp.status >= 400:
@@ -2528,31 +2407,29 @@ class AddOnClient:
                     result["__status"] = resp.status
                     return result
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.post_capability_dry_run", request_id=headers["X-Request-ID"])
         return None
 
     async def get_diagnostics(self) -> dict[str, Any] | None:
         """获取 Add-on 诊断信息（优先 /system/diagnostics，兼容 /diagnostics）。"""
         for path in ("/system/diagnostics", "/diagnostics"):
+            headers = self._request_headers()
             try:
                 session = await self._get_session()
                 async with session.get(
                     f"{self._base}{path}",
-                    headers=self._request_headers(),
+                    headers=headers,
                     timeout=_HEALTH_TIMEOUT,
                 ) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        data = await self._read_response_json(resp, operation="AddOnClient.get_diagnostics", expected=(dict,))
                         return data if isinstance(data, dict) else {}
                     if resp.status in (404, 405):
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = {}
+                    data = await self._read_response_json(resp, operation="AddOnClient.get_diagnostics", expected=(dict,))
                     return self._build_status_result(resp.status, data)
             except Exception as exc:
-                return self._handle_request_exception(exc)
+                return self._handle_request_failure(exc, operation="AddOnClient.get_diagnostics", request_id=headers["X-Request-ID"])
         return {}
 
     async def close(self) -> None:

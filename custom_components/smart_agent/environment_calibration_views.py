@@ -1,7 +1,10 @@
 """Authenticated read and admin-only mutation views for environment calibration."""
 from __future__ import annotations
 
+import json
 from typing import Any
+
+from .http_payloads import read_json_payload
 
 from homeassistant.components.http import HomeAssistantView
 
@@ -74,8 +77,8 @@ class _EnvironmentCalibrationView(HomeAssistantView):
 
     async def _json_body(self, request: Any) -> dict[str, Any] | None:
         try:
-            body = await request.json()
-        except Exception:
+            body = await read_json_payload(request, operation=self.name)
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return None
         return body if isinstance(body, dict) else None
 

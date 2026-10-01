@@ -4,6 +4,7 @@ DevicesMixin — 设备管理层。
       习惯/规则的 CRUD、行为规律删除。
 """
 from __future__ import annotations
+from .ai_scene_projection import require_ai_scene_projection
 
 import logging
 import asyncio
@@ -187,31 +188,44 @@ def _build_runtime_capability_facts(entity_id: str, state_obj: Any) -> dict[str,
     return {**base, "facts_digest": _runtime_digest(base)}
 
 
+def _scan_ha_area_items(area_items: Any, target_norm: str) -> Any | None:
+    folded = target_norm.casefold()
+    try:
+        for area in area_items:
+            area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()
+            name = str(getattr(area, "name", "") or "").strip()
+            if target_norm in {area_id, name} or folded in {area_id.casefold(), name.casefold()}:
+                return area
+    except Exception as exc:
+        raise RuntimeError("ha_area_registry_lookup_failed: areas.scan") from exc
+    return None
+
+
 def _find_ha_area_by_id_or_name(area_reg: Any, target: str) -> Any | None:
     target_norm = str(target or "").strip()
     if not target_norm:
         return None
     getter = getattr(area_reg, "async_get_area", None)
+    lookup_error: Exception | None = None
     if callable(getter):
         try:
             area = getter(target_norm)
             if area is not None:
                 return area
-        except Exception:
-            pass
+        except Exception as exc:
+            lookup_error = exc
 
     raw_areas = getattr(area_reg, "areas", None)
     values = getattr(raw_areas, "values", None)
     try:
         area_items = values() if callable(values) else ()
-    except Exception:
-        area_items = ()
-    folded = target_norm.casefold()
-    for area in area_items:
-        area_id = str(getattr(area, "id", "") or getattr(area, "area_id", "") or "").strip()
-        name = str(getattr(area, "name", "") or "").strip()
-        if target_norm in {area_id, name} or folded in {area_id.casefold(), name.casefold()}:
-            return area
+    except Exception as exc:
+        raise RuntimeError("ha_area_registry_lookup_failed: areas.values") from exc
+    area = _scan_ha_area_items(area_items, target_norm)
+    if area is not None:
+        return area
+    if lookup_error is not None:
+        raise RuntimeError("ha_area_registry_lookup_failed: async_get_area") from lookup_error
     return None
 
 
@@ -245,21 +259,23 @@ class DevicesMixin:
         """Wait for the Add-on single writer before mutating HA runtime state."""
         post = getattr(self, "_post_internal_event_confirmed_async", None)
         if not callable(post):
-            self._sys_log("WARN", f"[Storage] persistence bridge unavailable: kind={kind}")
+            self._sys_log("WARN", f"[Storage] persistence bridge unavailable: operation=DevicesMixin._persist_business_event kind={kind}")
             return None
         try:
             result = await post(kind, dict(payload or {}), ts=ts)
+            status = int(result.get("status") or result.get("__status") or 0) if isinstance(result, dict) else 0
         except Exception as exc:
-            self._sys_log("WARN", f"[Storage] persistence request failed: kind={kind}, error={exc}")
+            self._sys_log("WARN", f"[Storage] persistence request failed: operation=DevicesMixin._persist_business_event "
+                          f"kind={kind} ts={ts} exception_type={type(exc).__name__}")
             return None
-        status = int(result.get("status") or result.get("__status") or 0) if isinstance(result, dict) else 0
         if (
             not isinstance(result, dict)
             or result.get("ok") is not True
             or result.get("persistence_confirmed") is not True
             or status >= 400
         ):
-            self._sys_log("WARN", f"[Storage] durable commit not confirmed: kind={kind}, result={result}")
+            self._sys_log("WARN", f"[Storage] durable commit not confirmed: operation=DevicesMixin._persist_business_event "
+                          f"kind={kind} ts={ts} status={status}")
             return None
         return result
 
@@ -411,10 +427,11 @@ class DevicesMixin:
         """Refresh legacy tuple mirrors and full scoped assets from the Add-on."""
         client = getattr(self, "_addon_client", None)
         status = {"ok": False, "sources": {}, "changed": False}
+        self._last_addon_memory_sync_status = status
         if client is None:
             status["error"] = "addon_client_unavailable"
-            self._last_addon_memory_sync_status = status
             return False
+        status["sources"] = dict.fromkeys(("get_memory_habits", "get_memory_profiles"), "pending")
         changed = False
         successful_sources = 0
         for attr, asset_attr, getter_name in (
@@ -428,8 +445,11 @@ class DevicesMixin:
             try:
                 rows = await getter()
             except Exception as exc:
-                status["sources"][getter_name] = f"exception:{exc}"
-                self._sys_log("WARN", f"[Storage] memory refresh failed: source={getter_name}, error={exc}")
+                status["sources"][getter_name] = f"exception:{type(exc).__name__}"
+                self._sys_log(
+                    "WARN", "[Storage] operation=DevicesMixin._async_refresh_memory_assets_from_addon "
+                    f"source={getter_name} exception_type={type(exc).__name__}",
+                )
                 continue
             if not isinstance(rows, list):
                 status["sources"][getter_name] = "invalid_payload"
@@ -455,11 +475,10 @@ class DevicesMixin:
             if getattr(self, asset_attr, None) != assets:
                 setattr(self, asset_attr, assets)
                 changed = True
-        status["ok"] = successful_sources == 2
-        status["changed"] = changed
-        self._last_addon_memory_sync_status = status
+            status["changed"] = changed
         if changed:
             self.async_set_updated_data({})
+        status["ok"] = successful_sources == 2
         return bool(status["ok"])
     def get_device_name(self, entity_id: str) -> str:
         """Return device friendly name with room prefix if available, fallback to entity_id."""
@@ -524,8 +543,7 @@ class DevicesMixin:
             assignment = self._get_entity_area_assignment(entity_id)
             return assignment["room"] if assignment else ""
         except Exception as exc:
-            _LOGGER.debug("[Devices] area registry unavailable for %s: %s", entity_id, exc)
-            return ""
+            raise RuntimeError("device_area_read_failed") from exc
 
     def get_device_capability(self, entity_id: str) -> dict[str, Any]:
         """返回单设备能力快照（Wave 6 只读语义，默认值保持保守）。"""
@@ -1639,7 +1657,8 @@ class DevicesMixin:
 
     def _refresh_ai_scenes_cache(self) -> None:
         """同步刷新 AI 场景内存缓存（在 executor 中调用）。"""
-        self._ai_scenes_cache = self._query_ai_scenes()
+        from .ai_scene_projection import refresh_ai_scene_projection
+        refresh_ai_scene_projection(self)
 
     async def async_create_scene_from_text(
         self, text: str, auto_activate: bool = False
@@ -1675,7 +1694,7 @@ class DevicesMixin:
         # Step 2: 生成唯一场景名（用户_ 前缀）
         base_name = f"用户_{text.strip()[:10]}"
         # 若名字已存在则加时间戳后缀
-        existing_names = {s.get("name", "") for s in getattr(self, "_ai_scenes_cache", [])}
+        existing_names = {s.get("name", "") for s in require_ai_scene_projection(self)}
         scene_name = base_name
         if scene_name in existing_names:
             scene_name = f"{base_name}_{self._ha_local_now().strftime('%H%M')}"
@@ -1707,7 +1726,7 @@ class DevicesMixin:
         # 刷新缓存，获取新场景 ID
         await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
         scene_record = next(
-            (s for s in self._ai_scenes_cache if s.get("name") == scene_name), None
+            (s for s in require_ai_scene_projection(self) if s.get("name") == scene_name), None
         )
         scene_id = scene_record["id"] if scene_record else -1
 
@@ -1775,7 +1794,7 @@ class DevicesMixin:
         # 先刷新缓存读取 pending 记录（不提前设 active）
         await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
 
-        scene = next((s for s in self._ai_scenes_cache if s["id"] == scene_id), None)
+        scene = next((s for s in require_ai_scene_projection(self) if s["id"] == scene_id), None)
         if not scene:
             self._sys_log("WARN", f"[AI场景] 批准后未找到场景记录 id={scene_id}")
             self.async_set_updated_data({})
@@ -1872,7 +1891,7 @@ class DevicesMixin:
                 self._update_ai_scene_status, scene_id, AI_SCENE_STATUS_ACTIVE
             )
             await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
-            _scene_after = next((s for s in self._ai_scenes_cache if s["id"] == scene_id), None)
+            _scene_after = next((s for s in require_ai_scene_projection(self) if s["id"] == scene_id), None)
             _activated = bool(_status_ok and _scene_after and _scene_after.get("status") == AI_SCENE_STATUS_ACTIVE)
             if not _activated:
                 self._sys_log("WARN", f"[AI场景] 激活状态写入失败，保持 pending: id={scene_id}")
@@ -1897,7 +1916,7 @@ class DevicesMixin:
         """用户拒绝候选场景 → 状态置为 rejected，并尝试删除对应 HA 场景实体。"""
         from .const import AI_SCENE_STATUS_REJECTED
         scene_name = next(
-            (s["name"] for s in self._ai_scenes_cache if s["id"] == scene_id), str(scene_id)
+            (s["name"] for s in require_ai_scene_projection(self) if s["id"] == scene_id), str(scene_id)
         )
         _reject_ok = await self.hass.async_add_executor_job(
             self._update_ai_scene_status, scene_id, AI_SCENE_STATUS_REJECTED
@@ -1906,7 +1925,7 @@ class DevicesMixin:
             self._sys_log("WARN", f"[AI场景] 拒绝状态写入失败: id={scene_id}")
             return
         await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
-        _scene_after = next((s for s in self._ai_scenes_cache if s["id"] == scene_id), None)
+        _scene_after = next((s for s in require_ai_scene_projection(self) if s["id"] == scene_id), None)
         if not (_scene_after and _scene_after.get("status") == AI_SCENE_STATUS_REJECTED):
             self._sys_log("WARN", f"[AI场景] 拒绝状态缓存校验失败: id={scene_id}")
             return
@@ -2081,7 +2100,7 @@ class DevicesMixin:
         import json as _json
         import yaml as _yaml
         
-        scene = next((s for s in self._ai_scenes_cache if s["id"] == scene_id), None)
+        scene = next((s for s in require_ai_scene_projection(self) if s["id"] == scene_id), None)
         if not scene:
             return "# 错误：找不到场景记录"
 

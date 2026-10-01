@@ -436,12 +436,16 @@ def build_addon_slow_decision_bundle(
         presence_snapshot,
         trigger_room=trigger_space_id or trigger_room,
     )
+    from .ai_scene_projection import ai_scene_projection_context
+    scene_projection = ai_scene_projection_context(owner)
     automation_policy_section = owner._render_addon_decision_automation_policy_section(
-        getattr(owner, "_ai_scenes_cache", []),
+        scene_projection["scenes"],
         getattr(owner, "_ha_scenes", []),
         getattr(owner, "_ha_scripts", []),
         trigger_room=trigger_room,
     )
+    if not scene_projection["available"]:
+        automation_policy_section += "\n本地 AI 场景目录读取失败，不可据此选择场景或认定没有场景。"
     context_text = _context_text(
         owner,
         trigger=trigger,

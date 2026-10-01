@@ -13,16 +13,12 @@ class DatabaseSceneBridgeMixin:
     """Keep legacy HA scene projections behind the database bridge boundary."""
 
     def _query_ai_scenes(self, status: str | None = None) -> list[dict]:
-        try:
-            if status:
-                return self._db.query(
-                    "SELECT * FROM ai_scenes WHERE status=? ORDER BY confidence DESC, id DESC",
-                    (status,),
-                )
-            return self._db.query("SELECT * FROM ai_scenes ORDER BY confidence DESC, id DESC")
-        except Exception as exc:
-            _LOGGER.warning("[AiScenes] query failed: %s", exc)
-            return []
+        if status:
+            return self._db.query_required(
+                "SELECT * FROM ai_scenes WHERE status=? ORDER BY confidence DESC, id DESC",
+                (status,),
+            )
+        return self._db.query_required("SELECT * FROM ai_scenes ORDER BY confidence DESC, id DESC")
 
     def _upsert_ai_scene(
         self,

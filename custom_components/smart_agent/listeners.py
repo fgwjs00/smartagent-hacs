@@ -4,6 +4,8 @@ ListenersMixin — 事件监听层。
 """
 from __future__ import annotations
 
+from .execution_audit import project_execution_audit
+
 import asyncio
 import hashlib
 import json
@@ -23,6 +25,7 @@ from .arrival_lighting_learning import arrival_lighting_entity_ids
 from .ha_adapter import async_call_service
 from .active_ai_rollout import (
     ActiveAiRolloutConfig,
+    blocked_rollout_actions,
     enrich_active_ai_action_spaces,
     evaluate_active_ai_execution_gate,
     scope_active_ai_canary_actions,
@@ -33,6 +36,9 @@ from .listener_trigger_projection import (
     format_listener_state,
     format_listener_trigger,
     listener_trigger_public_summary,
+)
+from .task_completion import (
+    TaskCompletion, create_ha_task, observe_ha_task, read_task_completion, report_task_completion,
 )
 from .listener_trigger_runtime import (
     build_presence_snapshot_for_entity,
@@ -858,11 +864,13 @@ class ListenersMixin:
             if isinstance(neighbors, (set, list, tuple)):
                 topology[str(room)] = sorted({str(item) for item in neighbors if str(item or "").strip()})
 
+        from .ai_scene_projection import ai_scene_projection_context
+        scene_projection = ai_scene_projection_context(self)
         snapshot: dict[str, Any] = {
             "device_info": device_info,
             "states": states,
             "state_observations": state_observations,
-            "ai_scenes": list(getattr(self, "_ai_scenes_cache", []) or []),
+            "ai_scenes": scene_projection["scenes"],
             "room_topology": topology,
             "mode": str(getattr(self, "_mode", "") or ""),
             "presence_contract_source": "addon_presence_engine",
@@ -870,6 +878,8 @@ class ListenersMixin:
             "observed_at": observed_at,
             "created_at": observed_at,
         }
+        if not scene_projection["available"]:
+            snapshot["ai_scenes_read_status"] = {key: value for key, value in scene_projection.items() if key != "scenes"}
         environment_context = self._build_fast_path_environment_context(device_info, entity_id)
         if environment_context:
             snapshot["environment_context"] = environment_context
@@ -1180,27 +1190,9 @@ class ListenersMixin:
             else []
         )
         if not rollout_blocked_actions and scoped_actions.blocked_entity_ids:
-            blocked_entity_ids = set(scoped_actions.blocked_entity_ids)
-            for action in candidate_actions:
-                action_entity_id = str(
-                    action.get("entity_id")
-                    or action.get("entity")
-                    or (
-                        action.get("target", {}).get("entity_id")
-                        if isinstance(action.get("target"), dict)
-                        else ""
-                    )
-                    or ""
-                ).strip().lower()
-                if action_entity_id not in blocked_entity_ids:
-                    continue
-                rollout_blocked_actions.append(
-                    {
-                        **action,
-                        "status": "blocked_by_rollout",
-                        "reason": "active_ai_canary_entity_not_allowed",
-                    }
-                )
+            rollout_blocked_actions = blocked_rollout_actions(
+                candidate_actions, set(scoped_actions.blocked_entity_ids)
+            )
         execution_flags = (
             rollout_payload.get("execution_flags")
             if isinstance(rollout_payload.get("execution_flags"), dict)
@@ -1351,12 +1343,13 @@ class ListenersMixin:
             )
             if isinstance(item, dict)
         ]
-        try:
-            executed = int(execution_result)
-        except (TypeError, ValueError):
-            executed = 0
-        raw_action_results = getattr(execution_result, "action_results", None)
-        action_results = list(raw_action_results) if isinstance(raw_action_results, list) else []
+        audit = project_execution_audit(
+            valid_actions, execution_result,
+            missing_reason="ha_fast_path_missing_structured_result",
+            suppressed_reason=execution_suppressed_reason,
+        )
+        executed = audit.executed
+        action_results = audit.action_results
         raw_pre_states = getattr(execution_result, "pre_states", None)
         pre_states = {
             str(entity_id): str(state)
@@ -1366,58 +1359,13 @@ class ListenersMixin:
         execution_transaction_id = str(
             getattr(execution_result, "transaction_id", "") or ""
         ).strip()
-        for index, action in enumerate(valid_actions):
-            params = action.get("params")
-            action_reason = str(action.get("reason") or "").strip()
-            if index < len(action_results) and isinstance(action_results[index], dict):
-                merged = {
-                    **action_results[index],
-                    "domain": str(action_results[index].get("domain") or action.get("domain") or ""),
-                    "service": str(action_results[index].get("service") or action.get("service") or ""),
-                    "entity_id": str(action_results[index].get("entity_id") or action.get("entity_id") or ""),
-                }
-                if isinstance(params, dict) and params and not isinstance(merged.get("params"), dict):
-                    merged["params"] = dict(params)
-                if action_reason and not str(merged.get("action_reason") or "").strip():
-                    merged["action_reason"] = action_reason
-                action_results[index] = merged
-                continue
-            fallback_result = {
-                "domain": str(action.get("domain") or ""),
-                "service": str(action.get("service") or ""),
-                "entity_id": str(action.get("entity_id") or ""),
-                "status": (
-                    "executed"
-                    if index < executed
-                    else "blocked"
-                    if execution_suppressed_reason
-                    else "not_executed"
-                ),
-                "reason": (
-                    execution_suppressed_reason
-                    or "ha_fast_path_missing_structured_result"
-                ),
-            }
-            if isinstance(params, dict) and params:
-                fallback_result["params"] = dict(params)
-            if action_reason:
-                fallback_result["action_reason"] = action_reason
-            action_results.append(fallback_result)
         action_results.extend(blocked_action_rows)
-        final_outcome = (
-            "observe_only"
-            if execution_suppressed_reason == "active_ai_shadow"
-            else "no_action"
-            if execution_suppressed_reason
-            in {"pending_selection_confirmation", "no_actions"}
-            else "blocked"
-            if execution_suppressed_reason
-            else "succeeded"
-            if valid_actions and executed >= len(valid_actions)
-            else "partial"
-            if executed > 0
-            else "failed"
-        )
+        final_outcome = audit.final_outcome
+        if audit.integrity_reason:
+            self._sys_log(
+                "WARN", f"[Add-on FastPath] execution_receipt_unconfirmed transaction_id={transaction_id} "
+                f"correlation_id={correlation_id} reason={audit.integrity_reason}",
+            )
         audit_context = {
             "source": "addon_fast_path_execution_audit",
             "transaction_id": transaction_id,
@@ -1441,6 +1389,9 @@ class ListenersMixin:
             "action_results": action_results,
             "pre_states": pre_states,
         }
+        if audit.integrity_reason:
+            audit_context["receipt_integrity_reason"] = audit.integrity_reason
+            audit_context["unconfirmed_count"] = audit.unconfirmed_count
         if isinstance(decision_contract_lineage, dict) and decision_contract_lineage:
             audit_context["lineage"] = {
                 str(key): str(value)[:512]
@@ -2690,144 +2641,47 @@ class ListenersMixin:
             _LOGGER.debug("[Listeners] smart_agent_decision_bubble emit failed: %s", exc)
 
     def _spawn_addon_fast_path_task(
-        self,
-        coro: Any,
-        *,
-        entity_id: str,
-        old_state: str,
-        new_state: str,
+        self, coro: Any, *, entity_id: str, old_state: str, new_state: str,
     ) -> None:
         try:
-            task = self.hass.async_create_task(coro)
+            task = create_ha_task(self.hass.async_create_task, coro, logger=_LOGGER,
+                                  operation="addon_fast_path", system_log=self._sys_log, system_level="ERROR")
         except Exception as exc:
-            close = getattr(coro, "close", None)
-            if callable(close):
-                close()
-            exception_type = type(exc).__name__
-            _LOGGER.warning(
-                "[Listeners] add-on fast-path task create failed entity=%s old_state=%s new_state=%s: %s",
-                entity_id,
-                old_state,
-                new_state,
-                exc,
-                exc_info=(type(exc), exc, getattr(exc, "__traceback__", None)),
-            )
-            self._sys_log(
-                "ERROR",
-                f"[Add-on FastPath] task create failed fail-closed | entity={entity_id} "
-                f"reason=task_create_failed exception_type={exception_type}",
-            )
-            self._emit_addon_fast_path_event(
-                {
-                    "source": "addon_fast_path",
-                    "entity_id": entity_id,
-                    "old_state": old_state,
-                    "new_state": new_state,
-                    "status": 0,
-                    "matched": False,
-                    "path_taken": "none",
-                    "reason": "task_create_failed",
-                    "exception_type": exception_type,
-                    "fail_closed": True,
-                }
-            )
+            report_task_completion(coro, TaskCompletion(error=exc, phase="create"), logger=_LOGGER,
+                                   operation="addon_fast_path", system_log=self._sys_log, system_level="ERROR")
+            self._emit_addon_fast_path_event({
+                "source": "addon_fast_path", "entity_id": entity_id,
+                "old_state": old_state, "new_state": new_state,
+                "status": 0, "matched": False, "path_taken": "none",
+                "reason": "task_create_failed", "exception_type": type(exc).__name__,
+                "fail_closed": True, "task_id": f"{id(coro):x}", "phase": "create",
+            })
             return
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if callable(add_done_callback):
-            add_done_callback(
-                lambda done_task: self._handle_addon_fast_path_task_done(
-                    done_task,
-                    entity_id=entity_id,
-                    old_state=old_state,
-                    new_state=new_state,
-                )
-            )
+        observe_ha_task(
+            task, lambda done: self._handle_addon_fast_path_task_done(
+                done, entity_id=entity_id, old_state=old_state, new_state=new_state,
+            ), logger=_LOGGER, operation="addon_fast_path", system_log=self._sys_log,
+        )
 
     def _handle_addon_fast_path_task_done(
-        self,
-        task: Any,
-        *,
-        entity_id: str,
-        old_state: str,
-        new_state: str,
+        self, task: Any, *, entity_id: str, old_state: str, new_state: str,
     ) -> None:
-        cancelled = False
-        try:
-            cancelled = bool(task.cancelled()) if hasattr(task, "cancelled") else False
-        except Exception:
-            cancelled = False
-        if cancelled:
-            self._sys_log(
-                "WARN",
-                f"[Add-on FastPath] task cancelled fail-closed | entity={entity_id} reason=task_cancelled",
-            )
-            self._emit_addon_fast_path_event(
-                {
-                    "source": "addon_fast_path",
-                    "entity_id": entity_id,
-                    "old_state": old_state,
-                    "new_state": new_state,
-                    "status": 0,
-                    "matched": False,
-                    "path_taken": "none",
-                    "reason": "task_cancelled",
-                    "fail_closed": True,
-                }
-            )
+        completion = read_task_completion(task)
+        if completion.error is None and not completion.cancelled:
             return
-        try:
-            exc = task.exception() if hasattr(task, "exception") else None
-        except asyncio.CancelledError:
-            self._sys_log(
-                "WARN",
-                f"[Add-on FastPath] task cancelled fail-closed | entity={entity_id} reason=task_cancelled",
-            )
-            self._emit_addon_fast_path_event(
-                {
-                    "source": "addon_fast_path",
-                    "entity_id": entity_id,
-                    "old_state": old_state,
-                    "new_state": new_state,
-                    "status": 0,
-                    "matched": False,
-                    "path_taken": "none",
-                    "reason": "task_cancelled",
-                    "fail_closed": True,
-                }
-            )
-            return
-        except Exception as err:
-            exc = err
-        if exc is None:
-            return
-        _LOGGER.warning(
-            "[Listeners] add-on fast-path task failed entity=%s old_state=%s new_state=%s: %s",
-            entity_id,
-            old_state,
-            new_state,
-            exc,
-            exc_info=(type(exc), exc, getattr(exc, "__traceback__", None)),
-        )
-        exception_type = type(exc).__name__
-        self._sys_log(
-            "ERROR",
-            f"[Add-on FastPath] task failed fail-closed | entity={entity_id} "
-            f"reason=task_exception exception_type={exception_type}",
-        )
-        self._emit_addon_fast_path_event(
-            {
-                "source": "addon_fast_path",
-                "entity_id": entity_id,
-                "old_state": old_state,
-                "new_state": new_state,
-                "status": 0,
-                "matched": False,
-                "path_taken": "none",
-                "reason": "task_exception",
-                "exception_type": exception_type,
-                "fail_closed": True,
-            }
-        )
+        report_task_completion(task, completion, logger=_LOGGER, operation="addon_fast_path",
+                               system_log=self._sys_log,
+                               system_level="WARN" if completion.cancelled else "ERROR")
+        event = {
+            "source": "addon_fast_path", "entity_id": entity_id,
+            "old_state": old_state, "new_state": new_state,
+            "status": 0, "matched": False, "path_taken": "none",
+            "reason": "task_cancelled" if completion.cancelled else "task_exception",
+            "fail_closed": True, "task_id": f"{id(task):x}", "phase": completion.phase,
+        }
+        if completion.error is not None:
+            event["exception_type"] = type(completion.error).__name__
+        self._emit_addon_fast_path_event(event)
 
     def _emit_listener_event(
         self,

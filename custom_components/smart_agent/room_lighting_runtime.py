@@ -2,11 +2,29 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from typing import Any
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later
+
+
+@dataclass(slots=True)
+class _RecheckProgress:
+    request_id: str = ""
+    stage: str = "prepare"
+    upstream_status: int | None = None
+
+    def failure(self, space: str, anchor: str, exc: Exception) -> dict:
+        # Transport/host failure does not prove whether the gateway or HA acted.
+        # Keep local locators, never raw response bodies or exception messages.
+        return {"ok": False, "error": "room_lighting_recheck_failed",
+                "request_id": self.request_id, "execution_state": "unknown",
+                "details": {"operation": "room_lighting.reconcile",
+                            "failure_stage": self.stage, "space_id": space,
+                            "entity_id": anchor, "exception_type": type(exc).__name__,
+                            "upstream_status": self.upstream_status}}
 
 
 async def reconcile_rooms(owner: Any, _now: Any = None, *, space_id: str = "") -> dict:
@@ -30,14 +48,21 @@ async def reconcile_rooms(owner: Any, _now: Any = None, *, space_id: str = "") -
         if lock.locked():
             continue
         async with lock:
+            progress = _RecheckProgress()
             try:
-                outcomes[space] = await _reconcile_room(owner, client, space, anchor, _now)
+                outcomes[space] = await _reconcile_room(owner, client, space, anchor, _now, progress)
             except Exception as exc:
-                owner._sys_log("WARNING", f"[RoomLighting] room={space} recheck_failed={type(exc).__name__}")
+                outcomes[space] = progress.failure(space, anchor, exc)
+                owner._sys_log("WARNING", "[RoomLighting] operation=room_lighting.reconcile "
+                    f"room={space} entity={anchor} request_id={progress.request_id} "
+                    f"failure_stage={progress.stage} recheck_failed={type(exc).__name__} "
+                    f"upstream_status={progress.upstream_status}")
     return outcomes
 
 
-async def _reconcile_room(owner: Any, client: Any, space: str, anchor: str, now: Any) -> dict:
+async def _reconcile_room(
+    owner: Any, client: Any, space: str, anchor: str, now: Any, progress: _RecheckProgress,
+) -> dict:
     snapshot = owner._build_addon_fast_path_snapshot(anchor)
     snapshot.pop("causal_events", None)
     now = now if isinstance(now, datetime) else owner._ha_local_now()
@@ -47,15 +72,23 @@ async def _reconcile_room(owner: Any, client: Any, space: str, anchor: str, now:
     snapshot["room_lighting_task"] = task
     current = owner.hass.states.get(anchor)
     request_id = owner._new_addon_fast_path_request_id(anchor, "", str(getattr(current, "state", "")))
+    progress.request_id, progress.stage = request_id, "provider_request"
     response = await client.run_decision_fast_path(entity_id=anchor,
         new_state=str(getattr(current, "state", "")), snapshot=snapshot, request_id=request_id)
+    progress.stage = "provider_response"
+    status = response.get("__status") if isinstance(response, dict) else None
+    if type(status) is int and 100 <= status <= 599:
+        progress.upstream_status = status
     if not isinstance(response, dict) or response.get("ok") is not True:
         raise RuntimeError("room_lighting_recheck_failed")
+    progress.stage = "response_schedule"
     schedule_room_check(owner, response)
+    progress.stage = "execution_validation"
     result = response.get("result") or {}
     from .confidence_arbitration_contract import validate_auto_execution_arbitration
     arbitration = validate_auto_execution_arbitration(response, context_snapshot=snapshot)
     if response.get("auto_execute") is True and result.get("actions") and arbitration.allowed:
+        progress.stage = "execution"
         return await owner._execute_fast_path_decision_result(result, entity_id=anchor,
             source_label="房间灯控核对", transaction_id=response.get("transaction_id", ""),
             correlation_id=response.get("correlation_id", ""),

@@ -94,6 +94,7 @@ class SmartAgentStatusSensor(CoordinatorEntity, SensorEntity):
                 for k, v in list(getattr(coordinator, "_last_ai_actions", {}).items())[:10]
             ],
             "critical_frigate_event": _critical_frigate_event(coordinator),
+            "frigate_enabled": bool(getattr(coordinator, "_frigate_enabled", False)),
             "frigate_events": getattr(coordinator, "get_recent_frigate_events", lambda: [])()[:5],
             "voice_status": getattr(coordinator, "_voice_status", "idle"),
             "last_stt": (getattr(coordinator, "_last_stt_text", "") or "")[:100],
@@ -113,6 +114,7 @@ class SmartAgentStatusSensor(CoordinatorEntity, SensorEntity):
                 for k, v in list(getattr(self.coordinator, "_last_ai_actions", {}).items())[:10]
             ],
             "critical_frigate_event": _critical_frigate_event(self.coordinator),
+            "frigate_enabled": bool(getattr(self.coordinator, "_frigate_enabled", False)),
             "frigate_events": getattr(self.coordinator, "get_recent_frigate_events", lambda: [])()[:5],
             "voice_status": getattr(self.coordinator, "_voice_status", "idle"),
             "last_stt": (getattr(self.coordinator, "_last_stt_text", "") or "")[:100],

@@ -25,32 +25,31 @@ if __package__:
         validate_service_call,
     )
     from .output_contracts import begin_output_attempt, finalize_output_attempt
+    from .action_execution_diagnostics import envelope_failure_details
+    from .service_failure_contracts import service_failure_code
 else:
-    _contract_module_name = "_smart_agent_service_contracts_runtime"
-    _contract_module = sys.modules.get(_contract_module_name)
-    if _contract_module is None:
-        _contract_path = Path(__file__).with_name("service_contracts.py")
-        _contract_spec = importlib.util.spec_from_file_location(_contract_module_name, _contract_path)
-        if _contract_spec is None or _contract_spec.loader is None:
-            raise RuntimeError(f"unable to load HA service contract module: {_contract_path}")
-        _contract_module = importlib.util.module_from_spec(_contract_spec)
-        sys.modules[_contract_module_name] = _contract_module
-        _contract_spec.loader.exec_module(_contract_module)
+    def _load_standalone_dependency(stem: str) -> Any:
+        name = f"_smart_agent_{stem}_runtime"
+        module = sys.modules.get(name)
+        if module is None:
+            path = Path(__file__).with_name(stem + ".py")
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"unable to load HA boundary dependency: {stem}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        return module
+
+    _contract_module = _load_standalone_dependency("service_contracts")
     ServiceContractResult = _contract_module.ServiceContractResult
     SERVICE_CONTRACTS = _contract_module.SERVICE_CONTRACTS
     validate_service_call = _contract_module.validate_service_call
-    _output_module_name = "_smart_agent_output_contracts_runtime"
-    _output_module = sys.modules.get(_output_module_name)
-    if _output_module is None:
-        _output_path = Path(__file__).with_name("output_contracts.py")
-        _output_spec = importlib.util.spec_from_file_location(_output_module_name, _output_path)
-        if _output_spec is None or _output_spec.loader is None:
-            raise RuntimeError(f"unable to load output contract module: {_output_path}")
-        _output_module = importlib.util.module_from_spec(_output_spec)
-        sys.modules[_output_module_name] = _output_module
-        _output_spec.loader.exec_module(_output_module)
+    _output_module = _load_standalone_dependency("output_contracts")
     begin_output_attempt = _output_module.begin_output_attempt
     finalize_output_attempt = _output_module.finalize_output_attempt
+    envelope_failure_details = _load_standalone_dependency("action_execution_diagnostics").envelope_failure_details
+    service_failure_code = _load_standalone_dependency("service_failure_contracts").service_failure_code
 
 
 _POST_STATE_VERIFY_TIMEOUT_SECONDS = 2.0
@@ -978,7 +977,8 @@ def get_ai_scenes_cache_snapshot(coord: Any) -> list[dict[str, Any]]:
     - 仅负责从宿主 coordinator 上读取并做最小形态保护；不承载任何业务逻辑。
     - 返回值用于 WS/HTTP 层组装展示 payload，避免直接引用可变内存态。
     """
-    cache = getattr(coord, "_ai_scenes_cache", None)
+    from .ai_scene_projection import require_ai_scene_projection
+    cache = require_ai_scene_projection(coord)
     if not isinstance(cache, list) or not cache:
         return []
 
@@ -1546,14 +1546,18 @@ async def async_execute_command_envelope(
                 verification=verification,
             )
             verified = receipt["effect_status"] == "verified_success"
+            failure_code = service_failure_code(exc)
             results.append({
                 **command,
                 "ok": verified,
                 "executed": True if verified else None,
                 "service_call_succeeded": False,
-                "error": "" if verified else str(exc) or exc.__class__.__name__,
+                "error": "" if verified else failure_code,
                 "error_type": "" if verified else "ha_service_error",
-                "transport_error_detail": str(exc) or exc.__class__.__name__,
+                "transport_error_detail": failure_code,
+                **envelope_failure_details(
+                    request_id, len(results) + 1, exc, operation="ha_service_dispatch",
+                ),
                 "retryable": False,
                 "latency_ms": int((time.monotonic() - started) * 1000),
                 "status": "succeeded" if verified else "effect_unknown",

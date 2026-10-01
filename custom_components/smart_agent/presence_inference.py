@@ -31,6 +31,8 @@ Canonical presence decisions are owned by addon_presence_engine.
 """
 from __future__ import annotations
 
+from .timezone_support import configured_timezone as _presence_inference_timezone
+
 import logging
 import time
 from dataclasses import dataclass, field
@@ -58,23 +60,6 @@ MEDIA_ACTIVE_STATES = frozenset(("playing", "paused"))
 HUMAN_DEVICE_TRACE_SOURCES = frozenset(("user", "manual", "physical", "dashboard", "voice"))
 
 
-def _presence_inference_timezone(configured_timezone: str):
-    normalized_tz = configured_timezone.lower()
-    fixed_offset_hours = {
-        "asia/shanghai": 8,
-        "asia/chongqing": 8,
-        "asia/harbin": 8,
-        "asia/hong_kong": 8,
-        "hongkong": 8,
-        "prc": 8,
-        "utc": 0,
-    }.get(normalized_tz)
-    try:
-        return ZoneInfo(configured_timezone)
-    except ZoneInfoNotFoundError:
-        if fixed_offset_hours is not None:
-            return timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
-        raise
 
 
 @dataclass

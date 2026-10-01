@@ -6,9 +6,11 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+from .database_transactions import DatabaseTransactionMixin
 from .const import DEVICE_CONTROL_MODES
 from .db_service import DatabaseService
 from .database_learning_projection import DatabaseLearningProjectionMixin
@@ -33,7 +35,18 @@ _BRIDGE_SCHEMA: tuple[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]], 
 )
 
 
-class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
+class ConfigProjectionError(RuntimeError):
+    """Identify an invalid local projection without logging its configuration values."""
+
+    def __init__(self, cause: Exception) -> None:
+        self.error_id = uuid.uuid4().hex
+        super().__init__(
+            "ha_config_projection_failed: operation=DatabaseMixin._load_config "
+            f"phase=project_rows error_id={self.error_id} cause_type={type(cause).__name__}"
+        )
+
+
+class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, DatabaseTransactionMixin):
     _VALID_CONTROL_MODES = DEVICE_CONTROL_MODES
 
     def _init_memory_db(self) -> None:
@@ -124,17 +137,19 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
         return True
 
     def _load_config(self) -> None:
-        """Load devices, habits, and rules from local HA bridge config tables."""
-        self.device_info = {}
+        """Publish all local config projections only after every required read succeeds."""
+        device_rows = self._db.query_required("SELECT * FROM devices")
+        habit_rows = self._db.query_required("SELECT content, locked FROM habits ORDER BY id")
+        rule_rows = self._db.query_required("SELECT content, locked FROM rules ORDER BY id")
+        device_info = {}
         try:
-            conn = self._db.get_raw_connection()
-            for row in conn.execute("SELECT * FROM devices"):
+            for row in device_rows:
                 columns = row.keys()
                 mode = row["control_mode"] if "control_mode" in columns else "shared"
                 if mode not in self._VALID_CONTROL_MODES:
                     mode = "shared"
                 sensor_type = row["sensor_type"] if "sensor_type" in columns else ""
-                self.device_info[row["entity_id"]] = {
+                device_info[row["entity_id"]] = {
                     "name": row["name"],
                     "room": row["area"],
                     "type": row["type"],
@@ -146,18 +161,20 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
                     "ha_entity_registry_id": row["ha_entity_registry_id"] if "ha_entity_registry_id" in columns else "",
                     "ha_platform": row["ha_platform"] if "ha_platform" in columns else "",
                 }
-            self._habits = [
+            habits = [
                 (row["content"], bool(row["locked"]))
-                for row in conn.execute("SELECT content, locked FROM habits ORDER BY id")
+                for row in habit_rows
             ]
-            self._rules = [
+            rules = [
                 (row["content"], bool(row["locked"]))
-                for row in conn.execute("SELECT content, locked FROM rules ORDER BY id")
+                for row in rule_rows
             ]
-        except Exception as exc:
-            _LOGGER.warning("[DB] load config failed: %s", exc)
-            self._habits = []
-            self._rules = []
+        except (KeyError, TypeError, ValueError) as exc:
+            # Do not log configuration contents or replace the previous complete projection.
+            error = ConfigProjectionError(exc)
+            _LOGGER.error("[DB] %s", error)
+            raise error from exc
+        self.device_info, self._habits, self._rules = device_info, habits, rules
 
     def _db_exec(self, sql: str, params: tuple = ()) -> bool:
         """Execute a permitted HA-local write."""
@@ -185,7 +202,7 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
         )
         return True
 
-    def _query_events(self, sql: str, params: tuple = (), max_rows: int = 10000) -> list[dict]:
+    def _query_events(self, sql: str, params: tuple = (), max_rows: int = 10000, *, required: bool = False) -> list[dict]:
         """Run a read query with an automatic LIMIT on simple SELECT statements."""
         normalized = (sql or "").strip()
         tail = normalized.rstrip(" ;\t\r\n")
@@ -198,7 +215,8 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
             or re.search(r"\bEXCEPT\b", tail, re.IGNORECASE)
         )
         effective_sql = f"{tail} LIMIT {max_rows}" if max_rows > 0 and not has_limit and not is_complex else tail
-        rows = self._db.query(effective_sql, params)
+        query = self._db.query_required if required else self._db.query
+        rows = query(effective_sql, params)
         if effective_sql != tail and len(rows) >= max_rows and hasattr(self, "_sys_log"):
             self._sys_log("INFO", f"[QueryLimit] automatic LIMIT {max_rows} applied")
         return rows
@@ -359,152 +377,26 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
             "top_failures": [],
         }
         cutoff = self._ha_db_cutoff_text(7)
-        try:
-            rows = self._db.query(
-                "SELECT COUNT(*) as total, SUM(success) as ok, SUM(retry_count) as retries, "
-                "AVG(latency_ms) as avg_lat FROM action_results WHERE time >= ?",
-                (cutoff,),
-            )
-            if rows and rows[0].get("total"):
-                row = rows[0]
-                stats["total"] = row["total"]
-                stats["success"] = row["ok"] or 0
-                stats["failed"] = stats["total"] - stats["success"]
-                stats["rate"] = round(stats["success"] / stats["total"] * 100, 1) if stats["total"] else 0.0
-                stats["retry_total"] = row["retries"] or 0
-                stats["avg_latency_ms"] = int(row["avg_lat"] or 0)
-            failures = self._db.query(
-                "SELECT entity_id, COUNT(*) as fail_cnt FROM action_results "
-                "WHERE success=0 AND time >= ? GROUP BY entity_id ORDER BY fail_cnt DESC LIMIT 5",
-                (cutoff,),
-            )
-            stats["top_failures"] = [{"entity_id": row["entity_id"], "count": row["fail_cnt"]} for row in failures]
-        except Exception as exc:
-            _LOGGER.warning("[QualityStats] query failed: %s", exc)
+        rows = self._db.query_required(
+            "SELECT COUNT(*) as total, SUM(success) as ok, SUM(retry_count) as retries, "
+            "AVG(latency_ms) as avg_lat FROM action_results WHERE time >= ?",
+            (cutoff,),
+        )
+        if rows and rows[0].get("total"):
+            row = rows[0]
+            stats["total"] = row["total"]
+            stats["success"] = row["ok"] or 0
+            stats["failed"] = stats["total"] - stats["success"]
+            stats["rate"] = round(stats["success"] / stats["total"] * 100, 1) if stats["total"] else 0.0
+            stats["retry_total"] = row["retries"] or 0
+            stats["avg_latency_ms"] = int(row["avg_lat"] or 0)
+        failures = self._db.query_required(
+            "SELECT entity_id, COUNT(*) as fail_cnt FROM action_results "
+            "WHERE success=0 AND time >= ? GROUP BY entity_id ORDER BY fail_cnt DESC LIMIT 5",
+            (cutoff,),
+        )
+        stats["top_failures"] = [{"entity_id": row["entity_id"], "count": row["fail_cnt"]} for row in failures]
         return stats
-
-    def _begin_transaction_db(
-        self,
-        trigger_summary: str,
-        scene_desc: str,
-        confidence: int,
-        action_count: int,
-        pre_states_json: str,
-        actions_json: str,
-    ) -> int:
-        now = self._ha_db_now_text()
-        txn_id = self._ha_transaction_id_ms()
-        try:
-            decoded_actions = json.loads(actions_json or "[]")
-            actions_payload = list(decoded_actions) if isinstance(decoded_actions, list) else []
-        except Exception:
-            actions_payload = []
-        payload = {
-            "transaction_id": str(txn_id),
-            "created_at": now,
-            "status": "pending",
-            "trigger_summary": trigger_summary[:200],
-            "scene_desc": scene_desc[:200],
-            "confidence": int(confidence),
-            "action_count": int(action_count),
-            "rollback_json": pre_states_json,
-            "envelope_json": {"actions": actions_payload},
-        }
-        if not self._enqueue_bridge_event("transaction_start", payload, ts=now):
-            _LOGGER.warning("[Transaction] begin enqueue failed: trigger=%s", trigger_summary[:60])
-            return 0
-        return txn_id
-
-    def _complete_transaction_db(
-        self,
-        txn_id: int,
-        dispatched: int,
-        blocked: int,
-        failed: int,
-        results_json: str,
-    ) -> None:
-        if not txn_id:
-            return
-        action_results = self._decode_transaction_action_results(results_json)
-        self._record_recent_ai_action_results(txn_id, action_results)
-        status = self._transaction_end_status(
-            action_results,
-            dispatched=dispatched,
-            blocked=blocked,
-            failed=failed,
-        )
-        timestamp = self._ha_db_now_text()
-        payload = {
-            "transaction_id": str(txn_id),
-            "updated_at": timestamp,
-            "status": status,
-            "final_outcome": status,
-            "blocked_count": int(blocked),
-            "failed_count": int(failed),
-            "action_results": action_results,
-            "result": {
-                "dispatched_count": int(dispatched),
-                "blocked_count": int(blocked),
-                "failed_count": int(failed),
-                "action_results": action_results,
-                "results": results_json,
-            },
-        }
-        if not self._enqueue_bridge_event("transaction_end", payload, ts=timestamp):
-            _LOGGER.warning("[Transaction] complete enqueue failed: txn_id=%s", txn_id)
-
-    @staticmethod
-    def _decode_transaction_action_results(results_json: str) -> list[dict[str, Any]]:
-        try:
-            decoded_results = json.loads(results_json or "[]")
-            if isinstance(decoded_results, list):
-                return [dict(item) for item in decoded_results if isinstance(item, dict)]
-        except Exception:
-            pass
-        return []
-
-    @staticmethod
-    def _transaction_end_status(
-        action_results: list[dict[str, Any]],
-        *,
-        dispatched: int,
-        blocked: int,
-        failed: int,
-    ) -> str:
-        has_scheduled = any(
-            str(item.get("status") or "") in {"scheduled", "delayed"}
-            for item in action_results
-        )
-        all_skipped = bool(action_results) and all(
-            str(item.get("status") or "").strip().lower() in {"skip", "skipped"}
-            or str(item.get("ha_command_status") or "").strip().lower() == "skipped"
-            for item in action_results
-        )
-        if has_scheduled:
-            return "scheduled"
-        if all_skipped and dispatched == 0 and blocked == 0 and failed == 0:
-            return "skipped"
-        if failed == 0 and (dispatched > 0 or blocked == 0):
-            return "success"
-        if dispatched > 0 and failed > 0:
-            return "partial"
-        if dispatched == 0 and blocked > 0:
-            return "blocked"
-        return "failed"
-
-    def _rollback_transaction_db(self, txn_id: int) -> dict | None:
-        _LOGGER.warning(
-            "[Transaction] legacy local rollback lookup disabled; use add-on rollback service: txn_id=%s",
-            txn_id,
-        )
-        return None
-
-    def _query_recent_transactions(self, limit: int = 30) -> list[dict]:
-        _LOGGER.warning(
-            "[Transaction] legacy local transaction query disabled; use add-on transaction read API: limit=%s",
-            limit,
-        )
-        return []
 
     def _get_entity_room(self, entity_id: str) -> str:
         room = getattr(self, "device_info", {}).get(entity_id, {}).get("room", "")
@@ -521,16 +413,12 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin):
     def _get_device_usage_stats(self, days: int = 7) -> list[dict]:
         """Return a small HA-local energy projection from stored event rows."""
         cutoff = self._ha_db_cutoff_text(days)
-        try:
-            rows = self._query_events(
-                "SELECT entity AS entity_id, state, time FROM events WHERE time >= ? "
-                "AND (entity LIKE 'light.%' OR entity LIKE 'switch.%' OR entity LIKE 'climate.%' "
-                "OR entity LIKE 'cover.%' OR entity LIKE 'fan.%') ORDER BY entity, time",
-                (cutoff,),
-            )
-        except Exception as exc:
-            _LOGGER.warning("[EnergyStats] query failed: %s", exc)
-            return []
+        rows = self._query_events(
+            "SELECT entity AS entity_id, state, time FROM events WHERE time >= ? "
+            "AND (entity LIKE 'light.%' OR entity LIKE 'switch.%' OR entity LIKE 'climate.%' "
+            "OR entity LIKE 'cover.%' OR entity LIKE 'fan.%') ORDER BY entity, time",
+            (cutoff,), required=True,
+        )
 
         stats: dict[str, dict[str, Any]] = {}
         for row in rows:

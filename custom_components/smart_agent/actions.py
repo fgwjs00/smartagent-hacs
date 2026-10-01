@@ -20,6 +20,15 @@ from homeassistant.util import dt as dt_util
 from homeassistant.exceptions import ServiceNotFound
 
 from .action_execution_runtime import ActionExecutionRuntimeMixin
+from .action_execution_context import ActionBatchContext, ActionCall
+from .service_execution_context import ServiceCallContext, PreparedServiceState
+from .service_execution_receipts import verify_service_receipt
+from .service_execution_success import record_service_success
+from .service_execution_preparation import prepare_service
+from .service_execution_transport import ServiceEnvelopeTransport
+from .service_execution_errors import (
+    ServiceErrorRecorder,
+)
 from .action_receipts import (
     ActionExecutionResult,
     ActionResultCollector,
@@ -143,6 +152,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         status: str = "",
         http_status: int | None = None,
         request_id: str = "",
+        failure_details: dict[str, str] | None = None,
     ) -> None:
         key = self._service_call_error_key(transaction_id, action_seq, entity_id)
         store = getattr(self, "_service_call_errors", None)
@@ -160,6 +170,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             detail["http_status"] = http_status
         if request_id:
             detail["request_id"] = request_id
+        if failure_details:
+            for name in ("operation", "error_id", "exception_type"):
+                if name in failure_details:
+                    detail[name] = failure_details[name]
         store[key] = detail
 
     def _clear_service_call_error(self, transaction_id: int, action_seq: int, entity_id: str) -> None:
@@ -220,83 +234,15 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
         return False, ""
 
-    def _is_night_time(self) -> bool:
-        """夜间窗口判定（保守）：22:00-06:00。"""
-        h = self._daylight_fallback_hour()
-        if h is None:
-            return False
-        return h >= 22 or h < 6
-
-    @staticmethod
-    def _room_looks_like_bedroom(room: str) -> bool:
-        """基于房间语义做卧室判定。"""
-        room_l = str(room or "").lower()
-        return any(k in room_l for k in ("卧", "bedroom", "主卧", "次卧", "儿童房", "master", "guest"))
-
-    def _apply_sleep_reentry_low_disturbance(
-        self,
-        entity_id: str,
-        domain: str,
-        service: str,
-        params: dict,
-        runtime_hints: dict,
-    ) -> tuple[str, dict]:
-        """夜间卧室二次进入时，锁定低扰动灯参数。"""
-        if domain != "light" or service != "turn_on":
-            return service, params
-        if not runtime_hints.get("sleep_reentry"):
-            return service, params
-
-        room = (self.device_info.get(entity_id) or {}).get("room", "")
-        if not (self._room_looks_like_bedroom(room) and self._is_night_time()):
-            return service, params
-
-        out = dict(params or {})
-        bri = out.get("brightness_pct")
-        if bri is None and "brightness" in out:
-            try:
-                bri = float(out.get("brightness")) / 255 * 100
-            except (TypeError, ValueError, ZeroDivisionError):
-                bri = None
-        if bri is None:
-            out["brightness_pct"] = 20
-        else:
-            try:
-                out["brightness_pct"] = min(float(bri), 30)
-            except (TypeError, ValueError):
-                out["brightness_pct"] = 20
-
-        if "color_temp_kelvin" in out:
-            try:
-                out["color_temp_kelvin"] = min(float(out["color_temp_kelvin"]), 3200)
-            except (TypeError, ValueError):
-                out["color_temp_kelvin"] = 3000
-        elif "color_temp" in out:
-            try:
-                _k = 1_000_000 / float(out["color_temp"])
-                out["color_temp_kelvin"] = min(_k, 3200)
-                out.pop("color_temp", None)
-            except (TypeError, ValueError, ZeroDivisionError):
-                out["color_temp_kelvin"] = 3000
-        else:
-            out["color_temp_kelvin"] = 3000
-
-        self._sys_log("INFO", f"[SleepGuard] 夜间卧室二次进入低扰动锁定: {entity_id} -> {out}")
-        return service, out
-
     def _action_entity_room(self, entity_id: str) -> str:
-        info = {}
         try:
             info = self.device_info.get(entity_id, {}) or {}
-        except Exception:
-            info = {}
-        room = str(info.get("room") or "").strip() if isinstance(info, dict) else ""
-        if not room and hasattr(self, "_get_entity_area"):
-            try:
+            room = str(info.get("room") or "").strip() if isinstance(info, dict) else ""
+            if not room and hasattr(self, "_get_entity_area"):
                 room = str(self._get_entity_area(entity_id) or "").strip()
-            except Exception:
-                room = ""
-        return room
+            return room
+        except Exception as exc:
+            raise RuntimeError("action_entity_room_read_failed") from exc
 
     @staticmethod
     def _float_or_none(value: Any) -> float | None:
@@ -933,24 +879,25 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         return binary_departure and any(marker in text for marker in presence_markers)
 
     @staticmethod
-    def _json_list_or_empty(value: Any) -> list[Any]:
+    def _scene_cache_list(value: Any) -> list[Any]:
+        """Absent optional metadata is empty; corrupt evidence must propagate."""
         if isinstance(value, list):
             return value
-        if isinstance(value, str) and value.strip():
-            try:
-                import json as _json
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return []
+        if isinstance(value, str):
+            import json as _json
 
-                parsed = _json.loads(value)
-            except Exception:
-                return []
-            return parsed if isinstance(parsed, list) else []
-        return []
+            parsed = _json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        raise ValueError("scene_lighting_metadata_invalid")
 
     @staticmethod
     def _scene_cache_entity_ids(scene: dict[str, Any]) -> list[str]:
         entity_ids: list[str] = []
         for key in ("entities", "entities_json"):
-            for item in ActionsMixin._json_list_or_empty(scene.get(key)):
+            for item in ActionsMixin._scene_cache_list(scene.get(key)):
                 if isinstance(item, dict):
                     entity_id = str(item.get("entity_id") or item.get("entity") or "").strip()
                 else:
@@ -958,7 +905,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 if entity_id:
                     entity_ids.append(entity_id)
         for key in ("actions", "actions_json"):
-            for item in ActionsMixin._json_list_or_empty(scene.get(key)):
+            for item in ActionsMixin._scene_cache_list(scene.get(key)):
                 if not isinstance(item, dict):
                     continue
                 entity_id = str(item.get("entity_id") or item.get("entity") or "").strip()
@@ -971,7 +918,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if any(entity_id.startswith("light.") for entity_id in ActionsMixin._scene_cache_entity_ids(scene)):
             return True
         for key in ("actions", "actions_json"):
-            for item in ActionsMixin._json_list_or_empty(scene.get(key)):
+            for item in ActionsMixin._scene_cache_list(scene.get(key)):
                 if not isinstance(item, dict):
                     continue
                 entity_id = str(item.get("entity_id") or item.get("entity") or "").strip()
@@ -982,10 +929,11 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         return False
 
     def _ai_scene_cache_row_for_entity(self, entity_id: str) -> dict[str, Any] | None:
+        from .ai_scene_projection import require_ai_scene_projection
         target = str(entity_id or "").strip()
         local_id = target.split(".", 1)[-1] if "." in target else target
         numeric_id = local_id[3:] if local_id.startswith("ai_") else ""
-        for scene in getattr(self, "_ai_scenes_cache", []) or []:
+        for scene in require_ai_scene_projection(self):
             if not isinstance(scene, dict):
                 continue
             scene_ids = {
@@ -1067,11 +1015,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if domain != "switch":
             return False
 
-        info = {}
-        try:
-            info = (getattr(self, "device_info", {}) or {}).get(entity_id, {}) or {}
-        except Exception:
-            info = {}
+        info = (getattr(self, "device_info", {}) or {}).get(entity_id, {}) or {}
 
         parts: list[str] = [entity_id]
         if isinstance(info, dict):
@@ -1140,11 +1084,17 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         )
 
     def _normalize_room_occupancy_entries(self, entries: Any) -> list[tuple[str, str]]:
+        if not isinstance(entries, (list, tuple)):
+            raise ValueError("presence_occupancy_entries_invalid")
         normalized: list[tuple[str, str]] = []
-        for item in entries or []:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
-                continue
-            normalized.append((str(item[0]), str(item[1]).lower()))
+        for item in entries:
+            if (
+                not isinstance(item, (list, tuple)) or len(item) < 2
+                or not isinstance(item[0], str) or not item[0].strip()
+                or not isinstance(item[1], str) or not item[1].strip()
+            ):
+                raise ValueError("presence_occupancy_entry_invalid")
+            normalized.append((item[0], item[1].lower()))
         return normalized
 
     def _legacy_room_occupancy_entries(self, room: str) -> list[tuple[str, str]]:
@@ -1210,8 +1160,8 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if hasattr(self, "_get_entity_area"):
             try:
                 area = str(self._get_entity_area(entity_id) or "").strip()
-            except Exception:
-                area = ""
+            except Exception as exc:
+                raise RuntimeError("action_entity_area_candidates_read_failed") from exc
             if area and area not in candidates:
                 candidates.append(area)
         return candidates
@@ -1232,24 +1182,25 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             self._last_live_presence_guard_status = {"ok": True, "reason": ""}
         try:
             occ_map = getter()
-        except Exception:
+        except Exception as exc:
             if uses_live_projection:
                 self._last_live_presence_guard_status = {
                     "ok": False,
                     "reason": "presence_live_projection_failed",
                 }
-            return []
+            raise RuntimeError("presence_occupancy_map_read_failed") from exc
         if not isinstance(occ_map, dict):
             if uses_live_projection:
                 self._last_live_presence_guard_status = {
                     "ok": False,
                     "reason": "presence_live_projection_invalid",
                 }
-            return []
+            raise ValueError("presence_occupancy_map_invalid")
         for candidate in self._space_candidate_values(room, room_candidates or []):
-            entries = occ_map.get(candidate) or []
-            if entries:
-                return self._normalize_room_occupancy_entries(entries)
+            if candidate in occ_map:
+                entries = self._normalize_room_occupancy_entries(occ_map[candidate])
+                if entries:
+                    return entries
         return []
 
     def _presence_snapshot_room_payload(
@@ -1296,8 +1247,8 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             return []
         try:
             snapshot = getter()
-        except Exception:
-            return []
+        except Exception as exc:
+            raise RuntimeError("canonical_presence_read_failed") from exc
         payload = self._presence_snapshot_room_payload(snapshot, room, room_candidates)
         if isinstance(payload, str):
             payload = {"state": payload}
@@ -1518,10 +1469,11 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if hasattr(self, "get_device_capability"):
             try:
                 cap = self.get_device_capability(entity_id)
-                if isinstance(cap, dict):
-                    return cap
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError("action_device_capability_read_failed") from exc
+            if not isinstance(cap, dict):
+                raise ValueError("action_device_capability_shape_invalid")
+            return cap
         info = self.device_info.get(entity_id, {}) or {}
         room = (info.get("room") or "").strip()
         return {
@@ -1700,6 +1652,18 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
     # ── Action Router ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _scene_route_entity_ids(value: Any) -> set[str]:
+        entries = ActionsMixin._scene_cache_list(value)
+        if any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("entity_id"), str)
+            or not entry["entity_id"].strip()
+            for entry in entries
+        ):
+            raise ValueError("scene_route_entities_invalid")
+        return {entry["entity_id"] for entry in entries}
+
     def _find_associated_script(self, entity_id: str, service: str) -> str | None:
         """Action Router: 根据设备 entity_id 和 service 查找最匹配的 HA 脚本/场景。
 
@@ -1707,10 +1671,13 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
           1. 激活的 AI 场景（包含此设备 + 当前时段匹配）→ 直接路由至 scene.ai_<id>
           2. 人工 HA 脚本/场景（名称模糊匹配）
         """
-        import json as _json
         from .const import AI_SCENE_STATUS_ACTIVE, ai_scene_matches_now
 
         is_on = "turn_on" in service or "open" in service
+
+        if getattr(self, "_ai_scenes_read_error", None) is not None:
+            self._sys_log("WARN", "[Action Router] ai_scene_projection_unavailable; retain direct device target")
+            return None
 
         # ── 1. 检查激活的 AI 场景（时段匹配 + 包含此设备 + 方向一致）────────
         # 使用 ai_scene_matches_now() 统一星期格式（SQLite %w，0=日），
@@ -1723,11 +1690,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 if not ai_scene_matches_now(sc, _now.hour, _now.weekday()):
                     continue
                 # 包含目标设备检查
-                try:
-                    ents = _json.loads(sc.get("entities_json", "[]"))
-                except Exception:
-                    continue
-                if not any(e.get("entity_id") == entity_id for e in ents):
+                if entity_id not in self._scene_route_entity_ids(sc.get("entities_json", "[]")):
                     continue
                 # 确认对应 HA 场景实体存在
                 ha_eid = f"scene.ai_{sc['id']}"
@@ -2175,106 +2138,33 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         ai_new_state: str,
         occupancy_cycle_id: str = "",
     ) -> None:
-        """Apply post-dispatch bookkeeping for one verified batch receipt."""
-        self._last_inference[entity_id] = now_ts
-        if domain in ("scene", "script") and service == "turn_on":
-            self._scene_last_exec[entity_id] = time.time()
-        self._last_ai_actions[entity_id] = {
-            "state": ai_new_state,
-            "time": now_ts,
-            "service": f"{domain}.{service}",
-            "scene": scene_desc,
-            "trigger": trigger_text,
-            "origin": "smartagent",
-            "actor": "smartagent:execution",
-            "decision_id": str(parent_transaction_id or "unknown"),
-            "transaction_id": str(parent_transaction_id or "unknown"),
-            "execution_transaction_id": str(transaction_id or "unknown"),
-            "world_snapshot_id": str(world_snapshot_id or "unknown"),
-            "correlation_id": correlation_id,
-        }
-        with self._user_overrides_lock:
-            self._user_overrides.pop(entity_id, None)
-        if occupancy_cycle_id:
-            self._record_device_operation(
-                entity_id,
-                ai_source,
-                ai_new_state,
-                params,
-                occupancy_cycle_id=occupancy_cycle_id,
-            )
-        else:
-            self._record_device_operation(entity_id, ai_source, ai_new_state, params)
-        normalized_parent_transaction_id = str(parent_transaction_id or "").strip()
-        event_detail = f"{entity_id} -> {service}"
-        event_metadata: dict[str, Any] = {
-            "detail": event_detail,
-            "domain": domain,
-            "service": service,
-            "entity_id": entity_id,
-        }
-        if params:
-            event_metadata["params"] = dict(params)
-        if reason:
-            event_metadata["reason"] = reason
-        if scene_desc:
-            event_metadata["scene_desc"] = scene_desc
-        if trigger_text:
-            event_metadata["trigger_summary"] = trigger_text
-        if transaction_id:
-            event_metadata["execution_transaction_id"] = int(transaction_id)
-        if normalized_parent_transaction_id:
-            event_metadata["parent_transaction_id"] = normalized_parent_transaction_id
-            event_metadata["decision_trace"] = {
-                "available": True,
-                "transaction_id": normalized_parent_transaction_id,
-                "url": f"/decision-trace/{normalized_parent_transaction_id}",
-            }
-        if correlation_id:
-            event_metadata["correlation_id"] = correlation_id
-        self.hass.async_add_executor_job(
-            self._record_event,
-            "AI_Action",
-            event_detail,
-            entity_id,
-            "on" if "turn_on" in service else "off",
-            "ai",
-            None,
-            transaction_id,
+        """Apply the shared post-dispatch bookkeeping for a verified batch receipt."""
+        context = ServiceCallContext(
+            ActionCall(domain, service, entity_id, params, reason),
+            ActionBatchContext(
+                scene_desc=scene_desc,
+                trigger_summary=trigger_text,
+                transaction_id=transaction_id,
+                parent_transaction_id=parent_transaction_id,
+                world_snapshot_id=world_snapshot_id,
+                correlation_id=correlation_id,
+                active_space_id="",
+                decision_time="",
+                cmd_source="",
+                require_world_snapshot_guard=False,
+                decision_contract_lineage=None,
+                user_intent_authority=None,
+            ),
             action_seq,
-            event_metadata,
+            "",
         )
-        if service == "turn_off" and trigger_text:
-            trigger_lower = trigger_text.lower()
-            if any(
-                keyword in trigger_lower
-                for keyword in ("离开", "departure", "无人", "empty", "人员离开")
-            ):
-                room = (self.device_info.get(entity_id) or {}).get("room", "")
-                if room and hasattr(self, "_last_departure_turnoff_time"):
-                    self._last_departure_turnoff_time[room] = time.time()
-        await self._async_update_status(
-            "运行中",
-            f"{self.get_device_name(entity_id)} -> {service} ({reason[:30]})",
+        await record_service_success(
+            self,
+            context,
+            PreparedServiceState(now_ts, ai_source, ai_new_state, params),
+            occupancy_cycle_id=occupancy_cycle_id,
+            prepared_batch=True,
         )
-        expected = "on" if ("turn_on" in service or "open" in service) else "off"
-        if len(self._pending_verifications) < self._VERIFY_QUEUE_MAX:
-            self._pending_verifications.append({
-                "entity_id": entity_id,
-                "domain": domain,
-                "service": service,
-                "expected_state": expected,
-                "reason": reason,
-                "fire_time": time.time(),
-                "retry": 0,
-                "transaction_id": transaction_id,
-                "action_seq": action_seq,
-                "parent_transaction_id": str(parent_transaction_id or "unknown"),
-                "world_snapshot_id": str(world_snapshot_id or "unknown"),
-                "correlation_id": correlation_id,
-            })
-        if domain == "climate" and "turn_on" in service:
-            await self._register_env_feedback(entity_id)
 
     async def _do_call_service(
         self,
@@ -2316,592 +2206,64 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if is_user_explicit and require_world_snapshot_guard:
             from .admin_actor import AuthenticatedOwnerSession
 
-            authenticated_user_explicit = (
-                type(user_intent_authority) is AuthenticatedOwnerSession
-            )
-        state = self.hass.states.get(entity_id)
-        is_presence_departure_turnoff = (
-            service == "turn_off"
-            and self._looks_like_presence_departure_turnoff(
-                reason=str(reason or ""),
-                scene_desc=str(scene_desc or ""),
-                trigger_summary=str(trigger_text or ""),
-            )
-        )
-        self._clear_service_call_error(transaction_id, action_seq, entity_id)
-        if state and service == "turn_off" and state.state == "off" and not is_presence_departure_turnoff:
-            self._remember_service_call_error(
-                transaction_id,
-                action_seq,
-                entity_id,
-                msg="already_in_target_state",
-                status="skipped",
-            )
-            return False
-
-        def _fail_before_service(msg: str, *, error_type: str = "ha_service_guard", status: str = "blocked") -> bool:
-            self._remember_service_call_error(
-                transaction_id,
-                action_seq,
-                entity_id,
-                msg=msg,
-                error=msg,
-                error_type=error_type,
-                status=status,
-            )
-            return False
-
-        def _is_service_missing_error(error: Exception | str) -> bool:
-            text = str(error).lower()
-            return "not found" in text or "unknown" in text or "does not exist" in text
-
-        def _service_failure_error_type(error: Exception | str) -> str:
-            return "service_missing" if _is_service_missing_error(error) else "ha_service_error"
-
-        def _fail_after_service(
-            msg: str,
-            *,
-            error_type: str = "ha_service_error",
-            status: str = "failed",
-            overwrite_stale: bool = False,
-        ) -> bool:
-            store = getattr(self, "_service_call_errors", None)
-            key = self._service_call_error_key(transaction_id, action_seq, entity_id)
-            existing = store.get(key) if isinstance(store, dict) else None
-            if isinstance(existing, dict):
-                existing_msg = str(existing.get("msg") or existing.get("error") or "")
-                existing_type = str(existing.get("error_type") or "")
-                existing_status = str(existing.get("ha_command_status") or "")
-                if existing_msg == str(msg or ""):
-                    should_upgrade_type = (
-                        bool(error_type)
-                        and (
-                            not existing_type
-                            or (existing_type == "ha_service_error" and error_type == "service_missing")
-                        )
-                    )
-                    if should_upgrade_type or (status and not existing_status):
-                        self._remember_service_call_error(
-                            transaction_id,
-                            action_seq,
-                            entity_id,
-                            msg=msg,
-                            error=str(existing.get("error") or msg),
-                            error_type=error_type if should_upgrade_type else existing_type,
-                            status=existing_status or status,
-                        )
-                    return False
-                if not overwrite_stale:
-                    current_is_generic = not error_type or error_type == "ha_service_error"
-                    existing_is_specific = bool(existing_type) and existing_type != "ha_service_error"
-                    if existing_is_specific and current_is_generic:
-                        return False
-            else:
-                self._remember_service_call_error(
-                    transaction_id,
-                    action_seq,
-                    entity_id,
-                    msg=msg,
-                    error=msg,
-                    error_type=error_type,
-                    status=status,
-                )
-                return False
-            self._remember_service_call_error(
-                transaction_id,
-                action_seq,
-                entity_id,
-                msg=msg,
-                error=msg,
-                error_type=error_type,
-                status=status,
-            )
-            return False
-
-        self_trigger_guard = evaluate_self_trigger_protection(
-            entity_id=entity_id,
-            service=service,
-            trigger_entities=self._batch_trigger_controllable,
-        )
-        if not self_trigger_guard.allowed and not authenticated_user_explicit:
-            self._sys_log("WARN", f"[自触发保护] {entity_id} 触发了本次推理，拒绝 AI 操作该设备 → {service}（防止死循环）")
-            return _fail_before_service(
-                self_trigger_guard.msg,
-                error_type=self_trigger_guard.error_type or "self_trigger_protection",
-                status=self_trigger_guard.status or "blocked_self_trigger",
-            )
-        now_ts = time.time()
-        # ── 自动化冲突硬拦截：若设备被 HA 自动化管辖且自动化近期执行过，拒绝 AI 操作 ──
-        auto_names = self._automation_managed_devices.get(entity_id)
-        if auto_names and not authenticated_user_explicit:
-            automation_records: list[dict[str, Any]] = []
-            for a_state in self.hass.states.async_all("automation"):
-                a_name = a_state.attributes.get("friendly_name", "")
-                if a_name not in auto_names:
-                    continue
-                last_triggered = a_state.attributes.get("last_triggered")
-                if last_triggered:
-                    try:
-                        if hasattr(last_triggered, "timestamp"):
-                            lt_ts = last_triggered.timestamp()
-                        else:
-                            from datetime import datetime as _dt
-                            lt_ts = _dt.fromisoformat(str(last_triggered).replace("Z", "+00:00")).timestamp()
-                        automation_records.append({
-                            "name": a_name,
-                            "last_triggered_ts": lt_ts,
-                        })
-                    except Exception as exc:
-                        _LOGGER.debug("[Actions] 自动化避让时间解析失败: %s", exc)
-            automation_guard = evaluate_automation_conflict_window(
-                entity_id=entity_id,
-                service=service,
-                managed_automation_names=auto_names,
-                automation_records=automation_records,
-                now_ts=now_ts,
-                window_seconds=self._AUTOMATION_EXEC_WINDOW,
-            )
-            if not automation_guard.allowed:
-                self._sys_log("WARN", f"[自动化避让] {entity_id} 被自动化「{automation_guard.automation_name}」管辖，"
-                              f"该自动化 {automation_guard.age_seconds}s 前刚触发，AI 退让 → {service}（{self._AUTOMATION_EXEC_WINDOW}s 窗口）")
-                return _fail_before_service(
-                    automation_guard.msg,
-                    error_type=automation_guard.error_type or "automation_conflict",
-                    status=automation_guard.status or "blocked",
-                )
-        # ── 优先级仲裁（Product Rule P0-P4 分级控制）──
-        from .const import MODE_HOME, SOURCE_AI_INFER, SOURCE_AI_RULE
-        ai_source = SOURCE_AI_INFER
-        if "🔒" in reason or "锁定" in reason:
-            ai_source = SOURCE_AI_RULE
-
-        global_suppress_guard = evaluate_global_suppress_window(
-            entity_id=entity_id,
-            service=service,
-            now_ts=now_ts,
-            suppress_until=self._global_suppress_until,
-            suppress_reason=self._global_suppress_reason,
-        )
-        if not global_suppress_guard.allowed:
-            self._sys_log(
-                "WARN",
-                f"[P0 全局抑制] {self._global_suppress_reason}"
-                f"（剩余 {global_suppress_guard.remaining_seconds}s）→ 拒绝 {entity_id}.{service}",
-            )
-            return _fail_before_service(
-                global_suppress_guard.msg,
-                error_type=global_suppress_guard.error_type or "global_suppress",
-                status=global_suppress_guard.status or "blocked",
-            )
-
-        if self._mode == MODE_HOME:
-            target_info = self.device_info.get(entity_id, {}) if isinstance(self.device_info, dict) else {}
-            if not isinstance(target_info, dict):
-                target_info = {}
-            current_cycle_id = str(
-                ((decision_contract_lineage or {}).get("occupancy_cycle_id") or "")
-                if isinstance(decision_contract_lineage, dict)
-                else ""
-            ).strip()
-            existing_priority_record = (
-                self._device_priority_map.get(entity_id)
-                if isinstance(getattr(self, "_device_priority_map", None), dict)
-                else None
-            )
-            reentry_override = evaluate_proactive_priority_handoff(
-                entity_id=entity_id,
-                service=service,
-                claim=priority_override_claim,
-                existing=existing_priority_record,
-                active_space_id=active_space_id,
-                target_space_id=target_space_id,
+            authenticated_user_explicit = type(user_intent_authority) is AuthenticatedOwnerSession
+        service_context = ServiceCallContext(
+            ActionCall(domain, service, entity_id, params, reason),
+            ActionBatchContext(
+                scene_desc=scene_desc,
+                trigger_summary=trigger_text,
+                transaction_id=transaction_id,
+                parent_transaction_id=parent_transaction_id,
                 world_snapshot_id=world_snapshot_id,
+                correlation_id=correlation_id,
+                active_space_id=active_space_id,
                 decision_time=decision_time,
-                occupancy_cycle_id=current_cycle_id,
-                now_ts=now_ts,
-                is_lighting=(
-                    domain == "light"
-                    or str(target_info.get("capability") or "") == "lighting"
-                ),
-                max_age_seconds=30,
-            )
-            if authenticated_user_explicit:
-                self._sys_log(
-                    "INFO",
-                    f"[priority] explicit user command bypassed AI anti-flap guard: {entity_id}.{service}",
-                )
-            elif require_world_snapshot_guard and reentry_override.allowed:
-                self._sys_log(
-                    "INFO",
-                    f"[主动优先级交接] {entity_id} 使用 Core cycle claim 反向动作",
-                )
-            elif (
-                isinstance(existing_priority_record, dict)
-                and existing_priority_record.get("priority") in {3, 4}
-                and str(existing_priority_record.get("source") or "").strip().lower()
-                in {"ai_rule", "ai_infer"}
-                and str(existing_priority_record.get("occupancy_cycle_id") or "").strip()
-                and (
-                    (
-                        str(existing_priority_record.get("state") or "").strip().lower()
-                        in self._OFF_STATES
-                        and ("turn_on" in service or "open" in service)
-                    )
-                    or (
-                        str(existing_priority_record.get("state") or "").strip().lower()
-                        not in self._OFF_STATES
-                        and ("turn_off" in service or "close" in service)
-                    )
-                )
-            ):
-                return _fail_before_service(
-                    "priority_guard_active",
-                    error_type="priority_guard",
-                )
-            else:
-                allowed, arb_reason = self._arbitrate(entity_id, ai_source, service, params)
-                if not allowed:
-                    self._sys_log("WARN", arb_reason)
-                    return _fail_before_service(
-                        str(arb_reason or "priority_guard_rejected"),
-                        error_type="priority_guard",
-                    )
-            # 人工 override 是唯一可配置的时间保护；未配置即禁用。
-            with self._user_overrides_lock:
-                override = self._user_overrides.get(entity_id)
-            manual_guard = evaluate_manual_override_window(
-                entity_id=entity_id,
-                service=service,
-                now_ts=now_ts,
-                override=override,
-                off_states=self._OFF_STATES,
-                window_seconds=getattr(
-                    self, "_manual_override_protection_seconds", 0
-                ),
-            )
-            if not manual_guard.allowed and not authenticated_user_explicit:
-                self._sys_log("WARN", f"[manual override protection] {manual_guard.msg}")
-                return _fail_before_service(
-                    manual_guard.msg,
-                    error_type=manual_guard.error_type or "user_override_protection",
-                    status=manual_guard.status or "blocked",
-                )
-            if manual_guard.clear_expired_override:
-                with self._user_overrides_lock:
-                    current_override = self._user_overrides.get(entity_id)
-                    if current_override is override or current_override == override:
-                        self._user_overrides.pop(entity_id, None)
-        canonical_service = str(service or "").strip().lower().split(".", 1)[-1]
-        ai_new_state = (
-            "on" if canonical_service in {"turn_on", "open_cover"} else "off"
+                cmd_source=cmd_source,
+                require_world_snapshot_guard=require_world_snapshot_guard,
+                decision_contract_lineage=decision_contract_lineage,
+                user_intent_authority=user_intent_authority,
+                authenticated_user_intent=authenticated_user_explicit,
+            ),
+            action_seq,
+            target_space_id,
+            priority_override_claim,
         )
-        safe_params = {k: v for k, v in params.items() if k != "entity_id"}
-        # HA 2024+ 已废弃 color_temp(mireds)，统一改为 color_temp_kelvin(Kelvin)
-        # 若 AI 仍输出旧格式，自动转换以避免 schema 报错
-        color_temp_guard = evaluate_color_temp_mireds_param(
-            entity_id=entity_id,
-            service=service,
-            params=safe_params,
-        )
-        if not color_temp_guard.allowed:
-            mired_val = str(color_temp_guard.msg).split(":", 1)[1] if ":" in color_temp_guard.msg else ""
-            self._sys_log("ERROR", f"[动作] {entity_id} color_temp({mired_val}) 非法，拒绝执行")
-            return _fail_before_service(
-                color_temp_guard.msg,
-                error_type=color_temp_guard.error_type or "invalid_action_param",
-                status=color_temp_guard.status or "blocked_invalid_params",
-            )
-        if color_temp_guard.normalized_params is not None:
-            safe_params = dict(color_temp_guard.normalized_params)
-        if color_temp_guard.color_temp_kelvin:
-            self._sys_log("INFO", f"[动作] {entity_id} color_temp({color_temp_guard.color_temp_mireds}mireds)"
-                          f" → color_temp_kelvin({color_temp_guard.color_temp_kelvin}K) 自动转换")
-        self._clear_service_call_error(transaction_id, action_seq, entity_id)
-
+        errors = ServiceErrorRecorder(self, transaction_id, action_seq, entity_id)
+        prepared = prepare_service(self, service_context, errors)
+        if prepared is None:
+            return False
         if prepare_only:
             return {
                 "domain": str(domain or "").strip(),
                 "service": str(service or "").strip(),
                 "entity_id": str(entity_id or "").strip(),
-                "data": dict(safe_params),
-                "now_ts": float(now_ts),
-                "ai_source": str(ai_source or ""),
-                "ai_new_state": str(ai_new_state or ""),
+                "data": dict(prepared.safe_params),
+                "now_ts": float(prepared.now_ts),
+                "ai_source": str(prepared.ai_source or ""),
+                "ai_new_state": str(prepared.ai_new_state or ""),
             }
+        self._last_inference[entity_id] = prepared.now_ts
 
-        self._last_inference[entity_id] = now_ts
-
-        def _is_param_rejection(exc: Exception | str) -> bool:
-            text = str(exc).lower()
-            return "extra keys" in text or "not allowed" in text or "unexpected" in text
-
-        async def _call_enveloped_service(call_data: dict[str, Any]) -> dict[str, Any]:
-            active_correlations = getattr(self, "_active_service_correlation_ids", None)
-            if not isinstance(active_correlations, dict):
-                active_correlations = {}
-                self._active_service_correlation_ids = active_correlations
-            task = asyncio.current_task()
-            previous = active_correlations.get(task)
-            if correlation_id:
-                active_correlations[task] = correlation_id
-            try:
-                active_execution_kwargs = (
-                    {
-                        "world_snapshot_id": world_snapshot_id,
-                        "active_space_id": active_space_id,
-                        "decision_time": decision_time,
-                        "target_space_id": target_space_id,
-                        "cmd_source": cmd_source,
-                        "require_world_snapshot_guard": True,
-                        "decision_contract_lineage": decision_contract_lineage,
-                        "user_intent_authority": user_intent_authority,
-                    }
-                    if require_world_snapshot_guard
-                    else {}
-                )
-                return await self._execute_enveloped_service(
-                    domain,
-                    service,
-                    entity_id,
-                    call_data,
-                    reason,
-                    transaction_id,
-                    action_seq,
-                    **active_execution_kwargs,
-                )
-            finally:
-                if previous:
-                    active_correlations[task] = previous
-                else:
-                    active_correlations.pop(task, None)
-
-        envelope_result: dict[str, Any] = {}
-        try:
-            envelope_result = await _call_enveloped_service(safe_params)
-        except Exception as call_err:
-            # Canonical active-AI commands are already admitted against an
-            # exact command envelope.  Retrying with stripped parameters
-            # would change the approved physical effect after admission.
-            # Preserve the first failure; only the legacy host path below may
-            # retain its historical compatibility fallback.
-            if require_world_snapshot_guard:
-                if _is_service_missing_error(call_err):
-                    self._sys_log("ERROR", f"[动作] {domain}.{service}({entity_id}) 实体/服务不存在，跳过。"
-                                  f"请检查设备是否在线或名称是否正确。原始错误: {call_err}")
-                    return _fail_after_service(str(call_err), error_type="service_missing")
-                self._sys_log("ERROR", f"[动作] {entity_id} canonical 服务调用失败: {call_err}")
-                return _fail_after_service(str(call_err))
-            err_str = str(call_err).lower()
-            # 部分设备不支持某些扩展参数，尝试智能降级：
-            # 优先仅剔除色温参数保留亮度，若仍失败再去除全部扩展参数
-            extra_keys = [k for k in safe_params]
-            if extra_keys and _is_param_rejection(err_str):
-                color_keys_present = [k for k in extra_keys if k in ACTION_PARAM_KEYS_COLOR]
-                non_color_params = {k: v for k, v in safe_params.items() if k not in ACTION_PARAM_KEYS_COLOR}
-                if color_keys_present and non_color_params:
-                    # 先尝试：去掉色温，保留亮度等其他参数
-                    self._sys_log("WARN", f"[动作] {entity_id} 不支持色温参数 {color_keys_present}，"
-                                  f"保留亮度重试: {non_color_params}")
-                    try:
-                        envelope_result = await _call_enveloped_service(non_color_params)
-                    except ServiceNotFound:
-                        raise
-                    except Exception as retry_err:
-                        if not _is_param_rejection(retry_err):
-                            self._sys_log("ERROR", f"[动作] {entity_id} 保留亮度重试失败: {retry_err}")
-                            return _fail_after_service(
-                                str(retry_err),
-                                error_type=_service_failure_error_type(retry_err),
-                                overwrite_stale=True,
-                            )
-                        # 再退一步：去除全部扩展参数
-                        self._sys_log("WARN", f"[动作] {entity_id} 亮度参数也失败，去除全部扩展参数重试")
-                        try:
-                            envelope_result = await _call_enveloped_service({})
-                        except ServiceNotFound:
-                            raise
-                        except Exception as bare_retry_err:
-                            self._sys_log("ERROR", f"[动作] {entity_id} 服务调用重试失败: {bare_retry_err}")
-                            return _fail_after_service(
-                                str(bare_retry_err),
-                                error_type=_service_failure_error_type(bare_retry_err),
-                                overwrite_stale=True,
-                            )
-                else:
-                    # 没有可保留的参数，直接裸调用
-                    self._sys_log("WARN", f"[动作] {entity_id} 不支持参数 {extra_keys}，去除后重试")
-                    try:
-                        envelope_result = await _call_enveloped_service({})
-                    except ServiceNotFound:
-                        raise
-                    except Exception as retry_err:
-                        self._sys_log("ERROR", f"[动作] {entity_id} 服务调用重试失败: {retry_err}")
-                        return _fail_after_service(
-                            str(retry_err),
-                            error_type=_service_failure_error_type(retry_err),
-                            overwrite_stale=True,
-                        )
-            elif _is_service_missing_error(call_err):
-                self._sys_log("ERROR", f"[动作] {domain}.{service}({entity_id}) 实体/服务不存在，跳过。"
-                              f"请检查设备是否在线或名称是否正确。原始错误: {call_err}")
-                return _fail_after_service(str(call_err), error_type="service_missing")
-            else:
-                self._sys_log("ERROR", f"[动作] {entity_id} 服务调用失败: {call_err}")
-                return _fail_after_service(str(call_err))
-        envelope_rows = envelope_result.get("results")
-        receipt = (
-            envelope_rows[0]
-            if isinstance(envelope_rows, list)
-            and len(envelope_rows) == 1
-            and isinstance(envelope_rows[0], dict)
-            else None
+        transport = ServiceEnvelopeTransport(
+            self, service_context, errors, ServiceNotFound, ACTION_PARAM_KEYS_COLOR
         )
-        receipt_dispositions = envelope_result.get(
-            "_smartagent_receipt_dispositions"
-        )
-        receipt_disposition = (
-            str(receipt_dispositions[0])
-            if isinstance(receipt_dispositions, list)
-            and len(receipt_dispositions) == 1
-            else ""
-        )
-        if isinstance(receipt, dict) and receipt.get("ok") is True:
-            receipt_status = str(receipt.get("status") or "").strip().lower()
-            strict_active_ai_receipt = (
-                require_world_snapshot_guard and not is_user_explicit
-            )
-            if (
-                receipt.get("executed") is False or receipt_status == "skipped"
-            ) and (
-                receipt_disposition == "noop" or not strict_active_ai_receipt
-            ):
-                noop_reason = str(
-                    receipt.get("reason") or receipt.get("status") or "already_in_target_state"
-                ).strip()
-                self._remember_service_call_error(
-                    transaction_id,
-                    action_seq,
-                    entity_id,
-                    msg=noop_reason,
-                    status="skipped",
-                )
-                return False
-            if (
-                receipt.get("executed") is not True
-                or (
-                    require_world_snapshot_guard
-                    and not is_user_explicit
-                    and receipt_disposition != "verified_success"
-                )
-            ):
-                return _fail_after_service(
-                    "ha_execution_receipt_unverified",
-                    error_type="ha_service_unverified_success",
-                    status="failed",
-                    overwrite_stale=True,
-                )
-        else:
-            return _fail_after_service(
-                "ha_execution_receipt_unverified",
-                error_type="ha_service_unverified_success",
-                status="failed",
-                overwrite_stale=True,
-            )
-        if domain in ("scene", "script") and service == "turn_on":
-            self._scene_last_exec[entity_id] = time.time()
-        self._last_ai_actions[entity_id] = {
-            "state": ai_new_state,
-            "time": now_ts,
-            "service": f"{domain}.{service}",
-            "scene": scene_desc,
-            "trigger": trigger_text,
-            "origin": "smartagent",
-            "actor": "smartagent:execution",
-            "decision_id": str(parent_transaction_id or "unknown"),
-            "transaction_id": str(parent_transaction_id or "unknown"),
-            "execution_transaction_id": str(transaction_id or "unknown"),
-            "world_snapshot_id": str(world_snapshot_id or "unknown"),
-            "correlation_id": correlation_id,
-        }
-        # AI 成功执行时清除该设备的用户覆盖记录，并记录后续仲裁状态。
-        with self._user_overrides_lock:
-            self._user_overrides.pop(entity_id, None)
+        envelope_result = await transport.execute(prepared.safe_params)
+        if envelope_result is False:
+            return False
+        if not verify_service_receipt(self, service_context, envelope_result, errors):
+            return False
         occupancy_cycle_id = str(
             ((decision_contract_lineage or {}).get("occupancy_cycle_id") or "")
             if isinstance(decision_contract_lineage, dict)
             else ""
         ).strip()
-        if occupancy_cycle_id and not is_user_explicit:
-            self._record_device_operation(
-                entity_id,
-                ai_source,
-                ai_new_state,
-                params,
-                occupancy_cycle_id=occupancy_cycle_id,
-            )
-        else:
-            self._record_device_operation(entity_id, ai_source, ai_new_state, params)
-        parent_transaction_id = str(parent_transaction_id or "").strip()
-        event_detail = f"{entity_id} -> {service}"
-        event_metadata: dict[str, Any] = {
-            "detail": event_detail,
-            "domain": domain,
-            "service": service,
-            "entity_id": entity_id,
-        }
-        if isinstance(params, dict) and params:
-            event_metadata["params"] = dict(params)
-        if reason:
-            event_metadata["reason"] = reason
-        if scene_desc:
-            event_metadata["scene_desc"] = scene_desc
-        if trigger_text:
-            event_metadata["trigger_summary"] = trigger_text
-        if transaction_id:
-            event_metadata["execution_transaction_id"] = int(transaction_id)
-        if parent_transaction_id:
-            event_metadata["parent_transaction_id"] = parent_transaction_id
-            event_metadata["decision_trace"] = {
-                "available": True,
-                "transaction_id": parent_transaction_id,
-                "url": f"/decision-trace/{parent_transaction_id}",
-            }
-        if correlation_id:
-            event_metadata["correlation_id"] = correlation_id
-        self.hass.async_add_executor_job(
-            self._record_event, "AI_Action", event_detail,
-            entity_id, "on" if "turn_on" in service else "off", "ai", None,
-            transaction_id, action_seq, event_metadata,
+        await record_service_success(
+            self,
+            service_context,
+            prepared,
+            occupancy_cycle_id=occupancy_cycle_id if not is_user_explicit else "",
+            prepared_batch=False,
         )
-        # Phase 11.3: 若为 turn_off 且触发文本包含离开/departure，记录该房间冷却时间戳
-        # 巡检将在冷却期（5分钟）内跳过对该房间的推理，防止巡检覆盖离开决策
-        if service == "turn_off" and trigger_text:
-            _trig_lower = trigger_text.lower()
-            if any(kw in _trig_lower for kw in ("离开", "departure", "无人", "empty", "人员离开")):
-                _room = (self.device_info.get(entity_id) or {}).get("room", "")
-                if _room and hasattr(self, "_last_departure_turnoff_time"):
-                    self._last_departure_turnoff_time[_room] = time.time()
-                    self._sys_log("INFO",
-                        f"[冷却保护] {_room} 检测到离开关灯，设置5分钟巡检冷却窗口")
-        await self._async_update_status("运行中", f"{self.get_device_name(entity_id)} → {service}（{reason[:30]}）")
-        # ── 注册延迟状态验证 ──
-        expected = "on" if ("turn_on" in service or "open" in service) else "off"
-        if len(self._pending_verifications) < self._VERIFY_QUEUE_MAX:
-            self._pending_verifications.append({
-                "entity_id": entity_id, "domain": domain, "service": service,
-                "expected_state": expected, "reason": reason,
-                "fire_time": time.time(), "retry": 0,
-                "transaction_id": transaction_id,
-                "action_seq": action_seq,
-                "parent_transaction_id": str(parent_transaction_id or "unknown"),
-                "world_snapshot_id": str(world_snapshot_id or "unknown"),
-                "correlation_id": correlation_id,
-            })
-
-        # ── 注册环境效果反馈检查（climate 设备：10 分钟后检验温度变化）──
-        if domain == "climate" and "turn_on" in service:
-            await self._register_env_feedback(entity_id)
-
         return True
 
     async def _register_env_feedback(self, entity_id: str, check_after_secs: int = 600) -> None:

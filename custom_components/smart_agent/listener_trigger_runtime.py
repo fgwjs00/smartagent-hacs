@@ -18,6 +18,9 @@ from homeassistant.helpers.event import async_call_later
 
 from .const import SOURCE_AUTOMATION, SOURCE_DASHBOARD, SOURCE_PHYSICAL, SOURCE_VOICE
 from .presence_runtime import room_candidates, room_snapshot
+from .task_completion import (
+    TaskCompletion, create_ha_task, observe_ha_task, read_task_completion, report_task_completion,
+)
 from .service_contracts import STATEFUL_EXECUTION_DOMAINS
 
 
@@ -515,73 +518,37 @@ def emit_slow_inference_task_failure(
             _LOGGER.debug("[SlowInference] decision_log enqueue failed: %s", exc)
 
 def handle_slow_inference_task_done(self, task: Any, *, trigger: str, entity_id: str) -> None:
-    cancelled = False
-    try:
-        cancelled = bool(task.cancelled()) if hasattr(task, "cancelled") else False
-    except Exception:
-        cancelled = False
-    if cancelled:
-        self._sys_log("WARN", f"[决策] 线上大模型任务被取消: {entity_id}")
-        self._emit_slow_inference_task_failure(
-            trigger=trigger,
-            entity_id=entity_id,
-            reason="slow_inference_task_cancelled",
-            scene="线上大模型任务已取消",
-            status=499,
-        )
+    completion = read_task_completion(task)
+    if completion.error is None and not completion.cancelled:
         return
-    try:
-        exc = task.exception() if hasattr(task, "exception") else None
-    except asyncio.CancelledError:
-        self._sys_log("WARN", f"[决策] 线上大模型任务被取消: {entity_id}")
-        self._emit_slow_inference_task_failure(
-            trigger=trigger,
-            entity_id=entity_id,
-            reason="slow_inference_task_cancelled",
-            scene="线上大模型任务已取消",
-            status=499,
-        )
-        return
-    except Exception as err:
-        exc = err
-    if exc is None:
-        return
-    self._sys_log("ERROR", f"[决策] 线上大模型任务异常: {entity_id} | {exc}")
+    message = report_task_completion(task, completion, logger=_LOGGER, operation="slow_inference",
+                                     system_log=self._sys_log,
+                                     system_level="WARN" if completion.cancelled else "ERROR")
     self._emit_slow_inference_task_failure(
-        trigger=trigger,
-        entity_id=entity_id,
-        reason="slow_inference_task_failed",
-        scene="线上大模型任务失败",
-        status=500,
-        message=str(exc),
+        trigger=trigger, entity_id=entity_id,
+        reason="slow_inference_task_cancelled" if completion.cancelled else "slow_inference_task_failed",
+        scene="线上大模型任务被取消" if completion.cancelled else "线上大模型任务失败",
+        status=499 if completion.cancelled else 500,
+        message="" if completion.cancelled else message,
     )
 
 def spawn_slow_inference_task(self, coro: Any, *, trigger: str, entity_id: str) -> None:
     try:
-        task = self.hass.async_create_task(coro)
+        task = create_ha_task(self.hass.async_create_task, coro, logger=_LOGGER,
+                              operation="slow_inference", system_log=self._sys_log, system_level="ERROR")
     except Exception as exc:
-        close = getattr(coro, "close", None)
-        if callable(close):
-            close()
-        self._sys_log("ERROR", f"[决策] 创建线上大模型任务失败: {entity_id} | {exc}")
+        message = report_task_completion(coro, TaskCompletion(error=exc, phase="create"), logger=_LOGGER,
+                                         operation="slow_inference", system_log=self._sys_log, system_level="ERROR")
         self._emit_slow_inference_task_failure(
-            trigger=trigger,
-            entity_id=entity_id,
-            reason="slow_inference_task_create_failed",
-            scene="线上大模型任务创建失败",
-            status=500,
-            message=str(exc),
+            trigger=trigger, entity_id=entity_id, reason="slow_inference_task_create_failed",
+            scene="线上大模型任务创建失败", status=500, message=message,
         )
         return
-    add_done_callback = getattr(task, "add_done_callback", None)
-    if callable(add_done_callback):
-        add_done_callback(
-            lambda finished: self._handle_slow_inference_task_done(
-                finished,
-                trigger=trigger,
-                entity_id=entity_id,
-            )
-        )
+    observe_ha_task(
+        task, lambda done: self._handle_slow_inference_task_done(
+            done, trigger=trigger, entity_id=entity_id,
+        ), logger=_LOGGER, operation="slow_inference", system_log=self._sys_log,
+    )
 
 def flush_triggers(self, _: datetime) -> None:
     self._merge_timer_unsub = None

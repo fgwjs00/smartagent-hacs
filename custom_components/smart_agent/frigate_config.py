@@ -21,11 +21,14 @@ FrigateConfigManager — Frigate NVR 配置文件管理器。
 from __future__ import annotations
 
 import glob
+import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
-from typing import Any, Optional
+import uuid
+from typing import Any, Callable, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +112,14 @@ def generate_camera_id(friendly_name: str) -> str:
     return f"cam_{h}"
 
 
+def _frigate_file_error(operation: str, phase: str, path: str, error: BaseException, *, outcome: str) -> RuntimeError:
+    reference = hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
+    return RuntimeError(
+        f"frigate_config_failed operation={operation} phase={phase} ref={reference} "
+        f"error_id={uuid.uuid4().hex} exception_type={type(error).__name__} outcome={outcome}"
+    )
+
+
 def read_frigate_config(path: str) -> dict:
     """
     读取并解析 Frigate YAML 配置文件。
@@ -117,19 +128,22 @@ def read_frigate_config(path: str) -> dict:
         path: 配置文件路径
 
     Returns:
-        解析后的配置字典，失败时返回空字典。
+        解析后的配置字典；真正空文档返回空字典，读取/解析失败继续抛出。
     """
+    phase = "load_yaml"
     try:
         import yaml  # noqa: PLC0415
+        phase = "read"
         with open(path, "r", encoding="utf-8") as f:
+            phase = "decode"
             config = yaml.safe_load(f)
-            return config if isinstance(config, dict) else {}
-    except FileNotFoundError:
-        _LOGGER.warning("[FrigateConfig] 配置文件不存在: %s", path)
-        return {}
+        if config is None:
+            return {}
+        if not isinstance(config, dict):
+            raise ValueError("frigate_config_not_mapping")
+        return config
     except Exception as exc:
-        _LOGGER.error("[FrigateConfig] 读取配置失败: %s", exc)
-        return {}
+        raise _frigate_file_error("frigate_config_read", phase, path, exc, outcome="unavailable") from exc
 
 
 def write_frigate_config(path: str, config: dict) -> bool:
@@ -143,48 +157,43 @@ def write_frigate_config(path: str, config: dict) -> bool:
         config: 要写入的配置字典
 
     Returns:
-        写入成功返回 True，失败返回 False。
+        写入成功返回 True；失败返回 False 并记录阶段，替换时失败表示结果未知，不重放。
     """
+    phase = "load_yaml"
     try:
         import yaml  # noqa: PLC0415
-
+        phase = "backup"
         # 备份原文件
         if os.path.exists(path):
             bak_path = path + ".bak"
-            try:
-                import shutil
-                shutil.copy2(path, bak_path)
-            except Exception:
-                pass
-
+            import shutil
+            shutil.copy2(path, bak_path)
+        phase = "mkdir"
         # 确保父目录存在
         os.makedirs(os.path.dirname(path), exist_ok=True)
-
         # 原子写：先写临时文件再 rename，避免 dump 中途失败截断/损坏原配置。
-        # dump 失败时原文件保持不变（临时文件被清理）。
         tmp_path = f"{path}.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                yaml.dump(
-                    config, f,
-                    allow_unicode=True,
-                    default_flow_style=False,
-                    sort_keys=False,
-                    indent=2,
-                )
-            os.replace(tmp_path, path)
-        except Exception:
+        phase = "write"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            yaml.dump(
+                config, f, allow_unicode=True, default_flow_style=False,
+                sort_keys=False, indent=2,
+            )
+        phase = "replace"
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        outcome = "unknown" if phase == "replace" else "not_committed"
+        if phase in ("write", "replace"):
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except Exception:
-                pass
-            raise
-        _LOGGER.info("[FrigateConfig] 配置已写入: %s", path)
-        return True
-    except Exception as exc:
-        _LOGGER.error("[FrigateConfig] 写入配置失败: %s", exc)
+            except Exception as cleanup_error:
+                _LOGGER.warning("%s", _frigate_file_error(
+                    "frigate_config_write", "cleanup", path, cleanup_error, outcome=outcome))
+        _LOGGER.warning("%s", _frigate_file_error("frigate_config_write", phase, path, exc, outcome=outcome))
         return False
+    _LOGGER.info("[FrigateConfig] 配置已写入 ref=%s", hashlib.sha256(os.fsencode(path)).hexdigest()[:16])
+    return True
 
 
 def build_camera_config(
@@ -292,6 +301,22 @@ def remove_camera_from_config(config: dict, camera_id: str) -> dict:
     return config
 
 
+class FrigateConfigInvalidData(ValueError):
+    """Fixed-field rejection of malformed read data; contains no response body."""
+
+
+def _frigate_mapping(value: Any, field: str) -> dict:
+    if not isinstance(value, dict):
+        raise FrigateConfigInvalidData(f"frigate_config_invalid field={field}")
+    return value
+
+
+def _frigate_identifier(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise FrigateConfigInvalidData(f"frigate_config_invalid field={field}")
+    return value
+
+
 def list_cameras_from_config(config: dict) -> list[dict]:
     """
     从 Frigate 配置中提取摄像头列表（供前端展示）。
@@ -306,35 +331,124 @@ def list_cameras_from_config(config: dict) -> list[dict]:
         摄像头信息列表，每项包含 camera_id / friendly_name / rtsp_url / zones。
     """
     cameras = []
-    for cam_id, cam_cfg in config.get("cameras", {}).items():
-        if not isinstance(cam_cfg, dict):
-            continue
+    config = _frigate_mapping(config, "config")
+    for cam_id, cam_cfg in _frigate_mapping(config.get("cameras", {}), "cameras").items():
+        _frigate_identifier(cam_id, "camera_id")
+        cam_cfg = _frigate_mapping(cam_cfg, "camera")
         rtsp = ""
-        inputs = cam_cfg.get("ffmpeg", {}).get("inputs", [])
-        if inputs and isinstance(inputs[0], dict):
+        inputs = _frigate_mapping(cam_cfg.get("ffmpeg", {}), "ffmpeg").get("inputs", [])
+        if not isinstance(inputs, list):
+            raise FrigateConfigInvalidData("frigate_config_invalid field=inputs")
+        for input_config in inputs:
+            _frigate_mapping(input_config, "input")
+        if inputs:
             rtsp = inputs[0].get("path", "")
 
         # 提取 zones 定义（zone_id + friendly_name）
         zones = []
-        for zone_id, zone_cfg in cam_cfg.get("zones", {}).items():
-            if not isinstance(zone_cfg, dict):
-                continue
+        for zone_id, zone_cfg in _frigate_mapping(cam_cfg.get("zones", {}), "zones").items():
+            _frigate_identifier(zone_id, "zone_id")
+            zone_cfg = _frigate_mapping(zone_cfg, "zone")
             zones.append({
                 "zone_id": zone_id,
                 "friendly_name": zone_cfg.get("friendly_name", zone_id),
             })
 
+        objects = _frigate_mapping(cam_cfg.get("objects", {}), "objects")
+        filters = _frigate_mapping(objects.get("filters", {}), "filters")
+        person = _frigate_mapping(filters.get("person", {}), "person")
+        detect = _frigate_mapping(cam_cfg.get("detect", {}), "detect")
         cameras.append({
             "camera_id": cam_id,
             "friendly_name": cam_cfg.get("friendly_name", cam_id),
             "rtsp_url": rtsp,
             "enabled": cam_cfg.get("enabled", True),
-            "min_score": cam_cfg.get("objects", {}).get("filters", {}).get("person", {}).get("min_score", 0.7),
-            "threshold": cam_cfg.get("objects", {}).get("filters", {}).get("person", {}).get("threshold", 0.85),
-            "fps": cam_cfg.get("detect", {}).get("fps", 5),
+            "min_score": person.get("min_score", 0.7),
+            "threshold": person.get("threshold", 0.85),
+            "fps": detect.get("fps", 5),
             "zones": zones,
         })
     return cameras
+
+
+def _frigate_discovery_warning(phase: str, url: str, error: BaseException | None = None, *, status: int = 0) -> None:
+    _LOGGER.warning(
+        "frigate_discovery_unavailable operation=frigate_discovery phase=%s ref=%s error_id=%s exception_type=%s",
+        phase, hashlib.sha256(url.encode()).hexdigest()[:16], uuid.uuid4().hex,
+        type(error).__name__ if error is not None else f"HTTP{status}",
+    )
+
+
+def _frigate_addon_slugs(payload: Any) -> list[str]:
+    data = _frigate_mapping(_frigate_mapping(payload, "supervisor").get("data"), "supervisor.data")
+    addons = data.get("addons")
+    if not isinstance(addons, list):
+        raise FrigateConfigInvalidData("frigate_config_invalid field=supervisor.addons")
+    slugs = []
+    for addon in addons:
+        slug = _frigate_identifier(_frigate_mapping(addon, "addon").get("slug"), "addon.slug")
+        if not _ADDON_SLUG_RE.fullmatch(slug):
+            raise FrigateConfigInvalidData("frigate_config_invalid field=addon.slug")
+        if "frigate" in slug.lower():
+            slugs.append(slug)
+    return slugs
+
+
+def _frigate_info_urls(payload: Any) -> list[str]:
+    data = _frigate_mapping(_frigate_mapping(payload, "addon_info").get("data"), "addon_info.data")
+    ip = data.get("ip_address", "")
+    if ip in (None, "", "null"):
+        return []
+    ip = _frigate_identifier(ip, "addon_info.ip_address")
+    return [f"http://{ip}:5000"]
+
+
+async def _frigate_read_projection(session: Any, url: str, phase: str, project: Callable, *, headers: dict | None = None) -> Any:
+    import aiohttp  # noqa: PLC0415
+    try:
+        options = {"timeout": aiohttp.ClientTimeout(total=5)}
+        if headers is not None:
+            options["headers"] = headers
+        async with session.get(url, **options) as response:
+            if response.status != 200:
+                _frigate_discovery_warning(phase, url, status=response.status)
+                return None
+            payload = await response.json(content_type=None) if phase == "config" else await response.json()
+            return project(payload)
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, UnicodeDecodeError, FrigateConfigInvalidData) as exc:
+        _frigate_discovery_warning(phase, url, exc)
+        return None
+
+
+async def _frigate_supervisor_urls(token: str) -> list[str]:
+    import aiohttp  # noqa: PLC0415
+    candidates = []
+    url, phase = "http://supervisor/addons", "addons"
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {token}"}
+            slugs = await _frigate_read_projection(session, url, phase, _frigate_addon_slugs, headers=headers)
+            for slug in slugs or []:
+                url, phase = f"http://supervisor/addons/{slug}/info", "info"
+                ips = await _frigate_read_projection(session, url, phase, _frigate_info_urls, headers=headers)
+                candidates.extend(ips or [])
+                candidates.extend([f"http://{slug.replace('_', '-')}:5000", f"http://{slug}:5000"])
+        return candidates
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        _frigate_discovery_warning(phase, url, exc)
+        return []
+
+
+async def _frigate_camera_candidate(base_url: str) -> list[dict] | None:
+    import aiohttp  # noqa: PLC0415
+    url = f"{base_url}/api/config"
+    try:
+        async with aiohttp.ClientSession() as session:
+            cameras = await _frigate_read_projection(session, url, "config", list_cameras_from_config)
+        return cameras
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        _frigate_discovery_warning("config", url, exc)
+        return None
 
 
 async def get_cameras_from_frigate_api() -> tuple[list[dict], str]:
@@ -350,69 +464,18 @@ async def get_cameras_from_frigate_api() -> tuple[list[dict], str]:
         (cameras_list, api_base_url) 成功时返回摄像头列表及 API 地址，
         全部失败返回 ([], "")。
     """
-    import aiohttp  # noqa: PLC0415
-
     token = os.environ.get("SUPERVISOR_TOKEN", "")
-    candidate_urls: list[str] = []
-
-    # ── 阶段 1：通过 Supervisor API 发现 Frigate slug 及内网 IP ──
-    if token:
-        try:
-            async with aiohttp.ClientSession() as _sess:
-                async with _sess.get(
-                    "http://supervisor/addons",
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for addon in data.get("data", {}).get("addons", []):
-                            slug = addon.get("slug", "")
-                            if "frigate" not in slug.lower():
-                                continue
-                            # 尝试从 info 端点获取内网 IP（最可靠）
-                            try:
-                                async with _sess.get(
-                                    f"http://supervisor/addons/{slug}/info",
-                                    headers={"Authorization": f"Bearer {token}"},
-                                    timeout=aiohttp.ClientTimeout(total=5),
-                                ) as info_resp:
-                                    if info_resp.status == 200:
-                                        info = await info_resp.json()
-                                        ip = info.get("data", {}).get("ip_address", "")
-                                        if ip and ip not in ("null", ""):
-                                            candidate_urls.append(f"http://{ip}:5000")
-                            except Exception:
-                                pass
-                            # slug 的两种 Docker hostname 形式
-                            candidate_urls.append(f"http://{slug.replace('_', '-')}:5000")
-                            candidate_urls.append(f"http://{slug}:5000")
-        except Exception as exc:
-            _LOGGER.debug("[FrigateConfig] Supervisor API 查询失败: %s", exc)
-
+    candidate_urls = await _frigate_supervisor_urls(token) if token else []
     # ── 阶段 2：通用兜底 hostname ──
     candidate_urls.append("http://frigate:5000")
 
     # ── 阶段 3：逐一尝试，取第一个成功的 ──
     for base_url in candidate_urls:
-        try:
-            async with aiohttp.ClientSession() as _sess:
-                async with _sess.get(
-                    f"{base_url}/api/config",
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        # Frigate API 返回 JSON（不论 Content-Type）
-                        config = await resp.json(content_type=None)
-                        cameras = list_cameras_from_config(config)
-                        _LOGGER.info(
-                            "[FrigateConfig] Frigate API 获取摄像头成功: %d 台 ← %s",
-                            len(cameras), base_url,
-                        )
-                        return cameras, base_url
-        except Exception as exc:
-            _LOGGER.debug("[FrigateConfig] %s 不可达: %s", base_url, exc)
-
+        cameras = await _frigate_camera_candidate(base_url)
+        if cameras is not None:
+            _LOGGER.info("[FrigateConfig] Frigate API 获取摄像头成功: %d 台 ref=%s",
+                         len(cameras), hashlib.sha256(base_url.encode()).hexdigest()[:16])
+            return cameras, base_url
     _LOGGER.warning("[FrigateConfig] Frigate API 所有候选地址均不可达，降级到文件系统读取")
     return [], ""
 

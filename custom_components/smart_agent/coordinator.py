@@ -43,6 +43,9 @@ _ADDON_REPAIR_UNREACHABLE_CODES = frozenset(
         "upstream_unreachable",
     }
 )
+_ADDON_REPAIR_ERROR_CODES = _ADDON_REPAIR_UNREACHABLE_CODES | frozenset(
+    {"addon_response_invalid", "invalid_response", "client_exception", "status_read_failed", "http_error"}
+)
 _FILE_LOG_LEVELS = {
     logging.DEBUG,
     logging.INFO,
@@ -70,6 +73,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .actions import ActionsMixin
+from .addon_client import build_status_read_failure
 from .active_ai_rollout import normalize_active_ai_mode
 from .database import DatabaseMixin
 from .decision_runtime import (
@@ -465,7 +469,8 @@ class SmartAgentCoordinator(
             dict[str, dict[str, Any]],
             float,
         ] = ({}, 0.0)
-        self._energy_stats: list[dict] = []
+        self._energy_stats: list[dict] | None = None
+        self._energy_stats_error: dict[str, str] | None = None
         self._mode = data.get(CONF_MODE, MODE_HOME)
         _saved_scene = data.get(CONF_SHOWROOM_SCENE, "") or ""
         self._showroom_scene: str | None = _saved_scene if _saved_scene in SHOWROOM_SCENES else None
@@ -576,6 +581,7 @@ class SmartAgentCoordinator(
 
         # Phase 4: AI 场景缓存（_blocking_init 中加载）
         self._ai_scenes_cache: list[dict] = []
+        self._ai_scenes_read_error: BaseException | None = None
 
     def _blocking_init(self) -> None:
         """All blocking I/O initialization (DB, pattern file, config). Runs in executor."""
@@ -591,14 +597,27 @@ class SmartAgentCoordinator(
         self._init_memory_db()
         self._load_config()
         # Phase 4: 加载 AI 场景缓存
-        self._ai_scenes_cache = self._query_ai_scenes()
+        from .ai_scene_projection import refresh_ai_scene_projection
+        try:
+            refresh_ai_scene_projection(self)
+        except Exception as exc:
+            _LOGGER.warning("[AiScenes] startup projection unavailable error_id=%s cause_type=%s",
+                            getattr(exc, "error_id", "ha_scene_projection"), type(exc).__name__)
         # Layer 2: 事务读面由 add-on 单一属主提供；启动阶段不再预读 HA 本地事务表。
         self._transactions_cache = []
         # 能耗分析：启动时执行一次，加载缓存
         try:
             self._energy_stats = self._get_device_usage_stats(days=7)
-        except Exception:
-            self._energy_stats = []
+            self._energy_stats_error = None
+        except Exception as exc:
+            self._energy_stats = None
+            self._energy_stats_error = {
+                "code": "energy_stats_unavailable",
+                "error_id": str(getattr(exc, "error_id", "startup_energy_stats")),
+                "cause_type": type(exc).__name__,
+            }
+            _LOGGER.warning("[EnergyStats] startup read unavailable error_id=%s cause_type=%s",
+                            self._energy_stats_error["error_id"], type(exc).__name__)
 
     def _get_ha_url(self) -> str:
         """获取 HA 的外部访问地址。"""
@@ -653,7 +672,11 @@ class SmartAgentCoordinator(
         try:
             return await bridge.post_confirmed(kind, payload, ts=ts)
         except Exception as exc:
-            _LOGGER.warning("[P1] confirmed internal event post failed: %s", exc)
+            _LOGGER.warning(
+                "[P1] confirmed internal event post failed "
+                "operation=SmartAgentCoordinator._post_internal_event_confirmed_async "
+                "kind=%s ts=%s exception_type=%s", kind, ts, type(exc).__name__,
+            )
             return {"ok": False, "status": 502, "error": "internal_event_persistence_failed"}
 
     def _post_internal_event_confirmed(
@@ -795,8 +818,7 @@ class SmartAgentCoordinator(
         now = time.time()
         if now - self._last_notify.get(key, 0) < NOTIFY_DEDUP_SECONDS:
             return
-        self._last_notify[key] = now
-        self._spawn_background_task(
+        task = self._spawn_background_task(
             async_call_service(
                 self.hass,
                 "persistent_notification",
@@ -808,6 +830,24 @@ class SmartAgentCoordinator(
             ),
             "notify_dedup_persistent_notification",
         )
+        if task is not None:
+            self._last_notify[key] = now
+
+    def _report_background_task_failure(self, label: str, *, phase: str, error: BaseException) -> None:
+        message = (
+            "[StartupTask] operation=SmartAgentCoordinator._report_background_task_failure "
+            f"task={label} phase={phase} exception_type={type(error).__name__}"
+        )
+        _LOGGER.warning(message)
+        logger = getattr(self, "_sys_log", None)
+        if callable(logger):
+            try:
+                logger("WARN", message)
+            except Exception as exc:
+                _LOGGER.warning(
+                    "[StartupTask] operation=SmartAgentCoordinator._report_background_task_failure "
+                    "task=%s phase=system_log exception_type=%s", label, type(exc).__name__,
+                )
 
     def _handle_background_task_done(self, task: Any, *, label: str) -> None:
         try:
@@ -817,32 +857,11 @@ class SmartAgentCoordinator(
         except asyncio.CancelledError:
             return
         except Exception as err:
-            _LOGGER.warning(
-                "[StartupTask] background task exception retrieval failed | task=%s exception_type=%s: %s",
-                label,
-                type(err).__name__,
-                err,
-                exc_info=True,
-            )
+            self._report_background_task_failure(label, phase="read_result", error=err)
             return
         if exc is None:
             return
-        _LOGGER.warning(
-            "[StartupTask] background task failed | task=%s exception_type=%s: %s",
-            label,
-            type(exc).__name__,
-            exc,
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-        logger = getattr(self, "_sys_log", None)
-        if callable(logger):
-            try:
-                logger(
-                    "WARN",
-                    f"[StartupTask] background task failed | task={label} exception_type={type(exc).__name__}: {exc}",
-                )
-            except Exception:
-                pass
+        self._report_background_task_failure(label, phase="result", error=exc)
 
     def _observe_background_task(self, task: Any, label: str) -> Any:
         try:
@@ -851,33 +870,22 @@ class SmartAgentCoordinator(
                     lambda done: self._handle_background_task_done(done, label=label)
                 )
         except Exception as exc:
-            _LOGGER.debug("[StartupTask] failed to attach task observer | task=%s: %s", label, exc)
+            self._report_background_task_failure(label, phase="attach_observer", error=exc)
         return task
 
     def _spawn_background_task(self, coro: Any, label: str) -> Any | None:
         try:
             task = self.hass.async_create_task(coro)
-        except Exception as exc:
+        except BaseException as exc:
             close = getattr(coro, "close", None)
             if callable(close):
-                close()
-            _LOGGER.warning(
-                "[StartupTask] background task create failed | task=%s exception_type=%s: %s",
-                label,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
-            logger = getattr(self, "_sys_log", None)
-            if callable(logger):
                 try:
-                    logger(
-                        "WARN",
-                        f"[StartupTask] background task create failed | task={label} "
-                        f"reason=task_create_failed exception_type={type(exc).__name__}: {exc}",
-                    )
-                except Exception:
-                    pass
+                    close()
+                except Exception as cleanup_error:
+                    self._report_background_task_failure(label, phase="close_coroutine", error=cleanup_error)
+            if not isinstance(exc, Exception):
+                raise
+            self._report_background_task_failure(label, phase="create", error=exc)
             return None
         return self._observe_background_task(task, label)
 
@@ -896,12 +904,32 @@ class SmartAgentCoordinator(
             return True
         return status_code in (502, 503, 504) and bool(status.get("retryable", True))
 
+    def _addon_status_is_recovered(self, status: Any) -> bool:
+        """Require a successful status observation before clearing repair history."""
+        if not isinstance(status, dict) or not status:
+            return False
+        code = status.get("__status", status.get("status_code", 200))
+        if type(code) is not int or not 200 <= code < 300:
+            return False
+        if status.get("error") not in (None, "") or status.get("error_type") not in (None, ""):
+            return False
+        if "ok" in status:
+            return status["ok"] is True
+        # The canonical legacy /status endpoint has no ok field.
+        return status.get("mode") in ("inference_engine", "stub") and all(
+            isinstance(status.get(key), str) and bool(status[key].strip())
+            for key in ("addon_version", "bundle_version")
+        )
+
     def _addon_repair_error_summary(self, status: Any) -> str:
         if not isinstance(status, dict):
-            return "addon_unreachable"
-        raw = status.get("error") or status.get("error_type") or status.get("__status") or "addon_unreachable"
-        summary = re.sub(r"\s+", " ", str(raw)).strip()
-        return summary[:120] or "addon_unreachable"
+            return "status_read_failed"
+        for field in ("error", "error_type"):
+            code = status.get(field)
+            if isinstance(code, str) and code in _ADDON_REPAIR_ERROR_CODES:
+                return code
+        code = status.get("__status", status.get("status_code"))
+        return f"http_{code}" if type(code) is int and 100 <= code < 600 else "status_read_failed"
 
     async def _async_poll_addon_repair_issue(self) -> None:
         now = time.time()
@@ -926,32 +954,36 @@ class SmartAgentCoordinator(
         try:
             status = await get_status()
         except Exception as exc:
-            _LOGGER.warning("[Repair] add-on health check failed: %s", exc, exc_info=True)
-            status = {
-                "ok": False,
-                "error": "addon_unreachable",
-                "error_type": "dependency_unreachable",
-                "retryable": True,
-                "__status": 502,
-                "exception_type": exc.__class__.__name__,
-            }
+            operation = "SmartAgentCoordinator._async_poll_addon_repair_issue"
+            _LOGGER.warning(
+                "[Repair] operation=%s check_at=%s exception_type=%s",
+                operation, now, type(exc).__name__,
+            )
+            status = build_status_read_failure(exc, operation=operation)
         await self._async_update_addon_repair_issue(status)
 
     async def _async_update_addon_repair_issue(self, status: Any) -> None:
         now = time.time()
-        if self._addon_status_is_unreachable(status):
+        if not self._addon_status_is_recovered(status):
             self._addon_repair_failure_count += 1
             self._addon_repair_last_error = self._addon_repair_error_summary(status)
+            if not self._addon_status_is_unreachable(status):
+                _LOGGER.warning(
+                    "[Repair] status_read_not_confirmed "
+                    "operation=SmartAgentCoordinator._async_update_addon_repair_issue check_at=%s",
+                    now,
+                )
+                return
             if self._addon_repair_first_failure_at is None:
                 self._addon_repair_first_failure_at = now
             elapsed = now - self._addon_repair_first_failure_at
             if elapsed < _ADDON_REPAIR_MIN_FAILURE_SECONDS:
                 return
-            if not self._addon_repair_issue_active:
+            if not self._addon_repair_issue_active or getattr(self, "_addon_repair_sync_pending", False):
                 await self._async_create_addon_repair_issue(status, elapsed)
             return
 
-        if self._addon_repair_issue_active:
+        if self._addon_repair_issue_active or getattr(self, "_addon_repair_sync_pending", False):
             await self._async_delete_addon_repair_issue()
         self._addon_repair_first_failure_at = None
         self._addon_repair_failure_count = 0
@@ -961,68 +993,69 @@ class SmartAgentCoordinator(
         error_summary = self._addon_repair_error_summary(status)
         addon_base = str(getattr(getattr(self, "_addon_client", None), "_base", "") or "")
         minutes = str(max(1, int(elapsed // 60)))
-        try:
-            from homeassistant.helpers import issue_registry as ir
-
-            severity = getattr(getattr(ir, "IssueSeverity", object), "ERROR", "error")
-            ir.async_create_issue(
-                self.hass,
-                DOMAIN,
-                _ADDON_REPAIR_ISSUE_ID,
-                is_fixable=False,
-                severity=severity,
-                translation_key="addon_unreachable",
-                translation_placeholders={
-                    "base_url": addon_base,
-                    "error": error_summary,
-                    "minutes": minutes,
-                },
-            )
-        except Exception as exc:
-            _LOGGER.warning("[Repair] create add-on unreachable issue failed: %s", exc, exc_info=True)
-
-        self._addon_repair_issue_active = True
-        try:
-            await async_call_service(
-                self.hass,
-                "persistent_notification",
-                "create",
-                {
-                    "title": "SmartAgent add-on unreachable",
-                    "message": (
-                        f"SmartAgent add-on has been unreachable for {minutes} minutes. "
-                        f"base_url={addon_base or '-'} error={error_summary}"
-                    ),
-                    "notification_id": _ADDON_REPAIR_NOTIFICATION_ID,
-                },
-                execution_class="notification",
-                actor_ref="coordinator.addon_repair",
-                output_ledger_publisher=self._output_ledger_publisher,
-            )
-        except Exception as exc:
-            _LOGGER.warning("[Repair] create add-on notification failed: %s", exc, exc_info=True)
+        await self._async_sync_addon_repair_issue(
+            active=True,
+            placeholders={"base_url": addon_base, "error": error_summary, "minutes": minutes},
+            notification={
+                "title": "SmartAgent add-on unreachable",
+                "message": (
+                    f"SmartAgent add-on has been unreachable for {minutes} minutes. "
+                    f"base_url={addon_base or '-'} error={error_summary}"
+                ),
+                "notification_id": _ADDON_REPAIR_NOTIFICATION_ID,
+            },
+        )
 
     async def _async_delete_addon_repair_issue(self) -> None:
+        await self._async_sync_addon_repair_issue(
+            active=False, placeholders={},
+            notification={"notification_id": _ADDON_REPAIR_NOTIFICATION_ID},
+        )
+
+    async def _async_sync_addon_repair_issue(
+        self, *, active: bool, placeholders: dict[str, str], notification: dict[str, str],
+    ) -> None:
+        # Both channels must confirm the transition. Retain pending across a
+        # partial failure or cancellation so the next normal poll can converge
+        # to its current desired state, including recovery after a failed create.
+        self._addon_repair_sync_pending = True
+        operation = "create" if active else "delete"
+        confirmed = True
         try:
             from homeassistant.helpers import issue_registry as ir
 
-            ir.async_delete_issue(self.hass, DOMAIN, _ADDON_REPAIR_ISSUE_ID)
+            if active:
+                severity = getattr(getattr(ir, "IssueSeverity", object), "ERROR", "error")
+                ir.async_create_issue(
+                    self.hass, DOMAIN, _ADDON_REPAIR_ISSUE_ID, is_fixable=False,
+                    severity=severity, translation_key="addon_unreachable",
+                    translation_placeholders=placeholders,
+                )
+            else:
+                ir.async_delete_issue(self.hass, DOMAIN, _ADDON_REPAIR_ISSUE_ID)
         except Exception as exc:
-            _LOGGER.warning("[Repair] delete add-on unreachable issue failed: %s", exc, exc_info=True)
-
+            confirmed = False
+            _LOGGER.warning(
+                "[Repair] operation=addon_repair.%s stage=issue_registry "
+                "issue_id=%s check_at=%s exception_type=%s",
+                operation, _ADDON_REPAIR_ISSUE_ID, self._addon_repair_last_check_at, type(exc).__name__,
+            )
         try:
             await async_call_service(
-                self.hass,
-                "persistent_notification",
-                "dismiss",
-                {"notification_id": _ADDON_REPAIR_NOTIFICATION_ID},
-                execution_class="notification",
-                actor_ref="coordinator.addon_repair",
+                self.hass, "persistent_notification", "create" if active else "dismiss", notification,
+                execution_class="notification", actor_ref="coordinator.addon_repair",
                 output_ledger_publisher=self._output_ledger_publisher,
             )
         except Exception as exc:
-            _LOGGER.warning("[Repair] dismiss add-on notification failed: %s", exc, exc_info=True)
-        self._addon_repair_issue_active = False
+            confirmed = False
+            _LOGGER.warning(
+                "[Repair] operation=addon_repair.%s stage=notification "
+                "notification_id=%s check_at=%s exception_type=%s",
+                operation, _ADDON_REPAIR_NOTIFICATION_ID, self._addon_repair_last_check_at, type(exc).__name__,
+            )
+        if confirmed:
+            self._addon_repair_issue_active = active
+            self._addon_repair_sync_pending = False
 
     async def _tts_speak(
         self,
@@ -2029,13 +2062,13 @@ class SmartAgentCoordinator(
         return "【占用快照】\n" + "\n".join(rows) + "\n" if rows else ""
 
     @staticmethod
-    def _addon_decision_json_list(value: Any) -> list[dict[str, Any]]:
+    def _addon_decision_json_list(value: Any, *, field: str = "scene_json") -> list[dict[str, Any]]:
         raw = value
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
-            except Exception:
-                raw = []
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"addon_decision_scene_json_invalid: {field}") from exc
         if not isinstance(raw, list):
             return []
         return [dict(item) for item in raw if isinstance(item, dict)]
@@ -2064,8 +2097,12 @@ class SmartAgentCoordinator(
             room = str(scene.get("room") or scene.get("trigger_room") or scene.get("area") or "").strip()
             if room_filter and room and room.lower() != room_filter:
                 continue
-            entities = SmartAgentCoordinator._addon_decision_json_list(scene.get("entities_json"))
-            actions = SmartAgentCoordinator._addon_decision_json_list(scene.get("actions_json"))
+            entities = SmartAgentCoordinator._addon_decision_json_list(
+                scene.get("entities_json"), field="entities_json",
+            )
+            actions = SmartAgentCoordinator._addon_decision_json_list(
+                scene.get("actions_json"), field="actions_json",
+            )
             entity_ids = [
                 str(item.get("entity_id") or "").strip()
                 for item in entities

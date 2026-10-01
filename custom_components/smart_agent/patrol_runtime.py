@@ -6,6 +6,7 @@ it does not import Home Assistant, call HA services, or mint execution authority
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import Any, Callable
@@ -387,13 +388,13 @@ def _decision_failed(decision_result: dict[str, Any]) -> bool:
     ).strip().lower()
     execution_attempted = (
         decision_result.get("auto_execute") is True
-        or final_outcome in {"succeeded", "partial", "failed"}
+        or final_outcome in {"succeeded", "partial", "failed", "unknown"}
     )
     execution_failed = (
         authorized_count > 0
         and execution_attempted
         and (
-            final_outcome in {"partial", "failed"}
+            final_outcome in {"partial", "failed", "unknown"}
             or executed_count < authorized_count
         )
     )
@@ -685,6 +686,14 @@ def _safety_net_execution_token(
     return status, candidate_count, token if token_issued else "", executable_blockers
 
 
+def _patrol_occurrence_idempotency(payload: dict[str, Any]) -> dict[str, str]:
+    occurrence = payload.get("task_occurrence")
+    if not isinstance(occurrence, dict) or not occurrence:
+        return {}
+    identity = json.dumps(occurrence, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return {"idempotency_key": "patrol-safety-net:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()}
+
+
 async def submit_patrol_safety_net_plan(
     owner: Any,
     *,
@@ -725,6 +734,7 @@ async def submit_patrol_safety_net_plan(
         "requested_by": "ha_patrol_scheduler",
         "dry_run": True,
     }
+    plan_request.update(_patrol_occurrence_idempotency(payload))
     result = await addon_client.post_operations_action_plan(plan_request)
     if not isinstance(result, dict):
         return None
