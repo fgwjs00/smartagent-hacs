@@ -2137,6 +2137,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         ai_source: str,
         ai_new_state: str,
         occupancy_cycle_id: str = "",
+        execution_transaction_id: str = "",
     ) -> None:
         """Apply the shared post-dispatch bookkeeping for a verified batch receipt."""
         context = ServiceCallContext(
@@ -2164,6 +2165,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             PreparedServiceState(now_ts, ai_source, ai_new_state, params),
             occupancy_cycle_id=occupancy_cycle_id,
             prepared_batch=True,
+            execution_transaction_id=execution_transaction_id,
         )
 
     async def _do_call_service(
@@ -2263,6 +2265,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             prepared,
             occupancy_cycle_id=occupancy_cycle_id if not is_user_explicit else "",
             prepared_batch=False,
+            execution_transaction_id=str(envelope_result.get("transaction_id") or ""),
         )
         return True
 

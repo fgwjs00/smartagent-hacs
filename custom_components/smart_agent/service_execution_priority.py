@@ -3,6 +3,7 @@
 from __future__ import annotations
 from typing import Any
 from .service_execution_context import ServiceCallContext
+from .action_execution_context import delegates_night_priority_to_core
 from .service_execution_errors import ServiceErrorRecorder
 from .execution_gate import evaluate_proactive_priority_handoff, evaluate_manual_override_window
 
@@ -104,6 +105,10 @@ def evaluate_home_service_priority(
         )
     elif batch.require_world_snapshot_guard and reentry.allowed:
         host._sys_log("INFO", f"[主动优先级交接] {call.entity_id} 使用 Core cycle claim 反向动作")
+    elif delegates_night_priority_to_core(batch, call) and _is_ai_cycle_record(existing):
+        # Core checks the exact successful night ON/OFF receipt and new activity.
+        # Keep the independent human takeover check below for this path too.
+        host._sys_log("INFO", f"[起夜优先级交接] {call.entity_id}.{call.service} 交由 Core 复核原动作出处")
     elif _reverses_ai_cycle(host, existing, call.service):
         return errors.before("priority_guard_active", error_type="priority_guard")
     else:

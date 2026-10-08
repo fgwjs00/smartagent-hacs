@@ -183,7 +183,7 @@ async def apply_initial_batch_guards(
             return await _finish_guard_rejection(host, state, context)
     if not state.actions:
         return host._action_execution_result(0, correlation_id=context.correlation_id)
-    if host._batch_trigger_controllable:
+    if host._batch_trigger_controllable and not context.authenticated_user_intent:
         _filter_self_triggered_actions(host, state, context)
         if not state.actions:
             host._sys_log("INFO", "[自触发预过滤] 所有动作均为自触发设备，跳过执行")

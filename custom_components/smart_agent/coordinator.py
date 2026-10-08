@@ -1301,6 +1301,8 @@ class SmartAgentCoordinator(
         occupancy_cycle_id: str = "",
         occurred_at: float | None = None,
     ) -> dict:
+        from datetime import datetime, timezone
+
         now = time.time() if occurred_at is None else occurred_at
         priority = SOURCE_PRIORITY_MAP.get(source, PRIORITY_AI_LEARNED)
         guard_seconds = (
@@ -1332,6 +1334,23 @@ class SmartAgentCoordinator(
             record["occupancy_cycle_id"] = normalized_cycle_id
         self._device_priority_map[entity_id] = record
         self._enforce_priority_storage_limits()
+        info = self.device_info.get(entity_id, {})
+        if source in {SOURCE_PHYSICAL, SOURCE_DASHBOARD, SOURCE_VOICE}:
+            # Publish attributed human evidence through the existing bridge.
+            # Core owns its use; this does not extend the priority hold.
+            space_id = info.get("space_id") or info.get("room") or ""
+            with self._user_manual_actions_lock:
+                self._user_manual_actions[entity_id] = {
+                    "state": new_state, "time": now, "source": source,
+                    "space_id": space_id,
+                }
+            timestamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+            if not self._enqueue_internal_event("event", {
+                "type": "manual_device_operation", "entity": entity_id,
+                "source": source, "state": new_state, "time": timestamp,
+                "area": space_id,
+            }, ts=timestamp):
+                self._sys_log("WARN", f"[人工操作证据] 入队失败: {entity_id}")
         return record
 
     def _arbitrate(
@@ -1420,12 +1439,16 @@ class SmartAgentCoordinator(
                 "state": rec["state"],
                 "remaining_sec": max(0, int(rec["guard_until"] - now)),
                 "guard_until": rec.get("guard_until", 0),
+                "updated_at": rec.get("time", 0),
             }
             if rec.get("params"):
                 row["params"] = comparable_action_params(eid.split(".", 1)[0], rec["params"])
             occupancy_cycle_id = str(rec.get("occupancy_cycle_id") or "").strip()
             if occupancy_cycle_id:
                 row["occupancy_cycle_id"] = occupancy_cycle_id
+            for key in ("decision_transaction_id", "execution_transaction_id"):
+                if rec.get(key):
+                    row[key] = str(rec[key])
             result.append(row)
         result.sort(key=lambda x: (x["priority"], -x["remaining_sec"]))
         return result

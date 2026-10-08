@@ -90,10 +90,10 @@ def active_ai_authorization_ref(
 
 
 def is_pre_dispatch_policy_rejection(result: Any, *, request_id: str) -> bool:
-    """Recognize the gateway's 403 response issued before command dispatch."""
+    """Recognize an explicit policy denial issued before command dispatch."""
     return (
         isinstance(result, dict)
-        and result.get("__status") == 403
+        and result.get("__status") in {403, 409}
         and result.get("ok") is False
         and result.get("executed") is False
         and result.get("error_type") == "policy_rejected"

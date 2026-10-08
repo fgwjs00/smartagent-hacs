@@ -45,6 +45,7 @@ from .dispatch_proof import (
 from .host_dispatch_proof import dispatch_proof_secret_for_ha_request
 from .http_payloads import read_json_payload
 from .coordinator import SmartAgentCoordinator, _coerce_file_log_level
+from .backup import BackupManager
 from .config_update_service import apply_config_update_service
 from .admin_actor import is_current_human_admin, is_current_human_user
 from .host_read_models import (
@@ -2284,6 +2285,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry,
     )
     await hass.async_add_executor_job(coordinator._blocking_init)
+    # The host owns backup files. Construct after configuration is loaded and
+    # off the event loop (the manager reads the integration manifest).
+    coordinator._backup_manager = await hass.async_add_executor_job(BackupManager, coordinator)
     await coordinator.async_config_entry_first_refresh()
     hass.data[DOMAIN][entry.entry_id] = coordinator
 

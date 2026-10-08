@@ -10,9 +10,33 @@ import logging
 import time
 from typing import Any
 
-from .const import SOURCE_AUTOMATION, SOURCE_DASHBOARD
+from .const import SOURCE_AUTOMATION, SOURCE_DASHBOARD, SOURCE_PHYSICAL
 from .presence_runtime import occupancy_cycle_outcome, schedule_arrival_baseline_sample
 from .sensor_event_filter import EnvironmentTelemetryFilter
+
+
+def _is_physical_control_edge(attribution: dict, domain: str, before: str, after: str) -> bool:
+    return (attribution.get("origin") == "physical_action" and domain in {"light", "switch"}
+            and before != after and before in {"on", "off"} and after in {"on", "off"})
+
+
+def _record_manual_operation(owner: Any, native: Any, entity_id: str, domain: str,
+                             old: Any, new: Any, physical_edge: bool) -> None:
+    record_operation = getattr(owner, "_record_device_operation", None)
+    if callable(record_operation):
+        from math import isfinite
+        old_attributes, new_attributes = getattr(old, "attributes", {}) or {}, getattr(new, "attributes", {}) or {}
+        temperatures = {key: new_attributes[key] for key in ("temperature", "target_temp_low", "target_temp_high")
+            if domain == "climate" and key in new_attributes and old_attributes.get(key) != new_attributes[key]
+            and type(new_attributes[key]) in (int, float) and isfinite(new_attributes[key])}
+        record_operation(entity_id, SOURCE_PHYSICAL if physical_edge else SOURCE_DASHBOARD, new.state, temperatures)
+        if native is not None:
+            native.record_manual_edge(new, entity_id)
+    user_overrides = getattr(owner, "_user_overrides", None)
+    user_overrides_lock = getattr(owner, "_user_overrides_lock", None)
+    if isinstance(user_overrides, dict) and user_overrides_lock is not None:
+        with user_overrides_lock:
+            user_overrides[entity_id] = {"state": new.state, "time": time.time()}
 
 
 def handle_listener_state_changed(
@@ -299,7 +323,8 @@ def handle_listener_state_changed(
 
     native = getattr(self, "_native_execution_attribution", None)
     native_attribution = native.attribution(new, entity_id) if native is not None else None
-    native_manual = bool(native_attribution and native_attribution.get("origin") == "user_action")
+    native_manual = bool(native_attribution and (native_attribution.get("origin") == "user_action"
+        or _is_physical_control_edge(native_attribution, domain, old_s, new_s)))
     if native_attribution and not native_manual:
         if native_attribution.get("origin") == "system_action":
             native.defer(ev)
@@ -384,33 +409,10 @@ def handle_listener_state_changed(
         device_info=dict(device_info_snapshot.get(entity_id) or {}),
     )
 
-    if new and new.context and new.context.user_id:
-        record_operation = getattr(self, "_record_device_operation", None)
-        if callable(record_operation):
-            from math import isfinite
-            old_attributes, new_attributes = getattr(old, "attributes", {}) or {}, getattr(new, "attributes", {}) or {}
-            temperatures = {key: new_attributes[key] for key in ("temperature", "target_temp_low", "target_temp_high")
-                if domain == "climate" and key in new_attributes and old_attributes.get(key) != new_attributes[key]
-                and type(new_attributes[key]) in (int, float) and isfinite(new_attributes[key])}
-            record_operation(entity_id, SOURCE_DASHBOARD, new_s, temperatures)
-
-        user_overrides = getattr(self, "_user_overrides", None)
-        user_overrides_lock = getattr(self, "_user_overrides_lock", None)
-        if isinstance(user_overrides, dict) and user_overrides_lock is not None:
-            with user_overrides_lock:
-                user_overrides[entity_id] = {
-                    "state": new_s,
-                    "time": time.time(),
-                }
-
-        user_manual_actions = getattr(self, "_user_manual_actions", None)
-        user_manual_actions_lock = getattr(self, "_user_manual_actions_lock", None)
-        if isinstance(user_manual_actions, dict) and user_manual_actions_lock is not None:
-            with user_manual_actions_lock:
-                user_manual_actions[entity_id] = {
-                    "state": new_s,
-                    "time": time.time(),
-                }
+    attribution = self._manual_action_attribution(new, entity_id=entity_id)
+    physical_edge = _is_physical_control_edge(attribution, domain, old_s, new_s)
+    if attribution.get("origin") == "user_action" or physical_edge:
+        _record_manual_operation(self, native, entity_id, domain, old, new, physical_edge)
 
     implicit_correction_recorded = self._record_implicit_reverse_correction(
         entity_id=entity_id,

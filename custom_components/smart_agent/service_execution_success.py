@@ -124,6 +124,7 @@ async def record_service_success(
     *,
     occupancy_cycle_id: str,
     prepared_batch: bool,
+    execution_transaction_id: str = "",
 ) -> None:
     call, batch = context.call, context.batch
     if prepared_batch:
@@ -132,13 +133,18 @@ async def record_service_success(
     with host._user_overrides_lock:
         host._user_overrides.pop(call.entity_id, None)
     if occupancy_cycle_id:
-        host._record_device_operation(
+        priority_record = host._record_device_operation(
             call.entity_id,
             prepared.ai_source,
             prepared.ai_new_state,
             call.params,
             occupancy_cycle_id=occupancy_cycle_id,
         )
+        if isinstance(priority_record, dict) and batch.parent_transaction_id and execution_transaction_id:
+            priority_record.update(
+                decision_transaction_id=str(batch.parent_transaction_id),
+                execution_transaction_id=execution_transaction_id,
+            )
     else:
         host._record_device_operation(
             call.entity_id, prepared.ai_source, prepared.ai_new_state, call.params

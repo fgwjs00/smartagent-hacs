@@ -838,6 +838,13 @@ class ListenersMixin:
                 state_observations[eid] = observation
                 attributes = getattr(state, "attributes", None)
                 if isinstance(attributes, dict):
+                    if eid.startswith("light."):
+                        # Forward the same HA observation used for state/time;
+                        # Core interprets relative brightness and white precedence.
+                        observation["attributes"] = {
+                            key: attributes[key] for key in ("brightness", "supported_color_modes")
+                            if key in attributes
+                        }
                     if eid.startswith("climate."):
                         # HA exposes these values in its configured display
                         # unit. Do not assume Celsius or use the setpoint as
@@ -1073,6 +1080,20 @@ class ListenersMixin:
             for key, value in decision_contract_lineage.items()
             if value
         }
+        room_lighting = result.get("room_lighting") or {}
+        rest_context = room_lighting.get("rest_context") if isinstance(room_lighting, dict) else None
+        night_off = rest_context.get("night_off") if isinstance(rest_context, dict) else None
+        if isinstance(night_off, dict):
+            # A transport marker to defer duplicated HA preflight, never an
+            # authority grant: /ha/execute reloads these exact facts from Core.
+            decision_contract_lineage["core_night_off_entity_ids"] = sorted(night_off)
+        night_choices = rest_context.get("night_choices") if isinstance(rest_context, dict) else None
+        if isinstance(night_choices, dict):
+            decision_contract_lineage["core_night_reopen_entity_ids"] = sorted(
+                eid for eid, choice in night_choices.items()
+                if isinstance(choice, dict) and isinstance(choice.get("reopen_origin"), dict)
+                and choice["reopen_origin"]
+            )
         nested_result = (
             result.get("result")
             if isinstance(result.get("result"), dict)

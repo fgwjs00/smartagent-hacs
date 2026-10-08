@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from typing import Any
-from .action_execution_context import ActionGuardContext, ActionGuardOutcome
+from .action_execution_context import ActionGuardContext, ActionGuardOutcome, delegates_night_off_to_core
 from .action_execution_diagnostics import action_failure_details, action_predispatch_failure, presence_refresh_failure
 from .const import MODE_SHOWROOM
 
@@ -199,6 +199,8 @@ async def evaluate_turnoff_presence(
     host: Any, context: ActionGuardContext
 ) -> ActionGuardOutcome | None:
     call, batch = context.call, context.batch
+    if delegates_night_off_to_core(batch, call):
+        return None
     if (
         call.domain in ("light", "switch")
         and host._mode != MODE_SHOWROOM

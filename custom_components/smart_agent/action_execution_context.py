@@ -62,6 +62,36 @@ class ActionCall:
     reason: str
 
 
+def delegates_night_priority_to_core(batch: ActionBatchContext, call: ActionCall) -> bool:
+    """Defer duplicate host preflight only; Core must still admit the exact action.
+
+    This transport marker is not an execution grant. Both single and batch paths
+    retain require_world_snapshot_guard and cannot fall back to a local HA call.
+    """
+    lineage = batch.decision_contract_lineage
+    if not isinstance(lineage, dict):
+        return False
+    decision_id = str(lineage.get("decision_transaction_id") or "").strip()
+    marker = {"turn_off": "core_night_off_entity_ids", "turn_on": "core_night_reopen_entity_ids"}.get(call.service)
+    entities = lineage.get(marker) if marker else None
+    return bool(
+        batch.require_world_snapshot_guard
+        and batch.cmd_source != "USER_EXPLICIT"
+        and decision_id
+        and decision_id == batch.parent_transaction_id
+        and batch.world_snapshot_id
+        and call.domain in {"light", "switch"}
+        and marker
+        and isinstance(entities, (list, tuple))
+        and call.entity_id in entities
+    )
+
+
+def delegates_night_off_to_core(batch: ActionBatchContext, call: ActionCall) -> bool:
+    """Only a local night close can defer the duplicate occupied-room check."""
+    return call.service == "turn_off" and delegates_night_priority_to_core(batch, call)
+
+
 @dataclass(frozen=True, slots=True)
 class ActionGuardOutcome:
     result: dict[str, Any]

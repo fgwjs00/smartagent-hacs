@@ -161,7 +161,7 @@ def _receipt_context(prepared: dict[str, Any], response: dict[str, Any]) -> dict
 
 
 async def _record_verified_success(
-    host: Any, prepared: dict[str, Any], context: ActionBatchContext
+    host: Any, prepared: dict[str, Any], context: ActionBatchContext, receipt: dict[str, Any]
 ) -> None:
     lineage = (
         context.decision_contract_lineage
@@ -185,6 +185,7 @@ async def _record_verified_success(
         ai_source=prepared["ai_source"],
         ai_new_state=prepared["ai_new_state"],
         occupancy_cycle_id=str(lineage.get("occupancy_cycle_id") or "").strip(),
+        execution_transaction_id=str(receipt.get("transaction_id") or ""),
     )
     host._clear_service_call_error(
         context.transaction_id, int(prepared["action_seq"]), prepared["entity_id"]
@@ -241,7 +242,7 @@ async def _account_receipt(
         and receipt.get("executed") is True
         and disposition == "verified_success"
     ):
-        await _record_verified_success(host, prepared, context)
+        await _record_verified_success(host, prepared, context, receipt)
         return BatchDispatchResult([{**result, "status": "ok"}], executed=1)
     error, error_type, command_status = _receipt_failure(receipt, response)
     if (

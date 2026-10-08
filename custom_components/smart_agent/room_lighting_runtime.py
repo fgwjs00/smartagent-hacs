@@ -100,7 +100,10 @@ async def _reconcile_room(
 
 def schedule_room_check(owner: Any, response: dict, *, schedule: Any = None) -> None:
     control = (response.get("result") or {}).get("room_lighting") or {}
-    space, due = control.get("space_id"), control.get("vacancy_due_at")
+    space = control.get("space_id")
+    deadlines = [datetime.fromisoformat(control[key]) for key in ("vacancy_due_at", "next_check_at")
+                 if control.get(key)]
+    due = min(deadlines) if deadlines else None
     if not space:
         return
     timers = getattr(owner, "_room_lighting_timers", None)
@@ -111,7 +114,11 @@ def schedule_room_check(owner: Any, response: dict, *, schedule: Any = None) -> 
         previous()
     if not due:
         return
-    seconds = (datetime.fromisoformat(due) - owner._ha_local_now()).total_seconds()
+    seconds = (due - owner._ha_local_now()).total_seconds()
+    if seconds <= 0:
+        # An expired retry is ready now. Other stale deadlines (for example an
+        # unresolved vacancy candidate) keep the normal cadence, avoiding a spin.
+        seconds = 0 if control.get("reason") == "room_lighting_retry_wait" else 20
     handle = None
     @callback
     def wake(now: Any) -> None:
@@ -119,5 +126,5 @@ def schedule_room_check(owner: Any, response: dict, *, schedule: Any = None) -> 
             return
         timers.pop(space, None)
         owner.hass.async_create_task(reconcile_rooms(owner, now, space_id=space))
-    handle = (schedule or async_call_later)(owner.hass, seconds if seconds > 0 else 20, wake)
+    handle = (schedule or async_call_later)(owner.hass, seconds, wake)
     timers[space] = handle

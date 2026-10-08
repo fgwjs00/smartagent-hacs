@@ -366,12 +366,16 @@ class BackupManager:
                     headers={"Authorization": f"Bearer {self._cloud_token}"},
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    return []
+                    if resp.status != 200:
+                        raise RuntimeError(f"BackupManager.list_backups: upstream_status={resp.status}")
+                    rows = await resp.json()
+                    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                        raise ValueError("BackupManager.list_backups: invalid_backup_inventory")
+                    return rows
         except Exception as exc:
-            _LOGGER.warning("[Backup] 列表查询失败: %s", exc)
-            return []
+            raise RuntimeError(
+                f"BackupManager.list_backups: cloud_inventory_failed exception_type={type(exc).__name__}"
+            ) from exc
 
     # ── 加密核心 ──────────────────────────────────────────────────────────────
 
@@ -735,10 +739,12 @@ class BackupManager:
     def _list_local(self) -> list[dict]:
         """列出本地备份文件。"""
         backup_dir = os.path.join(self._hass.config.config_dir, "smart_agent_backups")
-        if not os.path.isdir(backup_dir):
+        try:
+            filenames = os.listdir(backup_dir)
+        except FileNotFoundError:
             return []
         result = []
-        for fname in sorted(os.listdir(backup_dir), reverse=True):
+        for fname in sorted(filenames, reverse=True):
             if fname.endswith(".enc"):
                 fpath = os.path.join(backup_dir, fname)
                 stat = os.stat(fpath)
