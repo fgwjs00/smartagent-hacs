@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.237
-display_version: Beta 0.0.237
+release_version: 0.0.238
+display_version: Beta 0.0.238
 channel: beta
-release_date: '2026-10-12'
+release_date: '2026-10-16'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 修复 AI 管家专用模型代理与 Qwen3.8 的接口兼容；保留工作空间地址、私网隔离和文本响应边界。
-  customer_visible_version: Beta 0.0.237
+  summary: 整合存储保留、重启续跑、异常重试、冷备恢复和生命周期修复；继承模型代理兼容改进。
+  customer_visible_version: Beta 0.0.238
