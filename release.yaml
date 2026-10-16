@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.238
-display_version: Beta 0.0.238
+release_version: 0.0.239
+display_version: Beta 0.0.239
 channel: beta
 release_date: '2026-10-16'
 public_release_ready: true
@@ -8,5 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 整合存储保留、重启续跑、异常重试、冷备恢复和生命周期修复；继承模型代理兼容改进。
-  customer_visible_version: Beta 0.0.238
+  summary: 修复事务历史排序索引缺口，消除运维摘要全表扫描及空间、灯控读取的共享锁等待。
+  customer_visible_version: Beta 0.0.239
