@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.239
-display_version: Beta 0.0.239
+release_version: 0.0.240
+display_version: Beta 0.0.240
 channel: beta
-release_date: '2026-10-16'
+release_date: '2026-10-20'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 修复事务历史排序索引缺口，消除运维摘要全表扫描及空间、灯控读取的共享锁等待。
-  customer_visible_version: Beta 0.0.239
+  summary: 修复灯控决策同步存储阻塞和多房间串行重查，补齐任务取消恢复与存储原生模块指纹验收。
+  customer_visible_version: Beta 0.0.240

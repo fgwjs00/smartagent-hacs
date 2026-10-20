@@ -1836,9 +1836,8 @@ class SmartAgentCoordinator(
             except Exception:
                 pass
         self._listener_removers.clear()
-        for cancel in getattr(self, "_room_lighting_timers", {}).values():
-            cancel()
-        self._room_lighting_timers = {}
+        from .room_lighting_runtime import stop_room_checks
+        await stop_room_checks(self)
         cancel = getattr(self, "_room_lighting_startup_cancel", None)
         if callable(cancel):
             cancel()

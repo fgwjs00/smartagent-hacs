@@ -10,6 +10,9 @@ from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later
 
 
+MAX_CONCURRENT_ROOM_CHECKS = 4
+
+
 @dataclass(slots=True)
 class _RecheckProgress:
     request_id: str = ""
@@ -28,11 +31,19 @@ class _RecheckProgress:
 
 
 async def reconcile_rooms(owner: Any, _now: Any = None, *, space_id: str = "") -> dict:
-    if not owner._is_enabled() or getattr(owner, "_sensors_muted", False):
+    if (getattr(owner, "_room_lighting_stopping", False)
+            or not owner._is_enabled() or getattr(owner, "_sensors_muted", False)):
         return {}
     client = getattr(owner, "_addon_client", None)
     if client is None:
         return {}
+    reserved = await _reserve_rooms(owner, space_id)
+    if not reserved:
+        return {}
+    return await _run_room_checks(owner, client, reserved, _now)
+
+
+async def _reserve_rooms(owner: Any, space_id: str) -> list:
     rooms = {}
     for entity in owner._managed_listener_entity_ids():
         info = (owner.device_info or {}).get(entity) or {}
@@ -42,22 +53,92 @@ async def reconcile_rooms(owner: Any, _now: Any = None, *, space_id: str = "") -
     locks = getattr(owner, "_room_lighting_locks", None)
     if locks is None:
         locks = owner._room_lighting_locks = {}
-    outcomes = {}
+    # Reserve before yielding so overlapping periodic/timer callbacks coalesce,
+    # including rooms waiting for a worker. Do not enqueue one task per room.
+    reserved = []
     for space, anchor in rooms.items():
         lock = locks.setdefault(space, asyncio.Lock())
-        if lock.locked():
-            continue
-        async with lock:
-            progress = _RecheckProgress()
-            try:
-                outcomes[space] = await _reconcile_room(owner, client, space, anchor, _now, progress)
-            except Exception as exc:
-                outcomes[space] = progress.failure(space, anchor, exc)
-                owner._sys_log("WARNING", "[RoomLighting] operation=room_lighting.reconcile "
-                    f"room={space} entity={anchor} request_id={progress.request_id} "
-                    f"failure_stage={progress.stage} recheck_failed={type(exc).__name__} "
-                    f"upstream_status={progress.upstream_status}")
+        if not lock.locked():
+            await lock.acquire()  # Uncontended acquisition does not yield.
+            reserved.append((space, anchor, lock))
+    return reserved
+
+
+async def _run_room_checks(owner: Any, client: Any, reserved: list, now: Any) -> dict:
+    gate = getattr(owner, "_room_lighting_gate", None)
+    if gate is None:
+        gate = owner._room_lighting_gate = asyncio.Semaphore(MAX_CONCURRENT_ROOM_CHECKS)
+    tasks = getattr(owner, "_room_lighting_tasks", None)
+    if tasks is None:
+        tasks = owner._room_lighting_tasks = set()
+    parent = asyncio.current_task()
+    tasks.add(parent)
+    outcomes = {}
+    pending = iter(reserved)
+
+    async def worker():
+        for space, anchor, _lock in pending:
+            async with gate:
+                # Settings may have changed while another room was timing out.
+                if (getattr(owner, "_room_lighting_stopping", False)
+                        or not owner._is_enabled() or getattr(owner, "_sensors_muted", False)):
+                    continue
+                progress = _RecheckProgress()
+                try:
+                    outcomes[space] = await _reconcile_room(owner, client, space, anchor, now, progress)
+                except Exception as exc:
+                    outcomes[space] = progress.failure(space, anchor, exc)
+                    owner._sys_log("WARNING", "[RoomLighting] operation=room_lighting.reconcile "
+                        f"room={space} entity={anchor} request_id={progress.request_id} "
+                        f"failure_stage={progress.stage} recheck_failed={type(exc).__name__} "
+                        f"upstream_status={progress.upstream_status}")
+
+    workers = []
+    try:
+        for _ in range(min(MAX_CONCURRENT_ROOM_CHECKS, len(reserved))):
+            workers.append(asyncio.create_task(worker()))
+        group = asyncio.gather(*workers)
+        # Cancellation is handled once by our draining finally block. Repeated
+        # caller cancellation must not interrupt a child's cleanup await.
+        group.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        await asyncio.shield(group)
+    finally:
+        try:
+            await _cancel_room_tasks(workers)
+        finally:
+            for _, _, lock in reserved:
+                lock.release()
+            tasks.discard(parent)
     return outcomes
+
+
+async def stop_room_checks(owner: Any) -> None:
+    """Drain checks before closing their client; no timer may revive this owner."""
+    owner._room_lighting_stopping = True
+    for cancel in getattr(owner, "_room_lighting_timers", {}).values():
+        cancel()
+    owner._room_lighting_timers = {}
+    tasks = list(getattr(owner, "_room_lighting_tasks", ()))
+    await _cancel_room_tasks(tasks)
+
+
+async def _cancel_room_tasks(tasks) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    drained = asyncio.gather(*tasks, return_exceptions=True)
+    cancelled = None
+    while not drained.done():
+        try:
+            await asyncio.shield(drained)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+    failures = [result for result in drained.result()
+                if isinstance(result, Exception)]
+    if failures:
+        raise ExceptionGroup('room_lighting_shutdown_failed', failures)
 
 
 async def _reconcile_room(
@@ -99,6 +180,8 @@ async def _reconcile_room(
 
 
 def schedule_room_check(owner: Any, response: dict, *, schedule: Any = None) -> None:
+    if getattr(owner, "_room_lighting_stopping", False):
+        return
     control = (response.get("result") or {}).get("room_lighting") or {}
     space = control.get("space_id")
     deadlines = [datetime.fromisoformat(control[key]) for key in ("vacancy_due_at", "next_check_at")
