@@ -248,6 +248,8 @@ def reconcile_active_listener_states(
     """Wake the shared room loop on inventory/startup, including vacant rooms."""
     if not entity_ids or not self._is_enabled() or getattr(self, "_sensors_muted", False):
         return
+    from .presence_runtime import reconcile_occupancy_cycles
+    reconcile_occupancy_cycles(self)
     previous = getattr(self, "_room_lighting_startup_cancel", None)
     if callable(previous):
         previous()

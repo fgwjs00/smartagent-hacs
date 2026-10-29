@@ -829,9 +829,11 @@ class ObservationRefreshHostJsonReplayLedger:
             )
         return rows
 
-    async def _save_rows(self, rows: Mapping[str, Mapping[str, Any]]) -> None:
+    async def _save_rows(self, rows: Mapping[str, Mapping[str, Any]], *, write_class: str = "normal") -> None:
+        from .ha_storage_capacity import ha_store_write_scope
         document = self._document(rows)
-        await self._storage.async_save(document)
+        with ha_store_write_scope(write_class):
+            await self._storage.async_save(document)
         persisted = await self._load_rows()
         if self._document(persisted) != document:
             raise ObservationRefreshProviderRequestVerificationError(
@@ -940,7 +942,7 @@ class ObservationRefreshHostJsonReplayLedger:
                     "updated_at": current.isoformat(),
                 }
             )
-            await self._save_rows({**rows, attempt_id: updated})
+            await self._save_rows({**rows, attempt_id: updated}, write_class="accepted_result")
 
 
 @dataclass(frozen=True, slots=True)

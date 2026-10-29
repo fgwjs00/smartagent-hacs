@@ -12,6 +12,7 @@ from homeassistant.helpers.event import async_call_later
 from .admin_actor import AuthenticatedOwnerSession
 from .action_receipts import ActionResultCollector
 from .action_execution_context import (
+    self_trigger_entities,
     ActionBatchContext,
     ActionPreparationState,
     ActionGuardContext,
@@ -92,6 +93,7 @@ class ActionExecutionRuntimeMixin:
             is_global_cmd=is_global_cmd,
             confidence=confidence,
             authenticated_user_intent=authenticated_user_intent,
+            trigger_entities=self_trigger_entities(self),
         )
         guard_result = await apply_initial_batch_guards(self, preparation, batch)
         if guard_result is not None:

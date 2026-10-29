@@ -173,9 +173,9 @@ def install_observation_refresh_host_provider_runtime(
             "refresh_provider_runtime_registry_invalid"
         )
     if store_factory is None:
-        from homeassistant.helpers.storage import Store
+        from .ha_storage_capacity import create_capacity_store
 
-        store_factory = Store
+        store_factory = create_capacity_store
     if not callable(store_factory):
         raise ObservationRefreshProviderRequestVerificationError(
             "refresh_provider_store_factory_invalid"

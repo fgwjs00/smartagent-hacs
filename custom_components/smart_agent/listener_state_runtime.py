@@ -40,6 +40,28 @@ def _record_manual_operation(owner: Any, native: Any, entity_id: str, domain: st
 
 
 def handle_listener_state_changed(
+    self: Any, ev: Any, *, logger: logging.Logger,
+) -> None:
+    """Every managed presence observation repairs continuity before returning.
+
+    The normal arrival path first consumes the previous OFF interval. Finalizing
+    observation afterwards preserves that qualification while covering *all*
+    action-filter exits (mute, pause, startup and flap suppression included).
+    It never creates an arrival, schedules learning or dispatches an action.
+    """
+    try:
+        _dispatch_listener_state_changed(self, ev, logger=logger)
+    finally:
+        entity = ev.data.get("entity_id")
+        info = getattr(self, "device_info", {})
+        is_presence = getattr(self, "_is_presence_listener_entity", None)
+        if (isinstance(info, dict) and entity in info and callable(is_presence)
+                and is_presence(entity, info[entity])):
+            from .presence_runtime import reconcile_occupancy_cycles
+            reconcile_occupancy_cycles(self, current_entity=entity, current_state=ev.data.get("new_state"))
+
+
+def _dispatch_listener_state_changed(
     self: Any,
     ev: Any,
     *,

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import inspect
 import logging
+from uuid import uuid4
 from datetime import UTC, datetime
 from typing import Any, Callable
 
@@ -39,6 +41,7 @@ class InternalEventBridge:
         warn_threshold: int = 100,
         monitor_interval: float = 60.0,
         now_provider: Callable[[], Any] | None = None,
+        outbox_path: str | None = None,
     ) -> None:
         self._addon_client = addon_client
         self._log_callback = log_callback
@@ -49,10 +52,19 @@ class InternalEventBridge:
         self._worker_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
         self._retry_tasks: set[asyncio.Task] = set()
+        self._inflight: set[int] = set()
+        self._stopping = False
         self._posted = 0
         self._failed = 0
         self._dropped = 0
         self._seq = 0
+        self._stream_id = uuid4().hex
+        self._outbox = None
+        self._outbox_path = outbox_path
+        self._durable_task: asyncio.Task | None = None
+        if outbox_path is not None:
+            from .receipt_outbox import ReceiptOutbox
+            self._outbox = ReceiptOutbox(outbox_path)
 
     @property
     def stats(self) -> dict[str, int]:
@@ -62,6 +74,7 @@ class InternalEventBridge:
             "failed": self._failed,
             "dropped": self._dropped,
             "retrying": len(self._retry_tasks),
+            **(self._outbox.stats if self._outbox is not None else {}),
         }
 
     def _default_ts(self) -> str:
@@ -84,7 +97,7 @@ class InternalEventBridge:
         self._seq += 1
         return self._seq
 
-    def _client_accepts_envelope_headers(self) -> bool:
+    def _client_accepts_envelope_headers(self, *, stream: bool = False) -> bool:
         method = getattr(self._addon_client, "post_internal_event", None)
         try:
             signature = inspect.signature(method)
@@ -97,16 +110,26 @@ class InternalEventBridge:
         parameters = signature.parameters
         if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
             return True
+        if stream:
+            return "stream_id" in parameters
         return "envelope_version" in parameters and "transport" in parameters and "seq" in parameters
 
     def start(self) -> None:
         if self._worker_task and not self._worker_task.done():
             return
+        if self._stopping and self._outbox_path is not None:
+            from .receipt_outbox import ReceiptOutbox
+            self._outbox = ReceiptOutbox(self._outbox_path)
+        self._stopping = False
         self._worker_task = self._create_task(self._worker_loop(), "worker")
         try:
             self._monitor_task = self._create_task(self._monitor_loop(), "monitor")
+            if self._outbox is not None:
+                self._durable_task = self._create_task(self._durable_loop(), "durable")
         except BaseException:
             self._worker_task.cancel()
+            if self._monitor_task is not None:
+                self._monitor_task.cancel()
             self._worker_task = None
             raise
 
@@ -132,11 +155,13 @@ class InternalEventBridge:
             )
 
     async def stop(self) -> None:
+        self._stopping = True
         tasks = [
             task
             for task in (
                 self._monitor_task,
                 self._worker_task,
+                self._durable_task,
                 *tuple(self._retry_tasks),
             )
             if task is not None
@@ -149,49 +174,96 @@ class InternalEventBridge:
         self._retry_tasks.clear()
         self._monitor_task = None
         self._worker_task = None
+        self._durable_task = None
+        if self._outbox is not None:
+            self._outbox.close()
+
+    def prepare_execution_receipt(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Freeze identity once across direct confirmation, timeout and queue fallback."""
+        item = self._build_item("decision_execution", payload)
+        return {**item["payload"], "_receipt_delivery": {
+            key: item[key] for key in ("ts", "stream_id", "seq")}}
+
+    def prepare_correction(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Keep the concrete feedback and its transport identity across lost ACKs."""
+        if self._outbox is None or self._stopping:
+            raise RuntimeError("correction_outbox_unavailable")
+        item = self._build_item("correction", payload)
+        return {**item["payload"], "_receipt_delivery": {
+            key: item[key] for key in ("ts", "stream_id", "seq")}}
+
+    @staticmethod
+    def _durable_kind(kind: str, payload: dict[str, Any]) -> bool:
+        return kind == "decision_execution" or (kind == "correction"
+            and str(payload.get("action") or "record").strip().lower() in {"record", "report"})
 
     def _build_item(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> dict[str, Any]:
+        if self._durable_kind(kind, payload) and self._outbox is not None:
+            return self._outbox.admit(deepcopy(payload), ts=ts or self._default_ts(), kind=kind)
+        body = deepcopy(dict(payload or {}))
+        frozen = body.pop("_receipt_delivery", {}) if kind == "decision_execution" else {}
+        frozen = frozen if isinstance(frozen, dict) else {}
         return {
             "kind": str(kind or "").strip(),
-            "payload": dict(payload or {}),
-            "ts": str(ts or self._default_ts()),
+            "payload": body,
+            "ts": str(frozen.get("ts") or ts or self._default_ts()),
             "envelope_version": _ENVELOPE_VERSION,
             "transport": _TRANSPORT,
-            "seq": self._next_seq(),
+            "seq": frozen.get("seq") or self._next_seq(),
+            "stream_id": frozen.get("stream_id") or self._stream_id,
             "attempts": 0,
         }
 
-    def enqueue(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> bool:
-        item = self._build_item(kind, payload, ts=ts)
+    def _memory_size(self) -> int:
+        return self._queue.qsize() + len(self._inflight) + len(self._retry_tasks)
+
+    def _admit_memory(self, item: dict[str, Any], operation: str) -> bool:
+        if self._stopping:
+            return False
+        if self._memory_size() < self._queue.maxsize or self._queue.full():
+            try:
+                self._queue.put_nowait(item)
+                return True
+            except asyncio.QueueFull:
+                pass  # The bounded replacement below accounts for this failure.
+        return self._replace_queued_item(item, operation)
+
+    def _replace_queued_item(self, item: dict[str, Any], operation: str) -> bool:
         try:
+            self._queue.get_nowait()
+            self._queue.task_done()
+            self._dropped += 1
+        except asyncio.QueueEmpty:
+            pass  # Another consumer may have freed the queue; recheck total budget.
+        try:
+            if self._memory_size() >= self._queue.maxsize:
+                raise asyncio.QueueFull
             self._queue.put_nowait(item)
             return True
         except asyncio.QueueFull:
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-                self._dropped += 1
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                self._queue.put_nowait(item)
-                self._warn(
-                    f"[P1] operation=InternalEventBridge.enqueue seq={item['seq']} "
-                    f"internal event queue full; dropped oldest event "
-                    f"(dropped={self._dropped}, queued={self._queue.qsize()})"
-                )
-                return True
-            except asyncio.QueueFull:
-                self._dropped += 1
-                self._warn(
-                    f"[P1] operation=InternalEventBridge.enqueue seq={item['seq']} "
-                    "internal event queue full; failed to enqueue latest event",
-                )
-                return False
+            self._dropped += 1
+            return False
+        finally:
+            self._warn(f"[P1] operation=InternalEventBridge.{operation} seq={item['seq']} "
+                       f"internal event budget full; dropped={self._dropped} queued={self._queue.qsize()}")
+
+    def enqueue(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> bool:
+        if self._stopping:
+            return False
+        try:
+            item = self._build_item(kind, payload, ts=ts)
+        except Exception as exc:
+            self._failed += 1
+            self._warn(f"operation=InternalEventBridge.enqueue exception_type={type(exc).__name__} outcome=not_admitted")
+            return False
+        if item.get("durability"):
+            return True  # FULL commit completed; independent of the optional memory queue.
+        return self._admit_memory(item, "enqueue")
 
     async def _worker_loop(self) -> None:
         while True:
             item = await self._queue.get()
+            self._inflight.add(id(item))
             try:
                 ok = await self._post_item(item)
                 if ok:
@@ -213,6 +285,7 @@ class InternalEventBridge:
                 )
                 self._schedule_retry(item)
             finally:
+                self._inflight.discard(id(item))
                 self._queue.task_done()
 
     @staticmethod
@@ -259,9 +332,19 @@ class InternalEventBridge:
         ts: str | None = None,
     ) -> dict[str, Any]:
         """Post one event directly and return the Add-on persistence receipt."""
-        item = self._build_item(kind, payload, ts=ts)
+        if self._outbox is not None and self._durable_kind(kind, payload):
+            item = await asyncio.to_thread(self._build_item, kind, payload, ts=ts)
+        else:
+            item = self._build_item(kind, payload, ts=ts)
         result = await self._post_item_result(item)
         receipt, status = self._normalize_persistence_receipt(result)
+        if item.get("durability"):
+            if self._outbox.confirmed(item, receipt, status):
+                await asyncio.to_thread(self._outbox.acknowledge, item)
+            else:
+                await asyncio.to_thread(self._outbox.retry, item)
+                return {"ok": False, "status": status if status >= 400 else 502,
+                        "error": "durable_delivery_unconfirmed", "persistence_confirmed": False}
         if receipt is None:
             return {"ok": False, "status": 502, "error": "invalid_addon_persistence_receipt"}
         if status >= 400 or receipt.get("ok") is not True:
@@ -270,6 +353,8 @@ class InternalEventBridge:
 
     async def _post_item_result(self, item: dict[str, Any]) -> dict[str, Any] | None:
         kwargs: dict[str, Any] = {"ts": str(item.get("ts") or self._default_ts())}
+        if item.get("durability"):
+            kwargs["durability"] = item["durability"]
         if self._client_accepts_envelope_headers():
             kwargs.update(
                 {
@@ -278,6 +363,8 @@ class InternalEventBridge:
                     "seq": int(item.get("seq") or 0),
                 }
             )
+            if self._client_accepts_envelope_headers(stream=True):
+                kwargs["stream_id"] = str(item["stream_id"])
         result = await self._addon_client.post_internal_event(
             str(item.get("kind") or ""),
             dict(item.get("payload") or {}),
@@ -291,11 +378,17 @@ class InternalEventBridge:
         return receipt is not None and status < 400 and receipt.get("ok") is True
 
     def _schedule_retry(self, item: dict[str, Any]) -> None:
+        if self._stopping:
+            return
+        if id(item) not in self._inflight and self._memory_size() >= self._queue.maxsize:
+            self._dropped += 1
+            return
         attempts = int(item.get("attempts") or 0) + 1
         item["attempts"] = attempts
 
         async def _requeue_after_delay() -> None:
             await asyncio.sleep(min(30.0, float(attempts)))
+            self._retry_tasks.discard(asyncio.current_task())
             self._enqueue_retry_item(item)
 
         try:
@@ -307,32 +400,41 @@ class InternalEventBridge:
                 f"exception_type={type(exc).__name__} outcome=not_scheduled",
             )
             return
+        self._inflight.discard(id(item))
         self._retry_tasks.add(task)
         task.add_done_callback(self._retry_tasks.discard)
 
+    async def _durable_loop(self) -> None:
+        """Bounded worker; cancellation leaves committed evidence for restart."""
+        while True:
+            item = None
+            try:
+                item = await asyncio.to_thread(self._outbox.next_due)
+                if item is None:
+                    await asyncio.sleep(0.25)
+                    continue
+                result = await self._post_item_result(item)
+                receipt, status = self._normalize_persistence_receipt(result)
+                if self._outbox.confirmed(item, receipt, status):
+                    await asyncio.to_thread(self._outbox.acknowledge, item)
+                    self._posted += 1
+                else:
+                    self._failed += 1
+                    await asyncio.to_thread(self._outbox.retry, item)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._failed += 1
+                self._warn(f"operation=InternalEventBridge._durable_loop exception_type={type(exc).__name__} outcome=pending")
+                if item is not None:
+                    try:
+                        await asyncio.to_thread(self._outbox.retry, item)
+                    except Exception as retry_error:
+                        self._warn(f"operation=InternalEventBridge._durable_loop exception_type={type(retry_error).__name__} outcome=retry_not_saved")
+                await asyncio.sleep(1)
+
     def _enqueue_retry_item(self, item: dict[str, Any]) -> None:
-        try:
-            self._queue.put_nowait(item)
-        except asyncio.QueueFull:
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-                self._dropped += 1
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                self._queue.put_nowait(item)
-                self._warn(
-                    f"[P1] operation=InternalEventBridge._enqueue_retry_item seq={item['seq']} "
-                    f"internal event queue full; dropped oldest event "
-                    f"(dropped={self._dropped}, queued={self._queue.qsize()})"
-                )
-            except asyncio.QueueFull:
-                self._dropped += 1
-                self._warn(
-                    f"[P1] operation=InternalEventBridge._enqueue_retry_item seq={item['seq']} "
-                    "internal event queue full; failed to enqueue retry event",
-                )
+        self._admit_memory(item, "_enqueue_retry_item")
 
     async def _monitor_loop(self) -> None:
         while True:

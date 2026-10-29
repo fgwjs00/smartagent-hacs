@@ -1080,6 +1080,9 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
             "failed": int(bridge_stats.get("failed") or 0),
             "dropped": int(bridge_stats.get("dropped") or 0),
         }
+        for field in ("durable_pending", "durable_bytes", "durable_retrying"):
+            if field in bridge_stats:
+                internal_event_bridge[field] = int(bridge_stats[field])
 
         is_enabled = getattr(coord, "_is_enabled", None)
         enabled = bool(is_enabled()) if callable(is_enabled) else bool(getattr(coord, "_enabled", False))

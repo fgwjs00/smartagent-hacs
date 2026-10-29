@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.240
-display_version: Beta 0.0.240
+release_version: 0.0.241
+display_version: Beta 0.0.241
 channel: beta
-release_date: '2026-10-20'
+release_date: '2026-10-30'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 修复灯控决策同步存储阻塞和多房间串行重查，补齐任务取消恢复与存储原生模块指纹验收。
-  customer_visible_version: Beta 0.0.240
+  summary: 整合可信执行与回执持久化、学习去重与缓存恢复、存储容量治理、页面精简与读取性能，以及已验收的音频与 S31 接入修复。
+  customer_visible_version: Beta 0.0.241

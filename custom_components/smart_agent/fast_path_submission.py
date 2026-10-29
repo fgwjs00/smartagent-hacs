@@ -7,6 +7,7 @@ from .fast_path_request import FastPathRequest, schedule_fast_path_remainder
 from .fast_path_response import FastPathResponse
 from .fast_path_rollout import FastPathRollout
 from .service_contracts import STATEFUL_EXECUTION_DOMAINS
+from .action_execution_context import self_trigger_scope
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,18 +104,15 @@ async def _report_suppressed(context: FastPathExecution) -> None:
 
 async def _execute_protected(context: FastPathExecution) -> dict[str, Any]:
     host, entity_id = context.request.host, context.request.trigger.entity_id
-    previous = getattr(host, "_batch_trigger_controllable", set())
     domain = entity_id.split(".")[0]
+    entities = {entity_id} if domain in STATEFUL_EXECUTION_DOMAINS else set()
     if domain in STATEFUL_EXECUTION_DOMAINS:
-        host._batch_trigger_controllable = {entity_id}
         host._sys_log(
             "INFO",
             f"[自触发保护] FastPath 可控设备触发: {entity_id}，AI 不可反向操作该设备",
         )
-    try:
+    with self_trigger_scope(host, entities):
         return await _dispatch(context)
-    finally:
-        host._batch_trigger_controllable = previous
 
 
 async def _handoff_audit(

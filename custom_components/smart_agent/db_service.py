@@ -25,6 +25,8 @@ import sqlite3
 import threading
 from typing import Any
 
+from .storage_capacity import connect
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -140,7 +142,7 @@ class DatabaseService:
             conn = None
             phase = "connect"
             try:
-                conn = sqlite3.connect(
+                conn = connect(
                     self._db_path,
                     check_same_thread=False,   # 允许跨线程使用（配合 _write_lock 保证安全）
                     isolation_level=None,       # 自动提交模式：禁用 Python 隐式事务管理
@@ -149,6 +151,8 @@ class DatabaseService:
                 conn.row_factory = sqlite3.Row  # 全局设置，query() 无需再修改（线程安全）
                 for phase, value in (("journal_mode", "WAL"), ("cache_size", "-8000"),
                                      ("synchronous", "NORMAL"), ("busy_timeout", "5000")):
+                    if phase == "journal_mode" and conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+                        continue  # Reopening an existing WAL database remains read-only under pressure.
                     conn.execute(f"PRAGMA {phase}={value}")
                 self._conn = conn
             except BaseException as exc:

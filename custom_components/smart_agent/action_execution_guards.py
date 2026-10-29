@@ -98,7 +98,7 @@ def _filter_self_triggered_actions(
             action.get("service") or action.get("action") or action.get("command") or ""
         ).split(".", 1)[-1]
         if not (
-            entity_id and service == "turn_on" and entity_id in host._batch_trigger_controllable
+            entity_id and service == "turn_on" and entity_id in context.trigger_entities
         ):
             filtered.append(action)
             continue
@@ -107,7 +107,7 @@ def _filter_self_triggered_actions(
         guard = evaluate_self_trigger_protection(
             entity_id=entity_id,
             service=service,
-            trigger_entities=host._batch_trigger_controllable,
+            trigger_entities=context.trigger_entities,
         )
         message = (
             guard.msg
@@ -183,7 +183,7 @@ async def apply_initial_batch_guards(
             return await _finish_guard_rejection(host, state, context)
     if not state.actions:
         return host._action_execution_result(0, correlation_id=context.correlation_id)
-    if host._batch_trigger_controllable and not context.authenticated_user_intent:
+    if context.trigger_entities and not context.authenticated_user_intent:
         _filter_self_triggered_actions(host, state, context)
         if not state.actions:
             host._sys_log("INFO", "[自触发预过滤] 所有动作均为自触发设备，跳过执行")

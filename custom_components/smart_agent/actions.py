@@ -20,7 +20,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.exceptions import ServiceNotFound
 
 from .action_execution_runtime import ActionExecutionRuntimeMixin
-from .action_execution_context import ActionBatchContext, ActionCall
+from .action_execution_context import ActionBatchContext, ActionCall, self_trigger_entities
 from .service_execution_context import ServiceCallContext, PreparedServiceState
 from .service_execution_receipts import verify_service_receipt
 from .service_execution_success import record_service_success
@@ -2225,6 +2225,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 decision_contract_lineage=decision_contract_lineage,
                 user_intent_authority=user_intent_authority,
                 authenticated_user_intent=authenticated_user_explicit,
+                trigger_entities=self_trigger_entities(self),
             ),
             action_seq,
             target_space_id,

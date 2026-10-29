@@ -502,10 +502,10 @@ async def async_consume_dispatch_proof(
         raise DispatchProofError("dispatch_proof_consume_binding_invalid")
     if store_factory is None:
         try:
-            from homeassistant.helpers.storage import Store
+            from .ha_storage_capacity import create_capacity_store
         except Exception as exc:
             raise DispatchProofError("dispatch_proof_store_unavailable") from exc
-        store_factory = Store
+        store_factory = create_capacity_store
     runtime = hass.data.setdefault(_RUNTIME_KEY, {})
     state = runtime.setdefault(kid, {})
     lock = state.get("lock")

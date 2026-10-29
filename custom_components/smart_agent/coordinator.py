@@ -354,7 +354,6 @@ class SmartAgentCoordinator(
         self._pending_triggers: list[dict] = []
         self._pending_triggers_lock = threading.Lock()
         self._pending_trigger_controllable: dict[str, str] = {}
-        self._batch_trigger_controllable: dict[str, str] = {}
         self._merge_timer_unsub: Any = None
         self._scan_timer_unsub: Any = None
         self._habit_check_timer_unsub: Any = None
@@ -435,10 +434,12 @@ class SmartAgentCoordinator(
         self._addon_repair_last_check_at = 0.0
         self._addon_repair_last_error = ""
         from .internal_event_bridge import InternalEventBridge
+        from .receipt_outbox import receipt_outbox_path
         self._internal_event_bridge = InternalEventBridge(
             self._addon_client,
             log_callback=self._sys_log,
             now_provider=self._ha_local_now,
+            outbox_path=receipt_outbox_path(self._config_dir, entry.entry_id, self._addon_client._base),
         )
         # TTS 配置
         self._tts_service: str = (data.get(CONF_TTS_SERVICE) or "").strip()
@@ -638,6 +639,11 @@ class SmartAgentCoordinator(
         bridge = getattr(self, "_internal_event_bridge", None)
         if bridge is None:
             return False
+
+        # Critical evidence is admitted before returning True, including executor
+        # callers. Scheduling a callback is not a persistence acknowledgement.
+        if kind == "decision_execution":
+            return bool(bridge.enqueue(kind, payload, ts=ts))
 
         def _enqueue() -> None:
             bridge.enqueue(kind, payload, ts=ts)
@@ -2598,13 +2604,13 @@ class SmartAgentCoordinator(
         """Switch between home and showroom mode, and persist to config entry.
 
         展厅模式（MODE_SHOWROOM）仅限商业版（LICENSE_TIER_BIZ）授权使用。
-        内部开发版当前 license_tier 固定为 business，生产上线后该门控将生效。
+        每次进入展厅前刷新本地授权状态，过期缓存不能继续授予付费能力。
         """
         if mode not in (MODE_HOME, MODE_SHOWROOM):
             self._sys_log("WARN", f"无效模式: {mode}，保持当前 {self._mode}")
             return
         # License 门控：展厅模式仅限商业版
-        if mode == MODE_SHOWROOM and self._license_tier not in (LICENSE_TIER_BIZ,):
+        if mode == MODE_SHOWROOM and self.get_license_status().get("tier") != LICENSE_TIER_BIZ:
             self._sys_log(
                 "WARN",
                 f"[模式] 展厅模式仅限商业版授权（当前套餐: {self._license_tier}），"
@@ -2888,7 +2894,7 @@ class SmartAgentCoordinator(
             self._license_valid = False
             self._license_tier = LICENSE_TIER_FREE
             self._license_expires = ""
-            self._sys_log("WARN", "[License] 未配置 license_key，按免费版配额运行")
+            self._sys_log("WARN", "[License] 未配置 license_key，按免费版授权状态运行")
             return
 
         result = await self.async_verify_license(key=key)
@@ -3092,18 +3098,17 @@ class SmartAgentCoordinator(
             "world_snapshot_id": str(last_ai.get("world_snapshot_id") or "unknown"),
         }
         name = self.get_device_name(entity_id)
-        if not self._enqueue_internal_event("correction", correction_payload):
-            self._sys_log("WARN", f"[Correction] add-on correction enqueue failed: {entity_id}")
-            self.last_correction_text = f"记录失败: {name}（add-on 不可达，请稍后重试）"
+        from .correction_delivery import clear_correction_prompt, confirm_correction
+        self.last_correction_text = f"正在提交反馈: {name}"
+        self.async_set_updated_data({})
+        if not await confirm_correction(
+            self._internal_event_bridge, last_ai, correction_payload, self._last_ai_actions,
+        ):
+            self.last_correction_text = f"尚未确认记录: {name}（原反馈保留，请稍后查看或重试）"
             self.async_set_updated_data({})
 
-            async def _clear_fail():
-                await asyncio.sleep(5)
-                self.last_correction_text = ""
-                self.async_set_updated_data({})
-
             self._spawn_background_task(
-                _clear_fail(),
+                clear_correction_prompt(self),
                 "correction_clear_failure_prompt",
             )
             return
@@ -3115,16 +3120,10 @@ class SmartAgentCoordinator(
             self.last_correction_text = f"已记录: {name} (AI建议{last_ai.get('state')} -> 用户改为{user_state})"
             self._sys_log("WARN", f"[修正学习] 用户显式纠正了 AI 对 {name} 的操作")
 
-        self._last_ai_actions.pop(entity_id, None)
         self.async_set_updated_data({})
 
-        async def _clear():
-            await asyncio.sleep(5)
-            self.last_correction_text = ""
-            self.async_set_updated_data({})
-
         self._spawn_background_task(
-            _clear(),
+            clear_correction_prompt(self),
             "correction_clear_success_prompt",
         )
 
@@ -3153,10 +3152,10 @@ class SmartAgentCoordinator(
         import queue as _q
         try:
             self._log_dir = os.path.join(self._config_dir, "custom_components", DOMAIN, "logs")
-            os.makedirs(self._log_dir, exist_ok=True)
+            from .ha_storage_capacity import CapacityTimedRotatingFileHandler
             log_path = os.path.join(self._log_dir, LOG_FILENAME)
             retention = getattr(self, "_log_retention_days", LOG_RETENTION_DAYS)
-            file_handler = logging.handlers.TimedRotatingFileHandler(
+            file_handler = CapacityTimedRotatingFileHandler(
                 log_path,
                 when="midnight",
                 interval=1,

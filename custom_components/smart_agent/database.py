@@ -231,19 +231,19 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
         return bool(enqueue(kind, payload, ts=ts))
 
     def _ha_db_now_text(self) -> str:
+        from datetime import timezone
         try:
             local_now = getattr(self, "_ha_local_now", None)
             now_value = local_now() if callable(local_now) else None
-            if hasattr(now_value, "strftime"):
-                return now_value.strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(now_value, datetime) and now_value.utcoffset() is not None:
+                return now_value.astimezone(timezone.utc).isoformat()
         except Exception:
             pass
         try:
             from homeassistant.util import dt as dt_util
-            return dt_util.now().strftime("%Y-%m-%d %H:%M:%S")
+            return dt_util.utcnow().astimezone(timezone.utc).isoformat()
         except Exception:
-            from datetime import timezone
-            return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            return datetime.now(timezone.utc).isoformat()
 
     def _ha_db_cutoff_text(self, days: int) -> str:
         try:

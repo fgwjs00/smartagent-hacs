@@ -85,7 +85,7 @@ class BackupManager:
         # 列出云端备份
         backups = await mgr.list_backups()
         # 恢复备份
-        await mgr.restore_backup(backup_id="bkp_xxx", password="用户密码")
+        await mgr.restore_backup(backup_id="bkp_xxx", password="用户密码", operation_id="restore_unique_id")
     """
 
     def __init__(self, coordinator) -> None:
@@ -255,98 +255,240 @@ class BackupManager:
                 self._coord._sys_log("ERROR", _err_msg)
             return {"success": False, "backup_id": "", "size_bytes": 0, "message": f"备份失败: {exc}"}
 
-    async def restore_backup(
-        self,
-        backup_id: str,
-        password: str,
-    ) -> dict:
-        """
-        从云端下载备份并恢复（解密 → 写入本地数据库）。
+    def _get_restore_journal(self):
+        from .restore_journal import RestoreJournal
 
-        Args:
-            backup_id: 云端备份 ID
-            password: 用户备份密码
+        journal = getattr(self, "_restore_journal_store", None)
+        if journal is None:
+            config_dir = getattr(getattr(self._hass, "config", None), "config_dir", None)
+            if not isinstance(config_dir, str) or not os.path.isabs(config_dir):
+                raise RuntimeError("restore_journal_path_unavailable")
+            journal = RestoreJournal(os.path.join(config_dir, ".storage", "smart_agent_restore.sqlite3"))
+            self._restore_journal_store = journal
+        return journal
 
-        Returns:
-            {"success": bool, "message": str, "restored_keys": list[str]}
-        """
-        _msg = f"[Backup] 开始恢复备份: {backup_id}"
-        _LOGGER.info(_msg)
-        if hasattr(self._coord, "_sys_log"):
-            self._coord._sys_log("INFO", _msg)
+    @staticmethod
+    def _restore_unknown(operation_id: str, error: str) -> dict:
+        return {"operation_id": operation_id, "outcome": "unknown", "committed": None,
+                "ok": False, "restored": [], "error": error, "acknowledged": False}
 
+    @staticmethod
+    def _restore_payload_digest(backup_id: str, payload: dict) -> str:
+        body = {"scope": "ha_bridge:local_business_data", "backup_id": backup_id, "backup": payload}
+        encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def _validate_restore_receipt(self, receipt, operation_id: str, backup_id: str, digest: str = "") -> dict:
+        unknown = self._restore_unknown(operation_id, "invalid_restore_receipt")
+        if not isinstance(receipt, dict) or receipt.get("contract") != "backup_restore.v1":
+            if isinstance(receipt, dict) and receipt.get("error"):
+                unknown["error"] = str(receipt["error"])
+            return unknown
+        if receipt.get("operation_id") != operation_id or receipt.get("scope") != "ha_bridge:local_business_data":
+            return unknown
+        outcome = receipt.get("outcome")
+        if outcome == "unknown":
+            return {**unknown, "protocol_supported": True,
+                    "error": str(receipt.get("error") or "restore_unconfirmed")}
+        if outcome not in {"committed", "rolled_back", "not_committed", "rejected"}:
+            return unknown
+        if receipt.get("backup_id") != backup_id or receipt.get("committed") is not (outcome == "committed"):
+            return unknown
+        if (outcome == "rejected" and receipt.get("request_rejected") is True
+                and receipt.get("error") == "restore_identity_conflict"
+                and (not digest or receipt.get("payload_digest") == digest)):
+            return {**receipt, "not_dispatched": True}
+        fenced = outcome == "not_committed" and receipt.get("error") == "restore_fenced_before_commit"
+        actual_digest = receipt.get("payload_digest")
+        if (digest and actual_digest != digest and not (fenced and actual_digest == "")) or (
+                not fenced and (not isinstance(actual_digest, str) or len(actual_digest) != 64)):
+            return unknown
+        if not isinstance(receipt.get("receipt_token"), str) or len(receipt["receipt_token"]) != 48:
+            return unknown
+        if not receipt.get("completed_at") or not isinstance(receipt.get("restored"), list) or not all(
+                isinstance(item, str) for item in receipt["restored"]):
+            return unknown
+        if outcome == "committed" and receipt.get("ok") is not True:
+            return unknown
+        return dict(receipt)
+
+    def _restore_request(self, operation_id: str, backup_id: str, *, action: str, **body) -> dict:
+        confirm = getattr(self._coord, "_post_internal_event_confirmed", None)
+        if not callable(confirm):
+            return self._restore_unknown(operation_id, "restore_confirmation_unavailable")
         try:
-            # 0. 清洗 backup_id，防止路径穿越
-            backup_id = self._sanitize_backup_id(backup_id)
+            receipt = confirm("backup_restore", {"operation_id": operation_id, "backup_id": backup_id,
+                                                 "action": action, **body}, timeout=60.0)
+        except Exception:
+            return self._restore_unknown(operation_id, "restore_confirmation_unavailable")
+        digest = self._restore_payload_digest(backup_id, body["backup"]) if action == "restore" else ""
+        return self._validate_restore_receipt(receipt, operation_id, backup_id, digest)
 
-            # 1. 下载密文
+    def _read_restore_status(self, operation_id: str | None, reconcile: bool) -> dict:
+        journal = self._get_restore_journal()
+        handle = journal.read(operation_id or "")
+        if handle is None:
+            return self._restore_unknown(operation_id or "", "restore_handle_not_found")
+        operation_id = handle["operation_id"]
+        cached = json.loads(handle["receipt_json"]) if handle["receipt_json"] else None
+        if cached and cached.get("not_dispatched"):
+            return cached
+        receipt = self._restore_request(operation_id, handle["backup_id"], action="reconcile" if reconcile else "status")
+        if receipt.get("outcome") != "unknown":
+            receipt = self._validate_restore_receipt(receipt, operation_id, handle["backup_id"], handle["payload_digest"])
+        if cached:
+            return {**cached, "acknowledged": not handle["active"] or receipt.get("acknowledged") is True,
+                    "local_gate_released": not bool(handle["active"]),
+                    **({"status_query_error": receipt.get("error")} if receipt["outcome"] == "unknown" else {})}
+        if receipt["outcome"] != "unknown":
+            try:
+                return journal.remember(operation_id, receipt)
+            except Exception:
+                return {**receipt, "handle_cache_error": True}
+        return receipt
+
+    async def get_restore_status(self, operation_id: str | None = None, *, reconcile: bool = False) -> dict:
+        """Recover the current handle after HA restart; status never replays writes.
+
+        Explicit reconcile fences an absent/pending Add-on operation under its
+        writer lock. Ordinary status is read-only on the Add-on business store.
+        """
+        try:
+            receipt = await self._hass.async_add_executor_job(self._read_restore_status, operation_id, reconcile)
+        except Exception:
+            receipt = self._restore_unknown(operation_id or "", "restore_status_unavailable")
+        return await self._restore_reply(receipt)
+
+    def _validate_restore_ack_receipt(self, receipt: dict, handle: dict, known: dict | None = None) -> dict:
+        bound = self._validate_restore_receipt(receipt, handle["operation_id"],
+                                               handle["backup_id"], handle["payload_digest"])
+        if bound["outcome"] == "unknown":
+            return bound
+        immutable = ("contract", "scope", "operation_id", "backup_id", "payload_digest", "outcome",
+                     "committed", "ok", "restored", "completed_at", "receipt_token", "error")
+        if known is not None and any(bound.get(key) != known.get(key) for key in immutable):
+            return self._restore_unknown(handle["operation_id"], "restore_terminal_mismatch")
+        return bound
+
+    @staticmethod
+    def _restore_ack_failure(known: dict, handle: dict, error: str, *, sent: bool = False) -> dict:
+        return {**known, "acknowledged": False, "local_gate_released": not bool(handle["active"]),
+                "acknowledgement_outcome": "unknown" if sent else "not_sent",
+                "acknowledgement_error": error}
+
+    def _acknowledge_restore(self, operation_id: str, receipt_token: str) -> dict:
+        journal = self._get_restore_journal()
+        handle = journal.read(operation_id)
+        if handle is None:
+            return self._restore_unknown(operation_id, "restore_handle_not_found")
+        known = None
+        if handle["receipt_json"]:
+            known = self._validate_restore_ack_receipt(json.loads(handle["receipt_json"]), handle)
+            if known["outcome"] == "unknown":
+                return self._restore_ack_failure(known, handle, "invalid_cached_restore_receipt")
+        status = self._restore_request(operation_id, handle["backup_id"], action="status")
+        basis = self._validate_restore_ack_receipt(status, handle, known)
+        if basis["outcome"] == "unknown":
+            return self._restore_ack_failure(known or basis, handle, basis["error"])
+        if not isinstance(receipt_token, str) or receipt_token != basis.get("receipt_token"):
+            return self._restore_ack_failure(known or basis, handle, "restore_acknowledgement_token_mismatch")
+        try:
+            remembered = journal.remember(operation_id, basis)
+        except Exception:
+            return self._restore_ack_failure(known or basis, handle, "restore_handle_cache_unavailable")
+        basis = self._validate_restore_ack_receipt(basis, handle, remembered)
+        if basis["outcome"] == "unknown":
+            return self._restore_ack_failure(known or basis, handle, basis["error"])
+        receipt = self._restore_request(operation_id, handle["backup_id"], action="acknowledge", receipt_token=receipt_token)
+        receipt = self._validate_restore_ack_receipt(receipt, handle, basis)
+        if receipt["outcome"] == "unknown" or receipt.get("acknowledged") is not True:
+            return self._restore_ack_failure(basis, handle, "restore_acknowledgement_unconfirmed", sent=True)
+        try:
+            journal.acknowledge(operation_id)
+        except Exception:
+            return {**receipt, "local_gate_released": False, "handle_acknowledgement_error": True}
+        return {**receipt, "local_gate_released": True, "acknowledgement_outcome": "confirmed"}
+
+    async def acknowledge_restore(self, operation_id: str, receipt_token: str) -> dict:
+        """Acknowledge only a terminal bound to the local intent and observed result."""
+        try:
+            receipt = await self._hass.async_add_executor_job(self._acknowledge_restore, operation_id, receipt_token)
+        except Exception:
+            receipt = self._restore_unknown(operation_id, "restore_acknowledgement_unavailable")
+        return await self._restore_reply(receipt)
+
+
+    async def _restore_reply(self, receipt: dict) -> dict:
+        reply = {**receipt, "success": False, "restored_keys": list(receipt.get("restored") or [])}
+        outcome = receipt["outcome"]
+        if outcome == "committed":
+            try:
+                errors = await self._async_refresh_restored_projections(reply["restored_keys"])
+            except Exception as exc:
+                errors = ["projection_refresh_exception:" + type(exc).__name__]
+            if errors:
+                return {**reply, "committed": True, "requires_restart": True, "refresh_errors": errors,
+                        "message": "数据已提交，但运行投影刷新失败；需要重启或重新查询刷新，不要再次恢复"}
+            return {**reply, "success": True, "requires_restart": False, "refresh_errors": [],
+                    "message": "恢复已提交；确认该结果后再开始新的恢复操作"}
+        messages = {"rolled_back": "恢复事务已确认回滚", "not_committed": "已对账确认未提交，迟到请求已被阻止",
+                    "rejected": "恢复未开始：请求被拒绝", "unknown": "恢复结果未知；保留原操作 ID 查询或对账，不要换 ID 重试"}
+        return {**reply, "message": messages[outcome]}
+
+    async def restore_backup(self, backup_id: str, password: str, *, operation_id: str) -> dict:
+        """Start one explicit restore identity; duplicates only query its result."""
+        issued = False
+        claimed = False
+        try:
+            operation_id = self._sanitize_backup_id(operation_id)
+            backup_id = self._sanitize_backup_id(backup_id)
+            journal = self._get_restore_journal()
+            admission = await self._hass.async_add_executor_job(journal.claim, operation_id, backup_id)
+            if admission["state"] == "existing":
+                return await self.get_restore_status(operation_id)
+            if admission["state"] != "created":
+                return await self._restore_reply({"operation_id": operation_id, "outcome": "rejected", "committed": False,
+                    "error": "restore_handle_" + admission["state"], "restored": [],
+                    "blocking_operation_id": admission.get("blocking_operation_id", "")})
+            claimed = True
             encrypted = await self._download(backup_id)
             if not encrypted:
-                _err_msg = "[Backup] 恢复失败：未找到备份或下载失败"
-                _LOGGER.error(_err_msg)
-                if hasattr(self._coord, "_sys_log"):
-                    self._coord._sys_log("ERROR", _err_msg)
-                return {"success": False, "message": "未找到备份或下载失败", "restored_keys": []}
-
-            # 2. 解密
-            payload_bytes = await self._hass.async_add_executor_job(
-                self._decrypt, encrypted, password
-            )
-            if payload_bytes is None:
-                _err_msg = "[Backup] 恢复失败：解密失败，密码错误或备份已损坏"
-                _LOGGER.error(_err_msg)
-                if hasattr(self._coord, "_sys_log"):
-                    self._coord._sys_log("ERROR", _err_msg)
-                return {"success": False, "message": "解密失败：密码错误或备份已损坏", "restored_keys": []}
-
-            # 3. 恢复数据
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            restored_keys = await self._hass.async_add_executor_job(
-                self._restore_data, payload
-            )
-
-            # 成功语义以 DB 确认为前提：_restore_data 返回 None 表示事务回滚/失败，
-            # 不得报告恢复成功（否则用户会以为数据已恢复，实际什么都没写入）。
-            if restored_keys is None:
-                _fail_msg = "[Backup] 恢复失败：恢复事务已回滚，数据库未变更"
-                _LOGGER.error(_fail_msg)
-                if hasattr(self._coord, "_sys_log"):
-                    self._coord._sys_log("ERROR", _fail_msg)
-                return {"success": False, "message": "恢复失败：恢复事务已回滚，数据库保持原状", "restored_keys": []}
-
-            refresh_errors = await self._async_refresh_restored_projections(restored_keys)
-            if refresh_errors:
-                _fail_msg = (
-                    "[Backup] Add-on restore committed, but runtime projection refresh failed: "
-                    + ", ".join(refresh_errors)
-                )
-                _LOGGER.error(_fail_msg)
-                if hasattr(self._coord, "_sys_log"):
-                    self._coord._sys_log("ERROR", _fail_msg)
-                return {
-                    "success": False,
-                    "committed": True,
-                    "requires_restart": True,
-                    "message": "Restore committed, but runtime refresh failed; restart is required",
-                    "restored_keys": restored_keys,
-                    "refresh_errors": refresh_errors,
-                }
-            _res_msg = f"[Backup] 恢复完成，恢复数据类别: {restored_keys}"
-            _LOGGER.info(_res_msg)
-            if hasattr(self._coord, "_sys_log"):
-                self._coord._sys_log("INFO", _res_msg)
-            return {
-                "success": True,
-                "message": f"恢复成功，已恢复 {len(restored_keys)} 个数据类别",
-                "restored_keys": restored_keys,
-            }
-
+                raise ValueError("backup_download_unavailable")
+            plaintext = await self._hass.async_add_executor_job(self._decrypt, encrypted, password)
+            if plaintext is None:
+                raise ValueError("backup_decryption_failed")
+            payload = json.loads(plaintext.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid_backup_payload")
+            digest = self._restore_payload_digest(backup_id, payload)
+            await self._hass.async_add_executor_job(journal.bind, operation_id, digest)
+            issued = True  # Cancellation/timeout from this point cannot prove non-dispatch.
+            receipt = await self._hass.async_add_executor_job(self._restore_data, payload, operation_id, backup_id)
+            if receipt["outcome"] != "unknown":
+                try:
+                    receipt = await self._hass.async_add_executor_job(journal.remember, operation_id, receipt)
+                    if receipt.get("not_dispatched"):
+                        await self._hass.async_add_executor_job(journal.acknowledge, operation_id)
+                except Exception:
+                    # Preserve an already confirmed commit even if local caching fails.
+                    receipt = {**receipt, "handle_cache_error": True}
+            return await self._restore_reply(receipt)
         except Exception as exc:
-            _err_msg = f"[Backup] 恢复失败: {exc}"
-            _LOGGER.error(_err_msg)
-            if hasattr(self._coord, "_sys_log"):
-                self._coord._sys_log("ERROR", _err_msg)
-            return {"success": False, "message": f"恢复失败: {exc}", "restored_keys": []}
+            if issued:
+                return await self._restore_reply(self._restore_unknown(operation_id, "restore_wait_unconfirmed"))
+            safe_error = str(exc) if str(exc) in {
+                "backup_download_unavailable", "backup_decryption_failed", "invalid_backup_payload",
+            } else type(exc).__name__
+            receipt = {"operation_id": operation_id, "outcome": "rejected", "committed": False,
+                       "restored": [], "not_dispatched": True, "error": safe_error}
+            if claimed:
+                try:
+                    receipt = await self._hass.async_add_executor_job(journal.remember, operation_id, receipt)
+                    if receipt.get("not_dispatched"):
+                        await self._hass.async_add_executor_job(journal.acknowledge, operation_id)
+                except Exception:
+                    return await self._restore_reply(self._restore_unknown(operation_id, "restore_handle_update_failed"))
+            return await self._restore_reply(receipt)
 
     async def list_backups(self) -> list[dict]:
         """
@@ -611,28 +753,17 @@ class BackupManager:
 
         return payload
 
-    def _restore_data(self, payload: dict) -> list[str] | None:
-        """Restore business data through the Add-on single-writer transaction."""
-        confirm = getattr(self._coord, "_post_internal_event_confirmed", None)
-        if not callable(confirm):
-            _LOGGER.error("[Backup] restore failed: Add-on persistence confirmation unavailable")
-            return None
-        result = confirm("backup_restore", {"backup": dict(payload or {})}, timeout=60.0)
-        if (
-            not isinstance(result, dict)
-            or result.get("ok") is not True
-            or result.get("committed") is not True
-        ):
-            _LOGGER.error(
-                "[Backup] restore failed: Add-on did not confirm atomic commit: %s",
-                (result or {}).get("error") if isinstance(result, dict) else "invalid_receipt",
-            )
-            return None
-        restored = result.get("restored")
-        if not isinstance(restored, list):
-            _LOGGER.error("[Backup] restore failed: receipt has no restored list")
-            return None
-        return [str(item) for item in restored if str(item).strip()]
+    def _restore_data(self, payload: dict, operation_id: str, backup_id: str) -> dict:
+        """Return a bound result protocol, never None/implicit rollback."""
+        status = self._restore_request(operation_id, backup_id, action="status")
+        if status["outcome"] != "unknown":
+            return self._validate_restore_receipt(status, operation_id, backup_id,
+                                                  self._restore_payload_digest(backup_id, payload))
+        # Strict protocol gate: an old/mixed Add-on must never receive a restore
+        # body before proving that it supports operation identity and receipts.
+        if not status.get("protocol_supported") or status.get("error") != "restore_not_found":
+            return status
+        return self._restore_request(operation_id, backup_id, action="restore", backup=dict(payload))
 
     async def _async_refresh_restored_projections(self, restored_keys: list[str]) -> list[str]:
         restored = {str(item or "").strip() for item in restored_keys}
@@ -718,10 +849,9 @@ class BackupManager:
 
         def _write():
             backup_dir = os.path.join(self._hass.config.config_dir, "smart_agent_backups")
-            os.makedirs(backup_dir, exist_ok=True)
+            from .ha_storage_capacity import atomic_write_bytes
             fpath = os.path.join(backup_dir, f"{backup_id}.enc")
-            with open(fpath, "wb") as f:
-                f.write(encrypted)
+            atomic_write_bytes(fpath, encrypted)
             _LOGGER.info("[Backup] 已保存本地备份: %s", fpath)
             return {"backup_id": backup_id, "path": fpath}
 

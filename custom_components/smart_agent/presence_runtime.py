@@ -10,6 +10,8 @@ from typing import Any, Callable
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later
 
+from .presence_cycle_continuity import continuous_members, report_window, window_matches_policy
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -34,6 +36,7 @@ def _serializable_occupancy_cycles(owner: Any) -> dict[str, dict[str, Any]]:
             "cycle_id": cycle_id,
             "active": raw.get("active") is True,
             "generation": max(0, int(raw.get("generation") or 0)),
+            "vacant_member_windows": raw.get("vacant_member_windows", {}),
             **(
                 {"vacant_candidate_at": float(raw.get("vacant_candidate_at"))}
                 if raw.get("vacant_candidate_at") not in (None, "")
@@ -47,10 +50,10 @@ async def async_restore_occupancy_cycles(owner: Any) -> None:
     """Restore occupancy-cycle identity before listeners reconcile active states."""
     owner._arrival_occupancy_cycles = {}
     try:
-        from homeassistant.helpers.storage import Store
+        from .ha_storage_capacity import create_capacity_store
 
         entry_id = str(getattr(getattr(owner, "_entry", None), "entry_id", "") or "default")
-        store = Store(
+        store = create_capacity_store(
             owner.hass,
             _OCCUPANCY_CYCLE_STORE_VERSION,
             f"{_OCCUPANCY_CYCLE_STORE_KEY}.{entry_id}",
@@ -69,6 +72,11 @@ async def async_restore_occupancy_cycles(owner: Any) -> None:
             and str(cycle.get("cycle_id") or "").strip()
         }
     owner._arrival_occupancy_cycle_store = store
+    # Downtime is not continuous vacancy evidence. Boot reconciliation starts
+    # a full hold from fresh current states, preserving the durable cycle ID.
+    for cycle in owner._arrival_occupancy_cycles.values():
+        cycle.pop("vacant_candidate_at", None)
+        cycle.pop("vacant_member_windows", None)
 
 
 def persist_occupancy_cycles(owner: Any) -> None:
@@ -84,6 +92,105 @@ def persist_occupancy_cycles(owner: Any) -> None:
         )
     except Exception as exc:
         _LOGGER.debug("[PresenceCycle] persistence schedule failed: %s", exc)
+
+
+def presence_cycle_allows_use(info: dict, *, leave: bool = False) -> bool:
+    """Keep source purpose separate from observation freshness."""
+    if "use_for" not in info:
+        return True
+    raw = info.get("use_for")
+    values = raw.split(",") if isinstance(raw, str) else raw
+    uses = {str(item).strip() for item in values} if isinstance(values, (list, tuple, set)) else set()
+    accepted = {"turn_off", "vacant_and", "leave-confirmation-only"} if leave else {"turn_on", "occupied_or", "guard"}
+    return bool(uses & accepted)
+
+
+def _presence_members(owner: Any, excluded_entity: str = ""):
+    device_info = getattr(owner, "device_info", {})
+    states = getattr(getattr(owner, "hass", None), "states", None)
+    if not isinstance(device_info, dict):
+        return
+    for entity, info in device_info.items():
+        if entity == excluded_entity or not isinstance(info, dict) or not owner._is_presence_listener_entity(entity, info):
+            continue
+        room = str(info.get("space_id") or info.get("room") or info.get("area") or "").strip()
+        yield entity, info, room, states.get(entity) if hasattr(states, "get") else None
+
+
+def other_active_presence(owner: Any, room: str, excluded_entity: str) -> bool:
+    return any(member_room == room and presence_cycle_allows_use(info)
+               and owner._presence_cycle_observation_is_fresh(info, state)
+               and str(getattr(state, "state", "")).strip().lower() in owner._ARRIVAL_ACTIVE_STATES
+               for _, info, member_room, state in _presence_members(owner, excluded_entity))
+
+
+def occupancy_cycle_leave_observations(owner: Any, *, current_entity: str = "",
+                                      current_state: Any = None, current_value: str | None = None,
+                                      excluded_entity: str = "", member_windows: dict | None = None) -> dict[str, list[bool]]:
+    """One complete leave-member rule for recovery and ordinary state edges."""
+    rooms: dict[str, list[bool]] = {}
+    for entity, info, room, observed_state in _presence_members(owner, excluded_entity):
+        state = current_state if entity == current_entity else observed_state
+        fresh = owner._presence_cycle_observation_is_fresh(info, state)
+        value = str(current_value if entity == current_entity and current_value is not None
+                    else getattr(state, "state", "")).strip().lower()
+        observations = rooms.setdefault(room, [])
+        if presence_cycle_allows_use(info, leave=True):
+            observations.append(fresh and value == "off")
+            if member_windows is not None:
+                window = report_window(info, state, time.time())
+                if fresh and value == "off" and window is not None:
+                    member_windows.setdefault(room, {})[entity] = window
+        elif presence_cycle_allows_use(info) and fresh and value in owner._ARRIVAL_ACTIVE_STATES:
+            observations.append(False)
+    return rooms
+
+
+def reconcile_occupancy_cycles(owner: Any, *, current_entity: str = "", current_state: Any = None) -> None:
+    """Recovery/boot repairs the hold, without dispatching or learning arrival."""
+    cycles = getattr(owner, "_arrival_occupancy_cycles", {})
+    if not isinstance(cycles, dict):
+        return
+    windows: dict = {}
+    rooms = occupancy_cycle_leave_observations(owner, current_entity=current_entity,
+        current_state=current_state, member_windows=windows)
+    for room, cycle in cycles.items():
+        observations = rooms.get(room, [])
+        if not isinstance(cycle, dict) or cycle.get("active") is not True:
+            continue
+        if observations and all(observations):
+            current = windows.get(room, {})
+            if len(current) != len(observations):
+                cycle.pop("vacant_candidate_at", None)
+                cycle.pop("vacant_member_windows", None)
+                continue
+            if not continuous_members(cycle.get("vacant_member_windows"), current, time.time()):
+                cycle.pop("vacant_candidate_at", None)
+            cycle.setdefault("vacant_candidate_at", time.time())
+            cycle["vacant_member_windows"] = current
+        else:
+            cycle.pop("vacant_candidate_at", None)
+            cycle.pop("vacant_member_windows", None)
+    persist_occupancy_cycles(owner)
+
+
+def arrival_has_continuous_vacancy(owner: Any, room: str, entity: str) -> bool:
+    """Consume the preceding OFF lease, never the incoming ON report as vacancy."""
+    cycle = getattr(owner, "_arrival_occupancy_cycles", {}).get(room, {})
+    windows: dict = {}
+    observations = occupancy_cycle_leave_observations(owner, excluded_entity=entity, member_windows=windows).get(room, [])
+    current = windows.get(room, {})
+    if not all(observations) or len(current) != len(observations):
+        return False
+    info = getattr(owner, "device_info", {}).get(entity, {})
+    if presence_cycle_allows_use(info, leave=True):
+        prior = cycle.get("vacant_member_windows", {}).get(entity)
+        if not isinstance(prior, (list, tuple)) or len(prior) != 2:
+            return False
+        if not window_matches_policy(info, prior):
+            return False
+        current[entity] = tuple(prior)
+    return continuous_members(cycle.get("vacant_member_windows"), current, time.time())
 
 
 def _bounded_seconds(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -196,6 +303,8 @@ def advance_occupancy_cycle(
     room: str,
     new_state: str,
     other_active: bool,
+    departure_allowed: bool,
+    enter_allowed: bool,
     active_states: set[str] | tuple[str, ...],
     departure_debounce_seconds: float,
 ) -> tuple[str, bool, bool]:
@@ -203,9 +312,13 @@ def advance_occupancy_cycle(
     now = time.time()
     if str(new_state or "").strip().lower() in active_states:
         vacant_at = float(cycle.get("vacant_candidate_at") or 0.0)
-        if cycle.get("active") is True and vacant_at > 0 and now - vacant_at >= departure_debounce_seconds:
+        if (departure_allowed and cycle.get("active") is True and vacant_at > 0
+                and now - vacant_at >= departure_debounce_seconds):
             cycle["active"] = False
             cycle.pop("vacant_candidate_at", None)
+        if not enter_allowed:
+            cycle.pop("vacant_candidate_at", None)
+            return str(cycle.get("cycle_id") or ""), False, False
         if cycle.get("active") is True or other_active:
             cycle.pop("vacant_candidate_at", None)
             if not cycle.get("cycle_id"):
@@ -213,7 +326,7 @@ def advance_occupancy_cycle(
             return str(cycles.get(room, cycle).get("cycle_id") or ""), False, False
         cycle = _replace_cycle(cycles, cycle, room)
         return str(cycle["cycle_id"]), True, False
-    if other_active:
+    if not departure_allowed:
         cycle.pop("vacant_candidate_at", None)
     elif cycle.get("active") is True:
         cycle.setdefault("vacant_candidate_at", now)

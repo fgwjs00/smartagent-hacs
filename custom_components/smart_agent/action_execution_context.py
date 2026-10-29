@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .action_receipts import ActionExecutionResult, ActionResultCollector
+
+
+_SELF_TRIGGER_GUARD: ContextVar[tuple[object, frozenset[str]] | None] = ContextVar(
+    "smart_agent_self_trigger_guard", default=None)
+
+
+def self_trigger_entities(host: object) -> frozenset[str]:
+    scoped = _SELF_TRIGGER_GUARD.get()
+    return scoped[1] if scoped is not None and scoped[0] is host else frozenset()
+
+
+@contextmanager
+def self_trigger_scope(host: object, entities):
+    """Immutable per-task provenance; nested work restores its own context only."""
+    token = _SELF_TRIGGER_GUARD.set((host, frozenset(entities)))
+    try:
+        yield
+    finally:
+        _SELF_TRIGGER_GUARD.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +48,7 @@ class ActionBatchContext:
     is_global_cmd: bool = False
     confidence: int = 0
     authenticated_user_intent: bool = False
+    trigger_entities: frozenset[str] = frozenset()
 
     def receipt_metadata(self) -> dict[str, str]:
         return {

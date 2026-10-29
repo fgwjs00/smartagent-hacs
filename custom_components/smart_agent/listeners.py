@@ -78,7 +78,7 @@ from .listener_registry_runtime import (
     reconcile_device_info_entity_ids_from_ha_registry,
     refresh_listeners_if_entity_set_changed,
 )
-from .presence_runtime import DEFAULT_COLD_START_RECHECK_SECONDS, advance_occupancy_cycle, async_restore_occupancy_cycles, cleanup_startup_reconciliation, learning_space_identity, occupancy_cycle_outcome, persist_occupancy_cycles, resolve_space_id, room_candidates, room_snapshot, schedule_arrival_baseline_sample, schedule_startup_presence_reconciliation
+from .presence_runtime import DEFAULT_COLD_START_RECHECK_SECONDS, advance_occupancy_cycle, async_restore_occupancy_cycles, cleanup_startup_reconciliation, learning_space_identity, occupancy_cycle_outcome, persist_occupancy_cycles, presence_cycle_allows_use, resolve_space_id, room_candidates, room_snapshot, schedule_arrival_baseline_sample, schedule_startup_presence_reconciliation
 from .sensor_event_filter import EnvironmentTelemetryFilter, environment_sensor_kind
 from .service_contracts import DISCOVERY_DOMAINS, STATEFUL_EXECUTION_DOMAINS
 from .const import (
@@ -1445,6 +1445,14 @@ class ListenersMixin:
         if not transaction_id:
             return context
 
+        bridge = getattr(self, "_internal_event_bridge", None)
+        if bridge is not None:
+            try:
+                context = await asyncio.to_thread(bridge.prepare_execution_receipt, context)
+            except Exception as exc:
+                self._sys_log("WARN", "execution receipt not admitted "
+                              f"transaction_id={transaction_id} exception_type={type(exc).__name__}")
+                return {**context, "receipt_delivery_status": "not_admitted"}
         confirmed_post = getattr(
             self,
             "_post_internal_event_confirmed_async",
@@ -2097,66 +2105,8 @@ class ListenersMixin:
         raw_info: dict[str, Any],
         state_obj: Any,
     ) -> bool:
-        if raw_info.get("presence_eligible") is False or raw_info.get("stale") is True:
-            return False
-        eligible_text = str(raw_info.get("presence_eligible") or "").strip().lower()
-        if eligible_text in {"0", "false", "no", "off"}:
-            return False
-
-        if "use_for" in raw_info:
-            raw_use_for = raw_info.get("use_for")
-            if isinstance(raw_use_for, str):
-                use_for = {
-                    item.strip()
-                    for item in raw_use_for.split(",")
-                    if item.strip()
-                }
-            elif isinstance(raw_use_for, (list, tuple, set)):
-                use_for = {
-                    str(item or "").strip()
-                    for item in raw_use_for
-                    if str(item or "").strip()
-                }
-            else:
-                use_for = set()
-            if not use_for.intersection({"turn_on", "occupied_or", "guard"}):
-                return False
-
-        raw_ttl = raw_info.get("freshness_ttl_secs")
-        if raw_ttl in (None, ""):
-            return True
-        try:
-            freshness_ttl_secs = float(raw_ttl)
-        except (TypeError, ValueError):
-            return False
-        if not isfinite(freshness_ttl_secs) or freshness_ttl_secs < 0:
-            return False
-        if freshness_ttl_secs == 0:
-            return True
-
-        observed_value = (
-            getattr(state_obj, "last_reported", None)
-            or raw_info.get("last_observed_at")
-            or raw_info.get("observed_at")
-            or getattr(state_obj, "last_updated", None)
-            or getattr(state_obj, "last_changed", None)
-        )
-        if isinstance(observed_value, datetime):
-            observed_at = observed_value
-        else:
-            observed_text = str(observed_value or "").strip()
-            try:
-                observed_at = datetime.fromisoformat(
-                    observed_text.replace("Z", "+00:00")
-                )
-            except (TypeError, ValueError):
-                return False
-        if observed_at.tzinfo is None:
-            observed_at = observed_at.replace(tzinfo=timezone.utc)
-        age_secs = (
-            datetime.now(timezone.utc) - observed_at.astimezone(timezone.utc)
-        ).total_seconds()
-        return -60 <= age_secs <= freshness_ttl_secs
+        from .presence_cycle_continuity import report_window
+        return report_window(raw_info, state_obj, datetime.now(timezone.utc).timestamp()) is not None
 
 
     def _arrival_occupancy_cycle_for_edge(
@@ -2181,36 +2131,24 @@ class ListenersMixin:
         if not room:
             return "", False, False
 
-        states = getattr(getattr(self, "hass", None), "states", None)
-        other_active = False
-        for presence_entity_id, raw_info in device_info.items():
-            if presence_entity_id == entity_id or not isinstance(raw_info, dict):
-                continue
-            presence_room = str(
-                raw_info.get("space_id")
-                or raw_info.get("room")
-                or raw_info.get("area")
-                or ""
-            ).strip()
-            if presence_room != room or not self._is_presence_listener_entity(
-                presence_entity_id,
-                raw_info,
-            ):
-                continue
-            state_obj = states.get(presence_entity_id) if hasattr(states, "get") else None
-            if not self._presence_cycle_observation_is_fresh(raw_info, state_obj):
-                continue
-            state = str(getattr(state_obj, "state", "") or "").strip().lower()
-            if state in self._ARRIVAL_ACTIVE_STATES:
-                other_active = True
-                break
+        from .presence_runtime import other_active_presence
+        other_active = other_active_presence(self, room, entity_id)
 
         cycles = getattr(self, "_arrival_occupancy_cycles", None)
         if not isinstance(cycles, dict):
             cycles = {}
             self._arrival_occupancy_cycles = cycles
+        from .presence_runtime import occupancy_cycle_leave_observations, arrival_has_continuous_vacancy
+        entering = str(new_state or "").strip().lower() in self._ARRIVAL_ACTIVE_STATES
+        observations = occupancy_cycle_leave_observations(self, current_entity=entity_id,
+            current_value=new_state, excluded_entity=entity_id if entering else "").get(room, [])
+        # On arrival, the triggering member's previous OFF is represented by
+        # the existing hold. Every peer must still satisfy the leave contract.
+        departure_allowed = (arrival_has_continuous_vacancy(self, room, entity_id) if entering
+                             else bool(observations) and all(observations))
         outcome = advance_occupancy_cycle(
             cycles, room=room, new_state=new_state, other_active=other_active,
+            departure_allowed=departure_allowed, enter_allowed=presence_cycle_allows_use(info or {}),
             active_states=self._ARRIVAL_ACTIVE_STATES,
             departure_debounce_seconds=max(0.0, float(getattr(self, "_PRESENCE_OFF_DELAY", PRESENCE_OFF_DELAY) or 0.0)),
         )

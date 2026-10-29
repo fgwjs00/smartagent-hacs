@@ -27,6 +27,12 @@ class ActionExecutionResult(int):
         obj.pre_states = dict(pre_states or {})
         return obj
 
+    def fact_judgment(self, *, checked_at: str):
+        """Optional read-only interpretation; never changes the emitted receipt."""
+        from .execution_facts import assess_receipts
+        return assess_receipts({"action_results": self.action_results},
+            subject=str(self.transaction_id), source="ha_action_results", checked_at=checked_at)
+
 
 def active_ai_authorization_ref(
     decision_contract_lineage: dict[str, Any] | None,

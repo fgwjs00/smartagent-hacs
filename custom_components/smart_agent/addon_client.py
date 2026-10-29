@@ -608,6 +608,8 @@ class AddOnClient:
         envelope_version: int | None = None,
         transport: str | None = None,
         seq: int | None = None,
+        stream_id: str | None = None,
+        durability: str | None = None,
     ) -> dict[str, Any] | None:
         """Post a P1 HA-bridge event into add-on owned storage."""
         body: dict[str, Any] = {
@@ -619,6 +621,10 @@ class AddOnClient:
         }
         if ts:
             body["ts"] = str(ts)
+        if stream_id:
+            body["stream_id"] = str(stream_id)
+        if durability:
+            body["durability"] = str(durability)
         headers = self._request_headers({"X-SA-Internal": "ha-bridge"})
         try:
             session = await self._get_session()

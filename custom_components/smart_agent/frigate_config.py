@@ -146,6 +146,17 @@ def read_frigate_config(path: str) -> dict:
         raise _frigate_file_error("frigate_config_read", phase, path, exc, outcome="unavailable") from exc
 
 
+def _write_capacity_yaml(config, stream, lease) -> None:
+    """Measure encoded output before growth, retaining the original file phases."""
+    import io
+    import yaml
+    buffered = io.StringIO()
+    yaml.dump(config, buffered, allow_unicode=True, default_flow_style=False, sort_keys=False, indent=2)
+    body = buffered.getvalue()
+    lease.recheck(len(body.encode("utf-8")) + 4096)
+    stream.write(body)
+
+
 def write_frigate_config(path: str, config: dict) -> bool:
     """
     将配置字典写回 Frigate YAML 文件。
@@ -162,25 +173,26 @@ def write_frigate_config(path: str, config: dict) -> bool:
     phase = "load_yaml"
     try:
         import yaml  # noqa: PLC0415
-        phase = "backup"
-        # 备份原文件
-        if os.path.exists(path):
-            bak_path = path + ".bak"
-            import shutil
-            shutil.copy2(path, bak_path)
-        phase = "mkdir"
-        # 确保父目录存在
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        # 原子写：先写临时文件再 rename，避免 dump 中途失败截断/损坏原配置。
-        tmp_path = f"{path}.tmp"
-        phase = "write"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            yaml.dump(
-                config, f, allow_unicode=True, default_flow_style=False,
-                sort_keys=False, indent=2,
-            )
-        phase = "replace"
-        os.replace(tmp_path, path)
+        from .storage_capacity import DEFAULT_ADMISSION
+        phase = "capacity"
+        backup_bytes = os.path.getsize(path) if os.path.exists(path) else 0
+        with DEFAULT_ADMISSION.reserve(path, backup_bytes + 4096) as lease:
+            phase = "backup"
+            # 备份原文件
+            if os.path.exists(path):
+                bak_path = path + ".bak"
+                import shutil
+                shutil.copy2(path, bak_path)
+            phase = "mkdir"
+            # 确保父目录存在
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # 原子写：先写临时文件再 rename，避免 dump 中途失败截断/损坏原配置。
+            tmp_path = f"{path}.tmp"
+            phase = "write"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                _write_capacity_yaml(config, f, lease)
+            phase = "replace"
+            os.replace(tmp_path, path)
     except Exception as exc:
         outcome = "unknown" if phase == "replace" else "not_committed"
         if phase in ("write", "replace"):

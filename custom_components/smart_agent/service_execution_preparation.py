@@ -44,7 +44,7 @@ def _self_trigger(host: Any, context: ServiceCallContext, errors: ServiceErrorRe
     guard = evaluate_self_trigger_protection(
         entity_id=call.entity_id,
         service=call.service,
-        trigger_entities=host._batch_trigger_controllable,
+        trigger_entities=context.batch.trigger_entities,
     )
     if not guard.allowed and not context.batch.authenticated_user_intent:
         host._sys_log(

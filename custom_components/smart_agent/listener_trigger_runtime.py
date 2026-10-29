@@ -22,6 +22,7 @@ from .task_completion import (
     TaskCompletion, create_ha_task, observe_ha_task, read_task_completion, report_task_completion,
 )
 from .service_contracts import STATEFUL_EXECUTION_DOMAINS
+from .action_execution_context import self_trigger_scope
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -619,9 +620,8 @@ def flush_triggers(self, _: datetime) -> None:
         self._sys_log("INFO", "[状态校验] 所有触发均为通信闪断，取消本次推理")
         return
 
-    self._batch_trigger_controllable = controllable_snapshot
-    if self._batch_trigger_controllable:
-        self._sys_log("INFO", f"[自触发保护] 本批次含可控设备触发: {', '.join(self._batch_trigger_controllable)}，AI 不可反向操作这些设备")
+    if controllable_snapshot:
+        self._sys_log("INFO", f"[自触发保护] 本批次含可控设备触发: {', '.join(controllable_snapshot)}，AI 不可反向操作这些设备")
 
     contextual_triggers = [
         item
@@ -646,6 +646,8 @@ def flush_triggers(self, _: datetime) -> None:
             if item.get("one_off")
         ]
         merged_batch = {
+            "trigger_entities": frozenset(item["entity_id"] for item in mergeable_triggers
+                                          if item["entity_id"] in controllable_snapshot),
             "trigger": merged_trigger,
             "entity_id": str(mergeable_triggers[0].get("entity_id") or ""),
             "one_off_prompt": one_off_prompts[0] if one_off_prompts else "",
@@ -667,6 +669,7 @@ def flush_triggers(self, _: datetime) -> None:
             inference_batches.append(
                 {
                     "trigger": item["text"],
+                    "trigger_entities": frozenset({item["entity_id"]} & controllable_snapshot.keys()),
                     "entity_id": str(item.get("entity_id") or ""),
                     "one_off_prompt": str(item.get("one_off") or ""),
                     "source_trace_context": dict(context),
@@ -701,14 +704,13 @@ def flush_triggers(self, _: datetime) -> None:
                 decision_kwargs["trigger_space_id"] = hold_ref["task_occurrence"]["scope_id"]
             if batch.get("causal_events"):
                 decision_kwargs["causal_events"] = list(batch["causal_events"])
-            self._spawn_slow_inference_task(
-                self._run_addon_decision(
-                    trigger_text,
-                    **decision_kwargs,
-                ),
-                trigger=trigger_text,
-                entity_id=str(batch["entity_id"]),
-            )
+            # HA task creation captures this context; the callback itself must
+            # not leave provenance behind for the next room or inference batch.
+            with self_trigger_scope(self, batch["trigger_entities"]):
+                self._spawn_slow_inference_task(
+                    self._run_addon_decision(trigger_text, **decision_kwargs),
+                    trigger=trigger_text, entity_id=str(batch["entity_id"]),
+                )
         except Exception as exc:
             self._sys_log("ERROR", f"[合并] 创建推理任务失败: {exc}")
 
