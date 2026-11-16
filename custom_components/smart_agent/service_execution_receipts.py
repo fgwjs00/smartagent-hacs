@@ -26,8 +26,13 @@ def verify_service_receipt(
     if isinstance(receipt, dict) and receipt.get("ok") is True:
         status = str(receipt.get("status") or "").strip().lower()
         strict = context.batch.require_world_snapshot_guard and not context.is_user_explicit
-        if (receipt.get("executed") is False or status == "skipped") and (
-            disposition == "noop" or not strict
+        if (
+            (receipt.get("executed") is False or status == "skipped")
+            and (disposition == "noop" or not strict)
+        ) or (
+            strict
+            and disposition == "noop"
+            and receipt.get("state_attribution") == "idempotent_pre_existing_state"
         ):
             reason = str(
                 receipt.get("reason") or receipt.get("status") or "already_in_target_state"

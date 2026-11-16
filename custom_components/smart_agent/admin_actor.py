@@ -71,7 +71,7 @@ def is_current_human_user(user: Any) -> bool:
     return bool(
         user is not None
         and getattr(user, "is_active", None) is True
-        and getattr(user, "is_system_generated", None) is False
+        and getattr(user, "system_generated", None) is False
     )
 
 

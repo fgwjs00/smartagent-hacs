@@ -406,10 +406,7 @@ def local_room_topology_rows(coord: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     db = getattr(coord, "_db", None)
     if db is not None and hasattr(db, "query"):
-        try:
-            raw_rows = db.query("SELECT room_a, room_b, relation FROM room_topology", ()) or []
-        except Exception:
-            raw_rows = []
+        raw_rows = db.query("SELECT room_a, room_b, relation FROM room_topology", ()) or []
         for row in raw_rows:
             if isinstance(row, dict):
                 room_a = str(row.get("room_a") or "").strip()

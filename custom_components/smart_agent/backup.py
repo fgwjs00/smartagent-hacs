@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -448,7 +449,7 @@ class BackupManager:
                 return await self.get_restore_status(operation_id)
             if admission["state"] != "created":
                 return await self._restore_reply({"operation_id": operation_id, "outcome": "rejected", "committed": False,
-                    "error": "restore_handle_" + admission["state"], "restored": [],
+                    "error": "restore_handle_" + admission["state"], "restored": [], "not_dispatched": True,
                     "blocking_operation_id": admission.get("blocking_operation_id", "")})
             claimed = True
             encrypted = await self._download(backup_id)
@@ -513,11 +514,57 @@ class BackupManager:
                     rows = await resp.json()
                     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                         raise ValueError("BackupManager.list_backups: invalid_backup_inventory")
-                    return rows
+                    return [{**row, "storage_source": "cloud"} for row in rows]
         except Exception as exc:
             raise RuntimeError(
                 f"BackupManager.list_backups: cloud_inventory_failed exception_type={type(exc).__name__}"
             ) from exc
+
+    async def delete_backup(self, backup_id: str, *, operation_id: str) -> dict:
+        """Delete one local encrypted file; Operations owns identity and replay admission."""
+        cloud = bool(self._cloud_api_url and self._cloud_token)
+        result = {"operation_id": operation_id, "backup_id": backup_id,
+                  "storage_source": "cloud" if cloud else "ha_local", "ok": False, "deleted": False}
+        try:
+            for identity in (backup_id, operation_id):
+                if not isinstance(identity, str):
+                    raise ValueError("invalid_backup_delete_identity")
+                self._sanitize_backup_id(identity)
+        except ValueError:
+            _LOGGER.warning("[Backup] delete rejected: invalid_backup_delete_request")
+            return {**result, "error": "invalid_backup_delete_request"}
+        if cloud:
+            return {**result, "error": "backup_cloud_delete_not_open"}
+        try:
+            outcome = await self._hass.async_add_executor_job(self._delete_local, backup_id)
+        except (Exception, asyncio.CancelledError) as exc:
+            _LOGGER.warning("[Backup] delete unconfirmed: exception_type=%s", type(exc).__name__)
+            outcome = {"deleted": None, "error": "backup_delete_unconfirmed"}
+        return {**result, **outcome, "ok": outcome.get("deleted") is True}
+
+    def _delete_local(self, backup_id: str) -> dict:
+        """Only a successful unlink in this call establishes deletion."""
+        config_dir = os.path.realpath(self._hass.config.config_dir)
+        backup_dir = os.path.join(config_dir, "smart_agent_backups")
+        target = os.path.join(backup_dir, f"{backup_id}.enc")
+        try:
+            if os.path.realpath(backup_dir) != backup_dir or not stat.S_ISREG(os.lstat(target).st_mode):
+                return {"deleted": False, "error": "backup_delete_target_invalid"}
+        except FileNotFoundError:
+            _LOGGER.info("[Backup] delete rejected: backup_not_found")
+            return {"deleted": False, "error": "backup_not_found"}
+        except OSError as exc:
+            _LOGGER.warning("[Backup] delete target unavailable: exception_type=%s", type(exc).__name__)
+            return {"deleted": False, "error": "backup_delete_target_unavailable"}
+        try:
+            os.unlink(target)
+        except FileNotFoundError:
+            _LOGGER.info("[Backup] delete rejected: backup_not_found")
+            return {"deleted": False, "error": "backup_not_found"}
+        except OSError as exc:
+            _LOGGER.warning("[Backup] unlink unconfirmed: exception_type=%s", type(exc).__name__)
+            return {"deleted": None, "error": "backup_delete_unconfirmed"}
+        return {"deleted": True}
 
     # ── 加密核心 ──────────────────────────────────────────────────────────────
 
@@ -546,7 +593,7 @@ class BackupManager:
         """
         AES-256-GCM 加密（Python 标准库 + cryptography 包）。
 
-        统一二进制格式（与 _encrypt_pycrypto 完全兼容）：
+        统一二进制格式：
           MAGIC(7B) | salt(16B) | nonce(12B) | ciphertext | tag(16B，末尾)
 
         AESGCM.encrypt() 返回的 ciphertext_with_tag 格式正好是 ciphertext+tag，
@@ -559,11 +606,7 @@ class BackupManager:
         Returns:
             加密后的二进制数据
         """
-        try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        except ImportError:
-            # 回退：使用 PyCryptodome（格式与上方完全一致）
-            return BackupManager._encrypt_pycrypto(plaintext, password)
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
         salt = os.urandom(_SALT_LEN)
         nonce = os.urandom(_NONCE_LEN)
@@ -581,36 +624,6 @@ class BackupManager:
         return buf.getvalue()
 
     @staticmethod
-    def _encrypt_pycrypto(plaintext: bytes, password: str) -> bytes:
-        """
-        PyCryptodome 回退加密（当 cryptography 包不可用时）。
-
-        输出格式与 _encrypt 完全一致：
-          MAGIC(7B) | salt(16B) | nonce(12B) | ciphertext | tag(16B，末尾)
-        """
-        try:
-            from Crypto.Cipher import AES
-            from Crypto.Random import get_random_bytes
-        except ImportError:
-            raise RuntimeError(
-                "备份加密需要 'cryptography' 或 'pycryptodome' 包。"
-                "请在 HA 中运行：pip install cryptography"
-            )
-        salt = get_random_bytes(_SALT_LEN)
-        nonce = get_random_bytes(_NONCE_LEN)
-        key = BackupManager._derive_key(password, salt)
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-        ciphertext, tag = cipher.encrypt_and_digest(plaintext)
-
-        buf = io.BytesIO()
-        buf.write(_MAGIC)
-        buf.write(salt)
-        buf.write(nonce)
-        buf.write(ciphertext)  # ciphertext 在前（与 AESGCM 格式一致）
-        buf.write(tag)         # tag(16B) 在末尾
-        return buf.getvalue()
-
-    @staticmethod
     def _decrypt(data: bytes, password: str) -> bytes | None:
         """
         AES-256-GCM 解密。
@@ -622,6 +635,8 @@ class BackupManager:
         Returns:
             解密后的明文字节，或 None（密码错误/数据损坏）
         """
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         buf = io.BytesIO(data)
 
         # 验证魔数
@@ -637,27 +652,10 @@ class BackupManager:
         remaining = buf.read()
 
         try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
             aesgcm = AESGCM(key)
             return aesgcm.decrypt(nonce, remaining, None)
-        except ImportError:
-            pass
         except Exception:
             _LOGGER.error("[Backup] 解密失败：密码错误或数据损坏")
-            return None
-
-        # PyCryptodome 回退（格式与 AESGCM 一致：ciphertext | tag(末尾16B)）
-        try:
-            from Crypto.Cipher import AES
-            if len(remaining) < 16:
-                _LOGGER.error("[Backup] 备份数据长度不足，无法提取认证标签")
-                return None
-            ciphertext = remaining[:-16]   # tag 在末尾，ciphertext 在前
-            tag = remaining[-16:]          # 末尾 16 bytes 为 GCM tag
-            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-            return cipher.decrypt_and_verify(ciphertext, tag)
-        except Exception:
-            _LOGGER.error("[Backup] PyCryptodome 解密失败：密码错误或数据损坏")
             return None
 
     # ── 数据收集与恢复 ────────────────────────────────────────────────────────
@@ -884,5 +882,6 @@ class BackupManager:
                     "timestamp": self._ha_backup_timestamp_iso(stat.st_mtime),
                     "level": backup_id.split("_")[-1] if "_" in backup_id else "unknown",
                     "size_bytes": stat.st_size,
+                    "storage_source": "ha_local",
                 })
         return result

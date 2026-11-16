@@ -252,10 +252,16 @@ async def _account_receipt(
         and (
             receipt.get("executed") is False
             or str(receipt.get("status") or "").strip().lower() == "skipped"
+            or receipt.get("state_attribution") == "idempotent_pre_existing_state"
         )
     ):
+        skip_msg = (
+            str(receipt.get("reason") or receipt.get("status") or "already_in_target_state").strip()
+            if receipt.get("state_attribution") == "idempotent_pre_existing_state"
+            else error
+        )
         return BatchDispatchResult(
-            [{**result, "status": "skip", "msg": error, "ha_command_status": "skipped"}], blocked=1
+            [{**result, "status": "skip", "msg": skip_msg, "ha_command_status": "skipped"}], blocked=1
         )
     host._remember_service_call_error(
         context.transaction_id,

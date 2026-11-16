@@ -1182,60 +1182,6 @@ async def async_call_service(
     return None
 
 
-async def async_reload_scenes(hass: Any, *, authority: Any = None) -> None:
-    """Reload HA scene YAML through the adapter boundary."""
-    await async_call_service(
-        hass,
-        "scene",
-        "reload",
-        {},
-        execution_class="scene_maintenance",
-        authority=authority,
-    )
-
-
-async def async_create_scene(
-    hass: Any,
-    *,
-    scene_id: str,
-    entities: dict[str, Any],
-    authority: Any = None,
-) -> None:
-    """Create an ephemeral HA scene through the adapter boundary."""
-    await async_call_service(
-        hass,
-        "scene",
-        "create",
-        {"scene_id": scene_id, "entities": entities if isinstance(entities, dict) else {}},
-        execution_class="scene_maintenance",
-        authority=authority,
-    )
-
-
-async def async_delete_scene(hass: Any, entity_id: str, *, authority: Any = None) -> None:
-    """Delete a HA scene entity through the adapter boundary."""
-    await async_call_service(
-        hass,
-        "scene",
-        "delete",
-        {"entity_id": entity_id},
-        execution_class="scene_maintenance",
-        authority=authority,
-    )
-
-
-async def async_reload_automations(hass: Any, *, authority: Any = None) -> None:
-    """Reload HA automations through the adapter boundary."""
-    await async_call_service(
-        hass,
-        "automation",
-        "reload",
-        {},
-        execution_class="scene_maintenance",
-        authority=authority,
-    )
-
-
 def list_binary_sensor_states(hass: HomeAssistant) -> list[dict[str, Any]]:
     """返回 binary_sensor 的最小只读快照列表。"""
     rows: list[dict[str, Any]] = []

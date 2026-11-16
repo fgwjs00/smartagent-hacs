@@ -10,7 +10,7 @@ import hashlib
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from typing import Any
 
@@ -311,22 +311,13 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 return datetime.now(ZoneInfo(configured_timezone))
             except Exception:
                 if fixed_offset_hours is not None:
-                    try:
-                        from datetime import timedelta, timezone
-
-                        tz = timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
-                        return datetime.now(tz)
-                    except Exception:
-                        pass
+                    tz = timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
+                    return datetime.now(tz)
         try:
             from homeassistant.util import dt as dt_util
             return dt_util.now()
         except Exception:
-            try:
-                from datetime import timezone
-                return datetime.now(timezone.utc)
-            except Exception:
-                return None
+            return datetime.now(timezone.utc)
 
     def _daylight_fallback_hour(self) -> int | None:
         try:
@@ -1096,18 +1087,6 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 raise ValueError("presence_occupancy_entry_invalid")
             normalized.append((item[0], item[1].lower()))
         return normalized
-
-    def _legacy_room_occupancy_entries(self, room: str) -> list[tuple[str, str]]:
-        if not room or not hasattr(self, "_get_room_occupancy_map"):
-            return []
-        try:
-            occ_map = self._get_room_occupancy_map()
-        except Exception:
-            return []
-        if not isinstance(occ_map, dict):
-            return []
-        entries = occ_map.get(room) or []
-        return self._normalize_room_occupancy_entries(entries)
 
     @staticmethod
     def _space_candidate_values(*values: Any) -> list[str]:

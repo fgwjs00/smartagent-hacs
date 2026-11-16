@@ -55,7 +55,7 @@ class NativeExecutionAttribution:
             # Register the pending sender before awaiting the HA user lookup;
             # a state event can otherwise outrun this bookkeeping event.
             user = await self.owner.hass.auth.async_get_user(sender)
-            pending["system_user"] = getattr(user, "is_system_generated", None)
+            pending["system_user"] = getattr(user, "system_generated", None)
             if pending["system_user"] is True:
                 self.users.add(sender)
             elif pending["system_user"] is False:
@@ -221,6 +221,7 @@ class NativeExecutionAttribution:
         owner._record_implicit_reverse_correction(
             entity_id=entity_id, domain=entity_id.split(".", 1)[0], old_state=old_state,
             new_state=new_state, new_state_obj=new, source_type="用户界面", device_info=info,
+            occurred_at=observed_at,
         )
 
     def attribution(self, state: Any, entity_id: str) -> dict | None:

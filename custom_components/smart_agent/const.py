@@ -36,38 +36,6 @@ CONF_OUTPUT_LEDGER_INGRESS_SECRET = "output_ledger_ingress_secret"
 CONF_OUTPUT_LEDGER_ATTESTATION_SECRET = "output_ledger_attestation_secret"
 DEFAULT_OUTPUT_LEDGER_INGRESS_URL = ""
 
-# Dedicated current-admin -> add-on maintenance delegation ledger.  This
-# channel persists only a pre-dispatch reservation or a no-dispatch terminal
-# receipt; it never grants change application or device-effect authority.
-CONF_MAINTENANCE_CHANGE_INGRESS_ENABLED = "maintenance_change_ingress_enabled"
-CONF_MAINTENANCE_CHANGE_INGRESS_URL = "maintenance_change_ingress_url"
-CONF_MAINTENANCE_CHANGE_INGRESS_SECRET = "maintenance_change_ingress_secret"
-CONF_MAINTENANCE_DELEGATION_ATTESTATION_SECRET = (
-    "maintenance_delegation_attestation_secret"
-)
-DEFAULT_MAINTENANCE_CHANGE_INGRESS_URL = ""
-
-# Explicit current-session Field Canary operator identity ingress.  This is
-# intentionally separate from the ordinary add-on bearer and from the
-# RegistrySnapshot transport.  Enabling it can persist only an operator
-# identity fact; it does not publish an approval or execution authority.
-CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_ENABLED = (
-    "field_canary_operator_identity_ingress_enabled"
-)
-CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL = (
-    "field_canary_operator_identity_ingress_url"
-)
-CONF_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_SECRET = (
-    "field_canary_operator_identity_ingress_secret"
-)
-CONF_FIELD_CANARY_OPERATOR_IDENTITY_ATTESTATION_SECRET = (
-    "field_canary_operator_identity_attestation_secret"
-)
-CONF_FIELD_CANARY_OPERATOR_IDENTITY_PREVIOUS_ATTESTATION_SECRET = (
-    "field_canary_operator_identity_previous_attestation_secret"
-)
-DEFAULT_FIELD_CANARY_OPERATOR_IDENTITY_INGRESS_URL = ""
-
 # Dedicated add-on -> HA verification keyring for Field Canary dispatch proof
 # v2.  It must never fall back to the ordinary add-on bearer used by v1.
 CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_ENABLED = (

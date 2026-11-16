@@ -113,6 +113,19 @@ def is_pre_dispatch_policy_rejection(result: Any, *, request_id: str) -> bool:
     )
 
 
+def _valid_native_active_ai_row(row: dict[str, Any]) -> bool:
+    return (
+        row.get("reported_state_matches") is True
+        and row.get("verified") is True
+        and row.get("assumed_state") is False
+        and row.get("transport_status") == "acknowledged"
+        and row.get("state_attribution") in {
+            "smartagent_context",
+            "idempotent_pre_existing_state",
+        }
+    )
+
+
 def canonical_active_ai_receipt_dispositions(
     result: Any,
     *,
@@ -124,9 +137,7 @@ def canonical_active_ai_receipt_dispositions(
 
     if not isinstance(result, dict):
         return None
-    if (
-        str(result.get("request_id") or "") != str(request_id or "")
-    ):
+    if str(result.get("request_id") or "") != str(request_id or ""):
         return None
     returned_ref = result.get("authorization_ref")
     if not isinstance(returned_ref, dict) or any(
@@ -184,11 +195,7 @@ def canonical_active_ai_receipt_dispositions(
             continue
         native = row.get("verification_contract_version") == "ha_reported_state.v1"
         snapshot = row.get("reported_state") if native else row.get("post_state_snapshot")
-        if native and (row.get("reported_state_matches") is not True
-                       or row.get("verified") is not True
-                       or row.get("assumed_state") is not False
-                       or row.get("transport_status") != "acknowledged"
-                       or row.get("state_attribution") != "smartagent_context"):
+        if native and not _valid_native_active_ai_row(row):
             return None
         if (
             row.get("ok") is not True
@@ -205,7 +212,11 @@ def canonical_active_ai_receipt_dispositions(
             in {"", "unknown", "unavailable"}
         ):
             return None
-        dispositions.append("verified_success")
+        dispositions.append(
+            "noop"
+            if native and row.get("state_attribution") == "idempotent_pre_existing_state"
+            else "verified_success"
+        )
     return dispositions
 
 

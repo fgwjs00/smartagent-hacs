@@ -359,16 +359,10 @@ async def async_refresh_device_info_from_addon_devices(
                     reconciled.pop(entity_id, None)
         presence_inference = getattr(self, "_presence_inference", None)
         if presence_inference is not None and hasattr(presence_inference, "device_info"):
-            try:
-                presence_inference.device_info = self.device_info
-            except Exception:
-                pass
+            presence_inference.device_info = self.device_info
         updater = getattr(self, "async_set_updated_data", None)
         if callable(updater):
-            try:
-                updater({})
-            except Exception:
-                pass
+            updater({})
 
     status.update(
         {

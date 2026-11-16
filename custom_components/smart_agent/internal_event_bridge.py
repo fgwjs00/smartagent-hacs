@@ -53,6 +53,8 @@ class InternalEventBridge:
         self._monitor_task: asyncio.Task | None = None
         self._retry_tasks: set[asyncio.Task] = set()
         self._inflight: set[int] = set()
+        self._delivery_failures: dict[int, dict[str, Any]] = {}
+        self._quarantined: dict[int, dict[str, Any]] = {}
         self._stopping = False
         self._posted = 0
         self._failed = 0
@@ -92,6 +94,19 @@ class InternalEventBridge:
                     f"exception_type={type(exc).__name__} fallback=ha_clock",
                 )
         return _now_iso()
+
+    @property
+    def delivery_diagnostics(self) -> dict[str, Any]:
+        """Bounded metadata only; ordinary queued payloads remain memory-owned."""
+        events = [dict(row) for row in self._delivery_failures.values()]
+        durable = self._outbox.delivery_diagnostics if self._outbox is not None else {}
+        failed_events = len(events) + int(durable.get("failed_events", 0))
+        events.extend(durable.get("events", []))
+        return {"available": True, "failed_events": failed_events,
+                "retrying": len(self._retry_tasks) + int(durable.get("retrying", 0)),
+                "quarantined": len(self._quarantined) + int(durable.get("quarantined", 0)),
+                "events": events[:100], "truncated": failed_events > 100,
+                "memory_recovery": "process_lifetime", "stopping": self._stopping}
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -215,7 +230,7 @@ class InternalEventBridge:
         }
 
     def _memory_size(self) -> int:
-        return self._queue.qsize() + len(self._inflight) + len(self._retry_tasks)
+        return self._queue.qsize() + len(self._inflight) + len(self._retry_tasks) + len(self._quarantined)
 
     def _admit_memory(self, item: dict[str, Any], operation: str) -> bool:
         if self._stopping:
@@ -230,7 +245,8 @@ class InternalEventBridge:
 
     def _replace_queued_item(self, item: dict[str, Any], operation: str) -> bool:
         try:
-            self._queue.get_nowait()
+            removed = self._queue.get_nowait()
+            self._delivery_failures.pop(id(removed), None)
             self._queue.task_done()
             self._dropped += 1
         except asyncio.QueueEmpty:
@@ -268,6 +284,7 @@ class InternalEventBridge:
                 ok = await self._post_item(item)
                 if ok:
                     self._posted += 1
+                    self._delivery_failures.pop(id(item), None)
                 else:
                     self._failed += 1
                     self._warn(
@@ -287,6 +304,42 @@ class InternalEventBridge:
             finally:
                 self._inflight.discard(id(item))
                 self._queue.task_done()
+
+    @staticmethod
+    def _is_permanent_rejection_code(error: Any, kind: str) -> bool:
+        return error == "invalid_internal_event_time" or (
+            kind == "decision_execution" and error == "execution_receipt_version_invalid"
+        ) or (
+            kind == "behavior" and error == "world_snapshot_unavailable"
+        )
+
+    @staticmethod
+    def _rejection_layers_conflict(layers: list[dict], error: Any) -> bool:
+        """Preserve positive or contradictory evidence before receipt normalization."""
+        if any(layer.get(flag) is True for layer in layers
+               for flag in ("ok", "retryable", "committed", "persistence_confirmed")):
+            return True
+        if any(layer.get("error", error) != error for layer in layers):
+            return True
+        return any(key in layer and str(layer[key]) != "422" for layer in layers
+                   for key in ("status", "__status"))
+
+    @staticmethod
+    def _permanent_rejection(result: dict | None, status: int, kind: str) -> str | None:
+        """Only known pre-write rejections; contradictory receipts remain unconfirmed."""
+        if status != 422 or not isinstance(result, dict):
+            return None
+        nested = result.get("result")
+        layers = [result, nested] if isinstance(nested, dict) else [result]
+        receipt = {key: value for layer in layers for key, value in layer.items()}
+        error = receipt.get("error")
+        if not InternalEventBridge._is_permanent_rejection_code(error, kind):
+            return None
+        if receipt.get("ok") is not False or receipt.get("retryable") is not False:
+            return None
+        if InternalEventBridge._rejection_layers_conflict(layers, error):
+            return None
+        return error
 
     @staticmethod
     def _persistence_http_status(result: dict[str, Any]) -> int:
@@ -342,7 +395,8 @@ class InternalEventBridge:
             if self._outbox.confirmed(item, receipt, status):
                 await asyncio.to_thread(self._outbox.acknowledge, item)
             else:
-                await asyncio.to_thread(self._outbox.retry, item)
+                await asyncio.to_thread(self._outbox.retry, item,
+                                        quarantine=bool(self._permanent_rejection(result, status, item["kind"])))
                 return {"ok": False, "status": status if status >= 400 else 502,
                         "error": "durable_delivery_unconfirmed", "persistence_confirmed": False}
         if receipt is None:
@@ -375,6 +429,7 @@ class InternalEventBridge:
     async def _post_item(self, item: dict[str, Any]) -> bool:
         result = await self._post_item_result(item)
         receipt, status = self._normalize_persistence_receipt(result)
+        item["_permanent_rejection"] = self._permanent_rejection(result, status, item["kind"])
         return receipt is not None and status < 400 and receipt.get("ok") is True
 
     def _schedule_retry(self, item: dict[str, Any]) -> None:
@@ -385,6 +440,20 @@ class InternalEventBridge:
             return
         attempts = int(item.get("attempts") or 0) + 1
         item["attempts"] = attempts
+        failed_at = datetime.now(UTC).isoformat()
+        previous = self._delivery_failures.get(id(item), {})
+        self._delivery_failures[id(item)] = {
+            "kind": item["kind"], "stream_id": item["stream_id"], "seq": item["seq"],
+            "failure_count": attempts, "first_failed_at": previous.get("first_failed_at", failed_at),
+            "last_failed_at": failed_at, "state": "retrying", "durable": False,
+        }
+        if item.get("_permanent_rejection"):
+            self._delivery_failures[id(item)].update(state="quarantined", error=item["_permanent_rejection"])
+            self._quarantined[id(item)] = item
+            if len(self._quarantined) >= max(1, self._queue.maxsize // 2):  # K6: kept, never evicted; make pressure visible
+                self._warn(f"[P1] operation=InternalEventBridge._schedule_retry quarantined={len(self._quarantined)} "
+                           f"budget={self._queue.maxsize}; permanent rejections are consuming the event budget")
+            return
 
         async def _requeue_after_delay() -> None:
             await asyncio.sleep(min(30.0, float(attempts)))
@@ -395,6 +464,7 @@ class InternalEventBridge:
             task = self._create_task(_requeue_after_delay(), "retry", seq=item["seq"])
         except Exception as exc:
             self._dropped += 1
+            self._delivery_failures.pop(id(item), None)
             self._warn(
                 f"[P1] operation=InternalEventBridge._schedule_retry seq={item['seq']} "
                 f"exception_type={type(exc).__name__} outcome=not_scheduled",
@@ -420,7 +490,8 @@ class InternalEventBridge:
                     self._posted += 1
                 else:
                     self._failed += 1
-                    await asyncio.to_thread(self._outbox.retry, item)
+                    await asyncio.to_thread(self._outbox.retry, item,
+                                            quarantine=bool(self._permanent_rejection(result, status, item["kind"])))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -435,6 +506,18 @@ class InternalEventBridge:
 
     def _enqueue_retry_item(self, item: dict[str, Any]) -> None:
         self._admit_memory(item, "_enqueue_retry_item")
+
+    def resume_quarantined(self, stream_id: str, seq: int) -> bool:
+        """Explicit recovery only; replay the retained envelope, never edit its identity."""
+        if self._stopping:
+            return False
+        for key, item in tuple(self._quarantined.items()):
+            if item["stream_id"] == stream_id and type(seq) is int and item["seq"] == seq:
+                del self._quarantined[key]
+                item.pop("_permanent_rejection", None)
+                self._delivery_failures[key]["state"] = "retrying"
+                return self._admit_memory(item, "resume_quarantined")
+        return self._outbox.resume_quarantined(stream_id, seq) if self._outbox is not None else False
 
     async def _monitor_loop(self) -> None:
         while True:

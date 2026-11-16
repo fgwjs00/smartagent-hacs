@@ -1,4 +1,4 @@
-"""Portable add-on-owned settings synchronization for the HA coordinator."""
+"""Portable add-on settings and listener synchronization for the HA coordinator."""
 from __future__ import annotations
 
 import logging
@@ -6,6 +6,58 @@ from typing import Any
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def report_addon_sync_failure(owner: Any, operation: str, exception_type: str) -> bool:
+    """Warn once per failed synchronization episode, without response or exception text."""
+    failures = getattr(owner, "_addon_sync_failures", None)
+    if failures is None:
+        failures = owner._addon_sync_failures = {}
+    count = failures.get(operation, 0)
+    failures[operation] = count + 1
+    if count == 0:
+        _LOGGER.warning("[AddonSync] operation=%s outcome=failed exception_type=%s", operation, exception_type)
+    return False
+
+
+def report_addon_sync_recovery(owner: Any, operation: str) -> bool:
+    count = getattr(owner, "_addon_sync_failures", {}).pop(operation, 0)
+    if count:
+        _LOGGER.info("[AddonSync] operation=%s outcome=recovered failed_attempts=%s", operation, count)
+    return True
+
+
+async def _fetch_addon_settings(owner: Any) -> dict[str, Any] | None:
+    client = getattr(owner, "_addon_client", None)
+    if client is None:
+        report_addon_sync_failure(owner, "settings", "client_unavailable")
+        return None
+    try:
+        payload = await client.get_system_settings()
+    except Exception as exc:
+        report_addon_sync_failure(owner, "settings", type(exc).__name__)
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is False or payload.get("__status", 200) != 200:
+        report_addon_sync_failure(owner, "settings", "response_unavailable")
+        return None
+    return payload
+
+
+async def sync_listener_resources(owner: Any, *, reason: str) -> bool:
+    """Keep the existing sequence; device refresh returns changed, not success."""
+    try:
+        await owner._async_refresh_device_info_from_addon_devices(reason=reason)
+        devices_ok = getattr(owner, "_last_addon_device_sync_status", {}).get("ok") is True
+        if reason == "periodic_listener":
+            await owner.async_refresh_device_areas()
+        memory_ok = await owner._async_refresh_memory_assets_from_addon()
+        if reason == "periodic_listener" and owner._refresh_listeners_if_entity_set_changed():
+            _LOGGER.debug("[Listeners] refreshed subscriptions after managed entity set changed")
+    except Exception as exc:
+        return report_addon_sync_failure(owner, "listener_resources", type(exc).__name__)
+    if devices_ok is not True or memory_ok is not True:
+        return report_addon_sync_failure(owner, "listener_resources", "response_unavailable")
+    return report_addon_sync_recovery(owner, "listener_resources")
 
 
 def _changed(owner: Any, attribute: str, value: Any, applied: list[str], label: str) -> bool:
@@ -165,8 +217,6 @@ def _apply_mode_and_learning_settings(
             value = "shadow"
         _changed(owner, "_active_ai_mode", value, applied, f"active_ai_mode={value}")
     habit_value = payload.get("habit_proactive")
-    if habit_value is None:
-        habit_value = payload.get("habit_proactive_ask")
     if habit_value is not None:
         value = bool(habit_value)
         _changed(owner, "_habit_proactive", value, applied, f"habit_proactive={value}")
@@ -178,15 +228,8 @@ async def apply_addon_system_settings(
     apply_presence_timing: Any,
 ) -> bool:
     """Pull canonical settings and apply them without owning HA lifecycle setup."""
-    addon_client = getattr(owner, "_addon_client", None)
-    if addon_client is None:
-        return False
-    try:
-        payload = await addon_client.get_system_settings()
-    except Exception as exc:
-        _LOGGER.debug("[AddonSettings] get_system_settings 失败: %s", exc)
-        return False
-    if not isinstance(payload, dict):
+    payload = await _fetch_addon_settings(owner)
+    if payload is None:
         return False
 
     applied: list[str] = []
@@ -219,7 +262,7 @@ async def apply_addon_system_settings(
             "[AddonSettings] 已从 add-on 同步策略开关：" + ", ".join(applied),
         )
         owner.async_set_updated_data({})
-    return True
+    return report_addon_sync_recovery(owner, "settings")
 
 
 __all__ = ["apply_addon_system_settings"]

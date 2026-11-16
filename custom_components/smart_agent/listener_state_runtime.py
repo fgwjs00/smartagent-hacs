@@ -21,7 +21,7 @@ def _is_physical_control_edge(attribution: dict, domain: str, before: str, after
 
 
 def _record_manual_operation(owner: Any, native: Any, entity_id: str, domain: str,
-                             old: Any, new: Any, physical_edge: bool) -> None:
+                             old: Any, new: Any, physical_edge: bool, *, occurred_at: float) -> None:
     record_operation = getattr(owner, "_record_device_operation", None)
     if callable(record_operation):
         from math import isfinite
@@ -29,14 +29,15 @@ def _record_manual_operation(owner: Any, native: Any, entity_id: str, domain: st
         temperatures = {key: new_attributes[key] for key in ("temperature", "target_temp_low", "target_temp_high")
             if domain == "climate" and key in new_attributes and old_attributes.get(key) != new_attributes[key]
             and type(new_attributes[key]) in (int, float) and isfinite(new_attributes[key])}
-        record_operation(entity_id, SOURCE_PHYSICAL if physical_edge else SOURCE_DASHBOARD, new.state, temperatures)
+        record_operation(entity_id, SOURCE_PHYSICAL if physical_edge else SOURCE_DASHBOARD,
+                         new.state, temperatures, occurred_at=occurred_at)
         if native is not None:
-            native.record_manual_edge(new, entity_id)
+            native.record_manual_edge(new, entity_id, observed_at=occurred_at)
     user_overrides = getattr(owner, "_user_overrides", None)
     user_overrides_lock = getattr(owner, "_user_overrides_lock", None)
     if isinstance(user_overrides, dict) and user_overrides_lock is not None:
         with user_overrides_lock:
-            user_overrides[entity_id] = {"state": new.state, "time": time.time()}
+            user_overrides[entity_id] = {"state": new.state, "time": occurred_at}
 
 
 def handle_listener_state_changed(
@@ -154,34 +155,11 @@ def _dispatch_listener_state_changed(
         )
         return
 
-    # Persist every managed entity's authoritative HA State projection before
-    # the downstream decision filters can return early.  This keeps the
-    # canonical control registry synchronized with real capability removals,
-    # zero feature masks and entity deletion without granting execution.
-    persist_device = getattr(self, "_persist_device_record", None)
-    create_task = getattr(getattr(self, "hass", None), "async_create_task", None)
-    if callable(persist_device) and callable(create_task):
-        try:
-            create_task(
-                persist_device(
-                    entity_id,
-                    device_info_snapshot.get(entity_id),
-                    state_obj=new,
-                ),
-                f"smartagent_runtime_capability_{entity_id}",
-            )
-        except TypeError:
-            create_task(
-                persist_device(
-                    entity_id,
-                    device_info_snapshot.get(entity_id),
-                    state_obj=new,
-                )
-            )
-        except Exception as exc:
-            logger.debug("[Listeners] runtime capability persistence skipped for %s: %s", entity_id, exc)
+    raw_managed_device_info = getattr(self, "device_info", {}) or {}
+    is_managed_entity = isinstance(raw_managed_device_info, dict) and entity_id in raw_managed_device_info
 
     environment_telemetry_tracked = False
+    environment_telemetry_filtered = False
     if domain == "sensor":
         environment_metadata = self._listener_entity_metadata(
             entity_id,
@@ -201,6 +179,7 @@ def _dispatch_listener_state_changed(
         )
         environment_telemetry_tracked = environment_decision.tracked
         if environment_decision.tracked and not environment_decision.forward:
+            environment_telemetry_filtered = True
             self._last_listener_filter_reason = (
                 f"environment_telemetry_{environment_decision.reason}"
             )
@@ -214,7 +193,44 @@ def _dispatch_listener_state_changed(
                 environment_decision.threshold,
                 environment_decision.elapsed,
             )
-            return
+
+    # Persist every managed entity's authoritative HA State projection before
+    # the downstream decision filters can return early, while skipping noisy
+    # sub-threshold sensor ticks that carry no capability/availability change.
+    old_features = (getattr(old, "attributes", None) or {}).get("supported_features") if old is not None else None
+    new_features = (getattr(new, "attributes", None) or {}).get("supported_features") if new is not None else None
+    capability_or_availability_changed = (
+        new is None
+        or new_s in {"unavailable", "unknown"}
+        or old_s in {"unavailable", "unknown"}
+        or old_features != new_features
+    )
+    if is_managed_entity and (not environment_telemetry_filtered or capability_or_availability_changed):
+        persist_device = getattr(self, "_persist_device_record", None)
+        create_task = getattr(getattr(self, "hass", None), "async_create_task", None)
+        if callable(persist_device) and callable(create_task):
+            try:
+                create_task(
+                    persist_device(
+                        entity_id,
+                        device_info_snapshot.get(entity_id),
+                        state_obj=new,
+                    ),
+                    f"smartagent_runtime_capability_{entity_id}",
+                )
+            except TypeError:
+                create_task(
+                    persist_device(
+                        entity_id,
+                        device_info_snapshot.get(entity_id),
+                        state_obj=new,
+                    )
+                )
+            except Exception as exc:
+                logger.debug("[Listeners] runtime capability persistence skipped for %s: %s", entity_id, exc)
+
+    if environment_telemetry_filtered:
+        return
 
     logger.debug("[事件] %s: %s -> %s (来源: %s)", entity_id, old_s, new_s, source_type)
     self._emit_listener_event(
@@ -422,28 +438,28 @@ def _dispatch_listener_state_changed(
             )
             return
 
+    occurred_at = time.time()
     self._record_arrival_manual_action_evidence(
-        entity_id=entity_id,
-        old_state=old_s,
-        new_state=new_s,
-        new_state_obj=new,
-        source_type=source_type,
+        entity_id=entity_id, old_state=old_s, new_state=new_s,
+        new_state_obj=new, source_type=source_type,
         device_info=dict(device_info_snapshot.get(entity_id) or {}),
+        occurred_at=occurred_at,
     )
 
     attribution = self._manual_action_attribution(new, entity_id=entity_id)
     physical_edge = _is_physical_control_edge(attribution, domain, old_s, new_s)
     if attribution.get("origin") == "user_action" or physical_edge:
-        _record_manual_operation(self, native, entity_id, domain, old, new, physical_edge)
+        _record_manual_operation(self, native, entity_id, domain, old, new, physical_edge,
+                                 occurred_at=occurred_at)
 
     implicit_correction_recorded = self._record_implicit_reverse_correction(
-        entity_id=entity_id,
-        domain=domain,
+        entity_id=entity_id, domain=domain,
         old_state=old_s,
         new_state=new_s,
         new_state_obj=new,
         source_type=source_type,
         device_info=dict(device_info_snapshot.get(entity_id) or {}),
+        occurred_at=occurred_at,
     )
     self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type, old, new)
     self._record_presence_interaction_trace(entity_id, domain, new_s, source_type)

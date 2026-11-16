@@ -561,12 +561,8 @@ class ListenersMixin:
         return suppressions
 
     def _snapshot_correction_suppressions(self) -> list[dict[str, Any]]:
-        for attr in ("_correction_suppressions_cache", "_corrections_cache"):
-            cached = getattr(self, attr, None)
-            suppressions = self._normalize_correction_suppressions(cached)
-            if suppressions:
-                return suppressions
-        return []
+        cached = getattr(self, "_correction_suppressions_cache", None)
+        return self._normalize_correction_suppressions(cached)
 
     def _is_inflight_smartagent_state_feedback(
         self, entity_id: str, state: str
@@ -592,7 +588,7 @@ class ListenersMixin:
         new_state: str,
         new_state_obj: Any,
         source_type: str,
-        device_info: dict[str, Any],
+        device_info: dict[str, Any], occurred_at: float,
     ) -> bool:
         """Record a direct manual reversal of a recent successful AI lighting action."""
         capability = str(device_info.get("capability") or "").strip().lower()
@@ -620,7 +616,7 @@ class ListenersMixin:
         if ai_service != expected_service:
             return False
         try:
-            age = time.time() - float(last_ai.get("time") or 0)
+            age = occurred_at - float(last_ai.get("time") or 0)
         except (TypeError, ValueError):
             return False
         if age < 0 or age > self._CORRECTION_WINDOW_SECONDS:
@@ -632,8 +628,8 @@ class ListenersMixin:
         parent_transaction_id = str(last_ai.get("parent_transaction_id") or "").strip()
         context_user_id = str(getattr(context, "user_id", None) or "").strip()
         actor = f"ha_user:{context_user_id}" if context_user_id else "ha_user:physical_control"
-        payload: dict[str, Any] = {
-            "action": "record",
+        payload: dict[str, Any] = {"action": "record",
+            "time": datetime.fromtimestamp(occurred_at, timezone.utc).isoformat(),
             "outcome": "rejected",
             "entity_id": entity_id,
             "ai_service": ai_service,
@@ -712,7 +708,7 @@ class ListenersMixin:
         if isinstance(user_overrides, dict) and user_overrides_lock is not None:
             with user_overrides_lock:
                 user_overrides[entity_id] = {
-                    "time": time.time(),
+                    "time": occurred_at,
                     "state": user_state,
                     "source": "implicit_reverse_correction",
                 }

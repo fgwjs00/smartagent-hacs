@@ -1035,32 +1035,6 @@ class AddOnClient:
             },
         )
 
-    async def get_dashboard_summary(self) -> dict[str, Any]:
-        """获取仪表盘摘要（优先 /dashboard/summary）。"""
-        for path in ("/dashboard/summary", "/addon/dashboard-summary"):
-            result = await self.request_json("GET", path, expected_body_types=(dict,))
-            if not isinstance(result, dict):
-                return self._build_status_result(502, {
-                    "ok": False, "error": "addon_unreachable",
-                    "error_type": "dependency_unreachable", "retryable": True,
-                })
-            status = int(result.get("status_code", 0) or 0)
-            body = result.get("body")
-            if status == 200 and isinstance(body, dict):
-                return body
-            if status not in (404, 405):
-                return self._build_status_result(status, body)
-        legacy = await self.get_status()
-        if not isinstance(legacy, dict) or not legacy:
-            return {}
-        if legacy.get("ok") is False or legacy.get("error") or legacy.get("error_type"):
-            return legacy
-        return {
-            "decisions_today": int(legacy.get("inference_count_today", 0) or 0),
-            "addon_mode": legacy.get("mode", "unknown"),
-            "addon_inference_count_today": int(legacy.get("inference_count_today", 0) or 0),
-        }
-
     async def get_devices(self) -> list[dict[str, Any]] | dict[str, Any] | None:
         """获取设备列表（优先 add-on 服务面）。"""
         headers = self._request_headers()
@@ -1080,23 +1054,23 @@ class AddOnClient:
             return self._handle_request_failure(exc, operation="AddOnClient.get_devices", request_id=headers["X-Request-ID"])
         return None
 
-    async def get_rooms(self) -> list[dict[str, Any]] | dict[str, Any] | None:
-        """获取房间列表（优先 add-on 服务面）。"""
+    async def get_room_presence(self) -> list[dict[str, Any]] | dict[str, Any] | None:
+        """获取 add-on 当前房间在场事实，供缓存与执行前守护共用。"""
         headers = self._request_headers()
         try:
             session = await self._get_session()
             async with session.get(
-                f"{self._base}/rooms",
+                f"{self._base}/rooms/presence",
                 headers=headers,
                 timeout=_HEALTH_TIMEOUT,
             ) as resp:
                 if resp.status in (404, 405):
                     return None
                 return await self._read_response_collection(
-                    resp, operation="AddOnClient.get_rooms", wrapped=True,
+                    resp, operation="AddOnClient.get_room_presence", wrapped=True,
                 )
         except Exception as exc:
-            return self._handle_request_failure(exc, operation="AddOnClient.get_rooms", request_id=headers["X-Request-ID"])
+            return self._handle_request_failure(exc, operation="AddOnClient.get_room_presence", request_id=headers["X-Request-ID"])
         return None
 
     async def discover_devices(self) -> list[dict[str, Any]] | dict[str, Any] | None:

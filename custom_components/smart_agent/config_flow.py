@@ -343,12 +343,12 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
             )
             output_enabled_value = user_input.get(
                 CONF_OUTPUT_LEDGER_INGRESS_ENABLED,
-                False,
+                d.get(CONF_OUTPUT_LEDGER_INGRESS_ENABLED, False),
             )
             output_enabled = output_enabled_value is True
             output_url_raw = user_input.get(
                 CONF_OUTPUT_LEDGER_INGRESS_URL,
-                "",
+                d.get(CONF_OUTPUT_LEDGER_INGRESS_URL, DEFAULT_OUTPUT_LEDGER_INGRESS_URL),
             )
             output_url = (
                 output_url_raw.strip()
@@ -357,11 +357,11 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
             )
             output_ingress_secret = user_input.get(
                 CONF_OUTPUT_LEDGER_INGRESS_SECRET,
-                "",
+                d.get(CONF_OUTPUT_LEDGER_INGRESS_SECRET, ""),
             )
             output_attestation_secret = user_input.get(
                 CONF_OUTPUT_LEDGER_ATTESTATION_SECRET,
-                "",
+                d.get(CONF_OUTPUT_LEDGER_ATTESTATION_SECRET, ""),
             )
             host_proof_enabled = (
                 user_input.get(
@@ -610,13 +610,4 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
                              default=d.get(CONF_OBSERVATION_REFRESH_PROVIDER_PREVIOUS_REQUEST_SECRET, "")): _PASSWORD_SELECTOR,
                 vol.Optional(CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET,
                              default=d.get(CONF_OBSERVATION_REFRESH_PROVIDER_REPLAY_INTEGRITY_SECRET, "")): _PASSWORD_SELECTOR,
-                vol.Optional(CONF_OUTPUT_LEDGER_INGRESS_ENABLED,
-                             default=d.get(CONF_OUTPUT_LEDGER_INGRESS_ENABLED, False)): bool,
-                vol.Optional(CONF_OUTPUT_LEDGER_INGRESS_URL,
-                             default=d.get(CONF_OUTPUT_LEDGER_INGRESS_URL,
-                                           DEFAULT_OUTPUT_LEDGER_INGRESS_URL)): str,
-                vol.Optional(CONF_OUTPUT_LEDGER_INGRESS_SECRET,
-                             default=d.get(CONF_OUTPUT_LEDGER_INGRESS_SECRET, "")): _PASSWORD_SELECTOR,
-                vol.Optional(CONF_OUTPUT_LEDGER_ATTESTATION_SECRET,
-                             default=d.get(CONF_OUTPUT_LEDGER_ATTESTATION_SECRET, "")): _PASSWORD_SELECTOR,
             })

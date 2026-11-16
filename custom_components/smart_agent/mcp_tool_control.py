@@ -79,7 +79,7 @@ async def smart_control(context: McpToolContext) -> dict:
     trigger_str = f"[MCP外部调用指令] 对设备「{device_name}」({eid}) 执行: {cmd[:200]}"
     _LOGGER.info("[MCP Tools] 接收到控制任务: %s", trigger_str)
 
-    # 通过异步任务派发给慢脑处理（受完整保护层拦截）
-    hass.async_create_task(coordinator._run_inference(trigger_str))
+    # 通过异步任务派发给 Add-on 慢脑处理（受完整保护层拦截）
+    hass.async_create_task(coordinator._run_addon_decision(trigger_str, source="mcp"))
 
     return mcp_text(f"指令已安全提交: {trigger_str[:100]}")

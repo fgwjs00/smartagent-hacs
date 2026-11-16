@@ -63,6 +63,19 @@ class ReceiptOutbox:
             """)
         if self._conn.execute("SELECT 1 FROM delivery_cursor WHERE id=1").fetchone() is None:
             self._conn.execute("INSERT OR IGNORE INTO delivery_cursor VALUES(1,?,0)", (uuid4().hex,))
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(pending_receipts)")}
+            for name in ("first_failed_at", "last_failed_at"):
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE pending_receipts ADD COLUMN {name} TEXT")
+            if "delivery_state" not in columns:
+                self._conn.execute("ALTER TABLE pending_receipts ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'pending'")
+            self._conn.execute("COMMIT")
+        except BaseException:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
 
     def admit(self, payload: dict, *, ts: str, kind: str = "decision_execution") -> dict:
         if kind not in {"decision_execution", "correction"}:
@@ -113,7 +126,7 @@ class ReceiptOutbox:
         with self._lock:
             now = time.time()
             row = self._conn.execute(
-                "SELECT envelope FROM pending_receipts WHERE retry_at<=? OR retry_at>? ORDER BY sequence LIMIT 1",
+                "SELECT envelope FROM pending_receipts WHERE delivery_state!='quarantined' AND (retry_at<=? OR retry_at>?) ORDER BY sequence LIMIT 1",
                 (now, now + 60)).fetchone()
             return json.loads(row[0]) if row else None
 
@@ -133,16 +146,45 @@ class ReceiptOutbox:
         with self._lock, self._conn.capacity_scope("maintenance"):
             self._conn.execute("DELETE FROM pending_receipts WHERE sequence=?", (item["seq"],))
 
-    def retry(self, item: dict) -> None:
+    def retry(self, item: dict, *, quarantine: bool = False) -> None:
         with self._lock, self._conn.capacity_scope("maintenance"):
+            from datetime import UTC, datetime
+            failed_at = datetime.now(UTC).isoformat()
             self._conn.execute("""UPDATE pending_receipts SET attempts=attempts+1,
-                retry_at=?+min(60,1+attempts*2) WHERE sequence=?""", (time.time(), item["seq"]))
+                first_failed_at=CASE WHEN attempts=0 THEN ? ELSE first_failed_at END,
+                last_failed_at=?, retry_at=?+min(60,1+attempts*2), delivery_state=? WHERE sequence=?""",
+                (failed_at, failed_at, time.time(), 'quarantined' if quarantine else 'retrying', item["seq"]))
+
+    def resume_quarantined(self, stream_id: str, seq: int) -> bool:
+        with self._lock, self._conn.capacity_scope("maintenance"):
+            stream = self._conn.execute("SELECT stream FROM delivery_cursor WHERE id=1").fetchone()[0]
+            if stream != stream_id or type(seq) is not int:
+                return False
+            cursor = self._conn.execute("""UPDATE pending_receipts SET delivery_state='retrying', retry_at=0
+                WHERE sequence=? AND delivery_state='quarantined'""", (seq,))
+            return cursor.rowcount == 1
+
+    @property
+    def delivery_diagnostics(self) -> dict:
+        with self._lock:
+            count = self._conn.execute("SELECT count(*) FROM pending_receipts WHERE attempts>0").fetchone()[0]
+            quarantined = self._conn.execute("SELECT count(*) FROM pending_receipts WHERE delivery_state='quarantined'").fetchone()[0]
+            rows = self._conn.execute("""SELECT envelope,attempts,first_failed_at,last_failed_at,delivery_state
+                FROM pending_receipts WHERE attempts>0 ORDER BY sequence LIMIT 100""").fetchall()
+            events = []
+            for envelope, attempts, first, last, state in rows:
+                item = json.loads(envelope)
+                events.append({**{key: item[key] for key in ("kind", "stream_id", "seq")},
+                    "failure_count": attempts, "first_failed_at": first, "last_failed_at": last,
+                    "state": "quarantined" if state == "quarantined" else "retrying", "durable": True})
+            return {"failed_events": count, "retrying": count - quarantined, "quarantined": quarantined,
+                    "events": events, "truncated": count > 100}
 
     @property
     def stats(self) -> dict:
         with self._lock:
             count, total, retrying = self._conn.execute(
-                "SELECT count(*),coalesce(sum(bytes),0),coalesce(sum(attempts>0),0) FROM pending_receipts").fetchone()
+                "SELECT count(*),coalesce(sum(bytes),0),coalesce(sum(attempts>0 AND delivery_state!='quarantined'),0) FROM pending_receipts").fetchone()
             return {"durable_pending": count, "durable_bytes": total, "durable_retrying": retrying}
 
     def close(self) -> None:

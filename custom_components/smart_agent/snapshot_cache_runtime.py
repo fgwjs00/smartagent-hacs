@@ -250,11 +250,11 @@ async def fetch_presence_snapshot(
     addon_client: Any,
 ) -> dict[str, dict[str, Any]] | None:
     """Fetch and normalize Presence rows without owning the caller's cache."""
-    get_rooms = getattr(addon_client, "get_rooms", None)
-    if not callable(get_rooms):
+    get_presence = getattr(addon_client, "get_room_presence", None)
+    if not callable(get_presence):
         return None
     try:
-        payload = await get_rooms()
+        payload = await get_presence()
     except Exception:
         return None
     rows: Any = payload

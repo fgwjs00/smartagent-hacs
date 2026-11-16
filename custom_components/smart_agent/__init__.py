@@ -211,20 +211,17 @@ def _is_trusted_addon_proxy_peer(request: web.Request) -> bool:
         peer = transport.get_extra_info("peername") if transport is not None else None
     except Exception:
         peer = None
-    log_debug = getattr(_LOGGER, "debug", lambda *args, **kwargs: None)
-    log_info = getattr(_LOGGER, "info", log_debug)
-    log_warning = getattr(_LOGGER, "warning", log_debug)
     if not peer:
-        log_warning("[Auth] proxied request peername=%s trusted=False", peer)
+        _LOGGER.warning("[Auth] proxied request peername=%s trusted=False", peer)
         return False
 
     peer_host = str(peer[0]) if isinstance(peer, (tuple, list)) and peer else str(peer)
     trusted_peers = globals().get("_TRUSTED_ADDON_PROXY_PEERS", {"127.0.0.1", "::1", "localhost"})
     trusted_prefixes = globals().get("_TRUSTED_ADDON_PROXY_PEER_PREFIXES", ("127.", "172.30.32."))
     trusted = peer_host in trusted_peers or any(peer_host.startswith(prefix) for prefix in trusted_prefixes)
-    log_info("[Auth] proxied request peername=%s trusted=%s", peer, trusted)
+    _LOGGER.info("[Auth] proxied request peername=%s trusted=%s", peer, trusted)
     if not trusted:
-        log_warning("[Auth] rejected forged add-on proxy header from peername=%s", peer)
+        _LOGGER.warning("[Auth] rejected forged add-on proxy header from peername=%s", peer)
     return trusted
 
 
@@ -268,100 +265,6 @@ def _dispatch_proof_secret_for_request(
     # Verification keys come exclusively from the dedicated HA keyring.
     del request
     return dispatch_proof_secret_for_ha_request(hass, proof)
-
-
-def _ha_log_window_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    return max(minimum, min(maximum, parsed))
-
-
-def _ha_log_line_matches_level(line: str, level: str) -> bool:
-    if level == "all":
-        return True
-    lowered = line.lower()
-    if level == "error":
-        return "error" in lowered or "exception" in lowered or "traceback" in lowered
-    if level == "warning":
-        return "warn" in lowered or "warning" in lowered
-    if level == "info":
-        return "info" in lowered
-    return True
-
-
-def _ha_log_query_flag(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _ha_log_content_window(content: str, query: Any) -> tuple[str, dict[str, Any]]:
-    q = query if hasattr(query, "get") else {}
-    full_day = (
-        _ha_log_query_flag(q.get("full_day"))
-        or _ha_log_query_flag(q.get("all_day"))
-        or str(q.get("scope") or "").strip().lower() in {"day", "full_day", "all_day"}
-    )
-    level = str(q.get("level") or "all").strip().lower()
-    if level not in {"all", "error", "warning", "info"}:
-        level = "all"
-    keyword = str(q.get("keyword") or "").strip()
-    keyword_lower = keyword.lower()
-    max_bytes = _ha_log_window_int(
-        q.get("max_bytes"),
-        default=16 * 1024 * 1024 if full_day else 128 * 1024,
-        minimum=1,
-        maximum=16 * 1024 * 1024 if full_day else 512 * 1024,
-    )
-    tail_lines = _ha_log_window_int(
-        q.get("tail_lines"),
-        default=200000 if full_day else 800,
-        minimum=1,
-        maximum=200000 if full_day else 3000,
-    )
-
-    lines = str(content or "").splitlines()
-    filtered_lines = [
-        line
-        for line in lines
-        if _ha_log_line_matches_level(line, level)
-        and (not keyword_lower or keyword_lower in line.lower())
-    ]
-    tail_truncated = len(filtered_lines) > tail_lines
-    window_lines = filtered_lines[-tail_lines:]
-    window_content = "\n".join(window_lines)
-    if str(content or "").endswith("\n") and window_content:
-        window_content += "\n"
-    encoded = window_content.encode("utf-8")
-    byte_truncated = len(encoded) > max_bytes
-    if byte_truncated:
-        window_content = encoded[-max_bytes:].decode("utf-8", errors="ignore")
-
-    active = (
-        level != "all"
-        or bool(keyword)
-        or full_day
-        or "max_bytes" in q
-        or "tail_lines" in q
-    )
-    window = {
-        "active": active,
-        "level": level,
-        "keyword": keyword,
-        "max_bytes": max_bytes,
-        "tail_lines": tail_lines,
-        "full_day": full_day,
-        "filtered": level != "all" or bool(keyword),
-        "total_lines": len(lines),
-        "matched_lines": len(filtered_lines),
-        "returned_lines": len(window_content.splitlines()),
-        "original_byte_count": len(str(content or "").encode("utf-8")),
-        "returned_byte_count": len(window_content.encode("utf-8")),
-        "tail_truncated": tail_truncated,
-        "byte_truncated": byte_truncated,
-    }
-    window["truncated"] = bool(tail_truncated or byte_truncated)
-    return window_content, window
 
 
 def _json_error_payload(error: str, error_type: str, retryable: bool, **extra: Any) -> dict[str, Any]:
@@ -538,13 +441,6 @@ async def _refresh_coord_room_topology_cache(coord: Any) -> None:
     refresh_async = getattr(coord, "_async_refresh_room_topology_cache", None)
     if callable(refresh_async):
         result = refresh_async()
-        if hasattr(result, "__await__"):
-            await result
-        return
-
-    refresh_sync = getattr(coord, "_refresh_room_topology_cache", None)
-    if callable(refresh_sync):
-        result = refresh_sync()
         if hasattr(result, "__await__"):
             await result
 
@@ -1005,6 +901,16 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
     name = "api:smart_agent:v1:listener:diagnostics"
     requires_auth = True
 
+    @staticmethod
+    def _delivery_failure_fields(bridge: Any) -> dict[str, Any]:
+        if bridge is None or not hasattr(type(bridge), "delivery_diagnostics"):
+            return {}
+        try:
+            return {"delivery_failures": bridge.delivery_diagnostics}
+        except Exception as exc:
+            _LOGGER.warning("operation=listener_diagnostics.delivery_failures cause=%s", type(exc).__name__)
+            return {"delivery_failures": {"available": False, "error": "delivery_diagnostics_unavailable"}}
+
     async def get(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
@@ -1066,15 +972,10 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 integration_source=dict(_LOADED_INTEGRATION_SOURCE_IDENTITY),
             )
         bridge = getattr(coord, "_internal_event_bridge", None)
-        bridge_stats_raw: Any = {}
-        if bridge is not None:
-            try:
-                bridge_stats_raw = getattr(bridge, "stats", {}) or {}
-            except Exception:
-                bridge_stats_raw = {}
+        bridge_stats_raw: Any = getattr(bridge, "stats", {}) or {} if bridge is not None else {}
         bridge_stats = dict(bridge_stats_raw) if isinstance(bridge_stats_raw, dict) else {}
         internal_event_bridge = {
-            "available": bridge is not None,
+            "available": bridge is not None, **self._delivery_failure_fields(bridge),
             "queued": int(bridge_stats.get("queued") or 0),
             "posted": int(bridge_stats.get("posted") or 0),
             "failed": int(bridge_stats.get("failed") or 0),
@@ -1501,7 +1402,7 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
             )
 
         try:
-            await delete_device(eid)
+            outcome = await delete_device(eid)
         except Exception as exc:
             _LOGGER.exception("[DeviceRegistrySync] HA device delete failed: %s", exc)
             return self.json(
@@ -1517,17 +1418,12 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
                 status_code=502,
             )
 
-        return self.json(
-            {
-                "ok": True,
-                "entity_id": eid,
-                "deleted_entity_id": eid,
-                "deleted": True,
-                "scope": "entity",
-                "source": "ha_host_local",
-            },
-            status_code=200,
-        )
+        if outcome == "write_failed":  # report the real result; the add-on must not delete its copy
+            return self.json(_json_error_payload("device_delete_persist_failed", "storage_unavailable", True,
+                                                 scope="device_delete", source="ha_host_local", entity_id=eid),
+                             status_code=503)
+        return self.json({"ok": True, "entity_id": eid, "deleted_entity_id": eid, "deleted": outcome != "absent",
+                          "scope": "entity", "source": "ha_host_local"}, status_code=200)
 
 
 class SmartAgentEntityStateView(HomeAssistantView):
@@ -1643,16 +1539,269 @@ class SmartAgentBackupsView(HomeAssistantView):
 
 
 class SmartAgentBackupsActionView(HomeAssistantView):
-    """Operations Bridge action model: HA-owned backup create endpoint for the add-on."""
+    """HA backup actions and journal-validated restore status for the add-on."""
 
     url = "/api/v1/backups/{action}"
-    extra_urls: list[str] = []
+    extra_urls: list[str] = ["/api/v1/backups/restore/status/{operation_id}",
+                             "/api/v1/backups/restore/acknowledge/{operation_id}",
+                             "/api/v1/backups/restore/reconcile/{operation_id}"]
     name = "api:smart_agent:v1:backups:action"
     requires_auth = True
 
-    async def post(self, request: web.Request, action: str) -> web.Response:
+    def _create_unknown(self, error: str, *, exception_type: str = "") -> web.Response:
+        """A call may have created a backup before its response was lost."""
+        return self.json(
+            _json_error_payload(
+                error, "effect_unknown", False, scope="backups_action", action="create",
+                source="ha_host_local", outcome="unknown", effect_status="effect_unknown",
+                automatic_retry_allowed=False, exception_type=exception_type,
+            ),
+            status_code=502,
+        )
+
+    def _create_response(self, result: Any) -> web.Response:
+        """Require the BackupManager acknowledgement; this is not effect verification."""
+        if (not isinstance(result, dict) or result.get("success") is not True
+                or result.get("ok", True) is not True):
+            return self._create_unknown("backup_create_unconfirmed")
+        backup_id = result.get("backup_id")
+        if not isinstance(backup_id, str) or not backup_id.strip():
+            return self._create_unknown("backup_create_unconfirmed")
+        return self.json({**result, "ok": True, "action": "create", "source": "ha_host_local"}, status_code=200)
+
+    @staticmethod
+    def _restore_identity(value: Any) -> bool:
+        import re
+        return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_\-]{1,128}", value) is not None
+
+    @staticmethod
+    def _restore_shared_token_matches(body: dict, coord: Any) -> bool:
+        from secrets import compare_digest
+        transport = body.get("_smartagent_transport")
+        if not isinstance(transport, dict):
+            return False
+        if (transport.get("source") != "addon"
+                or transport.get("contract") != "ha_execute_internal_v1"):
+            return False
+        expected = getattr(getattr(coord, "_addon_client", None), "_auth_token", None)
+        supplied = transport.get("auth_token")
+        if (not isinstance(expected, str) or not expected.strip()
+                or not isinstance(supplied, str) or not supplied.strip()):
+            return False
+        return compare_digest(expected.encode("utf-8", "surrogatepass"),
+                              supplied.encode("utf-8", "surrogatepass"))
+
+    def _backup_internal_authorized(self, request: web.Request, body: dict, coord: Any,
+                                    operation_id: str = "") -> bool:
+        # Native HA authentication remains required. A verified SA request is
+        # scoped to these exact backup routes; the Supervisor user is not a human admin.
+        route = (getattr(request, "method", ""), getattr(request, "path", ""))
+        allowed = {("POST", "/api/v1/backups/restore"), ("POST", "/api/v1/backups/delete")}
+        if self._restore_identity(operation_id):
+            allowed.add(("GET", "/api/v1/backups/restore/status/" + operation_id))
+            allowed.update(("POST", "/api/v1/backups/restore/" + control + "/" + operation_id)
+                           for control in ("acknowledge", "reconcile"))
+        user = request.get("hass_user")
+        return (route in allowed and getattr(user, "is_active", None) is True
+                and getattr(user, "is_admin", None) is True
+                and _is_trusted_addon_proxy_peer(request)
+                and self._restore_shared_token_matches(body, coord))
+
+    @staticmethod
+    async def _read_restore_body(request: web.Request, *, operation: str = "backup_restore") -> dict:
+        try:
+            body = await read_json_payload(request, operation=operation)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise web.HTTPBadRequest(text=json.dumps(_json_error_payload(
+                "invalid_json", "bad_request", False)), content_type="application/json") from None
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text=json.dumps(_json_error_payload(
+                "invalid_body", "bad_request", False)), content_type="application/json")
+        return dict(body)
+
+    def _restore_response(self, result: Any, operation_id: str, backup_id: str = "", *,
+                          unknown_status: int = 202, invalid_status: int | None = None) -> web.Response:
+        """Preserve manager-validated facts and report query errors separately."""
+        if (not isinstance(result, dict) or result.get("operation_id") != operation_id
+                or result.get("outcome") not in {"unknown", "committed", "rolled_back", "not_committed", "rejected"}):
+            unknown_status = invalid_status if invalid_status is not None else unknown_status
+            result = {"operation_id": operation_id, "backup_id": backup_id,
+                      "outcome": "unknown", "committed": None, "ok": False,
+                      "error": "restore_status_unavailable", "restored": []}
+        fields = ("contract", "scope", "operation_id", "backup_id", "payload_digest", "receipt_token",
+                  "outcome", "committed", "ok", "success", "completed_at", "restored",
+                  "acknowledged", "local_gate_released", "requires_restart", "not_dispatched",
+                  "blocking_operation_id", "handle_acknowledgement_error")
+        payload = {key: result[key] for key in fields if key in result}
+        if result.get("acknowledgement_outcome") in ("confirmed", "not_sent", "unknown"):
+            payload["acknowledgement_outcome"] = result["acknowledgement_outcome"]
+        if result.get("error"):
+            # Never expose exception text or arbitrary upstream error contents.
+            error = result["error"]
+            payload["error"] = error if error in ("backup_download_unavailable", "backup_decryption_failed",
+                "invalid_backup_payload", "restore_handle_blocked", "restore_handle_conflict",
+            ) else "backup_restore_" + result["outcome"]
+        if result.get("status_query_error"):
+            payload.update(status_query_error="backup_restore_status_unavailable", status_refresh_unavailable=True)
+        if result.get("refresh_errors"):
+            payload["refresh_errors"] = ["restore_projection_refresh_unavailable"]
+        if result.get("acknowledgement_error"):
+            payload["acknowledgement_error"] = "backup_restore_acknowledgement_unconfirmed"
+        payload.update(automatic_retry_allowed=False, retryable=False)
+        return self.json(payload, status_code=unknown_status if result["outcome"] == "unknown" else 200)
+
+    async def _post_restore(self, request: web.Request, body: dict) -> web.Response:
+        operation_id, backup_id = body.get("operation_id"), body.get("backup_id")
+        if (not self._restore_identity(operation_id) or not self._restore_identity(backup_id)
+                or body.get("restore_scope") != "ha_bridge:local_business_data"
+                or body.get("operator_ack") != "non_rollback_acknowledged"
+                or not isinstance(body.get("password"), str) or not body["password"]):
+            return self.json(_json_error_payload(
+                "backup_action_not_open", "safety_blocked", False, action="restore",
+                not_dispatched=True), status_code=409)
+        coord = _get_first_coordinator(request.app["hass"])
+        if not self._backup_internal_authorized(request, body, coord):
+            return self.json(_json_error_payload(
+                "backup_restore_internal_required", "auth_failed", False,
+                not_dispatched=True), status_code=403)
+        body.pop("_smartagent_transport", None)
+        manager = getattr(coord, "_backup_manager", None)
+        restore = getattr(manager, "restore_backup", None)
+        if not callable(restore):
+            return self.json(_json_error_payload(
+                "backup_manager_unavailable", "dependency_unreachable", False,
+                not_dispatched=True), status_code=503)
+        try:
+            result = await restore(backup_id, body["password"], operation_id=operation_id)
+        except Exception as exc:
+            _LOGGER.warning("[BackupsBridge] restore unconfirmed: exception_type=%s", type(exc).__name__)
+            result = None
+        return self._restore_response(result, operation_id, backup_id)
+
+    async def get(self, request: web.Request, operation_id: str = "", action: str = "") -> web.Response:
+        if action or not self._restore_identity(operation_id):
+            return self.json(_json_error_payload(
+                "invalid_restore_identity", "bad_request", False), status_code=400)
+        body = await self._read_restore_body(request)
+        coord = _get_first_coordinator(request.app["hass"])
+        if not self._backup_internal_authorized(request, body, coord, operation_id):
+            return self.json(_json_error_payload(
+                "backup_restore_internal_required", "auth_failed", False), status_code=403)
+        body.pop("_smartagent_transport", None)
+        status = getattr(getattr(coord, "_backup_manager", None), "get_restore_status", None)
+        try:
+            result = await status(operation_id, reconcile=False) if callable(status) else None
+        except Exception as exc:
+            _LOGGER.warning("[BackupsBridge] restore status unavailable: exception_type=%s", type(exc).__name__)
+            result = None
+        return self._restore_response(result, operation_id, unknown_status=200)
+
+    async def _post_restore_control(self, request: web.Request, operation_id: str, control: str) -> web.Response:
+        """Use the existing bound journal; observing a result never invokes this path."""
+        body = await self._read_restore_body(request)
+        coord = _get_first_coordinator(request.app["hass"])
+        if not self._backup_internal_authorized(request, body, coord, operation_id):
+            return self.json(_json_error_payload(
+                "backup_restore_internal_required", "auth_failed", False, not_dispatched=True), status_code=403)
+        fields = {"_smartagent_transport", "receipt_token"} if control == "acknowledge" else {"_smartagent_transport"}
+        if set(body) != fields or getattr(request, "query", None):
+            return self.json(_json_error_payload(
+                "invalid_restore_control_request", "bad_request", False, not_dispatched=True), status_code=400)
+        body.pop("_smartagent_transport", None)
+        receipt_token = body.get("receipt_token")
+        if control == "acknowledge" and (not isinstance(receipt_token, str) or not receipt_token):
+            return self.json(_json_error_payload(
+                "restore_receipt_token_required", "bad_request", False, not_dispatched=True), status_code=409)
+        manager = getattr(coord, "_backup_manager", None)
+        method = getattr(manager, "acknowledge_restore" if control == "acknowledge" else "get_restore_status", None)
+        if not callable(method):
+            return self.json(_json_error_payload(
+                "backup_manager_unavailable", "dependency_unreachable", False, not_dispatched=True), status_code=503)
+        try:
+            result = (await method(operation_id, receipt_token) if control == "acknowledge"
+                      else await method(operation_id, reconcile=True))
+        except Exception as exc:
+            _LOGGER.warning("[BackupsBridge] restore control unconfirmed: action=%s exception_type=%s",
+                            control, type(exc).__name__)
+            result = None
+        return self._restore_response(result, operation_id, unknown_status=200, invalid_status=503)
+
+    def _delete_rejection(self, error: str, status: int, **binding: Any) -> web.Response:
+        return self.json(_json_error_payload(
+            error, "auth_failed" if status == 403 else "safety_blocked", False,
+            action="delete", deleted=False, not_dispatched=True, automatic_retry_allowed=False,
+            **binding), status_code=status)
+
+    def _delete_response(self, result: Any, operation_id: str, backup_id: str) -> web.Response:
+        """Accept only the manager's explicit result for this exact deletion."""
+        payload = {"operation_id": operation_id, "backup_id": backup_id, "storage_source": "ha_local",
+                   "ok": False, "deleted": None, "retryable": False, "automatic_retry_allowed": False}
+        errors = {"backup_not_found": 404, "backup_cloud_delete_not_open": 409,
+                  "backup_delete_target_invalid": 409, "backup_delete_target_unavailable": 503,
+                  "invalid_backup_delete_request": 400}
+        if (isinstance(result, dict) and result.get("operation_id") == operation_id
+                and result.get("backup_id") == backup_id):
+            source = result.get("storage_source")
+            if (source == "ha_local" and result.get("deleted") is True and result.get("ok") is True
+                    and not result.get("error")):
+                return self.json({**payload, "ok": True, "deleted": True}, status_code=200)
+            error = result.get("error")
+            if (result.get("deleted") is False and result.get("ok") is False and isinstance(error, str)
+                    and error in errors and source == ("cloud" if error == "backup_cloud_delete_not_open" else "ha_local")):
+                return self.json({**payload, "deleted": False, "storage_source": source, "error": error},
+                                 status_code=200)
+        return self.json({**payload, "error": "backup_delete_unconfirmed"}, status_code=202)
+
+    async def _post_delete(self, request: web.Request) -> web.Response:
+        from asyncio import CancelledError
+        try:
+            body = await self._read_restore_body(request, operation="backup_delete")
+        except web.HTTPBadRequest:
+            return self._delete_rejection("invalid_backup_delete_request", 400)
+        operation_id, backup_id = body.get("operation_id"), body.get("backup_id")
+        if (not self._restore_identity(operation_id) or not self._restore_identity(backup_id)
+                or body.get("operator_ack") != "non_rollback_acknowledged"):
+            return self._delete_rejection("invalid_backup_delete_request", 400)
+        coord = _get_first_coordinator(request.app["hass"])
+        if not self._backup_internal_authorized(request, body, coord):
+            return self._delete_rejection("backup_delete_internal_required", 403)
+        if (set(body) != {"operation_id", "backup_id", "operator_ack", "_smartagent_transport"}
+                or getattr(request, "query", None)):
+            return self._delete_rejection("invalid_backup_delete_request", 400)
+        delete = getattr(getattr(coord, "_backup_manager", None), "delete_backup", None)
+        if not callable(delete):
+            return self._delete_rejection("backup_manager_unavailable", 503,
+                                          operation_id=operation_id, backup_id=backup_id)
+        try:
+            result = await delete(backup_id, operation_id=operation_id)
+        except (Exception, CancelledError) as exc:
+            _LOGGER.warning("[BackupsBridge] delete unconfirmed: exception_type=%s", type(exc).__name__)
+            result = None
+        return self._delete_response(result, operation_id, backup_id)
+
+    async def _post_backup_route(self, request: web.Request, action: str, operation_id: str) -> web.Response | None:
+        if (getattr(request, "method", ""), getattr(request, "path", ""), action, operation_id) == (
+                "POST", "/api/v1/backups/delete", "delete", ""):
+            return await self._post_delete(request)
+        if (getattr(request, "method", ""), getattr(request, "path", ""), action, operation_id) == (
+                "POST", "/api/v1/backups/restore", "restore", ""):
+            return await self._post_restore(request, await self._read_restore_body(request))
+        if not action and self._restore_identity(operation_id):
+            for control in ("acknowledge", "reconcile"):
+                if (getattr(request, "method", ""), getattr(request, "path", "")) == (
+                        "POST", "/api/v1/backups/restore/" + control + "/" + operation_id):
+                    return await self._post_restore_control(request, operation_id, control)
+        return None
+
+    async def post(self, request: web.Request, action: str = "", operation_id: str = "") -> web.Response:
+        if (response := await self._post_backup_route(request, action, operation_id)) is not None:
+            return response
         if (err := _view_admin_check(request)):
             return err
+
+        if operation_id:
+            return self.json(_json_error_payload(
+                "backup_restore_status_read_only", "method_not_allowed", False), status_code=405)
 
         act = str(action or "").strip().lower()
         if act not in {"create", "restore", "delete"}:
@@ -1725,12 +1874,7 @@ class SmartAgentBackupsActionView(HomeAssistantView):
             )
 
         requested_level = str(body.get("level") or "").strip().lower()
-        if requested_level == "full":
-            level = "full"
-        elif requested_level == "basic":
-            level = "basic"
-        else:
-            level = "standard"
+        level = {"full": "full", "basic": "basic"}.get(requested_level, "standard")
         password = str(body.get("password") or body.get("backup_password") or "smart_agent_local_backup")
 
         try:
@@ -1739,25 +1883,9 @@ class SmartAgentBackupsActionView(HomeAssistantView):
                 result = await result
         except Exception as exc:
             _LOGGER.exception("[BackupsBridge] create backup failed: %s", exc)
-            return self.json(
-                _json_error_payload(
-                    "backup_create_failed",
-                    "dependency_unreachable",
-                    True,
-                    scope="backups_action",
-                    action=act,
-                    source="ha_host_local",
-                    exception_type=exc.__class__.__name__,
-                ),
-                status_code=502,
-            )
+            return self._create_unknown("backup_create_failed", exception_type=type(exc).__name__)
 
-        payload = dict(result) if isinstance(result, dict) else {}
-        ok = bool(payload.get("ok", payload.get("success", True)))
-        payload.setdefault("ok", ok)
-        payload.setdefault("action", act)
-        payload.setdefault("source", "ha_host_local")
-        return self.json(payload, status_code=200)
+        return self._create_response(result)
 
 
 class SmartAgentLicenseStatusView(HomeAssistantView):

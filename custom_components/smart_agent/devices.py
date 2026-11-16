@@ -8,7 +8,6 @@ from .ai_scene_projection import require_ai_scene_projection
 
 import logging
 import asyncio
-import threading
 import json as _json
 import hashlib
 import math
@@ -828,19 +827,25 @@ class DevicesMixin:
         """Service handler: add/update single device (pipe-separated description string)."""
         await self.async_dev_add(entity_id, description)
 
-    async def async_svc_delete_device(self, entity_id: str) -> None:
-        """Service handler: delete device by entity_id."""
+    async def async_svc_delete_device(self, entity_id: str) -> str:
+        """Service handler: delete device by entity_id.
+
+        Returns "deleted", "absent" (nothing to delete) or "write_failed" so HTTP callers
+        can report the real outcome instead of assuming success.
+        """
         if entity_id in self.device_info:
             name = self.device_info[entity_id]["name"]
             _ok = await self._persist_device_record(entity_id, action="delete")
             if not _ok:
                 self._sys_log("WARN", f"[设备删除] 写入失败，未删除: {entity_id}")
-                return
+                return "write_failed"
             del self.device_info[entity_id]
             self._refresh_listeners()
             self._sys_log("INFO", f"设备已删除: {name} ({entity_id})")
             await self._async_update_status("设备管理", f"删除设备: {name}")
             self.async_set_updated_data({})
+            return "deleted"
+        return "absent"
 
     async def async_svc_update_device(self, entity_id: str, name: str = "", room: str = "",
                                       dev_type: str = "", ops: str = "", sensor_type: str = "",
@@ -1787,131 +1792,6 @@ class DevicesMixin:
         self.async_set_updated_data({})
         return
 
-        import json as _json
-        from .const import AI_SCENE_STATUS_ACTIVE
-        from .ha_adapter import async_create_scene, async_reload_scenes
-
-        # 先刷新缓存读取 pending 记录（不提前设 active）
-        await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
-
-        scene = next((s for s in require_ai_scene_projection(self) if s["id"] == scene_id), None)
-        if not scene:
-            self._sys_log("WARN", f"[AI场景] 批准后未找到场景记录 id={scene_id}")
-            self.async_set_updated_data({})
-            return
-
-        # ── 5C-2: 写入 smart_agent_scenes.yaml（持久化）并调用 scene.reload ────
-        ha_scene_id = f"ai_{scene_id}"
-        ha_scene_eid = f"scene.{ha_scene_id}"
-        _registered_ok = False
-        try:
-            entities_raw = _json.loads(scene.get("entities_json", "[]"))
-            actions_raw = []
-            try:
-                actions_raw = _json.loads(scene.get("actions_json", "[]") or "[]")
-            except Exception:
-                actions_raw = []
-            action_params_by_entity: dict[str, dict] = {}
-            for act in actions_raw:
-                if not isinstance(act, dict):
-                    continue
-                eid_act = act.get("entity_id", "")
-                if not eid_act:
-                    continue
-                params_act = act.get("params") or {}
-                if isinstance(params_act, dict) and params_act:
-                    action_params_by_entity[eid_act] = params_act
-            ha_entities: dict = {}
-            for e in entities_raw:
-                eid = e.get("entity_id", "")
-                if not eid:
-                    continue
-                state = e.get("state", "on")
-                entry: dict = {"state": state}
-                merged = dict(e)
-                merged.update(action_params_by_entity.get(eid, {}))
-                if "brightness_pct" in merged:
-                    entry["brightness"] = int(float(merged["brightness_pct"]) * 2.55)
-                if "brightness" in merged:
-                    entry["brightness"] = merged["brightness"]
-                if "color_temp" in merged:
-                    entry["color_temp"] = merged["color_temp"]
-                if "color_temp_kelvin" in merged:
-                    entry["color_temp_kelvin"] = merged["color_temp_kelvin"]
-                if "temperature" in merged:
-                    entry["temperature"] = merged["temperature"]
-                ha_entities[eid] = entry
-
-            # 写入 YAML（executor 中同步 I/O）
-            yaml_ok = await self.hass.async_add_executor_job(
-                self._write_scene_to_yaml, ha_scene_id, scene["name"], ha_entities
-            )
-            if yaml_ok:
-                # 调用 scene.reload 令 HA 立即识别新场景
-                await async_reload_scenes(self.hass)
-                # 记录 ha_entity_id 到数据库
-                _ha_entity_ok = await self.hass.async_add_executor_job(
-                    self._update_ai_scene_ha_entity, scene_id, ha_scene_eid
-                )
-                if not _ha_entity_ok:
-                    self._sys_log("WARN", f"[AI场景] ha_entity_id 持久化失败，状态保持 pending: id={scene_id}")
-                else:
-                    _registered_ok = True
-                    self._sys_log(
-                        "INFO",
-                        f"[AI场景] 5C-2 已写入 YAML 并注册 {ha_scene_eid} "
-                        f"（{len(ha_entities)} 个设备，场景名: {scene['name']}）",
-                    )
-            else:
-                # YAML 写入失败时降级为 scene.create（易失但功能可用）
-                await async_create_scene(self.hass, scene_id=ha_scene_id, entities=ha_entities)
-                await self.hass.async_add_executor_job(
-                    self._mark_ai_scene_ephemeral, scene_id
-                )
-                # 降级路径同样记录 ha_entity_id，FastBrain 才能复用此场景
-                _ha_entity_ok = await self.hass.async_add_executor_job(
-                    self._update_ai_scene_ha_entity, scene_id, ha_scene_eid
-                )
-                if not _ha_entity_ok:
-                    self._sys_log("WARN", f"[AI场景] 降级路径 ha_entity_id 持久化失败，状态保持 pending: id={scene_id}")
-                else:
-                    _registered_ok = True
-                    self._sys_log(
-                        "WARN",
-                        f"[AI场景] YAML 写入失败，降级使用 scene.create（重启后失效）: {ha_scene_eid}",
-                    )
-        except Exception as exc:
-            self._sys_log("WARN", f"[AI场景] 场景注册失败，状态保持 pending: {exc}")
-
-        _activated = False
-
-        # 只有确认场景已在 HA 中可用，才将 DB 状态升为 active
-        if _registered_ok:
-            _status_ok = await self.hass.async_add_executor_job(
-                self._update_ai_scene_status, scene_id, AI_SCENE_STATUS_ACTIVE
-            )
-            await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
-            _scene_after = next((s for s in require_ai_scene_projection(self) if s["id"] == scene_id), None)
-            _activated = bool(_status_ok and _scene_after and _scene_after.get("status") == AI_SCENE_STATUS_ACTIVE)
-            if not _activated:
-                self._sys_log("WARN", f"[AI场景] 激活状态写入失败，保持 pending: id={scene_id}")
-
-        # ── 刷新 HA 资源，使新场景进入 Action Router ──────────────────────────
-        try:
-            self._refresh_ha_resources()
-        except Exception as exc:
-            self._sys_log("WARN", f"[AI场景] 刷新 HA 资源失败: {exc}")
-
-        if _activated:
-            self._sys_log("INFO", f"[AI场景] 已激活场景: {scene['name']} (id={scene_id})")
-
-            # ── Phase 7D: 同步导出为原生自动化逻辑 ────────────────────────────────
-            await self._export_to_ha_automation(scene_id)
-        else:
-            self._sys_log("WARN", f"[AI场景] 未完成激活，跳过自动化导出: id={scene_id}")
-
-        self.async_set_updated_data({})
-
     async def async_reject_ai_scene(self, scene_id: int) -> None:
         """用户拒绝候选场景 → 状态置为 rejected，并尝试删除对应 HA 场景实体。"""
         from .const import AI_SCENE_STATUS_REJECTED
@@ -1985,11 +1865,7 @@ class DevicesMixin:
         await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
         self.async_set_updated_data({})
 
-    # ── 5C-2: AI 场景 YAML 持久化 ────────────────────────────────────────────
-
-    # 文件级写锁：防止并发 executor 任务同时写入同一 YAML 文件
-    _scenes_yaml_lock: threading.Lock = threading.Lock()
-    _automations_yaml_lock: threading.Lock = threading.Lock()
+    # ── 5C-2: AI 场景 YAML 持久化（宿主侧只保留 fail-closed 拦截） ───────────
 
     def _write_scene_to_yaml(
         self, ha_scene_id: str, scene_name: str, ha_entities: dict
@@ -2002,49 +1878,6 @@ class DevicesMixin:
         )
         return False
 
-        import os as _os
-        import yaml as _yaml
-
-        config_dir = self.hass.config.config_dir
-        target_file = _os.path.join(config_dir, "smart_agent_scenes.yaml")
-
-        def _build_entry() -> dict:
-            entities_yaml: dict = {}
-            for eid, attrs in ha_entities.items():
-                entities_yaml[eid] = dict(attrs)
-            return {
-                "id": ha_scene_id,
-                "name": scene_name,
-                "entities": entities_yaml,
-            }
-
-        with self._scenes_yaml_lock:
-            try:
-                scenes: list = []
-                if _os.path.exists(target_file):
-                    try:
-                        with open(target_file, encoding="utf-8") as _f:
-                            existing = _yaml.safe_load(_f)
-                        if isinstance(existing, list):
-                            scenes = existing
-                    except Exception:
-                        scenes = []
-                # 去重：移除相同 id 的旧记录
-                scenes = [s for s in scenes if s.get("id") != ha_scene_id]
-                scenes.append(_build_entry())
-                with open(target_file, "w", encoding="utf-8") as _f:
-                    _yaml.dump(
-                        scenes, _f,
-                        allow_unicode=True, sort_keys=False, default_flow_style=False
-                    )
-                return True
-            except Exception as exc:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "[AI场景] smart_agent_scenes.yaml 写入失败: %s", exc
-                )
-                return False
-
     def _remove_scene_from_yaml(self, ha_scene_id: str) -> None:
         """Fail closed: direct HA scene YAML removal is not authorized."""
         self._sys_log(
@@ -2053,33 +1886,6 @@ class DevicesMixin:
             f"smart_agent_scenes.yaml scene={str(ha_scene_id).strip()}",
         )
         return
-
-        import os as _os
-        import yaml as _yaml
-
-        config_dir = self.hass.config.config_dir
-        target_file = _os.path.join(config_dir, "smart_agent_scenes.yaml")
-        if not _os.path.exists(target_file):
-            return
-        with self._scenes_yaml_lock:
-            try:
-                with open(target_file, encoding="utf-8") as _f:
-                    existing = _yaml.safe_load(_f)
-                if not isinstance(existing, list):
-                    return
-                updated = [s for s in existing if s.get("id") != ha_scene_id]
-                if len(updated) == len(existing):
-                    return  # 没有匹配项，无需写入
-                with open(target_file, "w", encoding="utf-8") as _f:
-                    _yaml.dump(
-                        updated, _f,
-                        allow_unicode=True, sort_keys=False, default_flow_style=False
-                    )
-            except Exception as exc:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "[AI场景] smart_agent_scenes.yaml 移除场景失败: %s", exc
-                )
 
     # ── Phase 7D: 原生 YAML 自动化导出 ────────────────────────────────────────
 
@@ -2224,30 +2030,6 @@ class DevicesMixin:
             f"不修改 HA 场景或 YAML id={int(scene_id)}",
         )
         return
-
-        from .ha_adapter import async_delete_scene, async_reload_scenes
-
-        ha_scene_id = f"ai_{scene_id}"
-        ha_scene_eid = f"scene.{ha_scene_id}"
-
-        # 从 smart_agent_scenes.yaml 移除（5C-2 持久化）
-        try:
-            await self.hass.async_add_executor_job(
-                self._remove_scene_from_yaml, ha_scene_id
-            )
-            # 调用 scene.reload 使 HA 识别场景已移除
-            await async_reload_scenes(self.hass)
-        except Exception as exc:
-            self._sys_log("WARN", f"[AI场景] YAML 移除场景失败: {exc}")
-
-        # 若场景实体仍存在（如通过 scene.create 创建），尝试删除
-        if self.hass.states.get(ha_scene_eid) is None:
-            return
-        try:
-            await async_delete_scene(self.hass, ha_scene_eid)
-            self._sys_log("INFO", f"[AI场景] HA 场景实体已删除: {ha_scene_eid}")
-        except Exception as exc:
-            self._sys_log("WARN", f"[AI场景] 删除 HA 场景实体失败（不影响数据库操作）: {exc}")
 
     async def async_trigger_ai_scene(self, scene_id: int) -> None:
         """Delegate scene execution to the add-on authority boundary."""

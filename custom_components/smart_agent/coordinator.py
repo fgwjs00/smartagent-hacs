@@ -96,7 +96,10 @@ from .snapshot_cache_runtime import fetch_presence_snapshot, fetch_room_topology
 from .slow_decision_bundle_runtime import (
     build_addon_slow_decision_bundle as build_slow_decision_bundle_projection,
 )
-from .addon_settings_runtime import apply_addon_system_settings
+from .addon_settings_runtime import (
+    apply_addon_system_settings, report_addon_sync_failure,
+    report_addon_sync_recovery, sync_listener_resources,
+)
 from .decision_audit_projection import (
     build_decision_trace_lineage,
     build_training_sample_payload,
@@ -1598,7 +1601,7 @@ class SmartAgentCoordinator(
         try:
             await self._async_apply_addon_system_settings()
         except Exception as exc:
-            _LOGGER.debug("[AddonSettings] 启动期同步失败（保留 config_entry 初值）: %s", exc)
+            report_addon_sync_failure(self, "settings", type(exc).__name__)
 
         try:
             await self._async_migrate_legacy_config()
@@ -1606,18 +1609,14 @@ class SmartAgentCoordinator(
             _LOGGER.warning("[Listeners] legacy config migration failed closed: %s", exc)
 
         # 周期同步：每 60 秒比对一次 add-on settings，发现变更即时刷内存
-        try:
-            await self._async_refresh_device_info_from_addon_devices(reason="startup")
-            await self._async_refresh_memory_assets_from_addon()
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] startup add-on device_info sync failed: %s", exc)
+        await sync_listener_resources(self, reason="startup")
 
         try:
             async def _settings_periodic_sync(_now: Any) -> None:
                 try:
                     await self._async_apply_addon_system_settings()
                 except Exception as exc:
-                    _LOGGER.debug("[AddonSettings] 周期同步失败: %s", exc)
+                    report_addon_sync_failure(self, "settings", type(exc).__name__)
 
             self._listener_removers.append(
                 async_track_time_interval(
@@ -1627,7 +1626,9 @@ class SmartAgentCoordinator(
                 )
             )
         except Exception as exc:
-            _LOGGER.debug("[AddonSettings] 周期同步注册失败: %s", exc)
+            report_addon_sync_failure(self, "settings_periodic_registration", type(exc).__name__)
+        else:
+            report_addon_sync_recovery(self, "settings_periodic_registration")
 
         from .room_lighting_runtime import reconcile_rooms
         async def room_lighting_periodic(now):
@@ -1663,14 +1664,7 @@ class SmartAgentCoordinator(
 
         try:
             async def _listener_entity_set_periodic_refresh(_now: Any) -> None:
-                try:
-                    await self._async_refresh_device_info_from_addon_devices(reason="periodic_listener")
-                    await self.async_refresh_device_areas()
-                    await self._async_refresh_memory_assets_from_addon()
-                    if self._refresh_listeners_if_entity_set_changed():
-                        _LOGGER.debug("[Listeners] refreshed subscriptions after managed entity set changed")
-                except Exception as exc:
-                    _LOGGER.debug("[Listeners] periodic subscription refresh failed: %s", exc)
+                await sync_listener_resources(self, reason="periodic_listener")
 
             self._listener_removers.append(
                 async_track_time_interval(
@@ -1680,7 +1674,9 @@ class SmartAgentCoordinator(
                 )
             )
         except Exception as exc:
-            _LOGGER.debug("[Listeners] periodic subscription refresh registration failed: %s", exc)
+            report_addon_sync_failure(self, "listeners_periodic_registration", type(exc).__name__)
+        else:
+            report_addon_sync_recovery(self, "listeners_periodic_registration")
 
         # Boundary: legacy compatibility only. The HA-side PresenceInference
         # object is not a canonical decision fact source; canonical presence
