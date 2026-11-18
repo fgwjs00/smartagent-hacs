@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.242
-display_version: Beta 0.0.242
+release_version: 0.0.243
+display_version: Beta 0.0.243
 channel: beta
-release_date: '2026-11-17'
+release_date: '2026-11-18'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 整合主线架构与存储治理、管理端策略版本绑定、网关连接复用、Z2M 配对状态与身份校验、终端输入恢复及回归契约修复；如影客户端实验保持单台范围。
-  customer_visible_version: Beta 0.0.242
+  summary: 合入管理端 V4 退役与 V5 单入口重构、多品牌设备接入中心与双生态桥接、中控屏视觉请求 4MB 上限及二步语音提醒确认协同。
+  customer_visible_version: Beta 0.0.243
