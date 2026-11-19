@@ -46,20 +46,6 @@ _ADDON_REPAIR_UNREACHABLE_CODES = frozenset(
 _ADDON_REPAIR_ERROR_CODES = _ADDON_REPAIR_UNREACHABLE_CODES | frozenset(
     {"addon_response_invalid", "invalid_response", "client_exception", "status_read_failed", "http_error"}
 )
-_FILE_LOG_LEVELS = {
-    logging.DEBUG,
-    logging.INFO,
-    logging.WARNING,
-    logging.ERROR,
-    logging.CRITICAL,
-}
-
-def _coerce_file_log_level(value: Any) -> int:
-    text = str(value or DEFAULT_FILE_LOG_LEVEL).strip().upper()
-    if text == "WARN":
-        text = "WARNING"
-    level = getattr(logging, text, logging.INFO)
-    return level if isinstance(level, int) and level in _FILE_LOG_LEVELS else logging.INFO
 
 
 from homeassistant.config_entries import ConfigEntry
@@ -75,6 +61,10 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .actions import ActionsMixin
 from .addon_client import build_status_read_failure
 from .active_ai_rollout import normalize_active_ai_mode
+from .coordinator_runtime_state import (
+    coerce_file_log_level as _coerce_file_log_level,
+    init_coordinator_runtime_state,
+)
 from .database import DatabaseMixin
 from .decision_runtime import (
     build_patrol_environment_projection,
@@ -273,6 +263,7 @@ class SmartAgentCoordinator(
     _OFF_STATES = frozenset(("off", "closed", "idle", "standby", "locked"))
     _AUTOMATION_EXEC_WINDOW = 30
     _USER_MANUAL_WINDOW = 1800
+    _init_runtime_state = init_coordinator_runtime_state
 
     def __init__(
         self,
@@ -282,131 +273,23 @@ class SmartAgentCoordinator(
         """Initialize and load config from entry (data + options)."""
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=5))
         self._entry = entry
-        self._config_dir = hass.config.config_dir
-        self._memory_db = os.path.join(self._config_dir, DB_FILENAME)
-        self._pattern_file = os.path.join(self._config_dir, PATTERN_FILENAME)
-        # Merge entry.data and entry.options (options override)
         data = {**(entry.data or {}), **(entry.options or {})}
-        self._file_log_level = _coerce_file_log_level(data.get(CONF_FILE_LOG_LEVEL, DEFAULT_FILE_LOG_LEVEL))
-        self._file_log_level_name = logging.getLevelName(self._file_log_level)
-        # 文件日志记录器（handler 延迟到 async_start_listeners 中在 executor 里初始化，避免阻塞事件循环）
-        self._file_logger = logging.getLogger(f"{DOMAIN}.system")
-        self._file_logger.setLevel(self._file_log_level)
-        self._file_logger.handlers.clear()
-        self._file_logger.propagate = False
-
-        self.engine = data.get(CONF_ENGINE, "local")
-        self.ollama_url = data.get(CONF_OLLAMA_URL, "http://127.0.0.1:11434")
-        self.ollama_model = data.get(CONF_OLLAMA_MODEL, "qwen3-smarthome")
-        self._online_api_key = data.get(CONF_ONLINE_API_KEY, "")
-        self.online_base_url = data.get(CONF_ONLINE_BASE_URL, "https://dashscope.aliyuncs.com/compatible-mode/v1")
-        self.online_model = data.get(CONF_ONLINE_MODEL, "qwen3.7-plus")
-        self.confidence_auto = int(data.get(CONF_CONFIDENCE_AUTO, DEFAULT_CONFIDENCE_AUTO))
-        self.confidence_notify = int(data.get(CONF_CONFIDENCE_NOTIFY, DEFAULT_CONFIDENCE_NOTIFY))
-        self.cooldown = int(data.get(CONF_COOLDOWN, 60))
-        try:
-            manual_override_seconds = int(
-                data.get(CONF_MANUAL_OVERRIDE_PROTECTION_SECONDS, 0)
-            )
-        except (TypeError, ValueError, OverflowError):
-            manual_override_seconds = 0
-        self._manual_override_protection_seconds = max(
-            0, min(manual_override_seconds, 86400)
+        self._init_runtime_state(
+            data,
+            config_dir=hass.config.config_dir,
+            integration_version=_SA_VERSION,
         )
-        self.showroom_biz_start_min: int = parse_biz_time(data.get(CONF_SHOWROOM_BIZ_START, DEFAULT_SHOWROOM_BIZ_START))
-        self.showroom_biz_end_min: int   = parse_biz_time(data.get(CONF_SHOWROOM_BIZ_END, DEFAULT_SHOWROOM_BIZ_END))
-        # 兼容旧版：保留整数小时属性，供仍引用旧属性的代码过渡（将逐步废弃）
-        self.showroom_biz_start: int = self.showroom_biz_start_min // 60
-        self.showroom_biz_end: int   = self.showroom_biz_end_min // 60
-        self.showroom_area_name: str = (data.get(CONF_SHOWROOM_AREA_NAME, DEFAULT_SHOWROOM_AREA_NAME) or "").strip()
-        _excl_raw: str = (data.get(CONF_SHOWROOM_EXCLUDED_SUBAREAS, DEFAULT_SHOWROOM_EXCLUDED_SUBAREAS) or "").strip()
-        self.showroom_excluded_subareas: list[str] = [s.strip() for s in _excl_raw.split(",") if s.strip()] if _excl_raw else []
-        # 区域角色映射（v4.11.0）：展厅 → display，体验区 → experience，工作区 → work
-        _zone_map_raw: str = (data.get(CONF_SHOWROOM_ZONE_MAP, DEFAULT_SHOWROOM_ZONE_MAP) or "").strip()
-        try:
-            import json as _json_coord
-            self._showroom_zone_map: dict[str, str] = _json_coord.loads(_zone_map_raw) if _zone_map_raw else {}
-        except (ValueError, TypeError):
-            self._showroom_zone_map = {}
-        self._last_showroom_cmd_time: float = 0.0  # 记录最近一次操作员指令时间，用于巡检抑制
-        # Phase 11.3: 记录各房间最近一次"离开触发关灯"的时间戳
-        # 巡检在冷却期（5分钟）内不会对同一房间重复发起推理，防止巡检覆盖离开决策
-        self._last_departure_turnoff_time: dict[str, float] = {}
-
-        # ── 品牌化/白标配置 ────────────────────────────────────────────────────
-        self.brand_name: str         = (data.get(CONF_BRAND_NAME, DEFAULT_BRAND_NAME) or DEFAULT_BRAND_NAME).strip()
-        self.brand_primary_color: str = (data.get(CONF_BRAND_PRIMARY_COLOR, DEFAULT_BRAND_PRIMARY_COLOR) or DEFAULT_BRAND_PRIMARY_COLOR).strip()
-        self.brand_logo_url: str     = (data.get(CONF_BRAND_LOGO_URL, DEFAULT_BRAND_LOGO_URL) or "").strip()
-        self.deploy_name: str        = (data.get(CONF_DEPLOY_NAME, DEFAULT_DEPLOY_NAME) or "").strip()
-
-        self._startup_grace = STARTUP_GRACE_SECONDS
-        self._startup_time = time.time()
-        self._last_inference: dict[str, float] = {}
-        self._active_timers: dict[str, Any] = {}
-        self._last_ai_actions: dict[str, dict] = {}
-        self._recent_ai_action_results: list[dict[str, Any]] = []
-        self._recent_ai_action_results_lock = threading.Lock()
-        self._user_overrides: dict[str, dict] = {}
-        self._user_overrides_lock = threading.Lock()
-        self._user_manual_actions: dict[str, dict] = {}
-        self._user_manual_actions_lock = threading.Lock()
-        self._arrival_manual_action_evidence: dict[str, list[dict[str, Any]]] = {}
-        self._trusted_manual_service_contexts: dict[str, dict[str, Any]] = {}
-        self._manual_scene_learning_sessions: dict[str, dict[str, Any]] = {}
-        self._manual_scene_learning_timers: dict[str, Any] = {}
-        self._pending_triggers: list[dict] = []
-        self._pending_triggers_lock = threading.Lock()
-        self._pending_trigger_controllable: dict[str, str] = {}
-        self._merge_timer_unsub: Any = None
-        self._scan_timer_unsub: Any = None
-        self._habit_check_timer_unsub: Any = None
-        self._last_notify: dict[str, float] = {}
-        self._terminal_logs: list[str] = []
-        self._action_history_structured: list[str] = [] # 结构化动作历史
-        self._sys_logs: list[str] = []
-        self._sys_log_html_rows: list[str] = []
-        self._sys_log_lock = threading.Lock()  # P1修复：保护 _sys_logs 跨线程读写
-        self._log_retention_days: int = int(data.get(CONF_LOG_RETENTION, LOG_RETENTION_DAYS))
-        self._pattern_summary = ""
-
-        # 初始化优先级仲裁引擎
         self._init_priority_system()
-        self._listener_removers: list = []
-        self._state_listener_removers: list = []
-        self._listener_entity_ids: set[str] = set()
-        self._enabled = bool(data.get(CONF_AI_ENABLED, True))
-        self._active_ai_mode = normalize_active_ai_mode(
-            data.get(CONF_ACTIVE_AI_MODE, DEFAULT_ACTIVE_AI_MODE)
-        )
-        self._sensors_muted = bool(data.get(CONF_SENSORS_MUTED, False))
-        self._learning_mode = bool(data.get(CONF_LEARNING_MODE, False))
-        self._habit_proactive = bool(data.get(CONF_HABIT_PROACTIVE, False))
-        self._mcp_enabled = bool(data.get("mcp_enabled", False))
-        self._patrol_enabled = False
-        self._patrol_interval_minutes = 15
-        self._patrol_scope_space_ids: tuple[str, ...] = ()
-        self._patrol_excluded_space_ids: tuple[str, ...] = ()
-        self._patrol_quiet_hours_start = ""
-        self._patrol_quiet_hours_end = ""
-        self._patrol_low_risk_entity_ids: tuple[str, ...] = ()
-        self._patrol_last_automatic_submit_monotonic = 0.0
-        self._ai_patrol_last_automatic_submit_monotonic = 0.0
-        self._ai_patrol_retry_space_ids: tuple[str, ...] = ()
-        self._ai_patrol_retry_not_before_monotonic = 0.0
-        self._frigate_enabled = bool(data.get(CONF_FRIGATE_ENABLED, False))  # 默认关闭，需手动启用
-        # Phase 5: 联网工具与知识库
-        from .tools import ToolRegistry
-        self._tools = ToolRegistry(hass, data)
-        self._cloud_fallback = bool(data.get(CONF_CLOUD_FALLBACK, False))
-        self._vision_enabled = bool(data.get(CONF_VISION_ENABLED, False))
-        self._vision_engine = data.get(CONF_VISION_ENGINE, ENGINE_ONLINE)
-        self._vision_model = (data.get(CONF_VISION_MODEL) or "qwen3.5-omni-flash").strip()
-        # License
         self._init_license()
         self._license_key = (data.get(CONF_LICENSE_KEY) or "").strip()
-        # Add-on 客户端（显式 URL 优先；留空时按端口回退）
+
+        from .tools import ToolRegistry
+
+        self._tools = ToolRegistry(hass, data)
+
         from .addon_client import AddOnClient, derive_addon_gateway_base_url
         from .const import CONF_ADDON_PORT, DEFAULT_ADDON_PORT
+
         _addon_token = (data.get(CONF_ADDON_AUTH_TOKEN) or "").strip()
         _addon_base_url = (data.get(CONF_ADDON_BASE_URL) or "").strip()
         if not _addon_base_url:
@@ -431,172 +314,33 @@ class SmartAgentCoordinator(
         from .output_ledger_publisher import OutputLedgerPublisher
 
         self._output_ledger_publisher = OutputLedgerPublisher(hass, entry)
-        self._addon_repair_issue_active = False
-        self._addon_repair_first_failure_at: float | None = None
-        self._addon_repair_failure_count = 0
-        self._addon_repair_last_check_at = 0.0
-        self._addon_repair_last_error = ""
+
         from .internal_event_bridge import InternalEventBridge
         from .receipt_outbox import receipt_outbox_path
+
         self._internal_event_bridge = InternalEventBridge(
             self._addon_client,
             log_callback=self._sys_log,
             now_provider=self._ha_local_now,
-            outbox_path=receipt_outbox_path(self._config_dir, entry.entry_id, self._addon_client._base),
+            outbox_path=receipt_outbox_path(
+                self._config_dir,
+                entry.entry_id,
+                self._addon_client._base,
+            ),
         )
-        # TTS 配置
-        self._tts_service: str = (data.get(CONF_TTS_SERVICE) or "").strip()
-        self._tts_target: str = (data.get(CONF_TTS_TARGET) or "").strip()
-        self._tts_level: int = int(data.get(CONF_TTS_LEVEL, TTS_LEVEL_OFF))
-        self._transactions_cache: list[dict] = []
-        self._env_feedback_tasks: list[dict] = []
-        self._env_feedback_lock = asyncio.Lock()
-        # Phase A: DeviceAdapter — AI Core 与 HA 设备层解耦（可测试化）
-        # 全局推理互斥锁：作为无法提取房间名时的兜底（如巡检、定时、位置变化触发）
-        self._inference_lock = asyncio.Lock()
-        # 按房间隔离的推理锁：不同房间的 LLM 推理可并发执行，互不阻塞
-        # key=房间名, value=asyncio.Lock()；动态创建，生命周期与 coordinator 相同
-        self._room_inference_locks: dict[str, asyncio.Lock] = {}
-        # 行为分析互斥锁：防止手动触发与定时触发重叠执行
-        self._analysis_lock = asyncio.Lock()
-        self._pending_habit_suggestion: dict | None = None
-        self._habit_suggest_cooldown: dict[str, float] = {}
-        self._habit_suggest_timeout_handle: Any = None
-        self._glitch_history: dict[str, list[float]] = {}      # 闪断检测历史
-        self._glitch_suppressed: dict[str, float] = {}         # 闪断抑制期
-        self._room_topology_cache: dict[str, set[str]] = {}  # P1-2: room → {adjacent rooms}
-        self._room_topology_cache_updated_at: float = 0.0
-        self._room_topology_refresh_pending: bool = False
-        self._presence_snapshot_cache: dict[str, dict[str, Any]] = {}
-        self._presence_snapshot_cache_updated_at: float = 0.0
-        self._presence_snapshot_cache_record: tuple[
-            dict[str, dict[str, Any]],
-            float,
-        ] = ({}, 0.0)
-        self._energy_stats: list[dict] | None = None
-        self._energy_stats_error: dict[str, str] | None = None
-        self._mode = data.get(CONF_MODE, MODE_HOME)
-        _saved_scene = data.get(CONF_SHOWROOM_SCENE, "") or ""
-        self._showroom_scene: str | None = _saved_scene if _saved_scene in SHOWROOM_SCENES else None
-        self._showroom_custom_prompt: str = (data.get(CONF_SHOWROOM_CUSTOM_PROMPT, "") or "").strip()
-        _raw_overrides = data.get(CONF_SHOWROOM_SCENE_OVERRIDES, "")
-        try:
-            if isinstance(_raw_overrides, dict):
-                self._showroom_scene_overrides = _raw_overrides
-            elif isinstance(_raw_overrides, str):
-                _parsed_overrides = json.loads(_raw_overrides) if _raw_overrides else {}
-                self._showroom_scene_overrides = _parsed_overrides if isinstance(_parsed_overrides, dict) else {}
-            else:
-                # 兼容历史异常类型（如 list/int），避免推理阶段 .items() / 索引报错
-                self._showroom_scene_overrides = {}
-        except (json.JSONDecodeError, TypeError):
-            self._showroom_scene_overrides = {}
-
-        # 展厅模式下的置信度与冷却（更积极执行）
-        self._SHOWROOM_COOLDOWN = 15
-        self._SHOWROOM_CONFIDENCE_AUTO = 70
-        self._SHOWROOM_CONFIDENCE_NOTIFY = 40
-
-        # 存在传感器去抖（防止 mmWave/存在雷达高频抖动淹没推理队列）
-        self._presence_off_timers: dict[str, Any] = {}
-        self._presence_last_on: dict[str, float] = {}
-        self._presence_on_start: dict[str, float] = {}
-        self._presence_flap_history: dict[str, list[float]] = {}      # 高频反转历史
-        self._presence_flap_suppressed: dict[str, float] = {}         # 抖动风暴抑制期
-
-        # 自我合理化防护限流（避免同一触发在短时间内反复对抗重试）
-        self._rational_guard_last_retry: dict[str, float] = {}
-
-        # Frigate 人数传感器防抖（防止摄像头检测抖动反复触发推理）
-        self._frigate_count_timers: dict[str, Any] = {}          # 待确认的防抖计时器取消句柄
-        self._frigate_count_last_trigger: dict[str, tuple[float, int]] = {}  # (时间戳, 人数)
-
-        # Frigate MQTT 深度集成状态（Phase 7A）
         self._init_frigate_mqtt()
-        
-        # 语音交互状态（UI 同步用）
-        self._voice_status = "idle"
-        self._voice_reply = ""
-        self._last_stt_text = ""
 
-        # 场景/脚本重复执行冷却
-        self._scene_last_exec: dict[str, float] = {}
-
-        # 关键视觉事件追踪（Phase 7B）
-        self._critical_frigate_event: dict | None = None
-
-        # 注册配对 API 视图
         self._pairing_view = SmartAgentPairingView(self)
         self.hass.http.register_view(self._pairing_view)
         self.hass.http.register_view(SmartAgentAuthPageView(self))
         self.hass.http.register_view(SmartAgentPairConfirmView(self))
 
-        # 注册配对授权服务
-        # 注册忽略服务：从近期操作列表移除条目（不记入学习）
-        # 巡检设备状态快照（用于检测是否有变化，无变化则跳过推理节省算力）
-        self._last_patrol_snapshot: str = ""
-        self._patrol_no_change_count: int = 0
-
-        # 重复推理抑制（记录上次推理结果，避免重复调用被冷却拦截的推理）
-        self._last_inference_result: dict | None = None
-
-        # 动作执行结果追踪
-        self._pending_verifications: list[dict] = []
-
-        # 极速配对模式（限时开启，无需扫码确认）
-        self._pairing_mode_end_time: float = 0
-        self._express_token: str = ""  # 极速配对时预创建的 HA LLAT
-        
-        # 运行时 options 更新标志：为 True 时跳过重载
-        self._skip_next_reload = False
-
-        # UI state (entities read these)
-        self._integration_version = _SA_VERSION
-        self.status_text = "正在初始化"
-        self.last_action_text = ""
-        self.last_correction_text = "" # 最新一次修正记录
-        self.terminal_log_html = ""
-        self.sys_log_html = ""
-        self.sys_log_html_short = ""  # 最新 30 条，用于 sensor 属性（避免超 16KB）
-        self._sys_log_html_rows = []
-
-        self.device_info: dict[str, dict] = {}
-        self._habits: list[tuple[str, bool]] = []
-        self._rules: list[tuple[str, bool]] = []
-
-        # Phase 10.0: 虚拟在场推断引擎（无传感器家庭兜底）
-        # 在 device_info 加载完成后（_async_setup 中）初始化
-        self._presence_inference = None
-
-        # Phase 12.0: 存在传感器融合域注册表（解决大开间/一镜多区误判）
-        self._fusion_registry = None
-
-        # HA 已有脚本/场景/自动化缓存（启动时和巡检时刷新）
-        self._ha_scripts: list[dict] = []
-        self._ha_scenes: list[dict] = []
-        self._ha_automations: list[dict] = []
-        self._automation_managed_sensors: set[str] = set()
-        self._automation_managed_devices: dict[str, set[str]] = {}
-        self._automation_managed_device_entities: dict[str, set[str]] = {}
-        self._automation_executing: dict[str, float] = {}
-
-        self._memory_retention_days = MEMORY_RETENTION_DAYS
-        self._action_quality_cache: dict = {}
-
-        # Phase 4: AI 场景缓存（_blocking_init 中加载）
-        self._ai_scenes_cache: list[dict] = []
-        self._ai_scenes_read_error: BaseException | None = None
-
     def _blocking_init(self) -> None:
         """All blocking I/O initialization (DB, pattern file, config). Runs in executor."""
         # 在 executor 中安全读取 manifest.json（非事件循环，不触发 HA 阻塞检测器）
         global _SA_VERSION
-        try:
-            _mp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest.json")
-            with open(_mp, encoding="utf-8") as _mf:
-                _SA_VERSION = json.load(_mf).get("version", "unknown")
-        except Exception:
-            pass
+        from .const import read_integration_manifest_version
+        _SA_VERSION = read_integration_manifest_version()
         self._integration_version = _SA_VERSION
         self._init_memory_db()
         self._load_config()
@@ -625,11 +369,11 @@ class SmartAgentCoordinator(
 
     def _get_ha_url(self) -> str:
         """获取 HA 的外部访问地址。"""
-        from homeassistant.helpers.network import get_url
+        from homeassistant.helpers.network import NoURLAvailableError, get_url
         try:
             return get_url(self.hass)
-        except Exception:
-            return "http://localhost:8123"
+        except NoURLAvailableError as exc:
+            raise RuntimeError("ha_url_unavailable") from exc
 
     def _enqueue_internal_event(
         self,
@@ -639,7 +383,7 @@ class SmartAgentCoordinator(
         ts: str | None = None,
     ) -> bool:
         """Thread-safe enqueue into the P1 HA-to-add-on storage bridge."""
-        bridge = getattr(self, "_internal_event_bridge", None)
+        bridge = self._internal_event_bridge
         if bridge is None:
             return False
 
@@ -675,7 +419,7 @@ class SmartAgentCoordinator(
         ts: str | None = None,
     ) -> dict[str, Any]:
         """Return only a terminal Add-on persistence receipt."""
-        bridge = getattr(self, "_internal_event_bridge", None)
+        bridge = self._internal_event_bridge
         if bridge is None:
             return {"ok": False, "status": 503, "error": "internal_event_bridge_unavailable"}
         try:
@@ -746,15 +490,15 @@ class SmartAgentCoordinator(
             dropped_html = ""
             if len(self._sys_logs) > LOG_MEM_MAX:
                 self._sys_logs = self._sys_logs[:LOG_MEM_MAX]
-            html_rows = getattr(self, "_sys_log_html_rows", [])
+            html_rows = self._sys_log_html_rows
             html_cache_rebuilt = False
-            if not isinstance(html_rows, list) or len(html_rows) != len(self._sys_logs) - 1:
+            if len(html_rows) != len(self._sys_logs) - 1:
                 html_rows = [self._format_log_row(r) for r in self._sys_logs[1:]]
                 html_cache_rebuilt = True
             html_rows.insert(0, html_row)
             if len(html_rows) > LOG_MEM_MAX:
                 dropped_html = html_rows.pop()
-            previous_full_html = str(getattr(self, "sys_log_html", "") or "")
+            previous_full_html = str(self.sys_log_html or "")
             if html_cache_rebuilt:
                 self.sys_log_html = "".join(html_rows)
             elif dropped_html and previous_full_html.endswith(dropped_html):
@@ -848,15 +592,13 @@ class SmartAgentCoordinator(
             f"task={label} phase={phase} exception_type={type(error).__name__}"
         )
         _LOGGER.warning(message)
-        logger = getattr(self, "_sys_log", None)
-        if callable(logger):
-            try:
-                logger("WARN", message)
-            except Exception as exc:
-                _LOGGER.warning(
-                    "[StartupTask] operation=SmartAgentCoordinator._report_background_task_failure "
-                    "task=%s phase=system_log exception_type=%s", label, type(exc).__name__,
-                )
+        try:
+            self._sys_log("WARN", message)
+        except Exception as exc:
+            _LOGGER.warning(
+                "[StartupTask] operation=SmartAgentCoordinator._report_background_task_failure "
+                "task=%s phase=system_log exception_type=%s", label, type(exc).__name__,
+            )
 
     def _handle_background_task_done(self, task: Any, *, label: str) -> None:
         try:
@@ -946,7 +688,7 @@ class SmartAgentCoordinator(
             return
         self._addon_repair_last_check_at = now
 
-        addon_client = getattr(self, "_addon_client", None)
+        addon_client = self._addon_client
         get_status = getattr(addon_client, "get_status", None)
         if not callable(get_status):
             await self._async_update_addon_repair_issue(
@@ -988,11 +730,11 @@ class SmartAgentCoordinator(
             elapsed = now - self._addon_repair_first_failure_at
             if elapsed < _ADDON_REPAIR_MIN_FAILURE_SECONDS:
                 return
-            if not self._addon_repair_issue_active or getattr(self, "_addon_repair_sync_pending", False):
+            if not self._addon_repair_issue_active or self._addon_repair_sync_pending:
                 await self._async_create_addon_repair_issue(status, elapsed)
             return
 
-        if self._addon_repair_issue_active or getattr(self, "_addon_repair_sync_pending", False):
+        if self._addon_repair_issue_active or self._addon_repair_sync_pending:
             await self._async_delete_addon_repair_issue()
         self._addon_repair_first_failure_at = None
         self._addon_repair_failure_count = 0
@@ -1000,7 +742,7 @@ class SmartAgentCoordinator(
 
     async def _async_create_addon_repair_issue(self, status: Any, elapsed: float) -> None:
         error_summary = self._addon_repair_error_summary(status)
-        addon_base = str(getattr(getattr(self, "_addon_client", None), "_base", "") or "")
+        addon_base = str(getattr(self._addon_client, "_base", "") or "")
         minutes = str(max(1, int(elapsed // 60)))
         await self._async_sync_addon_repair_issue(
             active=True,
@@ -1200,52 +942,50 @@ class SmartAgentCoordinator(
         self._sys_log("INFO", f"[资源] HA资源刷新: 脚本={len(scripts)} 场景={len(scenes)} 自动化={len(autos)}")
 
     def _get_room_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
-        getter = getattr(self, "get_presence_snapshot", None)
-        if callable(getter):
-            try:
-                presence_snapshot = getter()
-            except Exception:
-                presence_snapshot = None
-            rooms = presence_snapshot.get("rooms") if isinstance(presence_snapshot, dict) else None
-            canonical: dict[str, list[tuple[str, str]]] = {}
-            if isinstance(rooms, dict):
-                room_items = rooms.items()
-            elif isinstance(rooms, list):
-                room_items = (
-                    (
-                        str(item.get("room") or item.get("space") or item.get("space_id") or ""),
-                        item,
-                    )
-                    for item in rooms
-                    if isinstance(item, dict)
+        try:
+            presence_snapshot = self.get_presence_snapshot()
+        except Exception:
+            presence_snapshot = None
+        rooms = presence_snapshot.get("rooms") if isinstance(presence_snapshot, dict) else None
+        canonical: dict[str, list[tuple[str, str]]] = {}
+        if isinstance(rooms, dict):
+            room_items = rooms.items()
+        elif isinstance(rooms, list):
+            room_items = (
+                (
+                    str(item.get("room") or item.get("space") or item.get("space_id") or ""),
+                    item,
                 )
+                for item in rooms
+                if isinstance(item, dict)
+            )
+        else:
+            room_items = ()
+        for raw_room, payload in room_items:
+            if not isinstance(payload, dict):
+                continue
+            room = str(raw_room or payload.get("room") or payload.get("space") or payload.get("space_id") or "").strip()
+            if not room:
+                continue
+            state = str(payload.get("state") or "").strip().lower()
+            if state in {"occupied", "present", "on", "home", "motion", "person"}:
+                mapped_state = "on"
+                evidence_ids = payload.get("occupied_evidence_ids") or payload.get("evidence_ids") or ()
+            elif state in {"vacant", "clear", "off", "away", "none", "idle", "empty"}:
+                mapped_state = "off"
+                evidence_ids = payload.get("vacant_evidence_ids") or payload.get("evidence_ids") or ()
             else:
-                room_items = ()
-            for raw_room, payload in room_items:
-                if not isinstance(payload, dict):
-                    continue
-                room = str(raw_room or payload.get("room") or payload.get("space") or payload.get("space_id") or "").strip()
-                if not room:
-                    continue
-                state = str(payload.get("state") or "").strip().lower()
-                if state in {"occupied", "present", "on", "home", "motion", "person"}:
-                    mapped_state = "on"
-                    evidence_ids = payload.get("occupied_evidence_ids") or payload.get("evidence_ids") or ()
-                elif state in {"vacant", "clear", "off", "away", "none", "idle", "empty"}:
-                    mapped_state = "off"
-                    evidence_ids = payload.get("vacant_evidence_ids") or payload.get("evidence_ids") or ()
-                else:
-                    mapped_state = "unknown"
-                    evidence_ids = payload.get("evidence_ids") or payload.get("occupied_evidence_ids") or payload.get("vacant_evidence_ids") or ()
-                if isinstance(evidence_ids, str):
-                    evidence = [evidence_ids]
-                else:
-                    evidence = [str(eid or "") for eid in evidence_ids or () if str(eid or "").strip()]
-                if not evidence:
-                    evidence = [f"presence.{room}"]
-                canonical[room] = [(eid, mapped_state) for eid in evidence]
-            if canonical:
-                return canonical
+                mapped_state = "unknown"
+                evidence_ids = payload.get("evidence_ids") or payload.get("occupied_evidence_ids") or payload.get("vacant_evidence_ids") or ()
+            if isinstance(evidence_ids, str):
+                evidence = [evidence_ids]
+            else:
+                evidence = [str(eid or "") for eid in evidence_ids or () if str(eid or "").strip()]
+            if not evidence:
+                evidence = [f"presence.{room}"]
+            canonical[room] = [(eid, mapped_state) for eid in evidence]
+        if canonical:
+            return canonical
 
         occ: dict[str, list[tuple[str, str]]] = {}
         for entity_id, info in self.device_info.items():
@@ -1503,7 +1243,7 @@ class SmartAgentCoordinator(
 
     async def _async_presence_fusion_json_from_core(self) -> str | None:
         """Read Core Config presence policies and export the legacy registry shape."""
-        addon_client = getattr(self, "_addon_client", None)
+        addon_client = self._addon_client
         request_json = getattr(addon_client, "request_json", None)
         if not callable(request_json):
             return None
@@ -1541,7 +1281,7 @@ class SmartAgentCoordinator(
         if not str(legacy_json or "").strip() or str(legacy_json or "").strip() == "[]":
             return False
 
-        addon_client = getattr(self, "_addon_client", None)
+        addon_client = self._addon_client
         request_json = getattr(addon_client, "request_json", None)
         if not callable(request_json):
             return False
@@ -1745,12 +1485,12 @@ class SmartAgentCoordinator(
             self._circadian_engine = None
             self._circadian_auto_adjust = False
 
-        _vision_flag = "✓" if getattr(self, "_vision_enabled", False) else "✗"
-        _frigate_flag = "✓" if getattr(self, "_frigate_enabled", False) else "✗"
+        _vision_flag = "✓" if self._vision_enabled else "✗"
+        _frigate_flag = "✓" if self._frigate_enabled else "✗"
         self._sys_log("INFO", f"SmartAgent v{_SA_VERSION} 启动 — 引擎={self.engine}, "
                       f"设备数={len(self.device_info)}, 画像={len(self._habits)}, 规则={len(self._rules)}, "
                       f"视觉分析={_vision_flag}, Frigate={_frigate_flag}")
-        bridge = getattr(self, "_internal_event_bridge", None)
+        bridge = self._internal_event_bridge
         if bridge is not None:
             bridge.start()
         self._listener_removers.append(
@@ -1825,7 +1565,7 @@ class SmartAgentCoordinator(
         )
 
     async def async_shutdown(self) -> None:
-        for remove in getattr(self, "_state_listener_removers", []):
+        for remove in self._state_listener_removers:
             try:
                 remove()
             except Exception:
@@ -1840,7 +1580,7 @@ class SmartAgentCoordinator(
         self._listener_removers.clear()
         from .room_lighting_runtime import stop_room_checks
         await stop_room_checks(self)
-        cancel = getattr(self, "_room_lighting_startup_cancel", None)
+        cancel = self._room_lighting_startup_cancel
         if callable(cancel):
             cancel()
         self._room_lighting_startup_cancel = None
@@ -1850,16 +1590,19 @@ class SmartAgentCoordinator(
             except Exception:
                 pass
         self._active_timers.clear()
-        for cancel in getattr(self, "_manual_scene_learning_timers", {}).values():
+        for cancel in self._manual_scene_learning_timers.values():
             try:
                 cancel()
             except Exception:
                 pass
         self._manual_scene_learning_timers.clear()
         self._manual_scene_learning_sessions.clear()
-        for handle_name in ("_merge_timer_unsub", "_scan_timer_unsub",
-                            "_habit_check_timer_unsub", "_habit_suggest_timeout_handle"):
-            handle = getattr(self, handle_name, None)
+        for handle_name, handle in (
+            ("_merge_timer_unsub", self._merge_timer_unsub),
+            ("_scan_timer_unsub", self._scan_timer_unsub),
+            ("_habit_check_timer_unsub", self._habit_check_timer_unsub),
+            ("_habit_suggest_timeout_handle", self._habit_suggest_timeout_handle),
+        ):
             if handle:
                 try:
                     handle()
@@ -1867,7 +1610,7 @@ class SmartAgentCoordinator(
                     pass
                 setattr(self, handle_name, None)
         # 停止日志后台线程（flush 队列后退出）
-        listener = getattr(self, "_log_queue_listener", None)
+        listener = self._log_queue_listener
         if listener:
             try:
                 listener.stop()
@@ -1875,15 +1618,15 @@ class SmartAgentCoordinator(
                 pass
         # Frigate MQTT 清理
         await self._async_stop_frigate_mqtt()
-        bridge = getattr(self, "_internal_event_bridge", None)
+        bridge = self._internal_event_bridge
         if bridge is not None:
             await bridge.stop()
         # Add-on 客户端 HTTP Session 清理（v4.8.79）
-        if hasattr(self, "_addon_client"):
+        if self._addon_client is not None:
             await self._addon_client.close()
 
         # 关闭 DatabaseService 持久化连接（P4 架构：所有 DB 操作结束后安全释放）
-        db = getattr(self, "_db", None)
+        db = self._db
         if db is not None:
             try:
                 await self.hass.async_add_executor_job(db.close)
@@ -2359,7 +2102,7 @@ class SmartAgentCoordinator(
         task_occurrence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the rich bundle through the portable projection runtime."""
-        state_store = getattr(getattr(self, "hass", None), "states", None)
+        state_store = getattr(self.hass, "states", None)
         state_get = getattr(state_store, "get", None)
         return build_slow_decision_bundle_projection(
             self,
@@ -2378,32 +2121,14 @@ class SmartAgentCoordinator(
 
 
     def _ha_local_now(self) -> datetime:
-        configured_timezone = str(
-            getattr(getattr(getattr(self, "hass", None), "config", None), "time_zone", "") or ""
-        ).strip()
-        if configured_timezone:
-            normalized_tz = configured_timezone.lower()
-            fixed_offset_hours = {
-                "asia/shanghai": 8,
-                "asia/chongqing": 8,
-                "asia/harbin": 8,
-                "asia/hong_kong": 8,
-                "hongkong": 8,
-                "prc": 8,
-                "utc": 0,
-            }.get(normalized_tz)
-            try:
-                from zoneinfo import ZoneInfo
-
-                return datetime.now(ZoneInfo(configured_timezone))
-            except Exception:
-                if fixed_offset_hours is not None:
-                    try:
-                        tz = timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
-                        return datetime.now(tz)
-                    except Exception:
-                        pass
-        return dt_util.now()
+        from custom_components.smart_agent.timezone_support import ha_local_now
+        return ha_local_now(
+            self.hass,
+            fallback_now=lambda: dt_util.now(),
+            now_cls=datetime,
+            logger=_LOGGER,
+            source="Coordinator",
+        )
 
     def _ha_log_today(self) -> str:
         try:
@@ -2447,7 +2172,7 @@ class SmartAgentCoordinator(
             final_outcome=final_outcome,
             now=now,
             season=_ha_season_for_datetime(now),
-            default_confidence_auto=int(getattr(self, "confidence_auto", 0) or 0),
+            default_confidence_auto=int(self.confidence_auto or 0),
             decision_id=decision_id,
             transaction_id=transaction_id,
             execution_transaction_id=execution_transaction_id,
@@ -2514,7 +2239,7 @@ class SmartAgentCoordinator(
             state_obj = self.hass.states.get(entity_id)
             current_state = str(state_obj.state if state_obj is not None else "unknown").strip().lower()
             expected_state = str(item.get("expected_state") or "").strip().lower()
-            off_states = set(getattr(self, "_OFF_STATES", {"off", "closed", "idle"}))
+            off_states = set(self._OFF_STATES)
             if expected_state == "on":
                 stable = current_state not in off_states and current_state not in {"unknown", "unavailable"}
             elif expected_state == "off":
@@ -2580,7 +2305,7 @@ class SmartAgentCoordinator(
             self._sys_log("INFO", "[手动] 行为分析已在进行中，跳过重复触发")
             return
         async with self._analysis_lock:
-            addon_client = getattr(self, "_addon_client", None)
+            addon_client = self._addon_client
             if addon_client is None:
                 self._sys_log("WARN", "[AI场景] add-on ops provider unavailable: analyze")
                 return
@@ -2658,8 +2383,8 @@ class SmartAgentCoordinator(
         # ── 防重复调用保护：同一场景/指令在 2s 内重复触发时忽略第二次 ──────────────
         _dedup_key = f"{_new_key}|{_new_prompt}|cmd={is_command}"
         _dedup_now = _time_mod.time()
-        _last_dedup_key: str = getattr(self, "_last_showroom_dedup_key", "")
-        _last_dedup_ts: float = getattr(self, "_last_showroom_dedup_ts", 0.0)
+        _last_dedup_key: str = self._last_showroom_dedup_key
+        _last_dedup_ts: float = self._last_showroom_dedup_ts
         if _dedup_key == _last_dedup_key and (_dedup_now - _last_dedup_ts) < 2.0:
             self._sys_log("INFO", "[展厅] 忽略重复调用（2s 内相同指令）")
             return
@@ -2847,9 +2572,9 @@ class SmartAgentCoordinator(
             "showroom_excluded_subareas": self.showroom_excluded_subareas,
             "showroom_zone_map": json.dumps(self._showroom_zone_map, ensure_ascii=False),
             # ── 语音/TTS/视觉配置 ──
-            "voice_status": getattr(self, "_voice_status", "idle"),
-            "voice_reply": getattr(self, "_voice_reply", "")[:100],
-            "last_stt": getattr(self, "_last_stt_text", "")[:100],
+            "voice_status": self._voice_status,
+            "voice_reply": self._voice_reply[:100],
+            "last_stt": self._last_stt_text[:100],
             "frigate_enabled": self._frigate_enabled,
             "tts_service": self._tts_service,
             "tts_target": self._tts_target,
@@ -2858,14 +2583,14 @@ class SmartAgentCoordinator(
             "vision_engine": self._vision_engine,
             "vision_model": self._vision_model,
             # ── 外部服务配置 ──
-            "qweather_api_key": "****" if getattr(self, "_qweather_api_key", "") else "",
-            "searxng_url": getattr(self, "_searxng_url", ""),
+            "qweather_api_key": "****" if self._qweather_api_key else "",
+            "searxng_url": self._searxng_url,
             "cloud_fallback": self._cloud_fallback,
             # ── 其他配置 ──
             "license_key": (self._license_key[:6] + "****" + self._license_key[-4:]) if len(self._license_key) > 10 else "****",
             "log_retention_days": self._log_retention_days,
-            "file_log_level": getattr(self, "_file_log_level_name", DEFAULT_FILE_LOG_LEVEL),
-            "mcp_enabled": bool(getattr(self, "_mcp_enabled", False)),
+            "file_log_level": self._file_log_level_name,
+            "mcp_enabled": bool(self._mcp_enabled),
             # ── 品牌化配置 ──
             "brand_name": self.brand_name,
             "brand_primary_color": self.brand_primary_color,
@@ -3150,7 +2875,7 @@ class SmartAgentCoordinator(
             self._log_dir = os.path.join(self._config_dir, "custom_components", DOMAIN, "logs")
             from .ha_storage_capacity import CapacityTimedRotatingFileHandler
             log_path = os.path.join(self._log_dir, LOG_FILENAME)
-            retention = getattr(self, "_log_retention_days", LOG_RETENTION_DAYS)
+            retention = self._log_retention_days
             file_handler = CapacityTimedRotatingFileHandler(
                 log_path,
                 when="midnight",
@@ -3175,7 +2900,7 @@ class SmartAgentCoordinator(
     def get_log_dates(self) -> list[str]:
         """Return available log dates (YYYY-MM-DD), newest first. Runs in executor."""
         seen: set[str] = set()
-        log_dir = getattr(self, "_log_dir", "")
+        log_dir = self._log_dir
         if not log_dir or not os.path.isdir(log_dir):
             return []
         today = self._ha_log_today()
@@ -3192,7 +2917,7 @@ class SmartAgentCoordinator(
 
     def read_log_file(self, date: str) -> str:
         """Read log content for a specific date. Runs in executor."""
-        log_dir = getattr(self, "_log_dir", "")
+        log_dir = self._log_dir
         if not log_dir:
             return ""
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
@@ -3227,7 +2952,7 @@ class SmartAgentCoordinator(
         dates = self.get_log_dates()
         if not dates:
             return []
-        log_dir = getattr(self, "_log_dir", "")
+        log_dir = self._log_dir
         today = self._ha_log_today()
         result = []
         for date in dates:
@@ -3246,18 +2971,14 @@ class SmartAgentCoordinator(
 
     async def _async_refresh_presence_snapshot_cache(self) -> bool:
         """Refresh and commit the add-on-owned Presence projection."""
-        request_id = int(
-            getattr(self, "_presence_snapshot_refresh_request_id", 0) or 0
-        ) + 1
+        request_id = int(self._presence_snapshot_refresh_request_id or 0) + 1
         self._presence_snapshot_refresh_request_id = request_id
-        normalized_rooms = await fetch_presence_snapshot(
-            getattr(self, "_addon_client", None)
-        )
+        normalized_rooms = await fetch_presence_snapshot(self._addon_client)
         if normalized_rooms is None:
             return False
 
         committed_request_id = int(
-            getattr(self, "_presence_snapshot_refresh_committed_request_id", 0) or 0
+            self._presence_snapshot_refresh_committed_request_id or 0
         )
         if request_id <= committed_request_id:
             return False
@@ -3271,7 +2992,7 @@ class SmartAgentCoordinator(
 
     async def _async_refresh_room_topology_cache(self) -> None:
         """Refresh and commit room topology without exposing fetch failures."""
-        topology = await fetch_room_topology(getattr(self, "_addon_client", None))
+        topology = await fetch_room_topology(self._addon_client)
         if topology is None:
             return
         self._room_topology_cache = topology
@@ -3283,21 +3004,21 @@ class SmartAgentCoordinator(
         scope_space_ids = tuple(
             dict.fromkeys(
                 str(value or "").strip()
-                for value in getattr(self, "_patrol_scope_space_ids", ())
+                for value in self._patrol_scope_space_ids
                 if str(value or "").strip()
             )
         )
         excluded_space_ids = tuple(
             dict.fromkeys(
                 str(value or "").strip()
-                for value in getattr(self, "_patrol_excluded_space_ids", ())
+                for value in self._patrol_excluded_space_ids
                 if str(value or "").strip()
             )
         )
         low_risk_entity_ids = tuple(
             dict.fromkeys(
                 str(value or "").strip()
-                for value in getattr(self, "_patrol_low_risk_entity_ids", ())
+                for value in self._patrol_low_risk_entity_ids
                 if str(value or "").strip()
             )
         )
@@ -3359,12 +3080,12 @@ class SmartAgentCoordinator(
             "states": states,
             "presence_snapshot": self.get_presence_snapshot(),
             "patrol_policy": {
-                "interval_minutes": int(getattr(self, "_patrol_interval_minutes", 15) or 15),
+                "interval_minutes": int(self._patrol_interval_minutes or 15),
                 "scope_space_ids": list(scope_space_ids),
                 "excluded_space_ids": list(excluded_space_ids),
                 "quiet_hours": {
-                    "start": str(getattr(self, "_patrol_quiet_hours_start", "") or ""),
-                    "end": str(getattr(self, "_patrol_quiet_hours_end", "") or ""),
+                    "start": str(self._patrol_quiet_hours_start or ""),
+                    "end": str(self._patrol_quiet_hours_end or ""),
                 },
                 "low_risk_entity_ids": list(low_risk_entity_ids),
             },
@@ -3434,7 +3155,7 @@ class SmartAgentCoordinator(
             for room_name in coverage_spaces:
                 device_coverage.setdefault(room_name, []).append(entity_id)
                 if room_name not in space_roles:
-                    space_roles[room_name] = self.get_zone_role(room_name) if hasattr(self, "get_zone_role") else ""
+                    space_roles[room_name] = self.get_zone_role(room_name)
 
             if cap.get(DEVICE_CAP_KEY_SHARED_FIXTURE) is not True:
                 continue
@@ -3457,13 +3178,9 @@ class SmartAgentCoordinator(
     def get_presence_snapshot(self) -> dict[str, Any]:
         """Return the latest add-on Presence projection without blocking I/O."""
         return build_presence_snapshot(
-            cache_record=getattr(self, "_presence_snapshot_cache_record", None),
-            fallback_cache=getattr(self, "_presence_snapshot_cache", {}),
-            fallback_updated_at=getattr(
-                self,
-                "_presence_snapshot_cache_updated_at",
-                0.0,
-            ),
-            device_info=getattr(self, "device_info", {}),
+            cache_record=self._presence_snapshot_cache_record,
+            fallback_cache=self._presence_snapshot_cache,
+            fallback_updated_at=self._presence_snapshot_cache_updated_at,
+            device_info=self.device_info,
             now_monotonic=time.monotonic(),
         )

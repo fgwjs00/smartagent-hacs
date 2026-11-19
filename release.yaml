@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.243
-display_version: Beta 0.0.243
+release_version: 0.0.244
+display_version: Beta 0.0.244
 channel: beta
-release_date: '2026-11-18'
+release_date: '2026-11-19'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 合入管理端 V4 退役与 V5 单入口重构、多品牌设备接入中心与双生态桥接、中控屏视觉请求 4MB 上限及二步语音提醒确认协同。
-  customer_visible_version: Beta 0.0.243
+  summary: 完成过度防御复审 0.1d 收口：修复设备接入中心隔离会话主动关闭签名缺陷与隔离启动失败阻断、P0-4 拓扑严读、E/C/F 剩余项收敛及增量门禁加固。
+  customer_visible_version: Beta 0.0.244

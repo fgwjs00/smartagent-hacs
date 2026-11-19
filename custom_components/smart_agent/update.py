@@ -74,14 +74,8 @@ def _spawn_update_task(hass: HomeAssistant, coro: Any, label: str) -> Any | None
 # 在模块导入时（HA 事件循环启动前）读取 manifest.json，避免在异步上下文中执行阻塞 I/O
 def _read_manifest_version() -> str:
     """从 manifest.json 读取当前版本号（模块级同步调用，在事件循环外执行）。"""
-    import json as _json
-    import os as _os
-    try:
-        _path = _os.path.join(_os.path.dirname(__file__), "manifest.json")
-        with open(_path, encoding="utf-8") as _f:
-            return _json.load(_f).get("version", "unknown")
-    except Exception:
-        return "unknown"
+    from .const import read_integration_manifest_version
+    return read_integration_manifest_version()
 
 _CURRENT_VERSION: str = _read_manifest_version()
 

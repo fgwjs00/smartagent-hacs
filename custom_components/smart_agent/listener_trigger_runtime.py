@@ -35,11 +35,11 @@ def should_trigger(self, entity_id: str, old: str, new: str) -> bool:
     if elapsed < self._startup_grace:
         remaining = int(self._startup_grace - elapsed)
         self._sys_log("INFO", f"启动冷却中({remaining}s 后就绪)，忽略触发: {entity_id} {old}→{new}")
-        if remaining <= 3 and not getattr(self, "_startup_ready_notified", False):
+        if remaining <= 3 and not self._startup_ready_notified:
             self._startup_ready_notified = True
             self._sys_log("INFO", "✅ 系统即将就绪，下次触发将开始 AI 推理")
         return False
-    if not getattr(self, "_startup_ready_notified", False):
+    if not self._startup_ready_notified:
         self._startup_ready_notified = True
         self._sys_log("INFO", f"✅ 启动冷却已结束（{int(elapsed)}s），AI 推理已就绪")
     if new in ("unavailable", "unknown"):
@@ -94,10 +94,7 @@ def slow_inference_cooldown_key(self, entity_id: str, new_state: str) -> str:
 def is_presence_flap_suppressed(self, entity_id: str) -> tuple[bool, int]:
     """检查存在传感器是否处于抖动风暴抑制期。"""
     now_ts = time.time()
-    suppressed = getattr(self, "_presence_flap_suppressed", None)
-    if not isinstance(suppressed, dict):
-        suppressed = {}
-        self._presence_flap_suppressed = suppressed
+    suppressed = self._presence_flap_suppressed
     suppress_until = suppressed.get(entity_id, 0)
     if now_ts < suppress_until:
         return True, int(suppress_until - now_ts)
@@ -108,14 +105,8 @@ def is_presence_flap_suppressed(self, entity_id: str) -> tuple[bool, int]:
 def record_presence_flap(self, entity_id: str) -> None:
     """记录 on/off 反转并在高频抖动时进入抑制期。"""
     now_ts = time.time()
-    history_map = getattr(self, "_presence_flap_history", None)
-    if not isinstance(history_map, dict):
-        history_map = {}
-        self._presence_flap_history = history_map
-    suppressed = getattr(self, "_presence_flap_suppressed", None)
-    if not isinstance(suppressed, dict):
-        suppressed = {}
-        self._presence_flap_suppressed = suppressed
+    history_map = self._presence_flap_history
+    suppressed = self._presence_flap_suppressed
     history = history_map.setdefault(entity_id, [])
     history.append(now_ts)
     history_map[entity_id] = [
@@ -128,11 +119,8 @@ def record_presence_flap(self, entity_id: str) -> None:
     suppress_until = now_ts + self._PRESENCE_FLAP_SUPPRESS_SECS
     suppressed[entity_id] = suppress_until
     history_map[entity_id] = []
-    presence_on_start = getattr(self, "_presence_on_start", None)
-    if isinstance(presence_on_start, dict):
-        presence_on_start.pop(entity_id, None)
-    presence_off_timers = getattr(self, "_presence_off_timers", None)
-    old_off = presence_off_timers.pop(entity_id, None) if isinstance(presence_off_timers, dict) else None
+    self._presence_on_start.pop(entity_id, None)
+    old_off = self._presence_off_timers.pop(entity_id, None)
     if old_off:
         try:
             old_off()
@@ -146,10 +134,7 @@ def record_presence_flap(self, entity_id: str) -> None:
     )
 
 def cancel_presence_temporal_recheck(self, entity_id: str) -> None:
-    timers = getattr(self, "_presence_off_timers", None)
-    if not isinstance(timers, dict):
-        return
-    cancel = timers.pop(entity_id, None)
+    cancel = self._presence_off_timers.pop(entity_id, None)
     if callable(cancel):
         try:
             cancel()
@@ -198,10 +183,9 @@ def build_presence_snapshot_for_entity(
     """Build a compatibility Presence Snapshot without local HA inference."""
     candidates = room_candidates(self.device_info.get(entity_id, {}) or {})
     room = candidates[0] if candidates else ""
-    snapshot_fn = getattr(self, "get_presence_snapshot", None)
-    if callable(snapshot_fn) and room:
+    if room:
         try:
-            root_snapshot = snapshot_fn()
+            root_snapshot = self.get_presence_snapshot()
         except Exception as exc:
             _LOGGER.debug("[Listeners] get_presence_snapshot failed: %s", exc)
             root_snapshot = None
@@ -244,12 +228,10 @@ def is_presence_interaction_active(self, domain: str, state: str) -> bool:
     return False
 
 def presence_interaction_source(self, entity_id: str, source_type: str) -> str:
-    classifier = getattr(self, "_classify_source", None)
-    if callable(classifier):
-        try:
-            return str(classifier(entity_id, source_type))
-        except Exception as exc:
-            _LOGGER.debug("[PresenceInference] classify interaction source failed: %s", exc)
+    try:
+        return str(self._classify_source(entity_id, source_type))
+    except Exception as exc:
+        _LOGGER.debug("[PresenceInference] classify interaction source failed: %s", exc)
     if source_type == "自动化/脚本":
         return SOURCE_AUTOMATION
     if source_type == "用户界面":
@@ -272,7 +254,7 @@ def record_presence_interaction_trace(
     if not self._is_presence_interaction_active(domain, new_state):
         return False
     trace_source = str(source or self._presence_interaction_source(entity_id, source_type))
-    inference = getattr(self, "_presence_inference", None)
+    inference = self._presence_inference
     update_trace = getattr(inference, "update_device_trace", None)
     if not callable(update_trace):
         return False
@@ -486,37 +468,35 @@ def emit_slow_inference_task_failure(
         })
     except Exception as exc:
         _LOGGER.debug("[SlowInference] failure bubble emit failed: %s", exc)
-    enqueue = getattr(self, "_enqueue_internal_event", None)
-    if callable(enqueue):
-        result_payload = {
-            "source": "ha_slow_decision",
-            "path_taken": "llm",
-            "reason": reason,
-            "scene": scene,
-            "trigger": str(trigger or ""),
-            "actions": [],
-            "matched": False,
-            "final_outcome": "failed",
-            "fail_closed": True,
-            "message": str(message or ""),
-        }
-        log_payload = {
-            "trigger": str(trigger or ""),
-            "scene": scene,
-            "source": "ha_slow_decision",
-            "path_taken": "llm",
-            "confidence": 0,
-            "matched": False,
-            "action_count": 0,
-            "reason": reason,
-            "actions": [],
-            "result": result_payload,
-        }
-        try:
-            if not enqueue("decision_log", log_payload):
-                self._sys_log("WARN", f"[SlowInference] decision_log enqueue failed reason={reason}")
-        except Exception as exc:
-            _LOGGER.debug("[SlowInference] decision_log enqueue failed: %s", exc)
+    result_payload = {
+        "source": "ha_slow_decision",
+        "path_taken": "llm",
+        "reason": reason,
+        "scene": scene,
+        "trigger": str(trigger or ""),
+        "actions": [],
+        "matched": False,
+        "final_outcome": "failed",
+        "fail_closed": True,
+        "message": str(message or ""),
+    }
+    log_payload = {
+        "trigger": str(trigger or ""),
+        "scene": scene,
+        "source": "ha_slow_decision",
+        "path_taken": "llm",
+        "confidence": 0,
+        "matched": False,
+        "action_count": 0,
+        "reason": reason,
+        "actions": [],
+        "result": result_payload,
+    }
+    try:
+        if not self._enqueue_internal_event("decision_log", log_payload):
+            self._sys_log("WARN", f"[SlowInference] decision_log enqueue failed reason={reason}")
+    except Exception as exc:
+        _LOGGER.debug("[SlowInference] decision_log enqueue failed: %s", exc)
 
 def handle_slow_inference_task_done(self, task: Any, *, trigger: str, entity_id: str) -> None:
     completion = read_task_completion(task)

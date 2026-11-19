@@ -83,7 +83,7 @@ def _log_not_scheduled(context: FastPathFallback, *, low_confidence: bool = Fals
     host, entity_id, new_state = request.host, request.trigger.entity_id, request.trigger.new_state
     info = (
         host.device_info.get(entity_id, {})
-        if isinstance(getattr(host, "device_info", None), dict)
+        if isinstance(host.device_info, dict)
         else {}
     )
     if not isinstance(info, dict):

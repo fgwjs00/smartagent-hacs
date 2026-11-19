@@ -221,7 +221,7 @@ class FrigateMixin:
         )
 
     def _expire_critical_frigate_event(self, now: float | None = None, *, notify: bool = True) -> bool:
-        event = getattr(self, "_critical_frigate_event", None)
+        event = self._critical_frigate_event
         if not event:
             return False
         if now is None:
@@ -251,7 +251,7 @@ class FrigateMixin:
     def get_critical_frigate_event(self) -> dict | None:
         """Return the current critical event after enforcing TTL expiry."""
         self._expire_critical_frigate_event(notify=False)
-        return getattr(self, "_critical_frigate_event", None)
+        return self._critical_frigate_event
 
     async def _async_get_frigate_snapshot_base64(self, event_id: str) -> str | None:
         """Fetch snapshot from Frigate and convert to base64."""
@@ -342,10 +342,9 @@ class FrigateMixin:
         # activity fact to the add-on resident-world ledger; never forward the
         # image or free-form visual description.
         room = self._frigate_activity_signal_space(camera, event_id)
-        enqueue = getattr(self, "_enqueue_internal_event", None)
-        if room and callable(enqueue):
+        if room:
             observed_at = self._ha_local_now().isoformat()
-            forwarded = enqueue(
+            forwarded = self._enqueue_internal_event(
                 "world_signal",
                 {
                     "schema_version": "smartagent.world_signal.v1",
@@ -400,7 +399,7 @@ class FrigateMixin:
         输出结构化的行为标签（如"阅读"、"看电视"），存储在 _frigate_camera_activity[camera] 中，
         供 AI 决策上下文持续使用（不依赖单个事件 ID，有效期 10 分钟）。
         """
-        if not getattr(self, "_vision_enabled", False):
+        if not self._vision_enabled:
             return
 
         img_b64 = await self._async_get_frigate_snapshot_base64(event_id)
@@ -417,7 +416,7 @@ class FrigateMixin:
 
         仅对触发传感器所关联的摄像头执行分析，避免因单一房间有人而拉取所有摄像头帧。
         """
-        if not getattr(self, "_vision_enabled", False) or not getattr(self, "_frigate_enabled", False):
+        if not self._vision_enabled or not self._frigate_enabled:
             return
 
         # 从触发传感器推导关联摄像头：
@@ -431,9 +430,7 @@ class FrigateMixin:
 
         # 若推导失败，尝试从 device_info 获取传感器所在房间，再找同房间的摄像头
         if not camera_candidates:
-            sensor_room = ""
-            if hasattr(self, "device_info"):
-                sensor_room = (self.device_info.get(sensor_eid) or {}).get("room", "")
+            sensor_room = (self.device_info.get(sensor_eid) or {}).get("room", "")
             if sensor_room:
                 for eid in list(self.hass.states.async_entity_ids("binary_sensor")):
                     if "person_occupancy" not in eid:
@@ -462,7 +459,7 @@ class FrigateMixin:
 
     async def _async_start_frigate_mqtt(self) -> None:
         """订阅 Frigate MQTT events topic。在 async_start_listeners 中调用。"""
-        if not getattr(self, "_frigate_enabled", False):
+        if not self._frigate_enabled:
             return
         if self._frigate_mqtt_unsub:
             return
@@ -634,7 +631,7 @@ class FrigateMixin:
 
             # Phase 7G 行为识别：所有摄像头检测到人时触发，按冷却时间限流
             vision_delay = _MQTT_DEBOUNCE_NEW
-            if getattr(self, "_vision_enabled", False) and label == "person":
+            if self._vision_enabled and label == "person":
                 last_analyzed = self._frigate_activity_last_analyzed.get(camera, 0)
                 if now - last_analyzed >= _ACTIVITY_ANALYSIS_COOLDOWN:
                     self._frigate_activity_last_analyzed[camera] = now
@@ -684,9 +681,6 @@ class FrigateMixin:
         zone_ids: list[str] | None = None,
     ) -> None:
         """Persist a redacted, structured Frigate observation through the add-on bridge."""
-        record_event = getattr(self, "_record_event", None)
-        if not callable(record_event):
-            return
         if zone_ids is None:
             zone_ids = list(
                 snapshot.entered_zones
@@ -710,7 +704,7 @@ class FrigateMixin:
             **context,
         }
         try:
-            record_event(
+            self._record_event(
                 "vision_observation",
                 f"Frigate {snapshot.event_type}: {snapshot.camera_id}",
                 entity_id=f"camera.{snapshot.camera_id}",
@@ -743,11 +737,11 @@ class FrigateMixin:
                 space_ids.append(room)
 
         is_person = str(label or "").strip().lower() == "person"
-        all_zone_counts = getattr(self, "_frigate_zone_occupancy", {})
+        all_zone_counts = self._frigate_zone_occupancy
         zone_counts = all_zone_counts.get(camera_id, {})
         event_zone_sets = [
             (event_key.split(":", 1)[0], zones)
-            for event_key, zones in getattr(self, "_frigate_event_counted_zones", {}).items()
+            for event_key, zones in self._frigate_event_counted_zones.items()
             if ":" in event_key
         ]
         if space_ids and event_zone_sets:
@@ -812,8 +806,6 @@ class FrigateMixin:
             zones: new/update 事件传 current_zones，end 事件传 entered_zones（离开的区域）。
         """
         cam_zones = self._frigate_zone_occupancy.setdefault(camera, {})
-        if not hasattr(self, "_frigate_event_counted_zones"):
-            self._frigate_event_counted_zones = {}
         normalized_zones = list(dict.fromkeys(str(zone) for zone in zones if zone))
         target_zones = set(normalized_zones) or {""}
         event_key = self._frigate_event_zone_key(camera, event_id)
@@ -852,7 +844,7 @@ class FrigateMixin:
                 changed_zones = target_zones
 
         # 更新后打印各区域当前人数，方便日志追踪
-        if changed_zones and hasattr(self, "_sys_log"):
+        if changed_zones:
             cam_name = self._get_frigate_camera_name(camera)
             zone_counts = ", ".join(
                 f"{self._get_frigate_zone_name(camera, z)}={cam_zones.get(z, 0)}人"
@@ -1022,7 +1014,7 @@ class FrigateMixin:
 
     def _frigate_binding_value(self, table: str, field: str, where: str, params: tuple) -> Any:
         """Read only static binding queries; missing rows may use the documented fallback."""
-        if not hasattr(self, "_db"):
+        if self._db is None:
             return None
         try:
             rows = self._db.query_required(f"SELECT {field} FROM {table} WHERE {where}", params)
@@ -1298,7 +1290,7 @@ class FrigateMixin:
             return None
 
     def _frigate_known_db_zones(self) -> set[str]:
-        if not hasattr(self, "_db"):
+        if self._db is None:
             return set()
         from .frigate_authority import FRIGATE_ZONE_QUERIES, frigate_db_zone_ids
         known: set[str] = set()

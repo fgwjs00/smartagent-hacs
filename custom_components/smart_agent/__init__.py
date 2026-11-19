@@ -934,31 +934,26 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 items = []
             return sorted({str(item).strip() for item in items if str(item or "").strip()})
 
-        device_info = getattr(coord, "device_info", {}) or {}
+        device_info = coord.device_info
         managed_entity_ids = _sorted_str_list(device_info)
 
-        listener_entity_ids = _sorted_str_list(getattr(coord, "_listener_entity_ids", set()) or set())
+        listener_entity_ids = _sorted_str_list(coord._listener_entity_ids)
         unmanaged_warned_entity_ids = _sorted_str_list(
-            getattr(coord, "_unmanaged_listener_entity_warned", set()) or set()
+            coord._unmanaged_listener_entity_warned
         )
-        last_listener_event_raw = getattr(coord, "_last_listener_event", {}) or {}
+        last_listener_event_raw = coord._last_listener_event
         last_listener_event = dict(last_listener_event_raw) if isinstance(last_listener_event_raw, dict) else {}
         last_listener_filter_reason = str(
             last_listener_event.get("filter_reason")
-            or getattr(coord, "_last_listener_filter_reason", "")
+            or coord._last_listener_filter_reason
             or ""
         )
 
         managed_set = set(managed_entity_ids)
         listener_set = set(listener_entity_ids)
-        sync_status_raw = getattr(coord, "_last_addon_device_sync_status", {}) or {}
+        sync_status_raw = coord._last_addon_device_sync_status
         sync_status = dict(sync_status_raw) if isinstance(sync_status_raw, dict) else {}
-        runtime_version = str(
-            getattr(coord, "_integration_version", "")
-            or getattr(coord, "integration_version", "")
-            or getattr(coord, "_SA_VERSION", "")
-            or "unknown"
-        )
+        runtime_version = str(coord._integration_version or "unknown")
         loaded_identity_evidence: dict[str, Any] = {}
         identity_builder = globals().get(
             "_async_build_host_proof_loaded_identity_evidence"
@@ -966,12 +961,12 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
         if callable(identity_builder):
             loaded_identity_evidence = await identity_builder(
                 hass,
-                getattr(coord, "_addon_client", None),
+                coord._addon_client,
                 integration_version=runtime_version,
                 runtime_version=runtime_version,
                 integration_source=dict(_LOADED_INTEGRATION_SOURCE_IDENTITY),
             )
-        bridge = getattr(coord, "_internal_event_bridge", None)
+        bridge = coord._internal_event_bridge
         bridge_stats_raw: Any = getattr(bridge, "stats", {}) or {} if bridge is not None else {}
         bridge_stats = dict(bridge_stats_raw) if isinstance(bridge_stats_raw, dict) else {}
         internal_event_bridge = {
@@ -985,14 +980,10 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
             if field in bridge_stats:
                 internal_event_bridge[field] = int(bridge_stats[field])
 
-        is_enabled = getattr(coord, "_is_enabled", None)
-        enabled = bool(is_enabled()) if callable(is_enabled) else bool(getattr(coord, "_enabled", False))
+        enabled = bool(coord._is_enabled())
         states = getattr(hass, "states", None)
         get_state = getattr(states, "get", None)
-        presence_checker = getattr(coord, "_is_presence_listener_entity", None)
-        reconciled = getattr(coord, "_listener_active_state_reconciled", {}) or {}
-        if not isinstance(reconciled, dict):
-            reconciled = {}
+        presence_checker = coord._is_presence_listener_entity
 
         def _state_value(entity_id: str) -> Any:
             if not callable(get_state):
@@ -1059,7 +1050,6 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 "availability_reason": availability_reason,
                 "is_active_state": state_value.lower() in {"on", "open", "home", "playing"},
                 "is_presence_listener": is_presence,
-                "reconcile_marker": str(reconciled.get(entity_id) or ""),
                 "last_seen": _state_last_seen(attrs, state_obj),
                 "last_changed": _state_time_value(getattr(state_obj, "last_changed", None)),
                 "last_updated": _state_time_value(getattr(state_obj, "last_updated", None)),
@@ -1079,8 +1069,8 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 "loaded_identity_evidence": loaded_identity_evidence,
                 "internal_event_bridge": internal_event_bridge,
                 "enabled": enabled,
-                "sensors_muted": bool(getattr(coord, "_sensors_muted", False)),
-                "mode": str(getattr(coord, "_mode", "") or ""),
+                "sensors_muted": bool(coord._sensors_muted),
+                "mode": str(coord._mode or ""),
                 "device_info_count": len(managed_entity_ids),
                 "subscribed_entity_count": len(listener_entity_ids),
                 "managed_entity_ids": managed_entity_ids,
@@ -1088,13 +1078,13 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
                 "missing_listener_entity_ids": sorted(managed_set - listener_set),
                 "extra_listener_entity_ids": sorted(listener_set - managed_set),
                 "listener_entities": listener_entities,
-                "device_info_source": str(getattr(coord, "_device_info_source", "") or "ha_local_devices"),
+                "device_info_source": str(coord._device_info_source or "ha_local_devices"),
                 "last_addon_device_sync_status": sync_status,
                 "unmanaged_warned_entity_ids": unmanaged_warned_entity_ids,
                 "last_listener_event": last_listener_event,
                 "last_listener_filter_reason": last_listener_filter_reason,
-                "state_listener_active": bool(getattr(coord, "_state_listener_removers", []) or []),
-                "periodic_refresh_active": bool(getattr(coord, "_listener_removers", []) or []),
+                "state_listener_active": bool(coord._state_listener_removers),
+                "periodic_refresh_active": bool(coord._listener_removers),
             }
         )
 

@@ -33,12 +33,11 @@ def listener_entity_metadata(
 ) -> dict[str, Any]:
     row = dict(info) if isinstance(info, dict) else {}
     if not row:
-        device_info = getattr(self, "device_info", {})
-        stored = device_info.get(entity_id) if isinstance(device_info, dict) else None
+        stored = self.device_info.get(entity_id)
         if isinstance(stored, dict):
             row.update(stored)
     if state_obj is None:
-        states = getattr(getattr(self, "hass", None), "states", None)
+        states = getattr(self.hass, "states", None)
         get_state = getattr(states, "get", None)
         state_obj = get_state(entity_id) if callable(get_state) else None
     attributes = getattr(state_obj, "attributes", None)
@@ -73,17 +72,14 @@ def get_live_presence_occupancy_map(self) -> dict[str, list[tuple[str, str]]]:
         "ok": False,
         "reason": "presence_snapshot_unavailable",
     }
-    snapshot_getter = getattr(self, "get_presence_snapshot", None)
-    if not callable(snapshot_getter):
-        return {}
     snapshot = _read_live_presence_value(
-        self, snapshot_getter, failure_code="presence_live_snapshot_read_failed"
+        self, self.get_presence_snapshot, failure_code="presence_live_snapshot_read_failed"
     )
     rooms = snapshot.get("rooms") if isinstance(snapshot, dict) else None
     if not isinstance(rooms, dict):
         self._last_live_presence_guard_status["reason"] = "presence_rooms_unavailable"
         return {}
-    states = getattr(getattr(self, "hass", None), "states", None)
+    states = getattr(self.hass, "states", None)
     get_state = getattr(states, "get", None)
     if not callable(get_state):
         self._last_live_presence_guard_status["reason"] = "ha_states_unavailable"
@@ -246,11 +242,11 @@ def reconcile_active_listener_states(
     schedule: Any = async_call_later,
 ) -> None:
     """Wake the shared room loop on inventory/startup, including vacant rooms."""
-    if not entity_ids or not self._is_enabled() or getattr(self, "_sensors_muted", False):
+    if not entity_ids or not self._is_enabled() or self._sensors_muted:
         return
     from .presence_runtime import reconcile_occupancy_cycles
     reconcile_occupancy_cycles(self)
-    previous = getattr(self, "_room_lighting_startup_cancel", None)
+    previous = self._room_lighting_startup_cancel
     if callable(previous):
         previous()
     @callback
@@ -271,7 +267,7 @@ async def async_refresh_device_info_from_addon_devices(
         "reason": str(reason or "manual"),
         "count": 0,
     }
-    client = getattr(self, "_addon_client", None)
+    client = self._addon_client
     get_devices = getattr(client, "get_devices", None)
     if not callable(get_devices):
         status["reason"] = "addon_client_unavailable"
@@ -280,11 +276,9 @@ async def async_refresh_device_info_from_addon_devices(
 
     try:
         rows = await get_devices()
-        reconcile_ids = getattr(self, "_async_reconcile_ha_registry_entity_ids", None)
-        if isinstance(rows, list) and callable(reconcile_ids) and await reconcile_ids(rows, registry_event=registry_event):
+        if isinstance(rows, list) and await self._async_reconcile_ha_registry_entity_ids(rows, registry_event=registry_event):
             rows = await get_devices()
-        reconcile = getattr(self, "_reconcile_device_runtime_capabilities", None)
-        if isinstance(rows, list) and callable(reconcile) and await reconcile(rows):
+        if isinstance(rows, list) and await self._reconcile_device_runtime_capabilities(rows):
             # Read the confirmed projection back through Gateway capability binding.
             rows = await get_devices()
     except Exception as exc:
@@ -339,30 +333,16 @@ async def async_refresh_device_info_from_addon_devices(
         if not listener_runtime_entity and not environment_kind:
             skipped += 1
 
-    current = getattr(self, "device_info", {}) or {}
-    if not isinstance(current, dict):
-        current = {}
-    current_environment = getattr(self, "_environment_context_device_info", {}) or {}
-    if not isinstance(current_environment, dict):
-        current_environment = {}
+    current = self.device_info
+    current_environment = self._environment_context_device_info
     changed = current != next_device_info or current_environment != next_environment_context_info
     self.device_info = next_device_info
     self._environment_context_device_info = next_environment_context_info
     if changed:
-        reconciled = getattr(self, "_listener_active_state_reconciled", None)
-        if isinstance(reconciled, dict):
-            for entity_id in list(reconciled):
-                if (
-                    entity_id not in next_device_info
-                    and entity_id not in next_environment_context_info
-                ):
-                    reconciled.pop(entity_id, None)
-        presence_inference = getattr(self, "_presence_inference", None)
-        if presence_inference is not None and hasattr(presence_inference, "device_info"):
+        presence_inference = self._presence_inference
+        if presence_inference is not None:
             presence_inference.device_info = self.device_info
-        updater = getattr(self, "async_set_updated_data", None)
-        if callable(updater):
-            updater({})
+        self.async_set_updated_data({})
 
     status.update(
         {
@@ -554,18 +534,14 @@ def managed_listener_entity_ids(self) -> list[str]:
         self._reconcile_device_info_entity_ids_from_ha_registry()
     except Exception as exc:
         _LOGGER.debug("[Listeners] entity registry reconciliation failed: %s", exc)
-    device_info = getattr(self, "device_info", {}) or {}
-    if not isinstance(device_info, dict):
-        device_info = {}
+    device_info = self.device_info
     listener_entity_ids = [
         eid
         for eid in device_info
         if isinstance(eid, str)
         and self._is_listener_runtime_entity(eid, device_info.get(eid) if isinstance(device_info.get(eid), dict) else {})
     ]
-    environment_device_info = (
-        getattr(self, "_environment_context_device_info", {}) or {}
-    )
+    environment_device_info = self._environment_context_device_info
     if isinstance(environment_device_info, dict):
         # The gateway checks room occupancy and lighting need before lux can
         # request planning. Existing telemetry sampling still coalesces updates.
@@ -588,7 +564,7 @@ def reconcile_device_info_entity_ids_from_ha_registry(self) -> bool:
     except Exception as exc:
         _LOGGER.debug("[Listeners] entity registry unavailable: %s", exc)
         return False
-    for entity_id, info in (getattr(self, "device_info", {}) or {}).items():
+    for entity_id, info in self.device_info.items():
         if isinstance(info, dict):
             self._persist_ha_registry_metadata(entity_id, info, registry.async_get(entity_id))
     return False
@@ -609,7 +585,7 @@ def persist_ha_registry_metadata(self, entity_id: str, info: dict[str, Any], ent
         self._persist_device_registry_metadata(entity_id, info)
 
 def persist_device_registry_metadata(self, entity_id: str, info: dict[str, Any]) -> None:
-    if not callable(getattr(self, "_db_exec", None)):
+    if self._db is None:
         return
     now = self._listener_db_now_text()
     try:
@@ -628,7 +604,7 @@ def persist_device_registry_metadata(self, entity_id: str, info: dict[str, Any])
         _LOGGER.debug("[Listeners] device registry metadata persist skipped for %s: %s", entity_id, exc)
 
 def persist_device_entity_id_migration(self, old_entity_id: str, new_entity_id: str, info: dict[str, Any]) -> None:
-    if not callable(getattr(self, "_db_exec", None)):
+    if self._db is None:
         return
     now = self._listener_db_now_text()
     try:
@@ -657,7 +633,7 @@ def persist_device_entity_id_migration(self, old_entity_id: str, new_entity_id: 
 def refresh_listeners_if_entity_set_changed(self) -> bool:
     """Refresh HA state listeners when the managed entity id set drifts."""
     next_ids = set(self._managed_listener_entity_ids())
-    current_ids = set(getattr(self, "_listener_entity_ids", set()) or set())
+    current_ids = set(self._listener_entity_ids)
     if next_ids == current_ids:
         self._reconcile_active_listener_states(sorted(next_ids))
         return False

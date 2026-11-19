@@ -96,6 +96,7 @@ class BackupManager:
         """
         self._coord = coordinator
         self._hass = coordinator.hass
+        self._restore_journal_store: Any = None
         # 云端 API 基础地址（从集成配置读取，可为空）
         self._cloud_api_url: str = getattr(coordinator, "_backup_cloud_url", "")
         self._cloud_token: str = getattr(coordinator, "_backup_cloud_token", "")
@@ -131,7 +132,7 @@ class BackupManager:
                 )
 
         configured_timezone = str(
-            getattr(getattr(getattr(self, "_hass", None), "config", None), "time_zone", "") or ""
+            getattr(getattr(self._hass, "config", None), "time_zone", "") or ""
         ).strip()
         if configured_timezone:
             try:
@@ -214,8 +215,7 @@ class BackupManager:
         """
         _msg = f"[Backup] 开始备份（等级: {level}）"
         _LOGGER.info(_msg)
-        if hasattr(self._coord, "_sys_log"):
-            self._coord._sys_log("INFO", _msg)
+        self._coord._sys_log("INFO", _msg)
 
         try:
             # 1. 在事件循环中快照协调器的内存数据（线程安全）
@@ -240,8 +240,7 @@ class BackupManager:
             size = len(encrypted)
             _res_msg = f"[Backup] 备份完成: {result.get('backup_id')} ({size} bytes)"
             _LOGGER.info(_res_msg)
-            if hasattr(self._coord, "_sys_log"):
-                self._coord._sys_log("INFO", _res_msg)
+            self._coord._sys_log("INFO", _res_msg)
             return {
                 "success": True,
                 "backup_id": result.get("backup_id", ""),
@@ -252,14 +251,13 @@ class BackupManager:
         except Exception as exc:
             _err_msg = f"[Backup] 备份失败: {exc}"
             _LOGGER.error(_err_msg)
-            if hasattr(self._coord, "_sys_log"):
-                self._coord._sys_log("ERROR", _err_msg)
+            self._coord._sys_log("ERROR", _err_msg)
             return {"success": False, "backup_id": "", "size_bytes": 0, "message": f"备份失败: {exc}"}
 
     def _get_restore_journal(self):
         from .restore_journal import RestoreJournal
 
-        journal = getattr(self, "_restore_journal_store", None)
+        journal = self._restore_journal_store
         if journal is None:
             config_dir = getattr(getattr(self._hass, "config", None), "config_dir", None)
             if not isinstance(config_dir, str) or not os.path.isabs(config_dir):

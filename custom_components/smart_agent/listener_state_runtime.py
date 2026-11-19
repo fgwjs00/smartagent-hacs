@@ -54,10 +54,8 @@ def handle_listener_state_changed(
         _dispatch_listener_state_changed(self, ev, logger=logger)
     finally:
         entity = ev.data.get("entity_id")
-        info = getattr(self, "device_info", {})
-        is_presence = getattr(self, "_is_presence_listener_entity", None)
-        if (isinstance(info, dict) and entity in info and callable(is_presence)
-                and is_presence(entity, info[entity])):
+        info = self.device_info
+        if entity in info and self._is_presence_listener_entity(entity, info[entity]):
             from .presence_runtime import reconcile_occupancy_cycles
             reconcile_occupancy_cycles(self, current_entity=entity, current_state=ev.data.get("new_state"))
 
@@ -88,12 +86,8 @@ def _dispatch_listener_state_changed(
             source_type = "自动化/脚本"
 
     domain = entity_id.split(".")[0]
-    device_info_snapshot = getattr(self, "device_info", {}) or {}
-    if not isinstance(device_info_snapshot, dict):
-        device_info_snapshot = {}
-    environment_device_info = (
-        getattr(self, "_environment_context_device_info", {}) or {}
-    )
+    device_info_snapshot = dict(self.device_info)
+    environment_device_info = self._environment_context_device_info
     if isinstance(environment_device_info, dict):
         device_info_snapshot = {
             **device_info_snapshot,
@@ -102,15 +96,8 @@ def _dispatch_listener_state_changed(
     if entity_id not in device_info_snapshot:
         try:
             if self._reconcile_device_info_entity_ids_from_ha_registry():
-                device_info_snapshot = getattr(self, "device_info", {}) or {}
-                environment_device_info = (
-                    getattr(
-                        self,
-                        "_environment_context_device_info",
-                        {},
-                    )
-                    or {}
-                )
+                device_info_snapshot = dict(self.device_info)
+                environment_device_info = self._environment_context_device_info
                 if isinstance(environment_device_info, dict):
                     device_info_snapshot = {
                         **device_info_snapshot,
@@ -130,21 +117,14 @@ def _dispatch_listener_state_changed(
             source_type,
             unmanaged_filter_reason,
         )
-        warned = getattr(self, "_unmanaged_listener_entity_warned", set())
-        if not isinstance(warned, set):
-            warned = set()
+        warned = self._unmanaged_listener_entity_warned
         if entity_id not in warned:
             warned.add(entity_id)
-            self._unmanaged_listener_entity_warned = warned
-            log = getattr(self, "_sys_log", None)
             message = (
                 "[监听器] 收到未纳管实体状态变化，未触发 AI 决策: "
                 f"{entity_id} {old_s}->{new_s}。请在设备页纳管该实体，或检查 HA 实体 ID 是否已改名。"
             )
-            if callable(log):
-                log("WARN", message)
-            else:
-                logger.warning(message)
+            self._sys_log("WARN", message)
         self._emit_listener_event(
             listener_action="filtered",
             entity_id=entity_id,
@@ -155,8 +135,7 @@ def _dispatch_listener_state_changed(
         )
         return
 
-    raw_managed_device_info = getattr(self, "device_info", {}) or {}
-    is_managed_entity = isinstance(raw_managed_device_info, dict) and entity_id in raw_managed_device_info
+    is_managed_entity = entity_id in self.device_info
 
     environment_telemetry_tracked = False
     environment_telemetry_filtered = False
@@ -166,11 +145,7 @@ def _dispatch_listener_state_changed(
             info=device_info_snapshot.get(entity_id),
             state_obj=new,
         )
-        environment_filter = getattr(self, "_environment_telemetry_event_filter", None)
-        if not isinstance(environment_filter, EnvironmentTelemetryFilter):
-            environment_filter = EnvironmentTelemetryFilter()
-            self._environment_telemetry_event_filter = environment_filter
-        environment_decision = environment_filter.evaluate(
+        environment_decision = self._environment_telemetry_event_filter.evaluate(
             entity_id,
             old_s,
             new_s,
@@ -206,28 +181,27 @@ def _dispatch_listener_state_changed(
         or old_features != new_features
     )
     if is_managed_entity and (not environment_telemetry_filtered or capability_or_availability_changed):
-        persist_device = getattr(self, "_persist_device_record", None)
-        create_task = getattr(getattr(self, "hass", None), "async_create_task", None)
-        if callable(persist_device) and callable(create_task):
+        create_task = getattr(self.hass, "async_create_task", None)
+        if callable(create_task):
+            coro = self._persist_device_record(
+                entity_id,
+                device_info_snapshot.get(entity_id),
+                state_obj=new,
+            )
             try:
-                create_task(
-                    persist_device(
+                try:
+                    create_task(coro, f"smartagent_runtime_capability_{entity_id}")
+                except TypeError:
+                    logger.debug(
+                        "[Listeners] async_create_task rejected task name for %s; retrying unnamed",
                         entity_id,
-                        device_info_snapshot.get(entity_id),
-                        state_obj=new,
-                    ),
-                    f"smartagent_runtime_capability_{entity_id}",
-                )
-            except TypeError:
-                create_task(
-                    persist_device(
-                        entity_id,
-                        device_info_snapshot.get(entity_id),
-                        state_obj=new,
                     )
-                )
+                    create_task(coro)
             except Exception as exc:
-                logger.debug("[Listeners] runtime capability persistence skipped for %s: %s", entity_id, exc)
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                logger.warning("[Listeners] runtime capability persistence failed for %s: %s", entity_id, exc)
 
     if environment_telemetry_filtered:
         return
@@ -266,7 +240,7 @@ def _dispatch_listener_state_changed(
             # Presence person_count retains its dimension-specific step.
             # Every other numeric signal must be described by a SignalManifest;
             # never fall back to one cross-dimension numeric threshold.
-            frigate_on = getattr(self, "_frigate_enabled", False)
+            frigate_on = self._frigate_enabled
             is_person_count = frigate_on and any(kw in eid_lower for kw in self._PERSON_COUNT_KW)
             if is_person_count and delta < 1:
                 logger.debug(
@@ -359,7 +333,7 @@ def _dispatch_listener_state_changed(
         )
         return
 
-    native = getattr(self, "_native_execution_attribution", None)
+    native = self._native_execution_attribution
     native_attribution = native.attribution(new, entity_id) if native is not None else None
     native_manual = bool(native_attribution and (native_attribution.get("origin") == "user_action"
         or _is_physical_control_edge(native_attribution, domain, old_s, new_s)))
@@ -394,8 +368,7 @@ def _dispatch_listener_state_changed(
         )
         return
 
-    last_ai_actions = getattr(self, "_last_ai_actions", {})
-    last_ai = last_ai_actions.get(entity_id) if isinstance(last_ai_actions, dict) else None
+    last_ai = self._last_ai_actions.get(entity_id)
     if isinstance(last_ai, dict):
         expected_ai_state = str(last_ai.get("state") or "").strip().lower()
         try:

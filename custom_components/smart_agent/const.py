@@ -831,3 +831,16 @@ CHINESE_HOLIDAYS_2026: frozenset[str] = frozenset({
     "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
     "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
 })
+
+
+def read_integration_manifest_version() -> str:
+    """Read integration version from manifest.json without masking missing/corrupt files."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    manifest_path = _Path(__file__).with_name("manifest.json")
+    payload = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    version = str(payload.get("version") or "").strip() if isinstance(payload, dict) else ""
+    if not version:
+        raise RuntimeError("manifest_version_missing")
+    return version

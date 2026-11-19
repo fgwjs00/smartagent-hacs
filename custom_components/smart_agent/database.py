@@ -7,8 +7,10 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from homeassistant.util import dt as dt_util
 
 from .database_transactions import DatabaseTransactionMixin
 from .const import DEVICE_CONTROL_MODES
@@ -48,6 +50,18 @@ class ConfigProjectionError(RuntimeError):
 
 class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, DatabaseTransactionMixin):
     _VALID_CONTROL_MODES = DEVICE_CONTROL_MODES
+    hass: Any = None
+    device_info: dict[str, dict[str, Any]] = {}
+
+    def _ha_local_now(self) -> datetime:
+        from .timezone_support import ha_local_now
+        return ha_local_now(
+            self.hass,
+            fallback_now=lambda: dt_util.now(),
+            now_cls=datetime,
+            logger=_LOGGER,
+            source="Database",
+        )
 
     def _init_memory_db(self) -> None:
         try:
@@ -62,12 +76,10 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
                     conn.execute(index_sql)
         except Exception as exc:
             _LOGGER.error("[DB] initialization failed: %s", exc)
-            if hasattr(self, "_sys_log"):
-                self._sys_log("ERROR", f"Database initialization failed: {exc}")
+            self._sys_log("ERROR", f"Database initialization failed: {exc}")
             return
 
-        if hasattr(self, "_sys_log"):
-            self._sys_log("INFO", f"Database initialized: {self._memory_db}")
+        self._sys_log("INFO", f"Database initialized: {self._memory_db}")
 
     def _legacy_config_migration_batch(self) -> tuple[dict[str, Any], str | None] | None:
         """Build one deterministic migration batch from legacy HA projections and JSON."""
@@ -101,11 +113,7 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
             return
         payload, json_path = batch
         now = self._ha_db_now_text()
-        confirm = getattr(self, "_post_internal_event_confirmed", None)
-        if not callable(confirm):
-            _LOGGER.warning("[DB] legacy migration deferred: persistence confirmation unavailable")
-            return
-        result = confirm("legacy_config_migration", payload, ts=now)
+        result = self._post_internal_event_confirmed("legacy_config_migration", payload, ts=now)
         expected = len(payload["devices"]) + len(payload["habits"]) + len(payload["rules"])
         if not self._legacy_migration_committed(result, expected):
             _LOGGER.warning("[DB] legacy migration deferred: add-on did not confirm durable commit")
@@ -217,7 +225,7 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
         effective_sql = f"{tail} LIMIT {max_rows}" if max_rows > 0 and not has_limit and not is_complex else tail
         query = self._db.query_required if required else self._db.query
         rows = query(effective_sql, params)
-        if effective_sql != tail and len(rows) >= max_rows and hasattr(self, "_sys_log"):
+        if effective_sql != tail and len(rows) >= max_rows:
             self._sys_log("INFO", f"[QueryLimit] automatic LIMIT {max_rows} applied")
         return rows
 
@@ -225,51 +233,21 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
         return await self.hass.async_add_executor_job(self._query_events, sql, params, max_rows)
 
     def _enqueue_bridge_event(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> bool:
-        enqueue = getattr(self, "_enqueue_internal_event", None)
-        if not callable(enqueue):
-            return False
-        return bool(enqueue(kind, payload, ts=ts))
+        return bool(self._enqueue_internal_event(kind, payload, ts=ts))
 
     def _ha_db_now_text(self) -> str:
-        from datetime import timezone
-        try:
-            local_now = getattr(self, "_ha_local_now", None)
-            now_value = local_now() if callable(local_now) else None
-            if isinstance(now_value, datetime) and now_value.utcoffset() is not None:
-                return now_value.astimezone(timezone.utc).isoformat()
-        except Exception:
-            pass
-        try:
-            from homeassistant.util import dt as dt_util
-            return dt_util.utcnow().astimezone(timezone.utc).isoformat()
-        except Exception:
-            return datetime.now(timezone.utc).isoformat()
+        now_value = self._ha_local_now()
+        if isinstance(now_value, datetime) and now_value.utcoffset() is not None:
+            return now_value.astimezone(timezone.utc).isoformat()
+        return dt_util.utcnow().astimezone(timezone.utc).isoformat()
 
     def _ha_db_cutoff_text(self, days: int) -> str:
-        try:
-            local_now = getattr(self, "_ha_local_now", None)
-            now_value = local_now() if callable(local_now) else None
-            if hasattr(now_value, "strftime"):
-                return (now_value - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            pass
-        try:
-            from homeassistant.util import dt as dt_util
-            now = dt_util.now()
-        except Exception:
-            from datetime import timezone
-            now = datetime.now(timezone.utc)
+        now = self._ha_local_now()
         return (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     def _ha_transaction_id_ms(self) -> int:
-        try:
-            local_now = getattr(self, "_ha_local_now", None)
-            now_value = local_now() if callable(local_now) else None
-            if hasattr(now_value, "timestamp"):
-                return int(now_value.timestamp() * 1000)
-        except Exception:
-            pass
-        return int(time.time() * 1000)
+        now_value = self._ha_local_now()
+        return int(now_value.timestamp() * 1000)
 
     def _record_event(
         self,
@@ -286,7 +264,7 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
         """Forward an HA event into add-on owned storage."""
         timestamp = self._ha_db_now_text()
         area = ""
-        if entity_id and entity_id in getattr(self, "device_info", {}):
+        if entity_id and entity_id in self.device_info:
             area = self.device_info[entity_id].get("room", "")
         detail_payload = detail
         if isinstance(metadata, dict) and metadata:
@@ -305,8 +283,7 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
             "transaction_id": int(transaction_id or 0),
             "action_seq": int(action_seq or 0),
         }
-        enqueue = getattr(self, "_enqueue_internal_event", None)
-        if not callable(enqueue) or not enqueue("event", payload, ts=timestamp):
+        if not self._enqueue_internal_event("event", payload, ts=timestamp):
             _LOGGER.warning("[DB] failed to enqueue event: type=%s entity=%s", event_type, entity_id)
 
     def _record_action_result(
@@ -399,16 +376,10 @@ class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, D
         return stats
 
     def _get_entity_room(self, entity_id: str) -> str:
-        room = getattr(self, "device_info", {}).get(entity_id, {}).get("room", "")
+        room = self.device_info.get(entity_id, {}).get("room", "")
         if room:
             return room
-        area_getter = getattr(self, "_get_entity_area", None)
-        if callable(area_getter):
-            try:
-                return area_getter(entity_id) or "unknown"
-            except Exception:
-                return "unknown"
-        return "unknown"
+        return self._get_entity_area(entity_id) or "unknown"
 
     def _get_device_usage_stats(self, days: int = 7) -> list[dict]:
         """Return a small HA-local energy projection from stored event rows."""

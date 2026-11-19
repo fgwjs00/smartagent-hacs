@@ -924,10 +924,9 @@ def get_device_info_snapshot(coord: Any) -> dict[str, Any]:
     - 仅负责从宿主 coordinator 上读取并做最小形态保护；不承载任何业务逻辑。
     - 该快照用于 presence payload 的组装（第二阶段最小下沉切口）。
     """
-    device_info = getattr(coord, "device_info", None)
-    if not isinstance(device_info, dict):
+    if not isinstance(coord.device_info, dict):
         return {}
-    return dict(device_info)
+    return dict(coord.device_info)
 
 
 def get_room_topology_cache_snapshot(coord: Any) -> dict[Any, set[Any]]:

@@ -68,26 +68,10 @@ def build_smart_agent_websocket_commands(
     # ── WebSocket API：大数据列表通过 WS 按需下发，绕过 sensor 属性 16KB 上限 ──
 
     def _ws_ha_now_iso(coord: SmartAgentCoordinator | None) -> str:
-        try:
-            local_now = getattr(coord, "_ha_local_now", None)
-            if callable(local_now):
-                value = local_now()
-                if hasattr(value, "isoformat"):
-                    return value.isoformat()
-        except Exception:
-            pass
-        return dt_util.now().isoformat()
+        return coord._ha_local_now().isoformat() if coord is not None else dt_util.now().isoformat()
 
     def _ws_ha_today(coord: SmartAgentCoordinator | None) -> date:
-        try:
-            local_now = getattr(coord, "_ha_local_now", None)
-            if callable(local_now):
-                value = local_now()
-                if hasattr(value, "date"):
-                    return value.date()
-        except Exception:
-            pass
-        return dt_util.now().date()
+        return coord._ha_local_now().date() if coord is not None else dt_util.now().date()
 
     def _get_coord(hass: HomeAssistant) -> SmartAgentCoordinator | None:
         """从 hass.data 取出第一个 coordinator 实例（单实例部署常用）。"""
@@ -320,23 +304,8 @@ def build_smart_agent_websocket_commands(
         transaction_rows: list[dict[str, Any]] | None = None
         _addon_client = getattr(coord, "_addon_client", None)
         if _addon_client is not None:
-            try:
-                addon_diagnostics = _normalize_addon_diagnostics(await _addon_client.get_diagnostics())
-            except Exception as _diag_exc:
-                _LOGGER.debug("[DecisionStats] 获取 Add-on diagnostics 失败: %s", _diag_exc)
-                addon_diagnostics = {
-                    "ok": False,
-                    "error": "addon_diagnostics_fetch_failed",
-                    "error_type": "dependency_unreachable",
-                    "retryable": True,
-                }
-
-        # 最近 5 条事务（from cache）
-        if _addon_client is not None:
-            try:
-                transaction_rows = _transaction_rows_from_payload(await _addon_client.get_transactions())
-            except Exception as _txn_exc:
-                _LOGGER.debug("[DecisionStats] add-on transactions fetch failed: %s", _txn_exc)
+            addon_diagnostics = _normalize_addon_diagnostics(await _addon_client.get_diagnostics())
+            transaction_rows = _transaction_rows_from_payload(await _addon_client.get_transactions())
         if transaction_rows is None:
             transaction_rows = get_transactions_cache_snapshot(coord)
         tb = _today_blocked_from_transactions(transaction_rows, today_str)

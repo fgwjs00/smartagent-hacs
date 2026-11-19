@@ -341,7 +341,7 @@ async def run_addon_decision(
     explicit_voice_control = bool(
         type(user_intent_authority) is AuthenticatedOwnerSession and bundle.get("is_voice")
     )
-    addon_client = getattr(self, "_addon_client", None)
+    addon_client = self._addon_client
     self._sys_log(
         "INFO",
         "[决策] 慢脑上下文 "
@@ -391,7 +391,7 @@ async def run_addon_decision(
         )
         policy_context = DecisionPolicyContext(records, emitter, status, policy_unauthorized_speech)
         learning_observe_only = (
-            bool(getattr(self, "_learning_mode", False)) and source == "listener"
+            bool(self._learning_mode) and source == "listener"
         )
         executed = 0
         action_results: list[dict[str, Any]] = []

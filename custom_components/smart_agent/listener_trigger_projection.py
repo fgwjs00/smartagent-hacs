@@ -21,10 +21,7 @@ def format_listener_state(
     """Return the existing domain-aware Chinese state label."""
     if domain in owner._PRESENCE_DOMAINS:
         entity_text = entity_id.lower()
-        device_info = getattr(owner, "device_info", {})
-        if not isinstance(device_info, dict):
-            device_info = {}
-        raw_info = device_info.get(entity_id)
+        raw_info = owner.device_info.get(entity_id) if isinstance(owner.device_info, dict) else None
         info = raw_info if isinstance(raw_info, dict) else {}
         device_name = str(info.get("name") or "").lower()
         is_presence = any(

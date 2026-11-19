@@ -199,8 +199,8 @@ def _discover_patrol_spaces(
                             _add_space(value)
 
     for info_source in (
-        getattr(owner, "device_info", {}) or {},
-        getattr(owner, "_environment_context_device_info", {}) or {},
+        owner.device_info,
+        owner._environment_context_device_info,
     ):
         if not isinstance(info_source, dict):
             continue

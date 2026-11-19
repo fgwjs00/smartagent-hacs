@@ -31,7 +31,7 @@ Canonical presence decisions are owned by addon_presence_engine.
 """
 from __future__ import annotations
 
-from .timezone_support import configured_timezone as _presence_inference_timezone
+from .timezone_support import ha_local_now
 
 import logging
 import time
@@ -155,24 +155,17 @@ class PresenceInference:
         self._device_traces: dict[str, dict] = {}
 
     def _ha_local_now(self) -> datetime:
-        config = getattr(self.hass, "config", None)
-        configured_timezone = str(getattr(config, "time_zone", "") or "").strip()
-        if configured_timezone:
-            try:
-                return datetime.now(_presence_inference_timezone(configured_timezone))
-            except ZoneInfoNotFoundError:
-                _LOGGER.debug(
-                    "[PresenceInference] invalid HA timezone for local clock: %s",
-                    configured_timezone,
-                )
-            except Exception as exc:
-                _LOGGER.debug("[PresenceInference] HA timezone read failed for local clock: %s", exc)
-        try:
+        def _fallback() -> datetime:
             from homeassistant.util import dt as dt_util
-
             return dt_util.now()
-        except Exception:
-            return datetime.now(timezone.utc)
+
+        return ha_local_now(
+            self.hass,
+            fallback_now=_fallback,
+            now_cls=datetime,
+            logger=_LOGGER,
+            source="PresenceInference",
+        )
 
     # ── 外部接口 ────────────────────────────────────────────────────────────────
 

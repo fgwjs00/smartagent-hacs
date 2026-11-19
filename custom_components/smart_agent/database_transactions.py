@@ -24,9 +24,8 @@ def mark_transaction_audit(results: list[dict[str, Any]], confirmed: bool) -> No
 
 class DatabaseTransactionMixin:
     def _persist_transaction_event(self, kind: str, payload: dict, timestamp: str) -> bool:
-        post = getattr(self, "_post_internal_event_confirmed", None)
         try:
-            receipt = post(kind, payload, ts=timestamp) if callable(post) else None
+            receipt = self._post_internal_event_confirmed(kind, payload, ts=timestamp)
         except Exception as exc:
             _LOGGER.warning("[Transaction] audit transport failed: kind=%s cause=%s", kind, type(exc).__name__)
             return False

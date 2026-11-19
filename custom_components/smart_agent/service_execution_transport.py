@@ -23,10 +23,7 @@ class ServiceEnvelopeTransport:
     async def _call(self, data: dict[str, Any]) -> dict[str, Any]:
         host, context = self.host, self.context
         batch, call = context.batch, context.call
-        correlations = getattr(host, "_active_service_correlation_ids", None)
-        if not isinstance(correlations, dict):
-            correlations = {}
-            host._active_service_correlation_ids = correlations
+        correlations = host._active_service_correlation_ids
         task = asyncio.current_task()
         previous = correlations.get(task)
         if batch.correlation_id:

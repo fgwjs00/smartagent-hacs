@@ -37,7 +37,7 @@ class DatabaseSceneBridgeMixin:
         space_id, room, explain_bundle = ai_scene_space_attribution(
             entities_json,
             actions_json,
-            getattr(self, "device_info", {}),
+            self.device_info,
             source="ha_ai_scene_bridge",
         )
         payload = {
@@ -79,7 +79,7 @@ class DatabaseSceneBridgeMixin:
         space_id, room, explain_bundle = ai_scene_space_attribution(
             entities_json,
             actions_json,
-            getattr(self, "device_info", {}),
+            self.device_info,
             source="ha_ai_scene_bridge",
         )
         payload = {

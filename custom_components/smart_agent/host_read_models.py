@@ -404,20 +404,13 @@ def local_room_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dict[
 
 def local_room_topology_rows(coord: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    db = getattr(coord, "_db", None)
-    if db is not None and hasattr(db, "query"):
-        raw_rows = db.query("SELECT room_a, room_b, relation FROM room_topology", ()) or []
+    db = coord._db
+    if db is not None:
+        raw_rows = db.query_required("SELECT room_a, room_b, relation FROM room_topology", ())
         for row in raw_rows:
-            if isinstance(row, dict):
-                room_a = str(row.get("room_a") or "").strip()
-                room_b = str(row.get("room_b") or "").strip()
-                relation = str(row.get("relation") or "adjacent").strip() or "adjacent"
-            elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                room_a = str(row[0] or "").strip()
-                room_b = str(row[1] or "").strip()
-                relation = str(row[2] if len(row) > 2 else "adjacent").strip() or "adjacent"
-            else:
-                continue
+            room_a = str(row.get("room_a") or "").strip()
+            room_b = str(row.get("room_b") or "").strip()
+            relation = str(row.get("relation") or "adjacent").strip() or "adjacent"
             if room_a and room_b:
                 rows.append({"room_a": room_a, "room_b": room_b, "relation": relation})
         if rows:

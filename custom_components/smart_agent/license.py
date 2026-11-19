@@ -68,7 +68,7 @@ class LicenseMixin:
     def _license_local_now(self) -> datetime:
         """Return current time in HA configured timezone."""
         configured_timezone = str(
-            getattr(getattr(getattr(self, "hass", None), "config", None), "time_zone", "") or ""
+            getattr(getattr(self.hass, "config", None), "time_zone", "") or ""
         ).strip()
         if configured_timezone:
             try:
@@ -158,8 +158,7 @@ class LicenseMixin:
         except Exception as exc:
             _err_msg = f"License 验证异常（{exc}），降级到免费版"
             _LOGGER.warning("[License] %s", _err_msg)
-            if hasattr(self, "_sys_log"):
-                self._sys_log("WARN", f"[License] {_err_msg}")
+            self._sys_log("WARN", f"[License] {_err_msg}")
             return self._build_result(False, LICENSE_TIER_FREE, "", _err_msg)
 
     async def _async_use_license_cache(self, lk: str) -> dict:
@@ -251,14 +250,14 @@ class LicenseMixin:
         return self._license_instance_id
 
     def _get_license_instance_path(self) -> str:
-        directory = getattr(self, "_config_dir", "")
+        directory = self._config_dir
         if not directory:
             raise ValueError("未配置 HA 安装目录")
         return os.path.join(directory, _LICENSE_INSTANCE_FILE)
 
     def _get_license_cache_path(self) -> str:
         """获取本地 License 缓存文件路径。"""
-        return os.path.join(getattr(self, "_config_dir", ""), _LICENSE_CACHE_FILE)
+        return os.path.join(self._config_dir, _LICENSE_CACHE_FILE)
 
     def _load_license_cache(self, lk: str) -> dict | None:
         """从本地文件读取 License 缓存（同步，在 executor 中调用）。"""

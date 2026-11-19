@@ -90,7 +90,7 @@ def _snapshot_projection(
     raw_device_info = (
         snapshot.get("device_info")
         if isinstance(snapshot.get("device_info"), dict)
-        else getattr(owner, "device_info", {})
+        else owner.device_info
     )
     device_info = dict(raw_device_info or {}) if isinstance(raw_device_info, dict) else {}
     raw_states = snapshot.get("states") if isinstance(snapshot.get("states"), dict) else {}

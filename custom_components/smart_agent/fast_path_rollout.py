@@ -87,16 +87,13 @@ def prepare_fast_path_rollout(
         if isinstance(rollout_payload.get("execution_flags"), dict)
         else {}
     )
-    device_info = getattr(host, "device_info", {})
-    if not isinstance(device_info, dict):
-        device_info = {}
-    is_enabled = getattr(host, "_is_enabled", None)
+    device_info = host.device_info
     selection = _select_actions(actions, device_info, rollout_payload)
     trigger_info = device_info.get(entity_id, {})
     if not isinstance(trigger_info, dict):
         trigger_info = {}
     rollout_decision = evaluate_active_ai_execution_gate(
-        ai_enabled=bool(is_enabled()) if callable(is_enabled) else False,
+        ai_enabled=bool(host._is_enabled()),
         config=selection.config,
         trigger_space_id=_trigger_space(result, device_info, entity_id, trigger_info),
         actions=selection.enriched_actions,

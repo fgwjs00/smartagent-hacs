@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 from typing import Any
 
+from homeassistant.util import dt as dt_util
+
 from .arrival_lighting_learning import (
     arrival_environment_bucket,
     arrival_lighting_entity_ids,
@@ -20,6 +22,7 @@ class DatabaseLearningProjectionMixin:
 
     _RECENT_AI_ACTION_RESULT_LIMIT = 512
     _RECENT_AI_ACTION_RETENTION_SECONDS = 120.0
+    _DAYLIGHT_GUARD_LUX_THRESHOLD = 80.0
 
     @staticmethod
     def _normalized_recent_ai_action_status(value: Any) -> str:
@@ -36,6 +39,52 @@ class DatabaseLearningProjectionMixin:
             return "blocked"
         return status or "unknown"
 
+    def _normalize_recent_ai_action_item(
+        self,
+        transaction_id: int | str,
+        item: Any,
+        now_ts: float,
+    ) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        entity_id = str(item.get("entity_id") or "").strip()
+        if not entity_id:
+            return None
+        success_value = item.get("success")
+        return {
+            "entity_id": entity_id,
+            "domain": str(
+                item.get("domain")
+                or (entity_id.split(".", 1)[0] if "." in entity_id else "")
+            ),
+            "service": str(item.get("service") or ""),
+            "status": self._normalized_recent_ai_action_status(item.get("status")),
+            "verified": bool(item.get("verified", False)),
+            "success": bool(success_value) if success_value is not None else None,
+            "time": now_ts,
+            "transaction_id": str(transaction_id or item.get("transaction_id") or ""),
+            "action_seq": int(item.get("action_seq") or 0),
+        }
+
+    @staticmethod
+    def _upsert_recent_ai_action_row(
+        records: list[dict[str, Any]],
+        row: dict[str, Any],
+        now_ts: float,
+    ) -> None:
+        key = (row["transaction_id"], row["action_seq"], row["entity_id"])
+        for index, existing in enumerate(records):
+            existing_key = (
+                str(existing.get("transaction_id") or ""),
+                int(existing.get("action_seq") or 0),
+                str(existing.get("entity_id") or ""),
+            )
+            if existing_key == key:
+                row["time"] = float(existing.get("time") or now_ts)
+                records[index] = row
+                return
+        records.append(row)
+
     def _record_recent_ai_action_results(
         self,
         transaction_id: int | str,
@@ -43,40 +92,16 @@ class DatabaseLearningProjectionMixin:
     ) -> None:
         """Maintain a bounded HA-side causal projection of execution receipts."""
         now_ts = time.time()
-        normalized: list[dict[str, Any]] = []
-        for item in action_results:
-            if not isinstance(item, dict):
-                continue
-            entity_id = str(item.get("entity_id") or "").strip()
-            if not entity_id:
-                continue
-            success_value = item.get("success")
-            normalized.append(
-                {
-                    "entity_id": entity_id,
-                    "domain": str(
-                        item.get("domain")
-                        or (entity_id.split(".", 1)[0] if "." in entity_id else "")
-                    ),
-                    "service": str(item.get("service") or ""),
-                    "status": self._normalized_recent_ai_action_status(item.get("status")),
-                    "verified": bool(item.get("verified", False)),
-                    "success": bool(success_value) if success_value is not None else None,
-                    "time": now_ts,
-                    "transaction_id": str(transaction_id or item.get("transaction_id") or ""),
-                    "action_seq": int(item.get("action_seq") or 0),
-                }
-            )
+        normalized = [
+            row
+            for item in action_results
+            if (row := self._normalize_recent_ai_action_item(transaction_id, item, now_ts)) is not None
+        ]
         if not normalized:
             return
 
-        records = getattr(self, "_recent_ai_action_results", None)
-        if not isinstance(records, list):
-            records = []
-            self._recent_ai_action_results = records
-        lock = getattr(self, "_recent_ai_action_results_lock", None)
-
-        def _update() -> None:
+        records = self._recent_ai_action_results
+        with self._recent_ai_action_results_lock:
             cutoff = now_ts - self._RECENT_AI_ACTION_RETENTION_SECONDS
             records[:] = [
                 dict(row)
@@ -84,37 +109,9 @@ class DatabaseLearningProjectionMixin:
                 if isinstance(row, dict) and float(row.get("time") or 0) >= cutoff
             ]
             for row in normalized:
-                key = (
-                    row["transaction_id"],
-                    row["action_seq"],
-                    row["entity_id"],
-                )
-                existing_index = next(
-                    (
-                        index
-                        for index, existing in enumerate(records)
-                        if (
-                            str(existing.get("transaction_id") or ""),
-                            int(existing.get("action_seq") or 0),
-                            str(existing.get("entity_id") or ""),
-                        )
-                        == key
-                    ),
-                    None,
-                )
-                if existing_index is not None:
-                    row["time"] = float(records[existing_index].get("time") or now_ts)
-                    records[existing_index] = row
-                else:
-                    records.append(row)
+                self._upsert_recent_ai_action_row(records, row, now_ts)
             if len(records) > self._RECENT_AI_ACTION_RESULT_LIMIT:
                 records[:] = records[-self._RECENT_AI_ACTION_RESULT_LIMIT :]
-
-        if lock is not None:
-            with lock:
-                _update()
-        else:
-            _update()
 
     def _recent_ai_action_entities(
         self,
@@ -136,19 +133,8 @@ class DatabaseLearningProjectionMixin:
             for status in statuses
             if str(status or "").strip()
         }
-        records = getattr(self, "_recent_ai_action_results", None)
-        if not isinstance(records, list):
-            return {}
-        lock = getattr(self, "_recent_ai_action_results_lock", None)
-
-        def _snapshot() -> list[dict[str, Any]]:
-            return [dict(row) for row in records if isinstance(row, dict)]
-
-        if lock is not None:
-            with lock:
-                rows = _snapshot()
-        else:
-            rows = _snapshot()
+        with self._recent_ai_action_results_lock:
+            rows = [dict(row) for row in self._recent_ai_action_results if isinstance(row, dict)]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             try:
@@ -181,28 +167,12 @@ class DatabaseLearningProjectionMixin:
         occupancy_cycle_id: str = "",
     ) -> None:
         """Forward auditable arrival lighting samples to add-on owned memory."""
-        try:
-            local_now = getattr(self, "_ha_local_now", None)
-            now_value = local_now() if callable(local_now) else None
-            if hasattr(now_value, "strftime"):
-                now = now_value
-            else:
-                from homeassistant.util import dt as dt_util
-                now = dt_util.now()
-        except Exception:
-            try:
-                from homeassistant.util import dt as dt_util
-                now = dt_util.now()
-            except Exception:
-                from datetime import timezone
-                now = datetime.now(timezone.utc)
+        now = self._ha_local_now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         month = now.month
         season = "spring" if month in {3, 4, 5} else "summer" if month in {6, 7, 8} else "autumn" if month in {9, 10, 11} else "winter"
         try:
-            dark_lux_threshold = float(
-                getattr(self, "_DAYLIGHT_GUARD_LUX_THRESHOLD", 80.0)
-            )
+            dark_lux_threshold = float(self._DAYLIGHT_GUARD_LUX_THRESHOLD)
         except (TypeError, ValueError):
             dark_lux_threshold = 80.0
         environment_bucket = arrival_environment_bucket(
@@ -210,14 +180,9 @@ class DatabaseLearningProjectionMixin:
             dark_lux_threshold=dark_lux_threshold,
         )
         if light_states is None:
-            device_info = (
-                getattr(self, "device_info", {})
-                if isinstance(getattr(self, "device_info", None), dict)
-                else {}
-            )
-            states = getattr(getattr(self, "hass", None), "states", None)
+            states = getattr(self.hass, "states", None)
             lighting_entity_ids = arrival_lighting_entity_ids(
-                device_info,
+                self.device_info,
                 room,
                 entity_states=states,
             )
@@ -419,6 +384,5 @@ class DatabaseLearningProjectionMixin:
                 "transaction_id": str(linked_action.get("transaction_id") or "not_applicable"),
                 "world_snapshot_id": str(linked_action.get("world_snapshot_id") or "not_applicable"),
             }
-            enqueue = getattr(self, "_enqueue_internal_event", None)
-            if not callable(enqueue) or not enqueue("baseline", payload, ts=timestamp):
+            if not self._enqueue_internal_event("baseline", payload, ts=timestamp):
                 _LOGGER.debug("[ArrivalBaseline] sample enqueue failed: %s", entity_id)

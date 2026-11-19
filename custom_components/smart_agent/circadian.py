@@ -13,7 +13,7 @@ CircadianEngine — 昼夜节律引擎 (Phase 13.2)。
 """
 from __future__ import annotations
 
-from .timezone_support import configured_timezone as _circadian_timezone
+from .timezone_support import ha_local_now
 
 import logging
 from datetime import datetime, time as dt_time, timedelta, timezone
@@ -228,18 +228,17 @@ class CircadianEngine:
         return bri, ct
 
     def _ha_local_now(self) -> datetime:
-        config = getattr(getattr(self, "hass", None), "config", None)
-        configured_timezone = str(getattr(config, "time_zone", "") or "").strip()
-        if configured_timezone:
-            try:
-                return datetime.now(_circadian_timezone(configured_timezone))
-            except ZoneInfoNotFoundError:
-                _LOGGER.debug("[CircadianEngine] invalid HA timezone for local clock: %s", configured_timezone)
-            except Exception as exc:
-                _LOGGER.debug("[CircadianEngine] HA timezone read failed for local clock: %s", exc)
-        from homeassistant.util import dt as dt_util
+        def _fallback() -> datetime:
+            from homeassistant.util import dt as dt_util
+            return dt_util.now()
 
-        return dt_util.now()
+        return ha_local_now(
+            self.hass,
+            fallback_now=_fallback,
+            now_cls=datetime,
+            logger=_LOGGER,
+            source="CircadianEngine",
+        )
 
     def get_target(
         self, room: str = "", now: datetime | None = None

@@ -106,8 +106,8 @@ def presence_cycle_allows_use(info: dict, *, leave: bool = False) -> bool:
 
 
 def _presence_members(owner: Any, excluded_entity: str = ""):
-    device_info = getattr(owner, "device_info", {})
-    states = getattr(getattr(owner, "hass", None), "states", None)
+    device_info = owner.device_info
+    states = getattr(owner.hass, "states", None)
     if not isinstance(device_info, dict):
         return
     for entity, info in device_info.items():
@@ -182,7 +182,7 @@ def arrival_has_continuous_vacancy(owner: Any, room: str, entity: str) -> bool:
     current = windows.get(room, {})
     if not all(observations) or len(current) != len(observations):
         return False
-    info = getattr(owner, "device_info", {}).get(entity, {})
+    info = owner.device_info.get(entity, {})
     if presence_cycle_allows_use(info, leave=True):
         prior = cycle.get("vacant_member_windows", {}).get(entity)
         if not isinstance(prior, (list, tuple)) or len(prior) != 2:
@@ -409,116 +409,3 @@ def occupancy_cycle_outcome(
         else "occupancy_cycle_still_active" if incomplete_departure else ""
     )
     return cycle_id, arrival_started, duplicate_arrival, status
-
-
-def schedule_startup_presence_reconciliation(
-    owner: Any,
-    entity_id: str,
-    *,
-    reconcile_marker: str,
-    schedule: Callable[[Any, float, Callable[[datetime], None]], Any] = async_call_later,
-) -> None:
-    timers = getattr(owner, "_startup_presence_reconcile_timers", None)
-    if not isinstance(timers, dict):
-        timers = {}
-        owner._startup_presence_reconcile_timers = timers
-    existing = timers.pop(entity_id, None)
-    if callable(existing):
-        existing()
-    hold_seconds = max(
-        1,
-        int(getattr(owner, "_STARTUP_PRESENCE_RECONCILE_HOLD_SECONDS", DEFAULT_COLD_START_RECHECK_SECONDS) or DEFAULT_COLD_START_RECHECK_SECONDS),
-    )
-
-    @callback
-    def _reconcile(_: datetime) -> None:
-        timers.pop(entity_id, None)
-        reconciled = getattr(owner, "_listener_active_state_reconciled", {})
-        if not isinstance(reconciled, dict) or reconciled.get(entity_id) != reconcile_marker:
-            return
-        states = getattr(getattr(owner, "hass", None), "states", None)
-        get_state = getattr(states, "get", None)
-        state_obj = get_state(entity_id) if callable(get_state) else None
-        current_state = str(getattr(state_obj, "state", "") or "").strip().lower()
-        if current_state != "on" or not owner._is_enabled() or getattr(owner, "_sensors_muted", False):
-            return
-        device_info = getattr(owner, "device_info", {})
-        raw_info = device_info.get(entity_id) if isinstance(device_info, dict) else {}
-        info = raw_info if isinstance(raw_info, dict) else {}
-        room = resolve_space_id(
-            info,
-            entity_id=entity_id,
-            area_getter=getattr(owner, "_get_entity_area", None),
-        )
-        cycles = getattr(owner, "_arrival_occupancy_cycles", None)
-        if not isinstance(cycles, dict):
-            cycles = {}
-            owner._arrival_occupancy_cycles = cycles
-        cycle = cycles.get(room) if room and isinstance(cycles.get(room), dict) else {}
-        occupancy_cycle_id = str(cycle.get("cycle_id") or "").strip()
-        if not occupancy_cycle_id:
-            digest = hashlib.sha256(
-                f"{room}|{entity_id}|{reconcile_marker}".encode()
-            ).hexdigest()[:20]
-            occupancy_cycle_id = f"startup-{digest}"
-            if room:
-                cycles[room] = {
-                    "cycle_id": occupancy_cycle_id,
-                    "active": True,
-                    "generation": max(1, int(cycle.get("generation") or 0) + 1),
-                }
-        persist_occupancy_cycles(owner)
-        owner._emit_listener_event(
-            listener_action="fast_path_scheduled",
-            entity_id=entity_id,
-            old_state="off",
-            new_state="on",
-            source_type="startup_reconciliation",
-            occupancy_cycle_id=occupancy_cycle_id,
-            reconcile_reason="stable_recovered_occupancy",
-        )
-        owner._spawn_addon_fast_path_task(
-            owner._run_addon_fast_path_fail_closed(
-                entity_id,
-                "on",
-                "off",
-                occupancy_cycle_id=occupancy_cycle_id,
-                trigger_context={
-                    "kind": "startup_reconciliation",
-                    "stable_presence_seconds": hold_seconds,
-                    "verified_preference_required": True,
-                },
-                suppress_slow_fallback=True,
-            ),
-            entity_id=entity_id,
-            old_state="off",
-            new_state="on",
-        )
-
-    try:
-        timers[entity_id] = schedule(owner.hass, hold_seconds, _reconcile)
-    except Exception as exc:
-        timers.pop(entity_id, None)
-        _LOGGER.debug(
-            "[Listeners] startup presence reconciliation schedule failed for %s: %s",
-            entity_id,
-            exc,
-        )
-
-
-def cleanup_startup_reconciliation(owner: Any, entity_ids: list[str]) -> None:
-    current = set(entity_ids)
-    reconciled = getattr(owner, "_listener_active_state_reconciled", None)
-    if isinstance(reconciled, dict):
-        for stale_entity_id in set(reconciled) - current:
-            reconciled.pop(stale_entity_id, None)
-    timers = getattr(owner, "_startup_presence_reconcile_timers", None)
-    if not isinstance(timers, dict):
-        return
-    for stale_entity_id in set(timers) - current:
-        cancel = timers.pop(stale_entity_id, None)
-        if callable(cancel):
-            try:
-                cancel()
-            except Exception:
-                pass

@@ -155,10 +155,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         failure_details: dict[str, str] | None = None,
     ) -> None:
         key = self._service_call_error_key(transaction_id, action_seq, entity_id)
-        store = getattr(self, "_service_call_errors", None)
-        if not isinstance(store, dict):
-            store = {}
-            self._service_call_errors = store
+        store = self._service_call_errors
         detail: dict[str, Any] = {"msg": str(msg or error or status or "ha_service_call_failed")}
         if error:
             detail["error"] = str(error)
@@ -177,15 +174,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         store[key] = detail
 
     def _clear_service_call_error(self, transaction_id: int, action_seq: int, entity_id: str) -> None:
-        store = getattr(self, "_service_call_errors", None)
-        if isinstance(store, dict):
-            store.pop(self._service_call_error_key(transaction_id, action_seq, entity_id), None)
+        self._service_call_errors.pop(self._service_call_error_key(transaction_id, action_seq, entity_id), None)
 
     def _pop_service_call_error(self, transaction_id: int, action_seq: int, entity_id: str) -> dict[str, Any]:
-        store = getattr(self, "_service_call_errors", None)
-        if not isinstance(store, dict):
-            return {}
-        detail = store.pop(self._service_call_error_key(transaction_id, action_seq, entity_id), None)
+        detail = self._service_call_errors.pop(self._service_call_error_key(transaction_id, action_seq, entity_id), None)
         return dict(detail) if isinstance(detail, dict) else {}
 
     def _is_light_blocked_by_people_rule(
@@ -238,7 +230,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         try:
             info = self.device_info.get(entity_id, {}) or {}
             room = str(info.get("room") or "").strip() if isinstance(info, dict) else ""
-            if not room and hasattr(self, "_get_entity_area"):
+            if not room:
                 room = str(self._get_entity_area(entity_id) or "").strip()
             return room
         except Exception as exc:
@@ -291,33 +283,20 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         return None
 
     def _ha_local_now(self):
-        configured_timezone = str(
-            getattr(getattr(getattr(self, "hass", None), "config", None), "time_zone", "") or ""
-        ).strip()
-        if configured_timezone:
-            normalized_tz = configured_timezone.lower()
-            fixed_offset_hours = {
-                "asia/shanghai": 8,
-                "asia/chongqing": 8,
-                "asia/harbin": 8,
-                "asia/hong_kong": 8,
-                "hongkong": 8,
-                "prc": 8,
-                "utc": 0,
-            }.get(normalized_tz)
-            try:
-                from zoneinfo import ZoneInfo
-
-                return datetime.now(ZoneInfo(configured_timezone))
-            except Exception:
-                if fixed_offset_hours is not None:
-                    tz = timezone(timedelta(hours=fixed_offset_hours), configured_timezone)
-                    return datetime.now(tz)
-        try:
-            from homeassistant.util import dt as dt_util
-            return dt_util.now()
-        except Exception:
-            return datetime.now(timezone.utc)
+        from datetime import datetime as _stdlib_datetime
+        from homeassistant.util import dt as dt_util
+        from custom_components.smart_agent.timezone_support import ha_local_now
+        return ha_local_now(
+            self.hass,
+            fallback_now=lambda: (
+                dt_util.now()
+                if datetime is _stdlib_datetime
+                else datetime.now(None)
+            ),
+            now_cls=datetime,
+            logger=_LOGGER,
+            source="Actions",
+        )
 
     def _daylight_fallback_hour(self) -> int | None:
         try:
@@ -522,9 +501,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 value = str(info.get(key) or "").strip()
                 if value:
                     return value
-            if hasattr(self, "_get_entity_area"):
-                return str(self._get_entity_area(bound_entity_id) or "").strip()
-            return ""
+            return str(self._get_entity_area(bound_entity_id) or "").strip()
 
         if not evidence:
             return evaluation
@@ -631,7 +608,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         source_event_id = str(evidence.get("source_event_id") or "").strip()
         source_info = self.device_info.get(source_entity_id)
         if not isinstance(source_info, dict):
-            source_info = (getattr(self, "_environment_context_device_info", {}) or {}).get(source_entity_id)
+            source_info = self._environment_context_device_info.get(source_entity_id)
         if not isinstance(source_info, dict):
             source_info = {}
         source_kind = str(
@@ -1006,7 +983,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         if domain != "switch":
             return False
 
-        info = (getattr(self, "device_info", {}) or {}).get(entity_id, {}) or {}
+        info = self.device_info.get(entity_id, {}) or {}
 
         parts: list[str] = [entity_id]
         if isinstance(info, dict):
@@ -1123,7 +1100,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         return candidates
 
     def _action_entity_space_candidates(self, entity_id: str) -> list[str]:
-        info = self.device_info.get(entity_id, {}) if isinstance(getattr(self, "device_info", {}), dict) else {}
+        info = self.device_info.get(entity_id, {})
         if not isinstance(info, dict):
             info = {}
         candidates = self._space_candidate_values(
@@ -1136,13 +1113,12 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             info.get(DEVICE_CAP_KEY_COVERAGE_SPACES),
             info.get("coverage_space_ids"),
         )
-        if hasattr(self, "_get_entity_area"):
-            try:
-                area = str(self._get_entity_area(entity_id) or "").strip()
-            except Exception as exc:
-                raise RuntimeError("action_entity_area_candidates_read_failed") from exc
-            if area and area not in candidates:
-                candidates.append(area)
+        try:
+            area = str(self._get_entity_area(entity_id) or "").strip()
+        except Exception as exc:
+            raise RuntimeError("action_entity_area_candidates_read_failed") from exc
+        if area and area not in candidates:
+            candidates.append(area)
         return candidates
 
     def _legacy_room_occupancy_entries_for_candidates(
@@ -1150,30 +1126,20 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         room: str,
         room_candidates: list[str] | None = None,
     ) -> list[tuple[str, str]]:
-        live_getter = getattr(self, "_get_live_presence_occupancy_map", None)
-        getter = live_getter
-        uses_live_projection = callable(live_getter)
-        if not callable(getter):
-            getter = getattr(self, "_get_room_occupancy_map", None)
-        if not callable(getter):
-            return []
-        if uses_live_projection:
-            self._last_live_presence_guard_status = {"ok": True, "reason": ""}
+        self._last_live_presence_guard_status = {"ok": True, "reason": ""}
         try:
-            occ_map = getter()
+            occ_map = self._get_live_presence_occupancy_map()
         except Exception as exc:
-            if uses_live_projection:
-                self._last_live_presence_guard_status = {
-                    "ok": False,
-                    "reason": "presence_live_projection_failed",
-                }
+            self._last_live_presence_guard_status = {
+                "ok": False,
+                "reason": "presence_live_projection_failed",
+            }
             raise RuntimeError("presence_occupancy_map_read_failed") from exc
         if not isinstance(occ_map, dict):
-            if uses_live_projection:
-                self._last_live_presence_guard_status = {
-                    "ok": False,
-                    "reason": "presence_live_projection_invalid",
-                }
+            self._last_live_presence_guard_status = {
+                "ok": False,
+                "reason": "presence_live_projection_invalid",
+            }
             raise ValueError("presence_occupancy_map_invalid")
         for candidate in self._space_candidate_values(room, room_candidates or []):
             if candidate in occ_map:
@@ -1221,11 +1187,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         room: str,
         room_candidates: list[str] | None = None,
     ) -> list[tuple[str, str]]:
-        getter = getattr(self, "get_presence_snapshot", None)
-        if not room or not callable(getter):
+        if not room:
             return []
         try:
-            snapshot = getter()
+            snapshot = self.get_presence_snapshot()
         except Exception as exc:
             raise RuntimeError("canonical_presence_read_failed") from exc
         payload = self._presence_snapshot_room_payload(snapshot, room, room_candidates)
@@ -1292,14 +1257,12 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             "legacy": [{"entity_id": eid, "state": state} for eid, state in legacy],
         }
         self._last_presence_guard_conflict = conflict
-        logger = getattr(self, "_sys_log", None)
-        if callable(logger):
-            canonical_str = ", ".join(f"{eid}={state}" for eid, state in canonical[:3])
-            legacy_str = ", ".join(f"{eid}={state}" for eid, state in legacy[:3])
-            logger(
-                "INFO",
-                f"[PresenceGuard] canonical_presence_conflict room={room} canonical=({canonical_str}) legacy=({legacy_str})",
-            )
+        canonical_str = ", ".join(f"{eid}={state}" for eid, state in canonical[:3])
+        legacy_str = ", ".join(f"{eid}={state}" for eid, state in legacy[:3])
+        self._sys_log(
+            "INFO",
+            f"[PresenceGuard] canonical_presence_conflict room={room} canonical=({canonical_str}) legacy=({legacy_str})",
+        )
 
     def _room_occupancy_entries_with_source(
         self,
@@ -1317,8 +1280,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         self._last_presence_guard_conflict = {}
         if not legacy:
             return [], ""
-        live_getter = getattr(self, "_get_live_presence_occupancy_map", None)
-        return legacy, "ha_live_presence_state" if callable(live_getter) else "legacy_occupancy_map"
+        return legacy, "ha_live_presence_state"
 
     def _room_occupancy_entries(self, room: str, room_candidates: list[str] | None = None) -> list[tuple[str, str]]:
         entries, _source = self._room_occupancy_entries_with_source(room, room_candidates)
@@ -1351,12 +1313,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
             room = room_candidates[0]
         canonical = self._canonical_room_occupancy_entries(room, room_candidates)
         live = self._legacy_room_occupancy_entries_for_candidates(room, room_candidates)
-        live_getter = getattr(self, "_get_live_presence_occupancy_map", None)
-        live_source = "ha_live_presence_state" if callable(live_getter) else "legacy_occupancy_map"
-        live_status = getattr(self, "_last_live_presence_guard_status", {})
+        live_source = "ha_live_presence_state"
+        live_status = self._last_live_presence_guard_status
         if (
-            callable(live_getter)
-            and isinstance(live_status, dict)
+            isinstance(live_status, dict)
             and live_status.get("ok") is False
             and room
         ):
@@ -1437,7 +1397,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                 if str(eid or "").strip()
             ],
         }
-        conflict = getattr(self, "_last_presence_guard_conflict", None)
+        conflict = self._last_presence_guard_conflict
         if isinstance(conflict, dict) and conflict:
             detail["presence_conflict"] = dict(conflict)
         self._last_turnoff_presence_guard_detail = detail
@@ -1445,24 +1405,13 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
     def _get_action_device_capability(self, entity_id: str) -> dict[str, Any]:
         """统一动作层设备能力读取面（Wave 1B）。"""
-        if hasattr(self, "get_device_capability"):
-            try:
-                cap = self.get_device_capability(entity_id)
-            except Exception as exc:
-                raise RuntimeError("action_device_capability_read_failed") from exc
-            if not isinstance(cap, dict):
-                raise ValueError("action_device_capability_shape_invalid")
-            return cap
-        info = self.device_info.get(entity_id, {}) or {}
-        room = (info.get("room") or "").strip()
-        return {
-            "entity_id": entity_id,
-            "control_mode": info.get("control_mode", "shared"),
-            "role": info.get("role", ""),
-            "control_zone": info.get("control_zone", room),
-            "disturbance_level": info.get("disturbance_level", ""),
-            "room": room,
-        }
+        try:
+            cap = self.get_device_capability(entity_id)
+        except Exception as exc:
+            raise RuntimeError("action_device_capability_read_failed") from exc
+        if not isinstance(cap, dict):
+            raise ValueError("action_device_capability_shape_invalid")
+        return cap
 
     @staticmethod
     def _is_truthy_shared_fixture(value: Any) -> bool:
@@ -1654,7 +1603,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
         is_on = "turn_on" in service or "open" in service
 
-        if getattr(self, "_ai_scenes_read_error", None) is not None:
+        if self._ai_scenes_read_error is not None:
             self._sys_log("WARN", "[Action Router] ai_scene_projection_unavailable; retain direct device target")
             return None
 
@@ -1663,7 +1612,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         # 修复之前直接用 Python weekday（0=Mon）导致工作日匹配失效的 Bug。
         if is_on:
             _now = self._ha_local_now()
-            for sc in getattr(self, "_ai_scenes_cache", []):
+            for sc in self._ai_scenes_cache:
                 if sc.get("status") != AI_SCENE_STATUS_ACTIVE:
                     continue
                 if not ai_scene_matches_now(sc, _now.hour, _now.weekday()):
@@ -1736,10 +1685,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         request_id: str,
     ) -> list[tuple[str, str]]:
         """Mark transitions attributable to this in-flight SmartAgent dispatch."""
-        registry = getattr(self, "_inflight_smartagent_state_feedback", None)
-        if not isinstance(registry, dict):
-            registry = {}
-            self._inflight_smartagent_state_feedback = registry
+        registry = self._inflight_smartagent_state_feedback
         keys: list[tuple[str, str]] = []
         for command in commands:
             key = self._smartagent_state_feedback_key(command)
@@ -1760,9 +1706,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         request_id: str,
     ) -> None:
         """Release only markers owned by the completed dispatch."""
-        registry = getattr(self, "_inflight_smartagent_state_feedback", None)
-        if not isinstance(registry, dict):
-            return
+        registry = self._inflight_smartagent_state_feedback
         for key in keys:
             request_ids = registry.get(key)
             if not isinstance(request_ids, set):
@@ -1807,11 +1751,8 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
         payload = call_params if isinstance(call_params, dict) else {}
         is_user_explicit = str(cmd_source or "").strip().upper() == "USER_EXPLICIT"
-        active_correlations = getattr(self, "_active_service_correlation_ids", {})
-        active_correlation_id = (
-            active_correlations.get(asyncio.current_task(), "")
-            if isinstance(active_correlations, dict)
-            else ""
+        active_correlation_id = self._active_service_correlation_ids.get(
+            asyncio.current_task(), ""
         )
         normalized_correlation_id = str(
             correlation_id_override or active_correlation_id or ""
@@ -1939,12 +1880,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
 
         result: dict[str, Any] | None
         if require_world_snapshot_guard:
-            is_enabled = getattr(self, "_is_enabled", None)
-            ai_enabled = (
-                bool(is_enabled())
-                if callable(is_enabled)
-                else bool(getattr(self, "_enabled", False))
-            )
+            ai_enabled = bool(self._is_enabled())
             if not ai_enabled and not is_user_explicit:
                 result = {
                     "ok": False,
@@ -1988,7 +1924,7 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
                     "status": "blocked",
                 }
             else:
-                addon_client = getattr(self, "_addon_client", None)
+                addon_client = self._addon_client
                 execute = getattr(addon_client, "execute_command_envelope", None)
                 if not callable(execute):
                     result = {

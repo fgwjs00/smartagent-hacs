@@ -256,12 +256,8 @@ class DevicesMixin:
         ts: str | None = None,
     ) -> dict[str, Any] | None:
         """Wait for the Add-on single writer before mutating HA runtime state."""
-        post = getattr(self, "_post_internal_event_confirmed_async", None)
-        if not callable(post):
-            self._sys_log("WARN", f"[Storage] persistence bridge unavailable: operation=DevicesMixin._persist_business_event kind={kind}")
-            return None
         try:
-            result = await post(kind, dict(payload or {}), ts=ts)
+            result = await self._post_internal_event_confirmed_async(kind, dict(payload or {}), ts=ts)
             status = int(result.get("status") or result.get("__status") or 0) if isinstance(result, dict) else 0
         except Exception as exc:
             self._sys_log("WARN", f"[Storage] persistence request failed: operation=DevicesMixin._persist_business_event "
@@ -294,7 +290,7 @@ class DevicesMixin:
         if action != "delete":
             row = dict(info or {})
             if state_obj is None:
-                states = getattr(getattr(self, "hass", None), "states", None)
+                states = getattr(self.hass, "states", None)
                 getter = getattr(states, "get", None)
                 state_obj = getter(entity_id) if callable(getter) else None
             for key in REGISTRY_IDENTITY_FIELDS:
@@ -389,8 +385,7 @@ class DevicesMixin:
         ) is not None
 
     def _memory_asset_for_index(self, target: str, index: int) -> dict[str, Any]:
-        attr = "_rule_assets" if target == "rule" else "_habit_assets"
-        assets = getattr(self, attr, None)
+        assets = self._rule_assets if target == "rule" else self._habit_assets
         if not isinstance(assets, list) or index < 0 or index >= len(assets):
             return {}
         row = assets[index]
@@ -406,7 +401,7 @@ class DevicesMixin:
         locked: bool = False,
     ) -> None:
         attr = "_rule_assets" if target == "rule" else "_habit_assets"
-        assets = list(getattr(self, attr, None) or [])
+        assets = list((self._rule_assets if target == "rule" else self._habit_assets) or [])
         if action == "add":
             assets.append({"content": content, "locked": bool(locked)})
         elif 0 <= index < len(assets):
@@ -424,7 +419,7 @@ class DevicesMixin:
 
     async def _async_refresh_memory_assets_from_addon(self) -> bool:
         """Refresh legacy tuple mirrors and full scoped assets from the Add-on."""
-        client = getattr(self, "_addon_client", None)
+        client = self._addon_client
         status = {"ok": False, "sources": {}, "changed": False}
         self._last_addon_memory_sync_status = status
         if client is None:
@@ -970,19 +965,15 @@ class DevicesMixin:
             if result is None:
                 continue
             # This SQL helper maintains the old HA cache only after Core commits.
-            cache_writer = getattr(self, "_persist_device_entity_id_migration", None)
-            if callable(cache_writer):
-                cache_writer(old, new, {**row, **registry_metadata(entry)})
+            self._persist_device_entity_id_migration(old, new, {**row, **registry_metadata(entry)})
             changed = True
         return changed
 
     async def async_refresh_device_areas(self, *, changed_entity_ids: set[str] | None = None) -> int:
         """Re-read confirmed HA registry assignments; never write stale SA rooms back."""
-        if not hasattr(self, "_ha_area_sync_lock"):
-            self._ha_area_sync_lock = asyncio.Lock()
         async with self._ha_area_sync_lock:
             try:
-                entity_ids = set(self.device_info) | set(getattr(self, "_managed_registry_entity_ids", ()))
+                entity_ids = set(self.device_info) | set(self._managed_registry_entity_ids)
                 assignments = [
                     {"entity_id": eid, **assignment}
                     for eid in sorted(entity_ids)
@@ -1018,7 +1009,7 @@ class DevicesMixin:
             self._refresh_listeners_if_entity_set_changed()
         changed = set()
         changed_fields = data.get("changes") or {}
-        for eid in set(self.device_info) | set(getattr(self, "_managed_registry_entity_ids", ())):
+        for eid in set(self.device_info) | set(self._managed_registry_entity_ids):
             entry = er.async_get(self.hass).async_get(eid)
             if (event.event_type == "entity_registry_updated" and eid == data.get("entity_id")
                     and ("area_id" in changed_fields or "device_id" in changed_fields)):
@@ -1036,7 +1027,7 @@ class DevicesMixin:
     async def async_sync_rooms_to_ha(self) -> dict:
         """Compatibility refresh entrypoint; edits use the common HA registry writer."""
         updated = await self.async_refresh_device_areas()
-        status = getattr(self, "_last_ha_area_sync", {}) or {}
+        status = self._last_ha_area_sync or {}
         return {
             "ok": status.get("ok", False), "created_areas": 0, "updated_entities": 0,
             "updated_projections": updated, "errors": int(status.get("ok") is not True),
@@ -1087,7 +1078,7 @@ class DevicesMixin:
             if scope == "device":
                 result["affected_assignments"] = [
                     {"entity_id": current_id, **current}
-                    for current_id in sorted(set(self.device_info) | set(getattr(self, "_managed_registry_entity_ids", ())) | {eid})
+                    for current_id in sorted(set(self.device_info) | set(self._managed_registry_entity_ids) | {eid})
                     if (current := self._get_entity_area_assignment(current_id)) is not None
                     and current["ha_device_id"] == device_id
                 ]
@@ -1641,7 +1632,7 @@ class DevicesMixin:
     async def async_delete_behavior_pattern(self, pattern_id: int) -> None:
         """Delete a single behavior pattern through the canonical add-on store."""
         try:
-            addon_client = getattr(self, "_addon_client", None)
+            addon_client = self._addon_client
             if addon_client is None:
                 self._sys_log("WARN", f"[行为习惯] Add-on 不可用，跳过删除: id={pattern_id}")
                 return
@@ -1978,7 +1969,7 @@ class DevicesMixin:
 
     async def async_rollback_transaction(self, txn_id: int) -> None:
         """Delegate rollback to the add-on canonical transaction source."""
-        addon_client = getattr(self, "_addon_client", None)
+        addon_client = self._addon_client
         rollback = getattr(addon_client, "rollback_transaction", None)
         if not callable(rollback):
             self._sys_log("WARN", f"[Transaction] rollback unavailable: add-on client missing, id={txn_id}")
@@ -2033,7 +2024,7 @@ class DevicesMixin:
 
     async def async_trigger_ai_scene(self, scene_id: int) -> None:
         """Delegate scene execution to the add-on authority boundary."""
-        addon_client = getattr(self, "_addon_client", None)
+        addon_client = self._addon_client
         trigger = getattr(addon_client, "trigger_ai_scene", None)
         if not callable(trigger):
             self._sys_log("WARN", "[AI场景] add-on lifecycle provider unavailable")
