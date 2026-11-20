@@ -85,27 +85,23 @@ def _dispatch_listener_state_changed(
         elif new.context.parent_id:
             source_type = "自动化/脚本"
 
+    def _lookup_entity_device_info(target_entity_id: str) -> tuple[bool, Any]:
+        environment_device_info = self._environment_context_device_info
+        if isinstance(environment_device_info, dict) and target_entity_id in environment_device_info:
+            return True, environment_device_info[target_entity_id]
+        if target_entity_id in self.device_info:
+            return True, self.device_info[target_entity_id]
+        return False, None
+
     domain = entity_id.split(".")[0]
-    device_info_snapshot = dict(self.device_info)
-    environment_device_info = self._environment_context_device_info
-    if isinstance(environment_device_info, dict):
-        device_info_snapshot = {
-            **device_info_snapshot,
-            **environment_device_info,
-        }
-    if entity_id not in device_info_snapshot:
+    is_known_entity, entity_device_info = _lookup_entity_device_info(entity_id)
+    if not is_known_entity:
         try:
             if self._reconcile_device_info_entity_ids_from_ha_registry():
-                device_info_snapshot = dict(self.device_info)
-                environment_device_info = self._environment_context_device_info
-                if isinstance(environment_device_info, dict):
-                    device_info_snapshot = {
-                        **device_info_snapshot,
-                        **environment_device_info,
-                    }
+                is_known_entity, entity_device_info = _lookup_entity_device_info(entity_id)
         except Exception as exc:
             logger.debug("[Listeners] state-handler reconciliation skipped for %s: %s", entity_id, exc)
-    if entity_id not in device_info_snapshot:
+    if not is_known_entity:
         unmanaged_filter_reason = "unmanaged_entity"
         self._last_listener_filter_reason = unmanaged_filter_reason
         logger.debug(
@@ -142,7 +138,7 @@ def _dispatch_listener_state_changed(
     if domain == "sensor":
         environment_metadata = self._listener_entity_metadata(
             entity_id,
-            info=device_info_snapshot.get(entity_id),
+            info=entity_device_info,
             state_obj=new,
         )
         environment_decision = self._environment_telemetry_event_filter.evaluate(
@@ -185,7 +181,7 @@ def _dispatch_listener_state_changed(
         if callable(create_task):
             coro = self._persist_device_record(
                 entity_id,
-                device_info_snapshot.get(entity_id),
+                entity_device_info,
                 state_obj=new,
             )
             try:
@@ -415,7 +411,7 @@ def _dispatch_listener_state_changed(
     self._record_arrival_manual_action_evidence(
         entity_id=entity_id, old_state=old_s, new_state=new_s,
         new_state_obj=new, source_type=source_type,
-        device_info=dict(device_info_snapshot.get(entity_id) or {}),
+        device_info=dict(entity_device_info) if isinstance(entity_device_info, dict) else {},
         occurred_at=occurred_at,
     )
 
@@ -431,7 +427,7 @@ def _dispatch_listener_state_changed(
         new_state=new_s,
         new_state_obj=new,
         source_type=source_type,
-        device_info=dict(device_info_snapshot.get(entity_id) or {}),
+        device_info=dict(entity_device_info) if isinstance(entity_device_info, dict) else {},
         occurred_at=occurred_at,
     )
     self._record_silent_learning_behavior_sample(entity_id, old_s, new_s, source_type, old, new)
@@ -454,7 +450,7 @@ def _dispatch_listener_state_changed(
         )
         return
 
-    info = device_info_snapshot.get(entity_id) if isinstance(device_info_snapshot, dict) else {}
+    info = entity_device_info if isinstance(entity_device_info, dict) else {}
     info = self._listener_entity_metadata(entity_id, info=info, state_obj=new)
     is_presence_sensor = self._is_presence_listener_entity(entity_id, info)
     if domain == "binary_sensor" and not is_presence_sensor:

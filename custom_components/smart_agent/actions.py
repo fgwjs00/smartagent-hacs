@@ -283,16 +283,10 @@ class ActionsMixin(ActionExecutionRuntimeMixin):
         return None
 
     def _ha_local_now(self):
-        from datetime import datetime as _stdlib_datetime
-        from homeassistant.util import dt as dt_util
-        from custom_components.smart_agent.timezone_support import ha_local_now
+        from .timezone_support import ha_local_now
         return ha_local_now(
             self.hass,
-            fallback_now=lambda: (
-                dt_util.now()
-                if datetime is _stdlib_datetime
-                else datetime.now(None)
-            ),
+            fallback_now=lambda: dt_util.now(),
             now_cls=datetime,
             logger=_LOGGER,
             source="Actions",

@@ -51,7 +51,6 @@ class ConfigProjectionError(RuntimeError):
 class DatabaseMixin(DatabaseLearningProjectionMixin, DatabaseSceneBridgeMixin, DatabaseTransactionMixin):
     _VALID_CONTROL_MODES = DEVICE_CONTROL_MODES
     hass: Any = None
-    device_info: dict[str, dict[str, Any]] = {}
 
     def _ha_local_now(self) -> datetime:
         from .timezone_support import ha_local_now

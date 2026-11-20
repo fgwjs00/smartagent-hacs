@@ -1,11 +1,48 @@
 """Server-owned HA config update service handler."""
 from __future__ import annotations
 
+import json as _json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+_EXTERNAL_TOOL_KEYS = frozenset({"qweather_api_key", "searxng_url"})
+
+
+def _sync_coordinator_option_state(
+    coordinator: Any,
+    *,
+    key: str,
+    conf_key: str,
+    val: Any,
+    json_obj_keys: set[str],
+    coerce_file_log_level: Callable[[Any], int],
+) -> None:
+    sync_val = val
+    if key == "file_log_level":
+        sync_val = coerce_file_log_level(val)
+        coordinator._file_log_level_name = logging.getLevelName(sync_val)
+        coordinator._file_logger.setLevel(sync_val)
+    elif key in json_obj_keys and isinstance(val, str):
+        parsed = _json.loads(val) if val else {}
+        sync_val = parsed if isinstance(parsed, dict) else {}
+
+    if key in _EXTERNAL_TOOL_KEYS:
+        setattr(coordinator, f"_{key}", sync_val)
+        tools_map = getattr(getattr(coordinator, "_tools", None), "tools", None)
+        if isinstance(tools_map, dict):
+            for tool in tools_map.values():
+                tool_cfg = getattr(tool, "config", None)
+                if isinstance(tool_cfg, dict):
+                    tool_cfg[conf_key] = sync_val
+        return
+
+    attr_name = f"_{key}" if hasattr(coordinator, f"_{key}") else key
+    if hasattr(coordinator, attr_name):
+        setattr(coordinator, attr_name, sync_val)
+    elif hasattr(coordinator, key):
+        setattr(coordinator, key, sync_val)
 
 
 async def apply_config_update_service(
@@ -139,31 +176,25 @@ async def apply_config_update_service(
                     except (ValueError, TypeError) as _je:
                         _LOGGER.warning("[Config] %s 不是合法 JSON 对象: %s，已忽略", key, _je)
                         continue
+            elif key in _EXTERNAL_TOOL_KEYS:
+                val = str(val or "").strip()
 
-            if opts.get(conf_key) != val:
+            current_val = opts.get(conf_key, (getattr(entry, "data", None) or {}).get(conf_key))
+            if current_val != val:
                 # 密码型字段保护：前端回显使用掩码（如 **** / sk-xx****yy），
                 # 空值或掩码值不应覆盖已保存的真实密钥。
                 if conf_key in (CONF_ONLINE_API_KEY, CONF_QWEATHER_API_KEY, CONF_LICENSE_KEY):
                     if not str(val or "").strip() or "****" in str(val):
                         continue
                 opts[conf_key] = val
-                # 同步更新 coordinator 内存中的值（JSON 字段保持运行态结构类型）
-                sync_val = val
-                if key == "file_log_level":
-                    sync_val = coerce_file_log_level(val)
-                    coordinator._file_log_level_name = logging.getLevelName(sync_val)
-                    coordinator._file_logger.setLevel(sync_val)
-                if key in _JSON_OBJ_KEYS and isinstance(val, str):
-                    try:
-                        _obj = _json.loads(val) if val else {}
-                        sync_val = _obj if isinstance(_obj, dict) else {}
-                    except (ValueError, TypeError):
-                        sync_val = {}
-                attr_name = f"_{key}" if hasattr(coordinator, f"_{key}") else key
-                if hasattr(coordinator, attr_name):
-                    setattr(coordinator, attr_name, sync_val)
-                elif hasattr(coordinator, key):
-                    setattr(coordinator, key, sync_val)
+                _sync_coordinator_option_state(
+                    coordinator,
+                    key=key,
+                    conf_key=conf_key,
+                    val=val,
+                    json_obj_keys=_JSON_OBJ_KEYS,
+                    coerce_file_log_level=coerce_file_log_level,
+                )
                 any_changed = True
 
     if any_changed:

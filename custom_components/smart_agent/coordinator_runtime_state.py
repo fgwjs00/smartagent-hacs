@@ -42,6 +42,8 @@ from .const import (
     CONF_ONLINE_API_KEY,
     CONF_ONLINE_BASE_URL,
     CONF_ONLINE_MODEL,
+    CONF_QWEATHER_API_KEY,
+    CONF_SEARXNG_URL,
     CONF_SENSORS_MUTED,
     CONF_SHOWROOM_AREA_NAME,
     CONF_SHOWROOM_BIZ_END,
@@ -172,8 +174,8 @@ def _init_core_and_engine_state(self: Any, cfg: dict[str, Any], *, config_dir: s
         maximum=86400,
     )
     self._tools: Any = None
-    self._qweather_api_key: str = str(cfg.get("qweather_api_key") or "").strip()
-    self._searxng_url: str = str(cfg.get("searxng_url") or "").strip()
+    self._qweather_api_key: str = str(cfg.get(CONF_QWEATHER_API_KEY) or "").strip()
+    self._searxng_url: str = str(cfg.get(CONF_SEARXNG_URL) or "").strip()
     self._cloud_fallback = bool(cfg.get(CONF_CLOUD_FALLBACK, False))
     self._vision_enabled = bool(cfg.get(CONF_VISION_ENABLED, False))
     self._vision_engine = cfg.get(CONF_VISION_ENGINE, ENGINE_ONLINE)
@@ -287,7 +289,7 @@ def _init_listener_and_presence_state(self: Any, cfg: dict[str, Any]) -> None:
     self._room_topology_refresh_pending: bool = False
     self._presence_snapshot_cache: dict[str, dict[str, Any]] = {}
     self._presence_snapshot_cache_updated_at: float = 0.0
-    self._presence_snapshot_cache_record: tuple[dict[str, dict[str, Any]], float] | None = None
+    self._presence_snapshot_cache_record: tuple[dict[str, dict[str, Any]], float] = ({}, 0.0)
     self._presence_snapshot_refresh_request_id: int = 0
     self._presence_snapshot_refresh_committed_request_id: int = 0
     self._arrival_occupancy_cycles: dict[str, dict[str, Any]] = {}

@@ -1,12 +1,13 @@
 product: SmartAgent
-release_version: 0.0.244
-display_version: Beta 0.0.244
+release_version: 0.0.245
+display_version: Beta 0.0.245
 channel: beta
-release_date: '2026-11-19'
+release_date: '2026-11-20'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 完成过度防御复审 0.1d 收口：修复设备接入中心隔离会话主动关闭签名缺陷与隔离启动失败阻断、P0-4 拓扑严读、E/C/F 剩余项收敛及增量门禁加固。
-  customer_visible_version: Beta 0.0.244
+  summary: 完成两轮主线审查全部整改：修复 V5 备份恢复核实收尾、诊断/授权/MCP/配对/事务/待确认字段对齐、HomeKit 多桥重置与 HAP 5.0
+    解析、ZHA 入网与自动回退、Supervisor 防重放、按流程学习隔离及 HA 宿主回退。
+  customer_visible_version: Beta 0.0.245

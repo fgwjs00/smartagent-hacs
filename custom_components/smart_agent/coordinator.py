@@ -291,10 +291,15 @@ class SmartAgentCoordinator(
         from .const import CONF_ADDON_PORT, DEFAULT_ADDON_PORT
 
         _addon_token = (data.get(CONF_ADDON_AUTH_TOKEN) or "").strip()
+        _addon_port = int(data.get(CONF_ADDON_PORT) or DEFAULT_ADDON_PORT)
         _addon_base_url = (data.get(CONF_ADDON_BASE_URL) or "").strip()
         if not _addon_base_url:
-            _addon_base_url = derive_addon_gateway_base_url(self._get_ha_url())
-        _addon_port = int(data.get(CONF_ADDON_PORT) or DEFAULT_ADDON_PORT)
+            try:
+                _addon_base_url = derive_addon_gateway_base_url(self._get_ha_url())
+            except RuntimeError as exc:
+                if str(exc) != "ha_url_unavailable":
+                    raise
+                _addon_base_url = f"http://localhost:{_addon_port}"
         self._addon_client = AddOnClient(
             base_url=_addon_base_url,
             port=_addon_port,
@@ -2121,7 +2126,7 @@ class SmartAgentCoordinator(
 
 
     def _ha_local_now(self) -> datetime:
-        from custom_components.smart_agent.timezone_support import ha_local_now
+        from .timezone_support import ha_local_now
         return ha_local_now(
             self.hass,
             fallback_now=lambda: dt_util.now(),

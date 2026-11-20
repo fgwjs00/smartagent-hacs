@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, datetime as _stdlib_datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -375,9 +375,7 @@ class ListenersMixin:
         from .timezone_support import ha_local_now
         return ha_local_now(
             self.hass,
-            fallback_now=lambda: (
-                dt_util.now() if datetime is _stdlib_datetime else datetime.now(None)
-            ),
+            fallback_now=lambda: dt_util.now(),
             now_cls=datetime,
             logger=_LOGGER,
             source="Listeners",
@@ -929,8 +927,8 @@ class ListenersMixin:
         snapshot["now_ts"] = now_ts
 
         for key, getter in (
-            ("space_snapshot", self.get_space_runtime_snapshot),
-            ("device_capability_snapshot", self.get_device_capability_snapshot),
+            ("space_snapshot", lambda: self.get_space_runtime_snapshot()),
+            ("device_capability_snapshot", lambda: self.get_device_capability_snapshot()),
         ):
             try:
                 value = getter()
@@ -2528,6 +2526,27 @@ class ListenersMixin:
             event["exception_type"] = type(completion.error).__name__
         self._emit_addon_fast_path_event(event)
 
+    def _resolve_listener_event_area(
+        self,
+        entity_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        maybe_info = self.device_info.get(entity_id)
+        info = maybe_info if isinstance(maybe_info, dict) else {}
+        area = str(info.get("room") or info.get("area") or "").strip()
+        if area:
+            return area
+        try:
+            return str(self._get_entity_area(entity_id) or "").strip()
+        except Exception as area_exc:
+            payload["area_lookup_error"] = type(area_exc).__name__
+            _LOGGER.warning(
+                "[Listeners] entity area lookup failed for listener event entity=%s error_type=%s",
+                entity_id,
+                type(area_exc).__name__,
+            )
+            return ""
+
     def _emit_listener_event(
         self,
         *,
@@ -2563,11 +2582,7 @@ class ListenersMixin:
                 self._last_listener_filter_reason = str(filter_reason)
             try:
                 event_time = self._ha_local_now().isoformat()
-                maybe_info = self.device_info.get(str(entity_id or ""))
-                info = maybe_info if isinstance(maybe_info, dict) else {}
-                area = str(info.get("room") or info.get("area") or "").strip()
-                if not area:
-                    area = str(self._get_entity_area(str(entity_id or "")) or "").strip()
+                area = self._resolve_listener_event_area(str(entity_id or ""), payload)
                 self._enqueue_internal_event(
                     "event",
                     {
