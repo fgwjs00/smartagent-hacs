@@ -123,12 +123,23 @@ class ReceiptOutbox:
                 raise
 
     def next_due(self) -> dict | None:
+        item, _ = self.next_due_or_wait()
+        return item
+
+    def next_due_or_wait(self, default_wait: float = 30.0) -> tuple[dict | None, float]:
         with self._lock:
             now = time.time()
             row = self._conn.execute(
                 "SELECT envelope FROM pending_receipts WHERE delivery_state!='quarantined' AND (retry_at<=? OR retry_at>?) ORDER BY sequence LIMIT 1",
                 (now, now + 60)).fetchone()
-            return json.loads(row[0]) if row else None
+            if row:
+                return json.loads(row[0]), 0.0
+            pending = self._conn.execute(
+                "SELECT MIN(retry_at) FROM pending_receipts WHERE delivery_state!='quarantined'"
+            ).fetchone()
+            if not pending or pending[0] is None:
+                return None, float(default_wait)
+            return None, max(0.05, min(float(default_wait), float(pending[0]) - now))
 
     @staticmethod
     def confirmed(item: dict, receipt: dict | None, status: int) -> bool:

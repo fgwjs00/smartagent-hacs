@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from copy import deepcopy
 import inspect
 import logging
@@ -64,6 +65,8 @@ class InternalEventBridge:
         self._outbox = None
         self._outbox_path = outbox_path
         self._durable_task: asyncio.Task | None = None
+        self._durable_wakeup: asyncio.Event | None = None
+        self._durable_sends: dict[int, asyncio.Task] = {}
         if outbox_path is not None:
             from .receipt_outbox import ReceiptOutbox
             self._outbox = ReceiptOutbox(outbox_path)
@@ -177,6 +180,7 @@ class InternalEventBridge:
                 self._monitor_task,
                 self._worker_task,
                 self._durable_task,
+                *self._durable_sends.values(),
                 *tuple(self._retry_tasks),
             )
             if task is not None
@@ -211,6 +215,12 @@ class InternalEventBridge:
     def _durable_kind(kind: str, payload: dict[str, Any]) -> bool:
         return kind == "decision_execution" or (kind == "correction"
             and str(payload.get("action") or "record").strip().lower() in {"record", "report"})
+
+    def _wake_durable(self) -> None:
+        event = self._durable_wakeup
+        task = self._durable_task
+        if event is not None and task is not None:
+            task.get_loop().call_soon_threadsafe(event.set)
 
     def _build_item(self, kind: str, payload: dict[str, Any], *, ts: str | None = None) -> dict[str, Any]:
         if self._durable_kind(kind, payload) and self._outbox is not None:
@@ -273,6 +283,7 @@ class InternalEventBridge:
             self._warn(f"operation=InternalEventBridge.enqueue exception_type={type(exc).__name__} outcome=not_admitted")
             return False
         if item.get("durability"):
+            self._wake_durable()
             return True  # FULL commit completed; independent of the optional memory queue.
         return self._admit_memory(item, "enqueue")
 
@@ -387,23 +398,39 @@ class InternalEventBridge:
         """Post one event directly and return the Add-on persistence receipt."""
         if self._outbox is not None and self._durable_kind(kind, payload):
             item = await asyncio.to_thread(self._build_item, kind, payload, ts=ts)
-        else:
-            item = self._build_item(kind, payload, ts=ts)
+            try:
+                return await self._deliver_durable(item)
+            finally:
+                self._wake_durable()
+        item = self._build_item(kind, payload, ts=ts)
         result = await self._post_item_result(item)
         receipt, status = self._normalize_persistence_receipt(result)
-        if item.get("durability"):
-            if self._outbox.confirmed(item, receipt, status):
-                await asyncio.to_thread(self._outbox.acknowledge, item)
-            else:
-                await asyncio.to_thread(self._outbox.retry, item,
-                                        quarantine=bool(self._permanent_rejection(result, status, item["kind"])))
-                return {"ok": False, "status": status if status >= 400 else 502,
-                        "error": "durable_delivery_unconfirmed", "persistence_confirmed": False}
         if receipt is None:
             return {"ok": False, "status": 502, "error": "invalid_addon_persistence_receipt"}
         if status >= 400 or receipt.get("ok") is not True:
             return {**receipt, "ok": False, "status": status}
         return {**receipt, "ok": True, "status": status, "persistence_confirmed": True}
+
+    async def _deliver_durable(self, item: dict[str, Any]) -> dict[str, Any]:
+        # The direct caller and the outbox worker can observe the same committed row.
+        seq = item["seq"]
+        task = self._durable_sends.get(seq)
+        if task is None:
+            task = self._create_task(self._send_durable(item), "durable_send", seq=seq)
+            self._durable_sends[seq] = task
+            task.add_done_callback(lambda _done: self._durable_sends.pop(seq, None))
+        return await asyncio.shield(task)
+
+    async def _send_durable(self, item: dict[str, Any]) -> dict[str, Any]:
+        result = await self._post_item_result(item)
+        receipt, status = self._normalize_persistence_receipt(result)
+        if self._outbox.confirmed(item, receipt, status):
+            await asyncio.to_thread(self._outbox.acknowledge, item)
+            return {**receipt, "ok": True, "status": status, "persistence_confirmed": True}
+        await asyncio.to_thread(self._outbox.retry, item,
+                                quarantine=bool(self._permanent_rejection(result, status, item["kind"])))
+        return {"ok": False, "status": status if status >= 400 else 502,
+                "error": "durable_delivery_unconfirmed", "persistence_confirmed": False}
 
     async def _post_item_result(self, item: dict[str, Any]) -> dict[str, Any] | None:
         kwargs: dict[str, Any] = {"ts": str(item.get("ts") or self._default_ts())}
@@ -476,33 +503,37 @@ class InternalEventBridge:
 
     async def _durable_loop(self) -> None:
         """Bounded worker; cancellation leaves committed evidence for restart."""
-        while True:
-            item = None
-            try:
-                item = await asyncio.to_thread(self._outbox.next_due)
-                if item is None:
-                    await asyncio.sleep(0.25)
-                    continue
-                result = await self._post_item_result(item)
-                receipt, status = self._normalize_persistence_receipt(result)
-                if self._outbox.confirmed(item, receipt, status):
-                    await asyncio.to_thread(self._outbox.acknowledge, item)
-                    self._posted += 1
-                else:
+        wakeup = asyncio.Event()
+        self._durable_wakeup = wakeup
+        try:
+            while True:
+                item = None
+                try:
+                    wakeup.clear()
+                    item, wait_seconds = await asyncio.to_thread(self._outbox.next_due_or_wait)
+                    if item is None:
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(wakeup.wait(), timeout=wait_seconds)
+                        continue
+                    result = await self._deliver_durable(item)
+                    if result["persistence_confirmed"]:
+                        self._posted += 1
+                    else:
+                        self._failed += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
                     self._failed += 1
-                    await asyncio.to_thread(self._outbox.retry, item,
-                                            quarantine=bool(self._permanent_rejection(result, status, item["kind"])))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._failed += 1
-                self._warn(f"operation=InternalEventBridge._durable_loop exception_type={type(exc).__name__} outcome=pending")
-                if item is not None:
-                    try:
-                        await asyncio.to_thread(self._outbox.retry, item)
-                    except Exception as retry_error:
-                        self._warn(f"operation=InternalEventBridge._durable_loop exception_type={type(retry_error).__name__} outcome=retry_not_saved")
-                await asyncio.sleep(1)
+                    self._warn(f"operation=InternalEventBridge._durable_loop exception_type={type(exc).__name__} outcome=pending")
+                    if item is not None:
+                        try:
+                            await asyncio.to_thread(self._outbox.retry, item)
+                        except Exception as retry_error:
+                            self._warn(f"operation=InternalEventBridge._durable_loop exception_type={type(retry_error).__name__} outcome=retry_not_saved")
+                    await asyncio.sleep(1)
+        finally:
+            if self._durable_wakeup is wakeup:
+                self._durable_wakeup = None
 
     def _enqueue_retry_item(self, item: dict[str, Any]) -> None:
         self._admit_memory(item, "_enqueue_retry_item")
@@ -517,7 +548,10 @@ class InternalEventBridge:
                 item.pop("_permanent_rejection", None)
                 self._delivery_failures[key]["state"] = "retrying"
                 return self._admit_memory(item, "resume_quarantined")
-        return self._outbox.resume_quarantined(stream_id, seq) if self._outbox is not None else False
+        resumed = self._outbox.resume_quarantined(stream_id, seq) if self._outbox is not None else False
+        if resumed:
+            self._wake_durable()
+        return resumed
 
     async def _monitor_loop(self) -> None:
         while True:

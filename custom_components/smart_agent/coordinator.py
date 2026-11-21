@@ -1380,7 +1380,7 @@ class SmartAgentCoordinator(
             await reconcile_rooms(self, now)
 
         self._listener_removers.append(async_track_time_interval(
-            self.hass, room_lighting_periodic, timedelta(seconds=20)))
+            self.hass, room_lighting_periodic, timedelta(seconds=300)))
         self._spawn_background_task(reconcile_rooms(self), "room_lighting_reconciliation")
 
         # Phase 10.0: 初始化虚拟在场推断引擎（device_info 此时已加载完成）
