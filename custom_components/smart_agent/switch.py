@@ -52,10 +52,27 @@ async def _push_owner_system_setting(entity, field: str, value: bool) -> bool:
             f"[OwnerSettings] {field} 写入 add-on 失败: {exc}",
         )
         return False
-    if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
+    if not isinstance(result, dict):
         entity.coordinator._sys_log(
             "WARNING",
-            f"[OwnerSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
+            f"[OwnerSettings] {field} 写入 add-on 无有效响应",
+        )
+        return False
+    raw_status = result.get("__status")
+    if raw_status is None:
+        raw_status = result.get("status_code")
+    if raw_status is None:
+        status = 200
+    elif isinstance(raw_status, int) and not isinstance(raw_status, bool):
+        status = raw_status
+    elif isinstance(raw_status, str) and raw_status.strip().isdigit():
+        status = int(raw_status.strip())
+    else:
+        status = 500
+    if result.get("ok") is False or result.get("error") or not (200 <= status < 300):
+        entity.coordinator._sys_log(
+            "WARNING",
+            f"[OwnerSettings] {field} 写入 add-on 失败: status={status} error={result.get('error')}",
         )
         return False
     return True
@@ -256,21 +273,7 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
     async def _push_to_addon(self, field: str, value: bool) -> bool:
-        addon_client = getattr(self.coordinator, "_addon_client", None)
-        if addon_client is None:
-            return False
-        try:
-            result = await addon_client.post_system_settings({field: value})
-        except Exception as exc:
-            self.coordinator._sys_log("WARNING", f"[AddonSettings] {field} 写入 add-on 失败: {exc}")
-            return False
-        if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
-            self.coordinator._sys_log(
-                "WARNING",
-                f"[AddonSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
-            )
-            return False
-        return True
+        return await _push_owner_system_setting(self, field, value)
 
     async def async_turn_on(self, **kwargs) -> None:
         await _require_current_human_admin(self)
@@ -324,21 +327,7 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
     async def _push_to_addon(self, field: str, value: bool) -> bool:
-        addon_client = getattr(self.coordinator, "_addon_client", None)
-        if addon_client is None:
-            return False
-        try:
-            result = await addon_client.post_system_settings({field: value})
-        except Exception as exc:
-            self.coordinator._sys_log("WARNING", f"[AddonSettings] {field} 写入 add-on 失败: {exc}")
-            return False
-        if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
-            self.coordinator._sys_log(
-                "WARNING",
-                f"[AddonSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
-            )
-            return False
-        return True
+        return await _push_owner_system_setting(self, field, value)
 
     async def async_turn_on(self, **kwargs) -> None:
         await _require_current_human_admin(self)
@@ -397,21 +386,7 @@ class SmartAgentVisionSwitch(CoordinatorEntity, SwitchEntity):
         self.hass.config_entries.async_update_entry(self.coordinator._entry, options=opts)
 
     async def _push_to_addon(self, field: str, value: bool) -> bool:
-        addon_client = getattr(self.coordinator, "_addon_client", None)
-        if addon_client is None:
-            return False
-        try:
-            result = await addon_client.post_system_settings({field: value})
-        except Exception as exc:
-            self.coordinator._sys_log("WARNING", f"[AddonSettings] {field} 写入 add-on 失败: {exc}")
-            return False
-        if isinstance(result, dict) and int(result.get("status_code") or 200) >= 400:
-            self.coordinator._sys_log(
-                "WARNING",
-                f"[AddonSettings] {field} 写入 add-on 状态码异常: {result.get('status_code')}",
-            )
-            return False
-        return True
+        return await _push_owner_system_setting(self, field, value)
 
     async def async_turn_on(self, **kwargs) -> None:
         await _require_current_human_admin(self)

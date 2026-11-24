@@ -39,7 +39,7 @@ class ReceiptOutbox:
         self._closed = False
         self._conn = connect(path, isolation_level=None, check_same_thread=False)
         try:
-            self._conn.execute("PRAGMA busy_timeout=1000")
+            self._conn.execute("PRAGMA busy_timeout=5000")
             mode = self._conn.execute("PRAGMA journal_mode").fetchone()[0]
             if mode != "wal":
                 mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]

@@ -231,6 +231,9 @@ async def apply_addon_system_settings(
     payload = await _fetch_addon_settings(owner)
     if payload is None:
         return False
+    if str(payload.get("source") or "").strip() == "addon_default":
+        _LOGGER.debug("[AddonSettings] skip applying unpersisted addon_default payload over live runtime")
+        return report_addon_sync_recovery(owner, "settings")
 
     applied: list[str] = []
     _apply_inference_settings(owner, payload, applied)

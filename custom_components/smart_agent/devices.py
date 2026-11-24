@@ -11,6 +11,7 @@ import asyncio
 import json as _json
 import hashlib
 import math
+import sys
 from copy import deepcopy
 from datetime import datetime, timezone
 
@@ -235,6 +236,20 @@ def _rollback_service_for_snapshot_state(domain: str, state: Any) -> str:
     if domain == "climate":
         return "turn_off" if state_norm in _ROLLBACK_OFF_STATES else "turn_on"
     return "turn_on" if state_norm in {"on", "open"} else "turn_off"
+
+
+def _ha_error_class() -> type[Exception]:
+    mod = sys.modules.get("homeassistant.exceptions")
+    cls = getattr(mod, "HomeAssistantError", None) if mod is not None else None
+    return cls if isinstance(cls, type) and issubclass(cls, Exception) else RuntimeError
+
+
+def _parse_addon_http_status(result: dict[str, Any]) -> int:
+    raw = result.get("__status") or result.get("status_code") or result.get("status") or 0
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    text = str(raw).strip()
+    return int(text) if text.isdigit() else 0
 
 
 class DevicesMixin:
@@ -1631,23 +1646,21 @@ class DevicesMixin:
         self.async_set_updated_data({})
     async def async_delete_behavior_pattern(self, pattern_id: int) -> None:
         """Delete a single behavior pattern through the canonical add-on store."""
-        try:
-            addon_client = self._addon_client
-            if addon_client is None:
-                self._sys_log("WARN", f"[行为习惯] Add-on 不可用，跳过删除: id={pattern_id}")
-                return
-            result = await addon_client.post_behavior_pattern_action(int(pattern_id), "delete")
-            if not isinstance(result, dict):
-                self._sys_log("WARN", f"[行为习惯] Add-on 无响应，删除失败: id={pattern_id}")
-                return
-            status = int(result.get("__status") or result.get("status_code") or 0)
-            if status >= 400 or result.get("ok") is False:
-                self._sys_log("WARN", f"[行为习惯] 删除失败: id={pattern_id}, result={result}")
-                return
-            self._sys_log("INFO", f"[行为习惯] 已删除习惯规律 id={pattern_id}")
-            self.async_set_updated_data({})
-        except Exception as e:
-            _LOGGER.warning("[DevicesMixin] Delete pattern failed: %s", e)
+        err_cls = _ha_error_class()
+        addon_client = self._addon_client
+        if addon_client is None:
+            self._sys_log("WARN", f"[行为习惯] Add-on 不可用，跳过删除: id={pattern_id}")
+            raise err_cls(f"Add-on unavailable: delete behavior pattern id={pattern_id}")
+        result = await addon_client.post_behavior_pattern_action(int(pattern_id), "delete")
+        if not isinstance(result, dict):
+            self._sys_log("WARN", f"[行为习惯] Add-on 无响应，删除失败: id={pattern_id}")
+            raise err_cls(f"Add-on returned no response for delete pattern id={pattern_id}")
+        status = _parse_addon_http_status(result)
+        if status >= 400 or result.get("ok") is False:
+            self._sys_log("WARN", f"[行为习惯] 删除失败: id={pattern_id}, result={result}")
+            raise err_cls(f"Delete behavior pattern failed id={pattern_id}: status={status}")
+        self._sys_log("INFO", f"[行为习惯] 已删除习惯规律 id={pattern_id}")
+        self.async_set_updated_data({})
 
     # ── Phase 4: AI 场景管理 ─────────────────────────────────────────────────
 
@@ -1969,31 +1982,24 @@ class DevicesMixin:
 
     async def async_rollback_transaction(self, txn_id: int) -> None:
         """Delegate rollback to the add-on canonical transaction source."""
+        err_cls = _ha_error_class()
         addon_client = self._addon_client
         rollback = getattr(addon_client, "rollback_transaction", None)
         if not callable(rollback):
             self._sys_log("WARN", f"[Transaction] rollback unavailable: add-on client missing, id={txn_id}")
-            return
+            raise err_cls(f"Add-on rollback unavailable for transaction id={txn_id}")
 
-        try:
-            result = await rollback(int(txn_id))
-        except Exception as exc:
-            self._sys_log("WARN", f"[Transaction] add-on rollback failed id={txn_id}: {exc}")
-            return
-
+        result = await rollback(int(txn_id))
         if not isinstance(result, dict) or not result:
             self._sys_log("WARN", f"[Transaction] add-on rollback returned empty result id={txn_id}")
-            return
+            raise err_cls(f"Add-on rollback returned empty result id={txn_id}")
 
-        try:
-            status = int(result.get("__status") or result.get("status") or 0)
-        except (TypeError, ValueError):
-            status = 0
+        status = _parse_addon_http_status(result)
         ok = bool(result.get("ok")) or (200 <= status < 300 and not result.get("error"))
         if not ok:
             error = (result.get("error") or result.get("error_type") or (f"http_{status}" if status else "unknown_error"))
             self._sys_log("WARN", f"[Transaction] add-on rollback failed id={txn_id}: {error}")
-            return
+            raise err_cls(f"Add-on rollback failed id={txn_id}: {error}")
 
         refresh = getattr(addon_client, "get_transactions", None)
         if callable(refresh):

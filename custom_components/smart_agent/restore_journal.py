@@ -26,13 +26,21 @@ class RestoreJournal:
             active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)))""")
         db.execute("CREATE UNIQUE INDEX restore_one_active ON restore_handles(active) WHERE active=1")
 
+    @staticmethod
+    def _configure_connection(db) -> None:
+        db.execute("PRAGMA busy_timeout=5000")
+        mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+
     @contextmanager
     def _transaction(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         db = connect(self.path, timeout=5, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            db.execute("PRAGMA synchronous=FULL")
+            self._configure_connection(db)
             db.execute("BEGIN IMMEDIATE")
             self._initialize(db)
             yield db

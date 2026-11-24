@@ -884,19 +884,12 @@ class ListenersMixin:
                 "fallback_consumer": "none",
             }
 
-        try:
-            presence_snapshot = self.get_presence_snapshot()
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] get_presence_snapshot failed for add-on snapshot: %s", exc)
-            presence_snapshot = None
+        degraded_guards: list[str] = []
+        presence_snapshot = self._read_snapshot_guard("presence_snapshot", "get_presence_snapshot", degraded_guards)
         if isinstance(presence_snapshot, dict):
             snapshot["presence_snapshot"] = presence_snapshot
 
-        try:
-            locked_people_rules = self._build_locked_people_rules()
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] _build_locked_people_rules failed for add-on snapshot: %s", exc)
-            locked_people_rules = None
+        locked_people_rules = self._read_snapshot_guard("locked_people_rules", "_build_locked_people_rules", degraded_guards)
         if isinstance(locked_people_rules, list):
             snapshot["locked_people_rules"] = locked_people_rules
 
@@ -915,15 +908,13 @@ class ListenersMixin:
                 if filtered_evidence:
                     snapshot["presence_interaction_evidence"] = filtered_evidence
 
-        try:
-            priority_guards = self._get_priority_summary(include_lineage=True)
-        except Exception as exc:
-            _LOGGER.debug("[Listeners] _get_priority_summary failed for add-on snapshot: %s", exc)
-            priority_guards = None
+        priority_guards = self._read_snapshot_guard("priority_guards", "_get_priority_summary", degraded_guards, include_lineage=True)
         if isinstance(priority_guards, list):
             snapshot["manual_action_summary"] = {
                 "priority_guards": [dict(item) for item in priority_guards if isinstance(item, dict)]
             }
+        if degraded_guards:
+            snapshot["snapshot_degraded_guards"] = degraded_guards
         snapshot["now_ts"] = now_ts
 
         for key, getter in (
@@ -938,6 +929,19 @@ class ListenersMixin:
             if isinstance(value, dict):
                 snapshot[key] = value
         return snapshot
+
+    def _read_snapshot_guard(
+        self, guard_name: str, method_name: str, degraded: list[str], **kwargs: Any
+    ) -> Any:
+        getter = getattr(self, method_name, None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(**kwargs)
+        except Exception as exc:
+            _LOGGER.warning("[Listeners] %s failed for add-on snapshot: %s", guard_name, exc)
+            degraded.append(guard_name)
+            return None
 
     @staticmethod
     def _new_addon_fast_path_request_id(

@@ -166,7 +166,7 @@ _READ_PRAGMAS = frozenset("table_info table_xinfo table_list index_info index_xi
                          "database_list compile_options pragma_list function_list module_list collation_list".split())
 _CONNECTION_PRAGMAS = frozenset("busy_timeout cache_size cache_spill mmap_size synchronous "
                                "foreign_keys defer_foreign_keys recursive_triggers query_only "
-                               "trusted_schema read_uncommitted temp_store threads".split())
+                               "trusted_schema read_uncommitted temp_store threads journal_size_limit".split())
 _ACTION_PRAGMAS = frozenset("wal_checkpoint optimize incremental_vacuum shrink_memory".split())
 
 

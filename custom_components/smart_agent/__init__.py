@@ -2547,24 +2547,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def svc_save_room_topology(call: ServiceCall) -> None:
         if not await _check_admin(call):
             return
+        from .devices import _ha_error_class
+        err_cls = _ha_error_class()
         body = {"topology": call.data.get("topology") or []}
         _addon_client = getattr(coordinator, "_addon_client", None)
         if _addon_client is None:
             coordinator._sys_log("WARN", "[Topology] add-on topology provider unavailable: save_room_topology")
-            return
-        try:
-            normalized = await _save_rooms_topology_via_addon(_addon_client, body)
-        except Exception as exc:
-            coordinator._sys_log("WARN", f"[Topology] add-on topology save failed: {exc}")
-            return
+            raise err_cls("Add-on topology provider unavailable")
+        normalized = await _save_rooms_topology_via_addon(_addon_client, body)
         if normalized is None:
             coordinator._sys_log("WARN", "[Topology] add-on topology provider unavailable: save_room_topology")
-            return
+            raise err_cls("Add-on topology provider returned no response")
         payload, status = normalized
         if status >= 400 or payload.get("ok") is False:
             error = payload.get("error") or payload.get("error_type") or f"http_{status}"
             coordinator._sys_log("WARN", f"[Topology] add-on topology save rejected: {error}")
-            return
+            raise err_cls(f"Add-on topology save rejected: {error}")
         await _refresh_coord_room_topology_cache(coordinator)
         coordinator.async_set_updated_data({})
 

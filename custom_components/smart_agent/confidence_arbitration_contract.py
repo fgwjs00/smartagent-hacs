@@ -347,35 +347,56 @@ def _valid_arrival_lighting_typed_policy(
     return True
 
 
+_CRITICAL_SNAPSHOT_GUARDS = frozenset(
+    {"locked_people_rules", "priority_guards", "presence_snapshot"}
+)
+
+
+def _has_degraded_safety_guard(context_snapshot: dict[str, Any] | None) -> bool:
+    if not isinstance(context_snapshot, dict):
+        return False
+    degraded = context_snapshot.get("snapshot_degraded_guards")
+    if not isinstance(degraded, (list, tuple, set)):
+        return False
+    return any(str(item) in _CRITICAL_SNAPSHOT_GUARDS for item in degraded)
+
+
+def _validate_required_envelope(
+    payload: dict[str, Any] | None,
+    context_snapshot: dict[str, Any] | None,
+) -> tuple[AutoExecutionArbitrationValidation | None, tuple[float, float, float, float] | None]:
+    if _has_degraded_safety_guard(context_snapshot):
+        return AutoExecutionArbitrationValidation(False, "snapshot_safety_guard_degraded"), None
+    if not isinstance(payload, dict) or any(
+        key not in payload or payload.get(key) in (None, "")
+        for key in _REQUIRED_FIELDS
+    ):
+        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_missing"), None
+    confidence = _finite_percent(payload.get("confidence"))
+    confidence_auto = _finite_percent(payload.get("confidence_auto"))
+    confidence_notify = _finite_percent(payload.get("confidence_notify"))
+    threshold = _finite_percent(payload.get("threshold"))
+    if None in (confidence, confidence_auto, confidence_notify, threshold):
+        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid"), None
+    assert confidence is not None and confidence_auto is not None and confidence_notify is not None and threshold is not None
+    if confidence_notify > confidence_auto or threshold != confidence_auto:
+        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid"), None
+    if not isinstance(payload.get("auto_execute"), bool) or not isinstance(payload.get("confirm_required"), bool):
+        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid"), None
+    return None, (confidence, confidence_auto, confidence_notify, threshold)
+
+
 def validate_auto_execution_arbitration(
     payload: dict[str, Any] | None,
     *,
     context_snapshot: dict[str, Any] | None = None,
 ) -> AutoExecutionArbitrationValidation:
     """Validate an automatic response without making a second policy decision."""
-    if not isinstance(payload, dict) or any(
-        key not in payload or payload.get(key) in (None, "")
-        for key in _REQUIRED_FIELDS
-    ):
-        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_missing")
-
-    confidence = _finite_percent(payload.get("confidence"))
-    confidence_auto = _finite_percent(payload.get("confidence_auto"))
-    confidence_notify = _finite_percent(payload.get("confidence_notify"))
-    threshold = _finite_percent(payload.get("threshold"))
-    if None in (confidence, confidence_auto, confidence_notify, threshold):
-        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid")
-    assert confidence is not None
-    assert confidence_auto is not None
-    assert confidence_notify is not None
-    assert threshold is not None
-
-    if confidence_notify > confidence_auto or threshold != confidence_auto:
-        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid")
-    if not isinstance(payload.get("auto_execute"), bool) or not isinstance(
-        payload.get("confirm_required"), bool
-    ):
-        return AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid")
+    envelope_err, parsed = _validate_required_envelope(payload, context_snapshot)
+    if envelope_err is not None or parsed is None:
+        return envelope_err or AutoExecutionArbitrationValidation(False, "confidence_arbitration_invalid")
+    assert isinstance(payload, dict)
+    confidence, confidence_auto, confidence_notify, threshold = parsed
 
     result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
