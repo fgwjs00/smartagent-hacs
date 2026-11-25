@@ -743,11 +743,11 @@ async def async_ensure_ha_area(
     existing = _find_area(area_reg, requested_id or area_name)
     if existing is None and area_name:
         existing = _find_area(area_reg, area_name)
-    if existing is None:
+    created = existing is None
+    if created:
         existing = area_reg.async_get_or_create(area_name or requested_id)
     row = _area_entry_to_row(existing)
-    row["ok"] = True
-    return row
+    return dict(row, ok=True, created=created)
 
 
 async def async_delete_ha_area(hass: Any, area_id_or_name: str) -> dict[str, Any]:
