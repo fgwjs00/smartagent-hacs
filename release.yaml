@@ -1,13 +1,13 @@
 product: SmartAgent
-release_version: 0.0.248
-display_version: Beta 0.0.248
+release_version: 0.0.249
+display_version: Beta 0.0.249
 channel: beta
-release_date: '2026-11-25'
+release_date: '2026-11-26'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: V5 新增自定义集成安装、Zigbee 网关接入和 AI 批量整理实体。屋主管理员可以上传本地集成 ZIP，也可以安装已固定 SHA-256
-    的商店版本。正式网关镜像排除屏端调试包。
-  customer_visible_version: Beta 0.0.248
+  summary: 合并习惯学习与选灯修复、设备接入中心与华为流/仓库回退、房间设备 Supervisor 403 WS 回退、V5 管理端与手机端远程直达入口及
+    Cloud 跨站换票与解绑管理。
+  customer_visible_version: Beta 0.0.249
