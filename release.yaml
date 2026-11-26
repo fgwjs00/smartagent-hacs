@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.249
-display_version: Beta 0.0.249
+release_version: 0.0.250
+display_version: Beta 0.0.250
 channel: beta
 release_date: '2026-11-26'
 public_release_ready: true
@@ -8,6 +8,5 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 合并习惯学习与选灯修复、设备接入中心与华为流/仓库回退、房间设备 Supervisor 403 WS 回退、V5 管理端与手机端远程直达入口及
-    Cloud 跨站换票与解绑管理。
-  customer_visible_version: Beta 0.0.249
+  summary: 零纳管设备控制策略、AI 批量整理范围收口与命名保留、V5 管理端与中控屏移动端视图优化，以及 Cloud 用户默认家庭持久化支持。
+  customer_visible_version: Beta 0.0.250
