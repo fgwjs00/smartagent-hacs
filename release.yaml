@@ -1,12 +1,12 @@
 product: SmartAgent
-release_version: 0.0.250
-display_version: Beta 0.0.250
+release_version: 0.0.252
+display_version: Beta 0.0.252
 channel: beta
-release_date: '2026-11-26'
+release_date: '2026-11-27'
 public_release_ready: true
 component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 零纳管设备控制策略、AI 批量整理范围收口与命名保留、V5 管理端与中控屏移动端视图优化，以及 Cloud 用户默认家庭持久化支持。
-  customer_visible_version: Beta 0.0.250
+  summary: 包含零纳管设备策略与中控屏房间映射、远程网关配对失败日志增强，以及 V5 统一云端绑定面板交互。
+  customer_visible_version: Beta 0.0.252
