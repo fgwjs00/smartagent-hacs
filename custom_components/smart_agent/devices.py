@@ -1419,7 +1419,9 @@ class DevicesMixin:
             return 0
         labels = {"ai": "AI 全权", "ha": "HA 优先", "shared": "共享"}
         count = 0
-        for eid, info in self.device_info.items():
+        for eid, info in list(self.device_info.items()):
+            if not isinstance(info, dict):
+                continue
             if room and info.get("room", "") != room:
                 continue
             if dev_type and info.get("type", "") != dev_type:
@@ -1433,6 +1435,9 @@ class DevicesMixin:
                 self._sys_log("WARN", f"[管辖域] 批量写入失败，跳过设备: {eid}")
                 continue
             info["control_mode"] = mode
+            current = self.device_info.get(eid)
+            if isinstance(current, dict):
+                current["control_mode"] = mode
             count += 1
         if count:
             filter_desc = []
@@ -1669,6 +1674,13 @@ class DevicesMixin:
         from .ai_scene_projection import refresh_ai_scene_projection
         refresh_ai_scene_projection(self)
 
+    def _persisted_ai_scene_status(self, scene_id: int, fallback: dict | None = None) -> str:
+        record = next(
+            (s for s in require_ai_scene_projection(self) if s.get("id") == scene_id),
+            fallback,
+        )
+        return str(record.get("status") or "pending") if isinstance(record, dict) else "pending"
+
     async def async_create_scene_from_text(
         self, text: str, auto_activate: bool = False
     ) -> dict:
@@ -1739,12 +1751,13 @@ class DevicesMixin:
         )
         scene_id = scene_record["id"] if scene_record else -1
 
-        # Step 5: 若 auto_activate，直接激活
-        status = "pending"
+        # Step 5: 若 auto_activate，尝试激活并回读持久化真实状态
+        status = self._persisted_ai_scene_status(scene_id, scene_record)
         if auto_activate and scene_id > 0:
             try:
                 await self.async_approve_ai_scene(scene_id)
-                status = "active"
+                await self.hass.async_add_executor_job(self._refresh_ai_scenes_cache)
+                status = self._persisted_ai_scene_status(scene_id, scene_record)
             except Exception as e:
                 self._sys_log("WARN", f"[场景创建] 自动激活失败: {e}")
 

@@ -294,6 +294,28 @@ class SmartAgentConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return SmartAgentOptionsFlowHandler()
 
 
+def _resolve_options_flow_entry(
+    flow: "SmartAgentOptionsFlowHandler",
+) -> config_entries.ConfigEntry:
+    entry = getattr(flow, "_config_entry", None)
+    return entry if entry is not None else flow.config_entry
+
+
+def _options_flow_combined_config(
+    flow: "SmartAgentOptionsFlowHandler",
+) -> dict[str, object]:
+    entry = _resolve_options_flow_entry(flow)
+    return {**(entry.data or {}), **(entry.options or {})}
+
+
+def _merge_options_entry_payload(
+    flow: "SmartAgentOptionsFlowHandler",
+    saved: dict[str, object],
+) -> dict[str, object]:
+    entry = _resolve_options_flow_entry(flow)
+    return {**dict(entry.options or {}), **saved}
+
+
 class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
     """选项流：仅保留 HA 到 add-on 的连接参数。"""
 
@@ -303,7 +325,7 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
         """HA 侧只维护连接 add-on 所需的最小配置。"""
-        d = {**(self.config_entry.data or {}), **(self.config_entry.options or {})}
+        d = _options_flow_combined_config(self)
         errors: dict = {}
 
         if user_input is not None:
@@ -529,7 +551,7 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
                     )
                     user_input = None
             if user_input is not None and not (
-                security_channel_secret_mapping_is_valid(user_input)
+                security_channel_secret_mapping_is_valid({**d, **user_input})
             ):
                 errors["base"] = "invalid_security_channel_secret_separation"
                 user_input = None
@@ -560,7 +582,7 @@ class SmartAgentOptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_FIELD_CANARY_HOST_DISPATCH_PROOF_SECRET: host_proof_secret,
                 CONF_FIELD_CANARY_PREVIOUS_HOST_DISPATCH_PROOF_SECRET: previous_host_proof_secret,
             }
-            return self.async_create_entry(title="", data=saved)
+            return self.async_create_entry(title="", data=_merge_options_entry_payload(self, saved))
 
         addon_base_default = (d.get(CONF_ADDON_BASE_URL) or "").strip() or _suggest_addon_base_url(self.hass)
 

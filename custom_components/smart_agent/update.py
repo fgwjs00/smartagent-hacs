@@ -90,13 +90,6 @@ async def async_setup_entry(
     entity = SmartAgentUpdateEntity(hass, entry, coordinator)
     async_add_entities([entity])
 
-    # 立即检查一次
-    _spawn_update_task(hass, entity.async_check_for_update(), "initial_update_check")
-    # 每 24 小时定时检查，返回值是取消函数；存入实体以便卸载时注销
-    entity._cancel_interval = async_track_time_interval(
-        hass, entity._scheduled_check, _CHECK_INTERVAL
-    )
-
 
 class SmartAgentUpdateEntity(UpdateEntity):
     """SmartAgent 版本更新实体。"""
@@ -129,6 +122,15 @@ class SmartAgentUpdateEntity(UpdateEntity):
             manufacturer="SmartAgent",
             model="AI 智能家居控制器",
         )
+
+    async def async_added_to_hass(self) -> None:
+        """实体完成 HA 注册后再发起首次版本检查与定时轮询。"""
+        await super().async_added_to_hass()
+        _spawn_update_task(self.hass, self.async_check_for_update(), "initial_update_check")
+        if self._cancel_interval is None:
+            self._cancel_interval = async_track_time_interval(
+                self.hass, self._scheduled_check, _CHECK_INTERVAL
+            )
 
     async def async_will_remove_from_hass(self) -> None:
         """集成卸载时取消定时器，防止内存泄漏。"""
@@ -188,7 +190,8 @@ class SmartAgentUpdateEntity(UpdateEntity):
         else:
             _LOGGER.debug("[Update] 当前已是最新版本 v%s", self._current_version)
 
-        self.async_write_ha_state()
+        if self.hass is not None and self.entity_id:
+            self.async_write_ha_state()
 
     async def _fetch_version_info(self) -> tuple[str, str, str, bool]:
         """
@@ -249,15 +252,22 @@ class SmartAgentUpdateEntity(UpdateEntity):
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
         """
-        比较版本号（SemVer）：latest > current 时返回 True。
+        比较版本号（SemVer 核心数字段）：latest > current 时返回 True。
 
         Args:
-            latest: 最新版本字符串，如 "4.7.0"
-            current: 当前版本字符串，如 "4.6.0"
+            latest: 最新版本字符串，如 "6.0.1" 或 "6.1.0-bridge"
+            current: 当前版本字符串，如 "6.0.0-bridge"
         """
         try:
             def _parse(v: str) -> tuple[int, ...]:
-                return tuple(int(x) for x in v.split(".")[:3])
+                core = v.strip().lstrip("vV").split("+", 1)[0].split("-", 1)[0]
+                parts = core.split(".")[:3]
+                if not parts or any(not part.isdigit() for part in parts):
+                    raise ValueError("invalid_version")
+                nums = [int(part) for part in parts]
+                while len(nums) < 3:
+                    nums.append(0)
+                return tuple(nums)
             return _parse(latest) > _parse(current)
         except (ValueError, AttributeError):
             return False

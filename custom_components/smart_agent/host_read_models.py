@@ -15,6 +15,36 @@ from .ha_adapter import (
 )
 
 
+class HostReadModelError(RuntimeError):
+    """Typed fail-closed error raised when HA host registry or state reads fail."""
+
+    status_code = 503
+
+    def __init__(
+        self,
+        error: str,
+        *,
+        error_type: str = "dependency_unavailable",
+        retryable: bool = True,
+        **extra: Any,
+    ) -> None:
+        super().__init__(error)
+        self.error_code = error
+        self.error_type = error_type
+        self.retryable = retryable
+        self.payload: dict[str, Any] = {
+            "ok": False,
+            "error": error,
+            "error_type": error_type,
+            "retryable": retryable,
+            "source": "ha_host_local",
+            **extra,
+        }
+
+    def error_payload(self, scope: str, **extra: Any) -> dict[str, Any]:
+        return {**self.payload, "scope": scope, **extra}
+
+
 def _presence_sensor_keywords(coord: SmartAgentCoordinator) -> tuple[str, ...]:
     defaults = (
         "occupancy", "presence", "motion", "pir", "ren_ti", "cun_zai", "you_ren",
@@ -165,12 +195,12 @@ def local_device_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dic
             continue
         entity_id = str(eid)
         row = {"entity_id": entity_id, "managed": True, "in_sa": True, **dict(info)}
+        get_area = getattr(coord, "_get_entity_area", None)
         try:
-            get_area = getattr(coord, "_get_entity_area", None)
             raw_ha_area = get_area(entity_id) if callable(get_area) else ""
-            ha_area = str(raw_ha_area or "").strip()
-        except Exception:
-            ha_area = ""
+        except Exception as exc:
+            raise HostReadModelError("device_area_read_failed", entity_id=entity_id, cause_type=type(exc).__name__) from exc
+        ha_area = str(raw_ha_area or "").strip()
         if ha_area:
             cached_room = str(row.get("room") or row.get("area") or "").strip()
             if cached_room and cached_room != ha_area:
@@ -182,8 +212,8 @@ def local_device_rows(coord: Any, hass: HomeAssistant | None = None) -> list[dic
         if hass is not None:
             try:
                 state_obj = async_get_state(hass, entity_id)
-            except Exception:
-                state_obj = None
+            except Exception as exc:
+                raise HostReadModelError("device_state_read_failed", entity_id=entity_id, cause_type=type(exc).__name__) from exc
         if state_obj is not None:
             state = str(getattr(state_obj, "state", "") or "unknown")
             row["state"] = state
@@ -223,15 +253,23 @@ def local_ha_area_room_rows(hass: HomeAssistant | None) -> list[dict[str, Any]]:
         return []
     try:
         area_reg = async_get_area_registry(hass)
-        raw_areas = getattr(area_reg, "areas", None)
-        if isinstance(raw_areas, dict):
-            area_items = list(raw_areas.values())
-        elif hasattr(area_reg, "async_list_areas"):
-            area_items = list(area_reg.async_list_areas())
-        else:
+        if area_reg is None:
             area_items = []
-    except Exception:
-        return []
+        else:
+            raw_areas = getattr(area_reg, "areas", None)
+            if isinstance(raw_areas, dict):
+                area_items = list(raw_areas.values())
+            elif hasattr(area_reg, "async_list_areas"):
+                area_items = list(area_reg.async_list_areas())
+            else:
+                area_items = []
+    except Exception as exc:
+        err_cls = globals().get("HostReadModelError")
+        raise (
+            err_cls("ha_area_registry_read_failed", cause_type=type(exc).__name__)
+            if err_cls is not None
+            else RuntimeError("ha_area_registry_read_failed")
+        ) from exc
 
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()

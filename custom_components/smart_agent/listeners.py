@@ -26,11 +26,9 @@ from .arrival_lighting_learning import arrival_lighting_entity_ids
 from .ha_adapter import async_call_service
 from .active_ai_rollout import (
     ActiveAiRolloutConfig,
-    blocked_rollout_actions,
-    enrich_active_ai_action_spaces,
     evaluate_active_ai_execution_gate,
-    scope_active_ai_canary_actions,
 )
+from .decision_rollout import finalize_canary_empty_gate, select_rollout_actions
 from .fast_path_listener import run_addon_fast_path_fail_closed
 from .listener_trigger_projection import (
     compact_listener_triggers,
@@ -113,6 +111,57 @@ def _fast_path_timezone(configured_timezone: str) -> Any | None:
         if offset is None:
             raise
         return timezone(timedelta(hours=offset))
+
+
+def _evaluate_listener_fast_path_rollout(
+    *,
+    result: dict[str, Any],
+    candidate_source: list[Any],
+    device_info: Any,
+    trigger_info: dict[str, Any],
+    room: str,
+    active_ai_rollout: dict[str, Any] | None,
+    ai_enabled: bool,
+) -> tuple[list[dict[str, Any]], list[Any], list[dict[str, Any]], Any]:
+    candidate_actions = [dict(item) for item in candidate_source if isinstance(item, dict)]
+    trigger_space_id = str(
+        result.get("trigger_space_id")
+        or trigger_info.get("space_id")
+        or trigger_info.get("room_id")
+        or trigger_info.get("area_id")
+        or room
+        or ""
+    ).strip()
+    rollout_payload = active_ai_rollout if isinstance(active_ai_rollout, dict) else {}
+    rollout_config = ActiveAiRolloutConfig.from_mapping(rollout_payload)
+    valid_actions, rollout_actions, blocked_ids, computed_blocked = select_rollout_actions(
+        candidate_actions,
+        device_info,
+        rollout_config,
+    )
+    raw_explicit_blocked = result.get("rollout_blocked_actions")
+    explicit_blocked = (
+        [dict(item) for item in raw_explicit_blocked if isinstance(item, dict)]
+        if isinstance(raw_explicit_blocked, list)
+        else []
+    )
+    execution_flags = (
+        rollout_payload.get("execution_flags")
+        if isinstance(rollout_payload.get("execution_flags"), dict)
+        else {}
+    )
+    rollout_decision = finalize_canary_empty_gate(
+        evaluate_active_ai_execution_gate(
+            ai_enabled=ai_enabled,
+            config=rollout_config,
+            trigger_space_id=trigger_space_id,
+            actions=rollout_actions,
+            execution_flags=execution_flags,
+        ),
+        blocked_ids,
+        valid_actions,
+    )
+    return candidate_actions, valid_actions, explicit_blocked or computed_blocked, rollout_decision
 
 
 class ListenersMixin:
@@ -1081,7 +1130,10 @@ class ListenersMixin:
                     bound_decision_time
                 )
         device_info = self.device_info
-        room = result.get("trigger_room") or device_info.get(entity_id, {}).get("room", "")
+        trigger_info = device_info.get(entity_id, {}) if isinstance(device_info, dict) else {}
+        if not isinstance(trigger_info, dict):
+            trigger_info = {}
+        room = result.get("trigger_room") or trigger_info.get("room", "")
         try:
             defer_seconds = int(result.get("defer_seconds", 0) or 0)
         except (TypeError, ValueError):
@@ -1091,7 +1143,9 @@ class ListenersMixin:
             await asyncio.sleep(defer_seconds)
 
         valid_actions = actions if isinstance(actions, list) else []
-        if not valid_actions:
+        raw_original_actions = result.get("rollout_original_actions")
+        has_rollout_originals = isinstance(raw_original_actions, list) and bool(raw_original_actions)
+        if not valid_actions and not has_rollout_originals:
             selection_confirmation = result.get("selection_confirmation")
             pending_selection = (
                 isinstance(selection_confirmation, dict)
@@ -1115,67 +1169,16 @@ class ListenersMixin:
                 ),
                 decision_contract_lineage=decision_contract_lineage,
             )
-        candidate_actions = (
-            result.get("rollout_original_actions")
-            if isinstance(result.get("rollout_original_actions"), list)
-            else valid_actions
-        )
-        candidate_actions = [
-            dict(item) for item in candidate_actions if isinstance(item, dict)
-        ]
-        rollout_actions = enrich_active_ai_action_spaces(
-            candidate_actions,
-            device_info,
-        )
-        trigger_info = device_info.get(entity_id, {})
-        if not isinstance(trigger_info, dict):
-            trigger_info = {}
-        trigger_space_id = str(
-            result.get("trigger_space_id")
-            or trigger_info.get("space_id")
-            or trigger_info.get("room_id")
-            or trigger_info.get("area_id")
-            or room
-            or ""
-        ).strip()
-        rollout_payload = (
-            active_ai_rollout if isinstance(active_ai_rollout, dict) else {}
-        )
-        rollout_config = ActiveAiRolloutConfig.from_mapping(rollout_payload)
-        scoped_actions = scope_active_ai_canary_actions(
-            candidate_actions,
-            rollout_config,
-        )
-        if not scoped_actions.entity_missing:
-            valid_actions = list(scoped_actions.actions)
-            rollout_actions = enrich_active_ai_action_spaces(
-                valid_actions,
-                device_info,
+        candidate_actions, valid_actions, rollout_blocked_actions, rollout_decision = (
+            _evaluate_listener_fast_path_rollout(
+                result=result,
+                candidate_source=raw_original_actions if has_rollout_originals else valid_actions,
+                device_info=device_info,
+                trigger_info=trigger_info,
+                room=room,
+                active_ai_rollout=active_ai_rollout,
+                ai_enabled=bool(self._is_enabled()),
             )
-        rollout_blocked_actions = (
-            [
-                dict(item)
-                for item in result.get("rollout_blocked_actions", [])
-                if isinstance(item, dict)
-            ]
-            if isinstance(result.get("rollout_blocked_actions"), list)
-            else []
-        )
-        if not rollout_blocked_actions and scoped_actions.blocked_entity_ids:
-            rollout_blocked_actions = blocked_rollout_actions(
-                candidate_actions, set(scoped_actions.blocked_entity_ids)
-            )
-        execution_flags = (
-            rollout_payload.get("execution_flags")
-            if isinstance(rollout_payload.get("execution_flags"), dict)
-            else {}
-        )
-        rollout_decision = evaluate_active_ai_execution_gate(
-            ai_enabled=bool(self._is_enabled()),
-            config=rollout_config,
-            trigger_space_id=trigger_space_id,
-            actions=rollout_actions,
-            execution_flags=execution_flags,
         )
         trigger_summary = f"{source_label}[{scene}]"
         if trigger:
@@ -1245,7 +1248,7 @@ class ListenersMixin:
             parent_transaction_id=transaction_id,
             world_snapshot_id=world_snapshot_id,
             correlation_id=correlation_id,
-            active_space_id=trigger_space_id,
+            active_space_id=rollout_decision.trigger_space_id,
             decision_time=str(result.get("decision_time") or "").strip(),
             require_world_snapshot_guard=True,
             # The fast-path result is already a canonical Core command.  Keep

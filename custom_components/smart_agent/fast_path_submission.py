@@ -34,7 +34,7 @@ def prepare_fast_path_execution(
     trace = rollout.decision.as_trace()
     payload = dict(decision.result) if isinstance(decision.result, dict) else {}
     payload["actions"] = rollout.selection.actions
-    if rollout.selection.blocked_actions:
+    if rollout.selection.blocked_actions or rollout.selection.blocked_entity_ids:
         payload["rollout_original_actions"] = rollout.selection.original_actions
         payload["rollout_blocked_actions"] = rollout.selection.blocked_actions
     raw_result = decision.result if isinstance(decision.result, dict) else {}
@@ -67,7 +67,15 @@ async def _dispatch(context: FastPathExecution) -> dict[str, Any]:
 
 def _record_suppressed(context: FastPathExecution) -> None:
     request, plan = context.request, context.decision.plan
-    lineage = plan.lineage
+    lineage, selection = plan.lineage, context.rollout.selection
+    extra = (
+        {
+            "candidate_actions": selection.original_actions,
+            "rollout_blocked_actions": selection.blocked_actions,
+        }
+        if selection.blocked_actions
+        else {}
+    )
     request.host._enqueue_fast_path_execution_audit(
         transaction_id=lineage.transaction_id,
         correlation_id=lineage.correlation_id,
@@ -76,10 +84,11 @@ def _record_suppressed(context: FastPathExecution) -> None:
         trigger=request.trigger.summary,
         scene=plan.scene,
         confidence=plan.confidence,
-        actions=plan.actions,
+        actions=selection.actions if selection.blocked_actions else plan.actions,
         execution_result=0,
         execution_suppressed_reason=context.suppressed_reason,
         rollout=context.trace,
+        **extra,
     )
 
 

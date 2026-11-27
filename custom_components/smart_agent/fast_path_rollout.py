@@ -6,11 +6,9 @@ from typing import Any
 from .active_ai_rollout import (
     ActiveAiRolloutConfig,
     ActiveAiRolloutDecision,
-    blocked_rollout_actions,
-    enrich_active_ai_action_spaces,
-    scope_active_ai_canary_actions,
     evaluate_active_ai_execution_gate,
 )
+from .decision_rollout import finalize_canary_empty_gate, select_rollout_actions
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,30 +31,19 @@ class FastPathRollout:
 def _select_actions(
     actions: list[Any], device_info: dict[str, Any], rollout_payload: dict[str, Any]
 ) -> FastPathActionSelection:
-    rollout_actions = enrich_active_ai_action_spaces(actions, device_info)
     original_actions = list(actions)
     rollout_config = ActiveAiRolloutConfig.from_mapping(rollout_payload)
-    scoped_actions = scope_active_ai_canary_actions(
+    authorized_actions, rollout_actions, blocked_ids, rollout_blocked_actions = select_rollout_actions(
         original_actions,
+        device_info,
         rollout_config,
-    )
-    rollout_scope_filtered_entity_ids = list(scoped_actions.blocked_entity_ids)
-    authorized_actions = list(actions)
-    if not scoped_actions.entity_missing:
-        authorized_actions = list(scoped_actions.actions)
-        rollout_actions = enrich_active_ai_action_spaces(
-            authorized_actions,
-            device_info,
-        )
-    rollout_blocked_actions = blocked_rollout_actions(
-        original_actions, set(rollout_scope_filtered_entity_ids)
     )
     return FastPathActionSelection(
         rollout_config,
         original_actions,
         authorized_actions,
         rollout_actions,
-        rollout_scope_filtered_entity_ids,
+        list(blocked_ids),
         rollout_blocked_actions,
     )
 
@@ -70,8 +57,8 @@ def _trigger_space(
         or trigger_info.get("room_id")
         or trigger_info.get("area_id")
         or (result.get("trigger_room") if isinstance(result, dict) else "")
-        or device_info.get(entity_id, {}).get("room", "")
-    )
+        or trigger_info.get("room", "")
+    ).strip()
 
 
 def prepare_fast_path_rollout(
@@ -89,14 +76,18 @@ def prepare_fast_path_rollout(
     )
     device_info = host.device_info
     selection = _select_actions(actions, device_info, rollout_payload)
-    trigger_info = device_info.get(entity_id, {})
+    trigger_info = device_info.get(entity_id, {}) if isinstance(device_info, dict) else {}
     if not isinstance(trigger_info, dict):
         trigger_info = {}
-    rollout_decision = evaluate_active_ai_execution_gate(
-        ai_enabled=bool(host._is_enabled()),
-        config=selection.config,
-        trigger_space_id=_trigger_space(result, device_info, entity_id, trigger_info),
-        actions=selection.enriched_actions,
-        execution_flags=rollout_flags,
+    rollout_decision = finalize_canary_empty_gate(
+        evaluate_active_ai_execution_gate(
+            ai_enabled=bool(host._is_enabled()),
+            config=selection.config,
+            trigger_space_id=_trigger_space(result, device_info, entity_id, trigger_info),
+            actions=selection.enriched_actions,
+            execution_flags=rollout_flags,
+        ),
+        selection.blocked_entity_ids,
+        selection.actions,
     )
     return FastPathRollout(rollout_payload, selection, rollout_decision)

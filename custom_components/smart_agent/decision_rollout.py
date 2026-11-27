@@ -1,11 +1,13 @@
 """Existing slow-decision canary selection and owner scope projection."""
 
 from __future__ import annotations
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 from .action_normalization import action_entity_id
 from .active_ai_rollout import (
     ActiveAiRolloutConfig,
+    ActiveAiRolloutDecision,
     blocked_rollout_actions,
     enrich_active_ai_action_spaces,
     scope_active_ai_canary_actions,
@@ -31,6 +33,56 @@ class DecisionRollout:
     allow_execution: bool
 
 
+def select_rollout_actions(
+    actions: list[Any],
+    device_info: dict[str, Any],
+    config: ActiveAiRolloutConfig,
+    *,
+    candidate_actions: list[Any] | None = None,
+    explicit_voice_control: bool = False,
+    scope_on_enriched: bool = False,
+) -> tuple[list[Any], list[dict[str, Any]], tuple[str, ...], list[dict[str, Any]]]:
+    authorized = list(actions)
+    candidates = list(actions) if candidate_actions is None else list(candidate_actions)
+    enriched = enrich_active_ai_action_spaces(authorized, device_info)
+    if explicit_voice_control:
+        return authorized, enriched, (), []
+    scoped = scope_active_ai_canary_actions(
+        enriched if scope_on_enriched else authorized,
+        config,
+    )
+    if scoped.entity_missing:
+        return authorized, enriched, (), []
+    blocked_ids = tuple(scoped.blocked_entity_ids)
+    if blocked_ids or len(scoped.actions) != len(authorized):
+        if scope_on_enriched:
+            blocked_set = set(blocked_ids)
+            authorized = [
+                action
+                for action in authorized
+                if action_entity_id(action).lower() not in blocked_set
+            ]
+        else:
+            authorized = list(scoped.actions)
+        enriched = enrich_active_ai_action_spaces(authorized, device_info)
+    blocked = blocked_rollout_actions(candidates, set(blocked_ids))
+    return authorized, enriched, blocked_ids, blocked
+
+
+def finalize_canary_empty_gate(
+    decision: ActiveAiRolloutDecision,
+    blocked_entity_ids: Iterable[str],
+    authorized_actions: list[Any],
+) -> ActiveAiRolloutDecision:
+    blocked = tuple(sorted({str(item).strip().lower() for item in blocked_entity_ids if str(item).strip()}))
+    if blocked and not authorized_actions and decision.reason == "active_ai_no_actions":
+        return decision._replace(
+            reason="active_ai_canary_entity_not_allowed",
+            blocked_entity_ids=blocked,
+        )
+    return decision
+
+
 def _select_actions(
     valid_actions: list[dict[str, Any]],
     candidate_actions: list[dict[str, Any]],
@@ -38,18 +90,15 @@ def _select_actions(
     config: ActiveAiRolloutConfig,
     explicit_voice_control: bool,
 ) -> DecisionRolloutSelection:
-    enriched = enrich_active_ai_action_spaces(valid_actions, device_info)
-    scoped = None if explicit_voice_control else scope_active_ai_canary_actions(enriched, config)
-    blocked_ids = set() if scoped is None else set(scoped.blocked_entity_ids)
-    if scoped is not None and not scoped.entity_missing and blocked_ids:
-        valid_actions = [
-            action
-            for action in valid_actions
-            if action_entity_id(action).lower() not in blocked_ids
-        ]
-        enriched = enrich_active_ai_action_spaces(valid_actions, device_info)
-    blocked_actions = blocked_rollout_actions(candidate_actions, blocked_ids)
-    return DecisionRolloutSelection(valid_actions, enriched, blocked_ids, blocked_actions)
+    authorized, enriched, blocked_ids, blocked_actions = select_rollout_actions(
+        valid_actions,
+        device_info,
+        config,
+        candidate_actions=candidate_actions,
+        explicit_voice_control=explicit_voice_control,
+        scope_on_enriched=True,
+    )
+    return DecisionRolloutSelection(authorized, enriched, set(blocked_ids), blocked_actions)
 
 
 def _space_ids(actions: list[dict[str, Any]]) -> set[str]:
@@ -134,19 +183,18 @@ def _execution_gate(
             "user_explicit_rollout_bypass",
             True,
         )
-    decision = evaluate_active_ai_execution_gate(
-        ai_enabled=bool(getattr(host, "_enabled", False)),
-        config=config,
-        trigger_space_id=active_space_id,
-        actions=selection.enriched_actions,
-        execution_flags=execution_flags,
+    decision = finalize_canary_empty_gate(
+        evaluate_active_ai_execution_gate(
+            ai_enabled=bool(getattr(host, "_enabled", False)),
+            config=config,
+            trigger_space_id=active_space_id,
+            actions=selection.enriched_actions,
+            execution_flags=execution_flags,
+        ),
+        selection.blocked_entity_ids,
+        selection.actions,
     )
-    trace, reason = decision.as_trace(), decision.reason
-    if selection.blocked_entity_ids and not selection.actions:
-        reason = "active_ai_canary_entity_not_allowed"
-        trace["reason"] = reason
-        trace["blocked_entity_ids"] = sorted(selection.blocked_entity_ids)
-    return trace, reason, decision.allow_execution
+    return decision.as_trace(), decision.reason, decision.allow_execution
 
 
 def prepare_decision_rollout(

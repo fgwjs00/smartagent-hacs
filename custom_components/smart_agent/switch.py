@@ -111,7 +111,8 @@ class SmartAgentPausedSwitch(CoordinatorEntity, SwitchEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        pass
+        self._attr_is_on = bool(self.coordinator._enabled)
+        self.async_write_ha_state()
 
     def _persist(self, value: bool) -> None:
         """持久化到 config entry（必须在事件循环中调用）。"""
@@ -162,7 +163,8 @@ class SmartAgentSensorMuteSwitch(CoordinatorEntity, SwitchEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        pass
+        self._attr_is_on = bool(self.coordinator._sensors_muted)
+        self.async_write_ha_state()
 
     def _persist(self, value: bool) -> None:
         """持久化到 config entry（必须在事件循环中调用）。"""
@@ -211,7 +213,8 @@ class SmartAgentLearningModeSwitch(CoordinatorEntity, SwitchEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        pass
+        self._attr_is_on = bool(self.coordinator._learning_mode)
+        self.async_write_ha_state()
 
     def _persist(self, value: bool) -> None:
         """持久化到 config entry（必须在事件循环中调用）。"""
@@ -263,7 +266,8 @@ class SmartAgentHabitProactiveSwitch(CoordinatorEntity, SwitchEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        pass
+        self._attr_is_on = bool(self.coordinator._habit_proactive)
+        self.async_write_ha_state()
 
     def _persist(self, value: bool) -> None:
         """持久化到 config entry（必须在事件循环中调用）。"""
@@ -317,7 +321,8 @@ class SmartAgentFrigateSwitch(CoordinatorEntity, SwitchEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        pass
+        self._attr_is_on = bool(self.coordinator._frigate_enabled)
+        self.async_write_ha_state()
 
     def _persist(self, value: bool) -> None:
         """持久化到 config entry（必须在事件循环中调用）。"""
@@ -376,7 +381,8 @@ class SmartAgentVisionSwitch(CoordinatorEntity, SwitchEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        pass
+        self._attr_is_on = bool(self.coordinator._vision_enabled)
+        self.async_write_ha_state()
 
     def _persist(self, value: bool) -> None:
         """持久化到 config entry。"""

@@ -273,6 +273,7 @@ class SmartAgentCoordinator(
         """Initialize and load config from entry (data + options)."""
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=5))
         self._entry = entry
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         data = {**(entry.data or {}), **(entry.options or {})}
         self._init_runtime_state(
             data,
@@ -606,6 +607,9 @@ class SmartAgentCoordinator(
             )
 
     def _handle_background_task_done(self, task: Any, *, label: str) -> None:
+        tasks = self.__dict__.get("_background_tasks")
+        if isinstance(tasks, set) and getattr(task, "__hash__", None) is not None:
+            tasks.discard(task)
         try:
             if hasattr(task, "cancelled") and task.cancelled():
                 return
@@ -625,6 +629,8 @@ class SmartAgentCoordinator(
                 task.add_done_callback(
                     lambda done: self._handle_background_task_done(done, label=label)
                 )
+                if getattr(task, "__hash__", None) is not None:
+                    self.__dict__.setdefault("_background_tasks", set()).add(task)
         except Exception as exc:
             self._report_background_task_failure(label, phase="attach_observer", error=exc)
         return task
@@ -1569,6 +1575,55 @@ class SmartAgentCoordinator(
             "startup_unavail_check",
         )
 
+    @staticmethod
+    def _cancel_timer_mapping(timer_map: dict[str, Any] | None, *, label: str) -> None:
+        if not isinstance(timer_map, dict):
+            return
+        callbacks = list(timer_map.values())
+        timer_map.clear()
+        for cancel in callbacks:
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception as exc:
+                    _LOGGER.warning("[Shutdown] %s timer cancel failed: %s", label, type(exc).__name__)
+
+    async def _cancel_background_tasks(self) -> None:
+        tasks_set = self.__dict__.get("_background_tasks")
+        if not isinstance(tasks_set, set) or not tasks_set:
+            return
+        tasks = list(tasks_set)
+        tasks_set.clear()
+        current = asyncio.current_task()
+        pending = [t for t in tasks if t is not current and hasattr(t, "done") and not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _stop_file_logger(self) -> None:
+        file_logger = self.__dict__.get("_file_logger")
+        if file_logger is not None:
+            for handler in list(getattr(file_logger, "handlers", ())):
+                if isinstance(handler, logging.handlers.QueueHandler):
+                    file_logger.removeHandler(handler)
+                    try:
+                        handler.close()
+                    except Exception as exc:
+                        _LOGGER.warning("[Shutdown] QueueHandler close failed: %s", type(exc).__name__)
+        listener = self._log_queue_listener
+        self._log_queue_listener = None
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception as exc:
+                _LOGGER.warning("[Shutdown] QueueListener stop failed: %s", type(exc).__name__)
+            for handler in list(getattr(listener, "handlers", ())):
+                try:
+                    handler.close()
+                except Exception as exc:
+                    _LOGGER.warning("[Shutdown] FileHandler close failed: %s", type(exc).__name__)
+
     async def async_shutdown(self) -> None:
         for remove in self._state_listener_removers:
             try:
@@ -1589,19 +1644,11 @@ class SmartAgentCoordinator(
         if callable(cancel):
             cancel()
         self._room_lighting_startup_cancel = None
-        for cancel in self._active_timers.values():
-            try:
-                cancel()
-            except Exception:
-                pass
-        self._active_timers.clear()
-        for cancel in self._manual_scene_learning_timers.values():
-            try:
-                cancel()
-            except Exception:
-                pass
-        self._manual_scene_learning_timers.clear()
+        self._cancel_timer_mapping(self._active_timers, label="active")
+        self._cancel_timer_mapping(self._manual_scene_learning_timers, label="scene_learning")
         self._manual_scene_learning_sessions.clear()
+        self._cancel_timer_mapping(self._presence_off_timers, label="presence_off")
+        self._cancel_timer_mapping(self._frigate_count_timers, label="frigate_count")
         for handle_name, handle in (
             ("_merge_timer_unsub", self._merge_timer_unsub),
             ("_scan_timer_unsub", self._scan_timer_unsub),
@@ -1614,13 +1661,7 @@ class SmartAgentCoordinator(
                 except Exception:
                     pass
                 setattr(self, handle_name, None)
-        # 停止日志后台线程（flush 队列后退出）
-        listener = self._log_queue_listener
-        if listener:
-            try:
-                listener.stop()
-            except Exception:
-                pass
+        await self._cancel_background_tasks()
         # Frigate MQTT 清理
         await self._async_stop_frigate_mqtt()
         bridge = self._internal_event_bridge
@@ -1637,6 +1678,8 @@ class SmartAgentCoordinator(
                 await self.hass.async_add_executor_job(db.close)
             except Exception as exc:
                 _LOGGER.warning("[Shutdown] DatabaseService 关闭异常: %s", exc)
+        # 停止日志后台线程并卸载关闭 QueueHandler（flush 队列后退出）
+        self._stop_file_logger()
 
     # ── 对外服务接口 ──────────────────────────────────────────────────────────
 

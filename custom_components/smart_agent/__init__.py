@@ -749,19 +749,19 @@ class SmartAgentEventsWSView(HomeAssistantView):
             next_ids: set[str] = set()
             next_sampling_contracts: dict[str, dict[str, Any]] = {}
             if coord is not None:
-                for row in _local_device_rows(coord, hass):
-                    if not isinstance(row, dict):
-                        continue
-                    entity_id = str(row.get("entity_id") or "").strip()
-                    if not entity_id:
+                try:
+                    rows = _local_device_rows(coord, hass)
+                except RuntimeError as exc:
+                    _LOGGER.warning("[EventsWS] managed device read failed: %s", type(exc).__name__)
+                    return managed_event_entity_ids
+                for row in rows:
+                    if not isinstance(row, dict) or not (entity_id := str(row.get("entity_id") or "").strip()):
                         continue
                     if not is_explicitly_managed_device_row(row):
                         continue
                     next_ids.add(entity_id)
-                    sampling_contract = row.get("signal_sampling_contract")
-                    if isinstance(sampling_contract, dict):
+                    if isinstance(sampling_contract := row.get("signal_sampling_contract"), dict):
                         next_sampling_contracts[entity_id] = dict(sampling_contract)
-
             managed_event_entity_ids = next_ids
             managed_event_sampling_contracts = next_sampling_contracts
             managed_event_entity_ids_updated_at = now_monotonic
@@ -1089,8 +1089,6 @@ class SmartAgentListenerDiagnosticsView(HomeAssistantView):
         )
 
 
-
-
 class SmartAgentRoomsView(HomeAssistantView):
     """Area Registry Bridge（主计划 P4.2 例外）：只做 HA Area 读写，不承载房间业务语义。"""
 
@@ -1102,9 +1100,12 @@ class SmartAgentRoomsView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
-
         coord = _get_first_coordinator(request.app["hass"])
-        return self.json(_local_room_rows(coord, request.app["hass"]))
+        try:
+            return self.json(_local_room_rows(coord, request.app["hass"]))
+        except RuntimeError as exc:
+            p = exc.error_payload("rooms_list") if hasattr(exc, "error_payload") else {"ok": False, "error": str(exc) or "rooms_read_failed", "error_type": "dependency_unavailable", "retryable": True, "source": "ha_host_local", "scope": "rooms_list"}
+            return self.json(p, status_code=503)
 
     async def post(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
@@ -1238,11 +1239,14 @@ class SmartAgentManagedDevicesView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
-
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
             return self.json([])
-        return self.json(_local_device_rows(coord, request.app["hass"]))
+        try:
+            return self.json(_local_device_rows(coord, request.app["hass"]))
+        except RuntimeError as exc:
+            p = exc.error_payload("devices_list") if hasattr(exc, "error_payload") else {"ok": False, "error": str(exc) or "devices_read_failed", "error_type": "dependency_unavailable", "retryable": True, "source": "ha_host_local", "scope": "devices_list"}
+            return self.json(p, status_code=503)
 
 
 class SmartAgentDeviceDetailView(HomeAssistantView):
@@ -1256,23 +1260,19 @@ class SmartAgentDeviceDetailView(HomeAssistantView):
     async def get(self, request: web.Request, entity_id: str) -> web.Response:
         if (err := _view_admin_check(request)):
             return err
-
         eid = str(entity_id or "").strip()
         coord = _get_first_coordinator(request.app["hass"])
         if coord is None:
             return self.json(
-                _json_error_payload(
-                    "coordinator_unavailable",
-                    "dependency_unavailable",
-                    True,
-                    scope="device_detail",
-                    source="ha_host_local",
-                    entity_id=eid,
-                ),
+                _json_error_payload("coordinator_unavailable", "dependency_unavailable", True, scope="device_detail", source="ha_host_local", entity_id=eid),
                 status_code=503,
             )
-
-        for row in _local_device_rows(coord, request.app["hass"]):
+        try:
+            rows = _local_device_rows(coord, request.app["hass"])
+        except RuntimeError as exc:
+            p = getattr(exc, "payload", None) or _json_error_payload(str(exc) or "device_read_failed", "dependency_unavailable", True, source="ha_host_local")
+            return self.json(dict(p, scope="device_detail", entity_id=eid), status_code=503)
+        for row in rows:
             if not isinstance(row, dict):
                 continue
             row_entity_id = str(row.get("entity_id") or row.get("id") or "").strip()
