@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.252
-display_version: Beta 0.0.252
+release_version: 0.0.253
+display_version: Beta 0.0.253
 channel: beta
 release_date: '2026-11-27'
 public_release_ready: true
@@ -8,5 +8,6 @@ component:
   type: home_assistant_integration
   source_path: custom_components/smart_agent
 release_notes:
-  summary: 包含零纳管设备策略与中控屏房间映射、远程网关配对失败日志增强，以及 V5 统一云端绑定面板交互。
-  customer_visible_version: Beta 0.0.252
+  summary: 新增 AI 管家本地配对与 V5 配对卡片、修复 P0 安全与屏端/Cloud/License 回归（BUG-001/071/073/077/WP-6）、完善房间
+    WS 回退及 Android lanRelease 构建配置。
+  customer_visible_version: Beta 0.0.253
