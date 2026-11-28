@@ -1,6 +1,6 @@
 product: SmartAgent
-release_version: 0.0.255
-display_version: Beta 0.0.255
+release_version: 0.0.256
+display_version: Beta 0.0.256
 channel: beta
 release_date: '2026-11-28'
 public_release_ready: true
@@ -10,4 +10,4 @@ component:
 release_notes:
   summary: 增强 AI 管家多仓库 slug 动态发现与 V5 配对卡片，并继续内置中控屏精简版 LAN Release OTA（v0.2.107-lan-rel
     / Build 112，16.5MB）。
-  customer_visible_version: Beta 0.0.255
+  customer_visible_version: Beta 0.0.256
